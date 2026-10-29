@@ -57,7 +57,12 @@ class NativeSmokeWiring(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 base = pathlib.Path(tmp); evidence=base/'evidence'; data=base/'data'; app=base/'Chat Hub.app'
                 evidence.mkdir(); data.mkdir()
-                (data/'service.json').write_text(json.dumps({'api':'http://127.0.0.1:1234','bundle_id':'example.app','process_id':124 if fail_pid else 123}))
+                (data/'service.json').write_text(json.dumps({'api':'http://127.0.0.1:1234','process_id':124 if fail_pid else 123,'version':'0.1.1'}))
+                # The actual runner discovers activation identity from the app's
+                # Info.plist; service.json intentionally has no bundle_id.
+                contents=app/'Contents'; contents.mkdir(parents=True)
+                import plistlib
+                (contents/'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':'example.app'}))
                 (data/'service.token').write_text('x'*64)
                 # urllib's context manager must return JSON through json.load.
                 from io import BytesIO
