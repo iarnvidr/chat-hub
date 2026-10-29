@@ -330,7 +330,7 @@ async fn main() {
         #[cfg(target_os = "macos")]
         {
             let proxy_url = format!("http://{}", proxy.addr);
-            let ca_der = proxy.ca.cert_der().to_vec();
+            let ca_der = proxy.ca.cert_der().map_err(std::io::Error::other)?;
             let provider = tauri::WebviewWindowBuilder::new(
                 app,
                 "provider",

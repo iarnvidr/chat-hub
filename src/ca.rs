@@ -87,6 +87,10 @@ impl Ca {
             dir: dir.to_path_buf(),
         })
     }
+    /// DER-encoded public certificate for platform trust APIs.
+    pub fn cert_der(&self) -> Result<Vec<u8>, CaError> {
+        Ok(self.cert.der().as_ref().to_vec())
+    }
     pub fn key_path(&self) -> PathBuf {
         self.dir.join("ca-key.pem")
     }

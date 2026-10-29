@@ -6,7 +6,7 @@ use std::{
     ffi::{c_char, c_void, CStr},
     sync::OnceLock,
 };
-use tauri::Webview;
+use tauri::WebviewWindow;
 static CA_DER: OnceLock<Vec<u8>> = OnceLock::new();
 extern "C" {
     fn object_getClass(obj: *const c_void) -> *const c_void;
@@ -80,7 +80,7 @@ extern "C" fn challenge(
         }
     }
 }
-pub fn prepare(ca_der: &[u8], wv: &Webview) {
+pub fn prepare(ca_der: &[u8], wv: &WebviewWindow) {
     let _ = CA_DER.set(ca_der.to_vec());
     let _ = wv.with_webview(|w| unsafe {
         let webview = w.inner() as *mut AnyObject;
