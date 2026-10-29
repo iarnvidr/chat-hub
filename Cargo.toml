@@ -1,0 +1,38 @@
+[package]
+name = "chat-hub"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "chat_hub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chat-hub"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "io-util"] }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server", "http1"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+rcgen = { version = "0.13", features = ["pem"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
