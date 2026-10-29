@@ -129,24 +129,49 @@ mod e2e {
         Ok(())
     }
 }
+fn authorize_local_main(window: &tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("privileged command is restricted to the main application window".into());
+    }
+    let url = window.url().map_err(|e| e.to_string())?;
+    let local = (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
+        || (url.scheme() == "http" && url.host_str() == Some("tauri.localhost"));
+    if !local {
+        return Err("privileged command is restricted to the packaged local UI origin".into());
+    }
+    Ok(())
+}
 #[tauri::command]
-fn update_status(s: State<'_, AppState>) -> UpdateStatus {
-    s.updater.lock().unwrap().clone()
+fn update_status(
+    window: tauri::WebviewWindow,
+    s: State<'_, AppState>,
+) -> Result<UpdateStatus, String> {
+    authorize_local_main(&window)?;
+    Ok(s.updater.lock().map_err(|e| e.to_string())?.clone())
 }
 #[cfg(feature = "native-smoke")]
 #[tauri::command]
-fn e2e_result(id: String, value: String) -> Result<(), String> {
+fn e2e_result(window: tauri::WebviewWindow, id: String, value: String) -> Result<(), String> {
+    authorize_local_main(&window)?;
     e2e::e2e_result(id, value)
 }
 #[tauri::command]
-fn service_info(s: State<'_, AppState>) -> serde_json::Value {
-    serde_json::json!({"service":APP_NAME,"version":env!("CARGO_PKG_VERSION"),"api":s.api,"proxy":s.proxy,"process_id":std::process::id(),"executable":std::env::current_exe().ok()})
+fn service_info(
+    window: tauri::WebviewWindow,
+    s: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    Ok(
+        serde_json::json!({"service":APP_NAME,"version":env!("CARGO_PKG_VERSION"),"api":s.api,"proxy":s.proxy,"process_id":std::process::id(),"executable":std::env::current_exe().ok()}),
+    )
 }
 #[tauri::command]
 async fn check_for_updates(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UpdateStatus, String> {
+    authorize_local_main(&window)?;
     #[cfg(feature = "native-smoke")]
     if smoke() {
         let mut s = state.updater.lock().map_err(|e| e.to_string())?;
@@ -215,7 +240,12 @@ fn updater_builder(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updat
         .map_err(|e| e.to_string())
 }
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn install_update(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    authorize_local_main(&window)?;
     let pending = state
         .pending_update
         .lock()
