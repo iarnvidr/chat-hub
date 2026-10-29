@@ -1,8 +1,47 @@
 #!/usr/bin/env python3
 """Validate and assemble Tauri v2 updater release metadata/artifacts."""
-import argparse, json, re, sys
+import argparse, base64, binascii, json, re, sys
 from pathlib import Path
 from urllib.parse import urlparse
+
+MINISIGN_COMMENT = b"untrusted comment: minisign public key: "
+MINISIGN_ALGORITHM = b"\x45\x64"
+
+
+def parse_public_key(value):
+    """Parse a plaintext minisign key or Tauri's base64-encoded key file."""
+    if isinstance(value, str):
+        value = value.encode("ascii")
+    if not isinstance(value, bytes):
+        raise ValueError("public key must be text or bytes")
+    value = value.strip()
+    if not value:
+        raise ValueError("public key is empty")
+    if not value.startswith(b"untrusted comment:"):
+        try:
+            value = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("public key must be plaintext minisign or strict base64") from exc
+    lines = value.splitlines()
+    if len(lines) != 2 or not lines[0].startswith(MINISIGN_COMMENT):
+        raise ValueError("malformed minisign public key")
+    try:
+        comment_key_id = bytes.fromhex(lines[0][len(MINISIGN_COMMENT):].decode("ascii"))
+        payload = base64.b64decode(lines[1], validate=True)
+    except (UnicodeDecodeError, ValueError, binascii.Error) as exc:
+        raise ValueError("malformed minisign public key encoding") from exc
+    if len(comment_key_id) != 8 or len(payload) != 42:
+        raise ValueError("minisign public key must contain an 8-byte key ID and 42-byte key")
+    if comment_key_id != payload[2:10][::-1]:
+        raise ValueError("minisign public-key comment ID does not match payload key ID")
+    if payload[:2] != MINISIGN_ALGORITHM:
+        raise ValueError("unsupported minisign public-key algorithm")
+    return payload
+
+
+def minisign_public_key(value):
+    payload = parse_public_key(value)
+    return MINISIGN_COMMENT + payload[2:10][::-1].hex().upper().encode("ascii") + b"\n" + base64.b64encode(payload) + b"\n"
 
 SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 

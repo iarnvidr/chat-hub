@@ -72,12 +72,12 @@ jobs:
           tar -czf 'Chat Hub.app.tar.gz' 'Chat Hub.app'
           npx --yes @tauri-apps/cli@2.10.1 signer sign 'Chat Hub.app.tar.gz'
           test -s 'Chat Hub.app.tar.gz.sig'
-          python3 - "$GITHUB_WORKSPACE/src-tauri/tauri.conf.json" <<'PY'
-          import base64, json, pathlib, sys
-          encoded=json.load(open(sys.argv[1]))['plugins']['updater']['pubkey']
-          key=base64.b64decode(encoded, validate=True)
-          assert key.startswith(b'untrusted comment: minisign public key: '), 'invalid pinned updater public key'
-          pathlib.Path('updater.pub').write_bytes(key)
+          python3 - "$GITHUB_WORKSPACE/src-tauri/tauri.conf.json" "$GITHUB_WORKSPACE/build/updater_release.py" <<'PY'
+          import base64, importlib.util, json, pathlib, sys
+          spec=importlib.util.spec_from_file_location('updater_release', sys.argv[2])
+          module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+          configured=json.load(open(sys.argv[1]))['plugins']['updater']['pubkey']
+          pathlib.Path('updater.pub').write_bytes(module.minisign_public_key(configured))
           sig=base64.b64decode(pathlib.Path('Chat Hub.app.tar.gz.sig').read_bytes(), validate=True)
           pathlib.Path('Chat Hub.app.tar.gz.sig.minisig').write_bytes(sig)
           PY
