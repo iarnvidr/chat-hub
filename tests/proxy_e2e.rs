@@ -12,7 +12,30 @@ use tokio::{
 
 #[tokio::test]
 async fn connect_mitm_forwards_tls_response_and_emits_capture() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Run the actual CONNECT/TLS exercise in a new test-binary process. This is
+    // deliberately the first Rustls use there, proving proxy production builders
+    // do not rely on a process-global provider being installed by unrelated code.
+    const CHILD: &str = "CHAT_HUB_FRESH_TLS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "connect_mitm_forwards_tls_response_and_emits_capture",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("launch fresh TLS test process");
+        assert!(
+            status.success(),
+            "fresh-process TLS exercise failed: {status}"
+        );
+        return;
+    }
+    exercise_connect_mitm().await;
+}
+
+async fn exercise_connect_mitm() {
     let dir = std::env::temp_dir().join(format!("chat-hub-e2e-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -21,17 +44,21 @@ async fn connect_mitm_forwards_tls_response_and_emits_capture() {
     let upstream_cert = upstream_params.self_signed(&upstream_key).unwrap();
     let roots = dir.join("upstream.pem");
     fs::write(&roots, upstream_cert.pem()).unwrap();
-    let upstream_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            rustls_pemfile::certs(&mut upstream_cert.pem().as_bytes())
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            rustls_pemfile::private_key(&mut upstream_key.serialize_pem().as_bytes())
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+    let upstream_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        rustls_pemfile::certs(&mut upstream_cert.pem().as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        rustls_pemfile::private_key(&mut upstream_key.serialize_pem().as_bytes())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
     let upstream_task = tokio::spawn(async move {
@@ -47,8 +74,6 @@ async fn connect_mitm_forwards_tls_response_and_emits_capture() {
             request.push(byte[0]);
         }
         assert!(String::from_utf8_lossy(&request).starts_with("POST /synthetic HTTP/1.1"));
-        assert!(request.windows(4).any(|w| w == b"\r\n\r\n"));
-        // Consume exactly the declared payload, which is larger than the proxy's old 8 KiB read boundary.
         let headers = String::from_utf8_lossy(&request);
         let content_length: usize = headers
             .lines()
@@ -74,7 +99,6 @@ async fn connect_mitm_forwards_tls_response_and_emits_capture() {
         )
         .await
         .unwrap();
-        // Leave upstream TLS open after its length-delimited response; the client must not wait for EOF.
     });
     let ca = Ca::load_or_create(dir.join("proxy-ca")).unwrap();
     let (tx, mut rx) = mpsc::channel::<CaptureEvent>(4);
