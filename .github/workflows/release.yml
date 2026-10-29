@@ -59,6 +59,13 @@ jobs:
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
+      - name: Resolve native-smoke Cargo artifact path
+        id: native-smoke-artifact
+        run: |
+          set -euo pipefail
+          binary="$(python3 build/native_smoke_artifact.py src-tauri/Cargo.toml)"
+          test -n "$binary"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
       - name: Required native-smoke feature compilation
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
       - name: Build native-smoke binary for required launch harness
@@ -70,9 +77,11 @@ jobs:
           mkdir -p "$(dirname "$app")"
           ditto "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$app"
           exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
-          binary="${CARGO_TARGET_DIR:-target}/aarch64-apple-darwin/debug/chat-hub-desktop"
+          binary="${{ steps.native-smoke-artifact.outputs.binary }}"
           test -x "$binary"
           cp "$binary" "$app/Contents/MacOS/$exe"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "$exe"
+          cmp -s "$binary" "$app/Contents/MacOS/$exe"
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
       - name: Required native UI, health, relaunch, and shutdown smoke

@@ -16,7 +16,7 @@ class NativeSmokeWiring(unittest.TestCase):
         self.assertIn("native-ui-driver.py", harness)
         self.assertIn("MUNINN_NATIVE_UI_SMOKE=1", harness)
         self.assertIn("native-smoke", workflow)
-        self.assertIn("chat-hub-desktop", workflow)
+        self.assertIn("native_smoke_artifact.py", workflow)
         self.assertNotIn("BLOCKED: native UI", harness)
         driver = (ROOT / "build/native-ui-driver.py").read_text()
         self.assertIn("screencapture", driver)
