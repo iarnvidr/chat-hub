@@ -6,7 +6,7 @@ metas = {}
 for v in ('old', 'new'):
     meta = json.loads((root / f'{v}.json').read_text())
     metas[v] = meta
-    archive = root / v / 'Muninn.app.tar.gz'
+    archive = root / v / 'Chat-Hub.app.tar.gz'
     signature = pathlib.Path(str(archive) + '.sig')
     if not archive.is_file() or archive.stat().st_size < 1024:
         raise SystemExit(f'FAIL: missing/implausible {v} actual app tar.gz archive')
@@ -17,9 +17,9 @@ for v in ('old', 'new'):
     try:
         with tarfile.open(archive, 'r:gz') as tf:
             members = tf.getnames()
-            if not members or any(not (m == 'Muninn.app' or m.startswith('Muninn.app/')) for m in members):
-                raise SystemExit(f'FAIL: {v} archive is not rooted at Muninn.app')
-            plist = tf.extractfile('Muninn.app/Contents/Info.plist')
+            if not members or any(not (m == 'Chat Hub.app' or m.startswith('Chat Hub.app/')) for m in members):
+                raise SystemExit(f'FAIL: {v} archive is not rooted at Chat Hub.app')
+            plist = tf.extractfile('Chat Hub.app/Contents/Info.plist')
             if plist is None:
                 raise SystemExit(f'FAIL: {v} archive lacks bundle Info.plist')
             import plistlib

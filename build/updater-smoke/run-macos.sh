@@ -6,7 +6,8 @@ REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).
 export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
 export CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-: "${MUNINN_UPDATER_SMOKE_APP:?set to built debug Muninn.app}"
+MUNINN_UPDATER_SMOKE_APP="${CHAT_HUB_UPDATER_SMOKE_APP:-${MUNINN_UPDATER_SMOKE_APP:-}}"
+: "${MUNINN_UPDATER_SMOKE_APP:?set CHAT_HUB_UPDATER_SMOKE_APP (or legacy MUNINN_UPDATER_SMOKE_APP) to built debug Chat Hub.app}"
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'FAIL: Apple Silicon macOS required' >&2; exit 2; }
 [[ -d "$MUNINN_UPDATER_SMOKE_APP/Contents/MacOS" ]] || { echo 'FAIL: expected actual .app bundle' >&2; exit 2; }
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/muninn-updater-smoke.XXXXXX")"; chmod 700 "$TMP"
@@ -21,20 +22,21 @@ cleanup() {
       if [[ -s "$TMP/$name.json" ]]; then install -m 600 "$TMP/$name.json" "$EVIDENCE_DIR/$name.json"; fi
     done
   fi
-  restore_manifest
+  if [[ -n "${ROOT_MANIFEST_BACKUP:-}" && -f "$ROOT_MANIFEST_BACKUP" ]]; then cp "$ROOT_MANIFEST_BACKUP" "$ROOT_MANIFEST"; fi
+  if [[ -n "${MANIFEST_BACKUP:-}" && -f "$MANIFEST_BACKUP" ]]; then cp "$MANIFEST_BACKUP" "$MANIFEST"; fi
+  if [[ -n "${CONF_BACKUP:-}" && -f "$CONF_BACKUP" ]]; then cp "$CONF_BACKUP" "$CONF"; fi
+  if [[ -n "${PKG_BACKUP:-}" && -f "$PKG_BACKUP" ]]; then cp "$PKG_BACKUP" "$PKG"; fi
+  if [[ -n "${LOCK_BACKUP:-}" && -f "$LOCK_BACKUP" ]]; then cp "$LOCK_BACKUP" "$LOCK"; fi
   [[ "${MUNINN_UPDATER_SMOKE_KEEP:-0}" == 1 ]] || rm -rf "$TMP"
   return "$rc"
 }
 trap cleanup EXIT
 mkdir -p "$TMP/data" "$TMP/feed" "$TMP/e2e" "$TMP/home" "$TMP/healthy" "$TMP/tampered"
 # Preserve real bundle roots and isolate the source app from installer mutation.
-ditto "$MUNINN_UPDATER_SMOKE_APP" "$TMP/healthy/Muninn.app"
-ditto "$MUNINN_UPDATER_SMOKE_APP" "$TMP/tampered/Muninn.app"
 export HOME="$TMP/home" MUNINN_DATA_DIR="$TMP/data" MUNINN_E2E_DIR="$TMP/e2e"
 export MUNINN_NATIVE_UI_SMOKE=1
 PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 export MUNINN_UPDATER_SMOKE_ENDPOINT="http://127.0.0.1:$PORT/latest.json"
-APP="$(cd "$(dirname "$MUNINN_UPDATER_SMOKE_APP")" && pwd)/$(basename "$MUNINN_UPDATER_SMOKE_APP")"
 # Compile genuine binaries with all package version sources aligned. Restore all
 # temporarily edited inputs on errors/signals; no plist-only version simulation.
 MANIFEST="$ROOT/src-tauri/Cargo.toml"
@@ -44,10 +46,9 @@ CONF="$ROOT/src-tauri/tauri.conf.json"; CONF_BACKUP="$TMP/tauri.conf.json"
 PKG="$ROOT/package.json"; PKG_BACKUP="$TMP/package.json"
 LOCK="$ROOT/src-tauri/Cargo.lock"; LOCK_BACKUP="$TMP/Cargo.lock"
 cp "$ROOT_MANIFEST" "$ROOT_MANIFEST_BACKUP"; cp "$MANIFEST" "$MANIFEST_BACKUP"; cp "$CONF" "$CONF_BACKUP"; cp "$PKG" "$PKG_BACKUP"; cp "$LOCK" "$LOCK_BACKUP"
-restore_manifest() { cp "$ROOT_MANIFEST_BACKUP" "$ROOT_MANIFEST"; cp "$MANIFEST_BACKUP" "$MANIFEST"; cp "$CONF_BACKUP" "$CONF"; cp "$PKG_BACKUP" "$PKG"; cp "$LOCK_BACKUP" "$LOCK"; }
-trap restore_manifest EXIT
 build_fixture() {
   local version="$1" target="$TMP/target-$1"
+  python3 "$ROOT/build/updater-smoke/prepare_fixture.py" "$ROOT" "$version"
   CARGO_TARGET_DIR="$target" cargo build --locked --offline --manifest-path "$MANIFEST" --target aarch64-apple-darwin --features native-smoke
   local app="$TMP/build-$version/Chat Hub-$version.app" exe
   mkdir -p "$(dirname "$app")"
@@ -68,10 +69,11 @@ NEW="0.1.1"
 # Each fixture's desktop manifest/config/package and locked package record match.
 build_fixture "$OLD"
 build_fixture "$NEW"
-restore_manifest
 # Use the genuinely compiled old-version app as both isolated starting copies.
 APP="$TMP/build-$OLD/Chat Hub-$OLD.app"
-for bundle in "$TMP/healthy/Muninn.app" "$TMP/tampered/Muninn.app"; do
+for bundle in "$TMP/healthy/Chat Hub.app" "$TMP/tampered/Chat Hub.app"; do
+  rm -rf "$bundle"
+  ditto "$APP" "$bundle"
   codesign --force --deep --sign - "$bundle"
 done
 
@@ -80,32 +82,32 @@ npx --yes @tauri-apps/cli@2.10.1 signer generate --ci --write-keys "$TMP/test.ke
 PUB="$(find "$TMP" -maxdepth 1 -type f -name '*.key.pub' -print -quit)"
 [[ -s "$PUB" ]] || { echo 'FAIL: signer did not produce public key' >&2; exit 2; }
 export MUNINN_UPDATER_SMOKE_PUBKEY="$(cat "$PUB")"
-# Produce genuine gzip/tar updater payloads rooted at Muninn.app.
+# Produce genuine gzip/tar updater payloads rooted at Chat Hub.app.
 make_archive() {
-  local version="$1" out="$2" copy="$TMP/Muninn.app"
+  local version="$1" out="$2" copy="$TMP/Chat Hub.app"
   rm -rf "$copy"; ditto "$TMP/build-$version/Chat Hub-$version.app" "$copy"
   codesign --force --deep --sign - "$copy"
   mkdir -p "$out"
-  tar -czf "$out/Muninn.app.tar.gz" -C "$TMP" Muninn.app
+  tar -czf "$out/Chat-Hub.app.tar.gz" -C "$TMP" "Chat Hub.app"
   # CLI emits signature in the requested output file; never scrape stdout.
-  npx --yes @tauri-apps/cli@2.10.1 signer sign --private-key-path "$TMP/test.key" --password '' "$out/Muninn.app.tar.gz" >"$TMP/sign.log" 2>&1
-  [[ -s "$out/Muninn.app.tar.gz.sig" ]] || { echo 'FAIL: signer did not emit detached .sig file' >&2; exit 2; }
-  cp "$out/Muninn.app.tar.gz.sig" "$out/signature"
+  npx --yes @tauri-apps/cli@2.10.1 signer sign --private-key-path "$TMP/test.key" --password '' "$out/Chat-Hub.app.tar.gz" >"$TMP/sign.log" 2>&1
+  [[ -s "$out/Chat-Hub.app.tar.gz.sig" ]] || { echo 'FAIL: signer did not emit detached .sig file' >&2; exit 2; }
+  cp "$out/Chat-Hub.app.tar.gz.sig" "$out/signature"
 }
 mkdir -p "$TMP/old" "$TMP/new"
 make_archive "$OLD" "$TMP/old"
 make_archive "$NEW" "$TMP/new"
-SIG="$(cat "$TMP/new/Muninn.app.tar.gz.sig")"
-OLD_SIG="$(cat "$TMP/old/Muninn.app.tar.gz.sig")"
+SIG="$(cat "$TMP/new/Chat-Hub.app.tar.gz.sig")"
+OLD_SIG="$(cat "$TMP/old/Chat-Hub.app.tar.gz.sig")"
 
 python3 - "$TMP" "$OLD" "$OLD_SIG" "$NEW" "$SIG" "$PORT" <<'PY'
 import json,pathlib,sys
 p=pathlib.Path(sys.argv[1]); old,old_sig,version,sig,port=sys.argv[2:]
 (p/'old.json').write_text(json.dumps({'version':old,'signature':old_sig})+'\n')
 (p/'new.json').write_text(json.dumps({'version':version,'signature':sig})+'\n')
-(p/'feed/latest.json').write_text(json.dumps({'version':version,'notes':'synthetic test','pub_date':None,'platforms':{'darwin-aarch64':{'url':f'http://127.0.0.1:{port}/Muninn.app.tar.gz','signature':sig}}})+'\n')
+(p/'feed/latest.json').write_text(json.dumps({'version':version,'notes':'synthetic test','pub_date':None,'platforms':{'darwin-aarch64':{'url':f'http://127.0.0.1:{port}/Chat-Hub.app.tar.gz','signature':sig}}})+'\n')
 PY
-cp "$TMP/new/Muninn.app.tar.gz" "$TMP/feed/Muninn.app.tar.gz"
+cp "$TMP/new/Chat-Hub.app.tar.gz" "$TMP/feed/Chat-Hub.app.tar.gz"
 export MUNINN_UPDATER_SMOKE_CURRENT_VERSION="$OLD"
 python3 "$ROOT/build/updater-smoke/verify_artifacts.py" "$TMP"
 # loopback-only server, shared by actual plugin fetches
@@ -133,15 +135,15 @@ if [[ "$ready" != 1 ]]; then
   exit 2
 fi
 # Run actual installed bundle; launcher itself accesses bridge via E2E command files.
-python3 "$ROOT/build/updater-smoke/driver.py" healthy "$TMP" "$TMP/healthy/Muninn.app"
+python3 "$ROOT/build/updater-smoke/driver.py" healthy "$TMP" "$TMP/healthy/Chat Hub.app"
 # Tamper distinct copy, keep healthy candidate/evidence untouched, and retain genuine NEW signature/version.
 python3 - "$TMP" "$NEW" <<'PY'
 import json,pathlib,sys
 p=pathlib.Path(sys.argv[1]); version=sys.argv[2]
-archive=p/'feed/Muninn.app.tar.gz'
-source=p/'new/Muninn.app.tar.gz'; b=bytearray(source.read_bytes()); b[len(b)//2]^=1; archive.write_bytes(b)
+archive=p/'feed/Chat-Hub.app.tar.gz'
+source=p/'new/Chat-Hub.app.tar.gz'; b=bytearray(source.read_bytes()); b[len(b)//2]^=1; archive.write_bytes(b)
 # Keep the original signed metadata and same in-feed URL: only payload bytes are tampered.
 PY
-python3 "$ROOT/build/updater-smoke/driver.py" tampered "$TMP" "$TMP/tampered/Muninn.app"
+python3 "$ROOT/build/updater-smoke/driver.py" tampered "$TMP" "$TMP/tampered/Chat Hub.app"
 python3 "$ROOT/build/updater-smoke/verify_evidence.py" "$TMP"
 echo 'PASS: native updater smoke; boolean-only evidence generated'
