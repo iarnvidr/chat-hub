@@ -1,6 +1,6 @@
 # Architecture
 
-Huginn is intended to be a local-first conversation hub, not a replacement chat frontend. Provider websites remain the place users browse and send messages. The current PR1 is a service/proxy foundation; provider ingestion and user-facing library features remain future work.
+Chat Hub is intended to be a local-first conversation hub, not a replacement chat frontend. Provider websites remain the place users browse and send messages. The current PR1 is a service/proxy foundation; provider ingestion and user-facing library features remain future work.
 
 ## Implemented in PR1
 

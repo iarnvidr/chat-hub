@@ -15,14 +15,7 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets
-  macos-build:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-      - run: cargo build --all-targets
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - run: python3 -m unittest discover -s build -p 'test_*.py'

@@ -1,0 +1,115 @@
+name: Apple Silicon build
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: macos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.23.3'
+      - name: Restore helper tool cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/chat-hub-tools
+          key: chat-hub-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build/tools.lock.json', 'build/ffmpeg_lgpl.py') }}
+      - name: Install helper build tools
+        run: brew install meson ninja pkgconf
+      - name: Select the pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Build real Tauri app, ad-hoc signed (not notarized)
+        run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
+      - name: Build and mount-verify the DMG with corresponding sources
+        run: |
+          set -euo pipefail
+          python3 build/release_sources.py prepare "$RUNNER_TEMP/chat-hub/corresponding-source"
+          version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          bash build/package-dmg.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$RUNNER_TEMP/chat-hub/corresponding-source" "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg"
+      - name: Release app launch and localhost health smoke
+        continue-on-error: true
+        env:
+          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
+        run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
+      - name: Build debug binary for native UI interactions
+        continue-on-error: true
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
+      - id: prepare-debug-smoke
+        name: Prepare isolated debug bundle for native smokes
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app"
+          mkdir -p "$(dirname "$app")"
+          ditto "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$app"
+          exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          debug_binary="${CARGO_TARGET_DIR:-target}/aarch64-apple-darwin/debug/chat-hub-desktop"
+          test -x "$debug_binary"
+          cp "$debug_binary" "$app/Contents/MacOS/$exe"
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+      - id: updater-smoke
+        continue-on-error: true
+        if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
+        name: Native signed updater integration smoke (debug bundle)
+        env:
+          MUNINN_UPDATER_SMOKE_APP: ${{ runner.temp }}/chat-hub-debug-smoke/Chat Hub.app
+          MUNINN_UPDATER_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-updater-evidence
+        run: bash build/updater-smoke/run-macos.sh
+      - name: Native UI interaction smoke (debug bundle only)
+        continue-on-error: true
+        if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
+        env:
+          NATIVE_UI_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-debug-ui-evidence
+        run: bash build/native-ui-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-debug-ui-evidence"
+      - name: Upload release startup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chat-hub-macos-release-evidence
+          path: ${{ runner.temp }}/chat-hub-release-evidence/**
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
+      - id: upload
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chat-hub-macos-arm64
+          path: |
+            ${{ runner.temp }}/chat-hub/Chat Hub.app/**
+            ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip
+            ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip.sha256
+            ${{ runner.temp }}/chat-hub/Chat_Hub_*.dmg
+            ${{ runner.temp }}/chat-hub/verify-macos.txt
+            ${{ runner.temp }}/chat-hub-release-evidence/**
+            ${{ runner.temp }}/release-evidence/**
+            ${{ runner.temp }}/chat-hub-debug-ui-evidence/**
+            ${{ runner.temp }}/chat-hub-updater-evidence/**
+          if-no-files-found: error
+          # Builds of main stay downloadable for a month; PR builds for a week.
+          retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
+      - name: Show where to download this build
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            echo "### Chat Hub test build (Apple Silicon)"
+            echo
+            echo "Download: [chat-hub-macos-arm64]($ARTIFACT_URL) (sign in to GitHub; includes release archive/checksum and separate debug UI smoke evidence)."
+            echo "Not a release: ad-hoc signed and not notarized. See README, Install on the Mac."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Download: $ARTIFACT_URL"
+# Deliberately no automatic GitHub release. See docs/PUBLICATION.md before releasing.

@@ -2,7 +2,7 @@ use crate::error::Result;
 use rusqlite::{params, Connection};
 
 pub struct Store {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 impl Store {
     pub fn open(path: &str) -> Result<Self> {
@@ -18,7 +18,7 @@ impl Store {
         Ok(store)
     }
     fn migrate(&mut self) -> Result<()> {
-        self.connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', url TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(id UNINDEXED,title,content=''); INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);")?;
+        self.connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '', url TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(id UNINDEXED,title,content=''); INSERT OR IGNORE INTO schema_migrations(version) VALUES (1); CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, parent_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL DEFAULT ''); INSERT OR IGNORE INTO schema_migrations(version) VALUES (2);")?;
         Ok(())
     }
     pub fn health(&self) -> Result<bool> {
@@ -40,9 +40,11 @@ impl Store {
             .prepare("SELECT id,title,provider,url,updated_at FROM conversations WHERE id=?1")?;
         let mut rows = stmt.query([id])?;
         if let Some(row) = rows.next()? {
-            Ok(Some(
-                serde_json::json!({"id":row.get::<_,String>(0)?,"title":row.get::<_,String>(1)?,"provider":row.get::<_,String>(2)?,"url":row.get::<_,Option<String>>(3)?,"updated_at":row.get::<_,String>(4)?}),
-            ))
+            let mut value = serde_json::json!({"id":row.get::<_,String>(0)?,"title":row.get::<_,String>(1)?,"provider":row.get::<_,String>(2)?,"url":row.get::<_,Option<String>>(3)?,"updated_at":row.get::<_,String>(4)?});
+            let mut messages = self.connection.prepare("SELECT id,parent_id,role,content FROM messages WHERE conversation_id=?1 ORDER BY rowid")?;
+            let result = messages.query_map([id], |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"parent_id":r.get::<_,Option<String>>(1)?,"role":r.get::<_,String>(2)?,"content":r.get::<_,String>(3)?})))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            value["messages"] = serde_json::json!(result);
+            Ok(Some(value))
         } else {
             Ok(None)
         }
