@@ -17,6 +17,7 @@ cleanup() {
       if [[ -s "$TMP/$name.json" ]]; then install -m 600 "$TMP/$name.json" "$EVIDENCE_DIR/$name.json"; fi
     done
   fi
+  restore_manifest
   [[ "${MUNINN_UPDATER_SMOKE_KEEP:-0}" == 1 ]] || rm -rf "$TMP"
   return "$rc"
 }
@@ -30,11 +31,39 @@ export MUNINN_NATIVE_UI_SMOKE=1
 PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 export MUNINN_UPDATER_SMOKE_ENDPOINT="http://127.0.0.1:$PORT/latest.json"
 APP="$(cd "$(dirname "$MUNINN_UPDATER_SMOKE_APP")" && pwd)/$(basename "$MUNINN_UPDATER_SMOKE_APP")"
-# Use isolated copies, never mutate or launch the caller's source bundle.
-OLD="0.2.14-smoke.1"
-NEW="0.2.14-smoke.2"
+# Compile real binaries with independent package versions and target dirs. Restore
+# the tracked manifest even on errors/signals; no plist-only version simulation.
+MANIFEST="$ROOT/src-tauri/Cargo.toml"
+MANIFEST_BACKUP="$TMP/Cargo.toml"
+cp "$MANIFEST" "$MANIFEST_BACKUP"
+restore_manifest() { cp "$MANIFEST_BACKUP" "$MANIFEST"; }
+trap restore_manifest EXIT
+build_fixture() {
+  local version="$1" target="$TMP/target-$1"
+  python3 - "$MANIFEST" "$version" <<'PY'
+import pathlib,re,sys
+p=pathlib.Path(sys.argv[1]); s=p.read_text()
+s,n=re.subn(r'(?m)^version = "[^"]+"$',f'version = "{sys.argv[2]}"',s,count=1)
+assert n==1
+p.write_text(s)
+PY
+  CARGO_TARGET_DIR="$target" cargo build --locked --manifest-path "$MANIFEST" --target aarch64-apple-darwin --features native-smoke
+  local app="$TMP/build-$version/Muninn.app" exe
+  mkdir -p "$(dirname "$app")"
+  ditto "$MUNINN_UPDATER_SMOKE_APP" "$app"
+  exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+  cp "$target/aarch64-apple-darwin/debug/chat-hub-desktop" "$app/Contents/MacOS/$exe"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
+  codesign --force --deep --sign - "$app"
+}
+OLD="0.1.0"
+NEW="0.1.1"
+build_fixture "$OLD"
+build_fixture "$NEW"
+restore_manifest
+# Use the genuinely compiled old-version app as both isolated starting copies.
+APP="$TMP/build-$OLD/Muninn.app"
 for bundle in "$TMP/healthy/Muninn.app" "$TMP/tampered/Muninn.app"; do
-  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $OLD" "$bundle/Contents/Info.plist"
   codesign --force --deep --sign - "$bundle"
 done
 
@@ -46,8 +75,7 @@ export MUNINN_UPDATER_SMOKE_PUBKEY="$(cat "$PUB")"
 # Produce genuine gzip/tar updater payloads rooted at Muninn.app.
 make_archive() {
   local version="$1" out="$2" copy="$TMP/Muninn.app"
-  rm -rf "$copy"; ditto "$APP" "$copy"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$copy/Contents/Info.plist"
+  rm -rf "$copy"; ditto "$TMP/build-$version/Muninn.app" "$copy"
   codesign --force --deep --sign - "$copy"
   mkdir -p "$out"
   tar -czf "$out/Muninn.app.tar.gz" -C "$TMP" Muninn.app

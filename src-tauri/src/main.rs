@@ -231,14 +231,44 @@ async fn install_update(app: tauri::AppHandle, state: State<'_, AppState>) -> Re
         .ok_or("No checked signed update available")?;
     let (update, bytes) = pending;
     let bytes = if bytes.is_empty() {
-        update
-            .download(|_, _| {}, || {})
-            .await
-            .map_err(|e| e.to_string())?
+        match update.download(|_, _| {}, || {}).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let signature = matches!(
+                    error,
+                    tauri_plugin_updater::Error::Minisign(_)
+                        | tauri_plugin_updater::Error::SignatureUtf8(_)
+                        | tauri_plugin_updater::Error::Base64(_)
+                        | tauri_plugin_updater::Error::SignedVersionMismatch { .. }
+                        | tauri_plugin_updater::Error::MissingSignedVersion
+                );
+                if signature {
+                    let mut status = state.updater.lock().map_err(|e| e.to_string())?;
+                    status.status = "signature_rejected".into();
+                    status.message = "Update signature verification failed".into();
+                }
+                return Err(error.to_string());
+            }
+        }
     } else {
         bytes
     };
-    update.verify(&bytes).map_err(|e| e.to_string())?;
+    if let Err(error) = update.verify(&bytes) {
+        let signature = matches!(
+            error,
+            tauri_plugin_updater::Error::Minisign(_)
+                | tauri_plugin_updater::Error::SignatureUtf8(_)
+                | tauri_plugin_updater::Error::Base64(_)
+                | tauri_plugin_updater::Error::SignedVersionMismatch { .. }
+                | tauri_plugin_updater::Error::MissingSignedVersion
+        );
+        if signature {
+            let mut status = state.updater.lock().map_err(|e| e.to_string())?;
+            status.status = "signature_rejected".into();
+            status.message = "Update signature verification failed".into();
+        }
+        return Err(error.to_string());
+    }
     update.install(&bytes).map_err(|e| e.to_string())?;
     app.restart();
 }

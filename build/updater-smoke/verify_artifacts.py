@@ -28,7 +28,7 @@ for v in ('old', 'new'):
                 raise SystemExit(f'FAIL: {v} plist version does not match metadata')
     except (tarfile.TarError, OSError) as exc:
         raise SystemExit(f'FAIL: {v} archive is not valid gzip tar: {exc}')
-if metas['old']['version'] != '0.2.14-smoke.1' or metas['new']['version'] != '0.2.14-smoke.2':
-    raise SystemExit('FAIL: expected ordered smoke versions 0.2.14-smoke.1 then .2')
+if metas['old']['version'] != '0.1.0' or metas['new']['version'] != '0.1.1':
+    raise SystemExit('FAIL: expected ordered smoke versions 0.1.0 then 0.1.1')
 if metas['old']['version'] == metas['new']['version']:
     raise SystemExit('FAIL: versions are not distinct')

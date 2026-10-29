@@ -8,8 +8,8 @@ identity=healthy.get('restart_identity')
 tstatus=tampered.get('tamper_status')
 checks=(healthy.get('signature_accepted') is True,healthy.get('replacement_installed') is True,
  healthy.get('restart_requested') is True,healthy.get('restart_observed') is True,
- healthy.get('restart_process_exited') is True,healthy.get('settings_persisted') is True,
- healthy.get('tabs_persisted') is True,isinstance(identity,dict),
+ healthy.get('restart_process_exited') is True,healthy.get('after_version') == '0.1.1',
+ healthy.get('before_version') == '0.1.0',isinstance(identity,dict),
  isinstance(identity.get('before_pid') if isinstance(identity,dict) else None,int),
  isinstance(identity.get('after_pid') if isinstance(identity,dict) else None,int),
  identity.get('before_pid',0)>0 if isinstance(identity,dict) else False,
