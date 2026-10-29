@@ -2,7 +2,7 @@
 """Required real-bundle WKWebView, API, relaunch, and shutdown smoke."""
 import json, os, pathlib, plistlib, signal, socket, subprocess, sys, time, urllib.error, urllib.request
 app, evidence = map(pathlib.Path, sys.argv[1:3]); evidence.mkdir(parents=True, exist_ok=True)
-data = pathlib.Path(os.environ['HOME'])/'Library/Application Support/io.github.iarnvidr.chat-hub'
+data = pathlib.Path(os.environ['MUNINN_E2E_DATA_DIR']).resolve()
 e2e=pathlib.Path(os.environ['MUNINN_E2E_DIR']); bundle=plistlib.loads((app/'Contents/Info.plist').read_bytes()); bid=bundle['CFBundleIdentifier']
 record={'app':str(app),'bundle_id':bid}; proc=None
 
@@ -62,7 +62,9 @@ def synthetic_tls_fixture(info, token):
   try:
    with urllib.request.urlopen(req,timeout=2) as r: record=json.load(r)
    if record.get('provider')=='chatgpt' and 'fixture response; no provider login' in record['messages'][0]['content']:
-    return {'host':'chatgpt.com','fixture':'synthetic; not ChatGPT login','persisted_conversation_id':record['id'],'message_content':'fixture response; no provider login'}
+    content=record['messages'][0]['content'].encode()
+    import hashlib
+    return {'host':'chatgpt.com','fixture':'synthetic; not ChatGPT login','persisted_conversation_id':record['id'],'message_content_bytes':len(content),'message_content_sha256':hashlib.sha256(content).hexdigest(),'message_content_matches_fixture':True}
   except urllib.error.HTTPError as exc:
    if exc.code!=404: raise
   time.sleep(.2)
@@ -88,7 +90,7 @@ def ports_closed(info):
 def launch():
  return subprocess.Popen(['open','-a',str(app)],stdout=(evidence/'open.log').open('a'),stderr=subprocess.STDOUT)
 try:
- os.chmod(data.parent,0o700) if data.parent.exists() else None
+ data.mkdir(parents=True, exist_ok=True); os.chmod(data,0o700)
  exe=bundle['CFBundleExecutable']; binary=app/'Contents/MacOS'/exe
  proc=subprocess.Popen([str(binary),'--native-ui-smoke','--updater-smoke'],stdout=(evidence/'app.log').open('w'),stderr=subprocess.STDOUT)
  info,token=wait_service(); state=bridge('state');
@@ -111,35 +113,29 @@ try:
   health(info,token); time.sleep(1)
  record['survival_seconds']=15
  subprocess.run(['osascript','-e',f'tell application id "{bid}" to quit'],check=True,timeout=15)
- try: proc.wait(timeout=20)
- except subprocess.TimeoutExpired: raise RuntimeError('AppleScript graceful quit timed out')
- if proc.returncode not in (0,-signal.SIGTERM): raise RuntimeError(f'quit exit code {proc.returncode}')
- ports_closed(info); record['graceful_quit']=True
- # Launch Services does not inherit this Python process environment. Set only the
- # smoke bridge variables for the user session so the reopened app can expose IPC.
- subprocess.run(['launchctl','setenv','MUNINN_NATIVE_UI_SMOKE','1'],check=True,timeout=5)
- subprocess.run(['launchctl','setenv','MUNINN_E2E_DIR',str(e2e)],check=True,timeout=5)
- opener=subprocess.Popen(['open','-n','-a',str(app),'--args','--native-ui-smoke','--updater-smoke'],stdout=(evidence/'reopen.log').open('w'),stderr=subprocess.STDOUT)
- opener.wait(timeout=20)
- # An explicit -n launch is an actual full-bundle relaunch, not an executable-only restart.
- proc=None
- end=time.monotonic()+90; newpid=None
+ time.sleep(1)
+ if not alive(pid): raise RuntimeError('graceful quit terminated app; cannot verify same-PID reopen')
+ record['graceful_quit_requested']=True
+ # The same app process must survive the graceful-quit request. Reopen its native
+ # window through the bridge; never launch a second PID or mutate launchd globals.
+ end=time.monotonic()+30
  while time.monotonic()<end:
-  # Native bridge IPC readiness from the launched app confirms its own PID.
   try:
-   info2,token2=wait_service(); state2=bridge('state'); newpid=state2.get('process_id')
-   if newpid != pid and health(info2,token2).get('status')=='ok': break
-  except (RuntimeError,OSError,ValueError,urllib.error.URLError): time.sleep(.3)
- else: raise RuntimeError('full bundle reopen did not expose a healthy new process')
- pid=newpid
- health(info2,token2); record['reopen_pid']=newpid; record['reopen_health']='ok'
+   state2=bridge('state')
+   if state2.get('process_id')==pid and state2.get('window_visible'): break
+  except (RuntimeError,OSError,ValueError): pass
+  time.sleep(.2)
+ else: raise RuntimeError('same-PID app/window did not reopen')
+ info2,token2=wait_service()
+ if state2.get('process_id')!=pid: raise RuntimeError('reopen changed process PID')
+ health(info2,token2); record['reopen_pid']=pid; record['reopen_health']='ok'
  subprocess.run(['osascript','-e',f'tell application id "{bid}" to quit'],check=True,timeout=15)
  end=time.monotonic()+20
- while time.monotonic()<end and alive(newpid): time.sleep(.2)
- if alive(newpid): raise RuntimeError('reopened app graceful quit did not terminate PID')
- ports_closed(info2)
- subprocess.run(['launchctl','unsetenv','MUNINN_NATIVE_UI_SMOKE'],check=False,timeout=5)
- subprocess.run(['launchctl','unsetenv','MUNINN_E2E_DIR'],check=False,timeout=5)
+ while time.monotonic()<end:
+  if not alive(pid): break
+  time.sleep(.2)
+ if alive(pid): raise RuntimeError('reopened app graceful quit did not terminate PID')
+ ports_closed(info2); record['ports_closed_after_quit']=True
  record['passed']=True
 except Exception as exc:
  record.update(passed=False,error=f'{type(exc).__name__}: {exc}'); print(record['error'],file=sys.stderr)

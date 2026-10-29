@@ -7,7 +7,7 @@ evidence="${2:-${NATIVE_LAUNCH_EVIDENCE_DIR:-${RUNNER_TEMP:-/tmp}/native-launch-
 mkdir -p "$evidence"
 e2e="$(mktemp -d "${RUNNER_TEMP:-/tmp}/native-launch-e2e.XXXXXX")"
 chmod 700 "$e2e"
-export MUNINN_E2E_DIR="$e2e" MUNINN_NATIVE_UI_SMOKE=1
+export MUNINN_E2E_DIR="$e2e" MUNINN_E2E_DATA_DIR="$e2e/data" MUNINN_NATIVE_UI_SMOKE=1
 fixture="$e2e/upstream.pem"
 python3 - "$fixture" <<'PY'
 import pathlib, subprocess, sys

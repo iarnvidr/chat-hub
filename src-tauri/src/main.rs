@@ -328,8 +328,30 @@ fn main() {
     let updater_builder = tauri_plugin_updater::Builder::new();
     let builder = tauri::Builder::default().plugin(updater_builder.build());
     let builder = builder.setup(|app| {
-        let dir = app.path().app_data_dir()?;
+        let dir = {
+            #[cfg(feature = "native-smoke")]
+            {
+                if smoke() {
+                    if let Some(path) = std::env::var_os("MUNINN_E2E_DATA_DIR") {
+                        PathBuf::from(path)
+                    } else {
+                        app.path().app_data_dir()?
+                    }
+                } else {
+                    app.path().app_data_dir()?
+                }
+            }
+            #[cfg(not(feature = "native-smoke"))]
+            {
+                app.path().app_data_dir()?
+            }
+        };
         std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let token = persistent_token(&dir).map_err(std::io::Error::other)?;
         let db = dir.join("chat-hub.sqlite3");
         let ca = dir.join("ca");
