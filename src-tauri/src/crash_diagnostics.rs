@@ -29,16 +29,29 @@ mod macos {
         }
     }
     unsafe extern "C" fn log(exception: Id) {
-        let name = text(exception, b"name\0");
-        let reason = text(exception, b"reason\0");
-        let stack = text(exception, b"callStackSymbols\0");
-        let report = format!("Uncaught Objective-C exception\nname: {name}\nreason: {reason}\ncallStackSymbols: {stack}\n");
-        let _ = std::io::stderr().write_all(report.as_bytes());
-        if let Some(path) = std::env::var_os("CHAT_HUB_CRASH_EVIDENCE") {
-            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-                let _ = file.write_all(report.as_bytes());
+        // Never unwind across the Objective-C callback boundary. Diagnostics are best effort.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let name = text(exception, b"name\0");
+            let reason = text(exception, b"reason\0");
+            // Preserve the original exception before doing any stack introspection, which may
+            // itself fail. NSArray is not an NSString: render it through -description first.
+            let initial =
+                format!("Uncaught Objective-C exception\nname: {name}\nreason: {reason}\n");
+            let _ = std::io::stderr().write_all(initial.as_bytes());
+            if let Some(path) = std::env::var_os("CHAT_HUB_CRASH_EVIDENCE") {
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = file.write_all(initial.as_bytes());
+                }
             }
-        }
+            let stack = text(text(exception, b"callStackSymbols\0"), b"description\0");
+            let tail = format!("callStackSymbols: {stack}\n");
+            let _ = std::io::stderr().write_all(tail.as_bytes());
+            if let Some(path) = std::env::var_os("CHAT_HUB_CRASH_EVIDENCE") {
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = file.write_all(tail.as_bytes());
+                }
+            }
+        }));
     }
     pub fn install() {
         unsafe {
