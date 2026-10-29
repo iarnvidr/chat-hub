@@ -215,11 +215,8 @@ mod tests {
         let (_, root) = x509_parser::parse_x509_certificate(&root_der).unwrap();
         let root_bc = root.basic_constraints().unwrap().unwrap();
         assert!(root_bc.value.ca);
-        assert_eq!(
-            root.key_usage().unwrap().unwrap().value.key_cert_sign(),
-            true
-        );
-        assert_eq!(root.key_usage().unwrap().unwrap().value.crl_sign(), true);
+        assert!(root.key_usage().unwrap().unwrap().value.key_cert_sign());
+        assert!(root.key_usage().unwrap().unwrap().value.crl_sign());
         assert!(root.extensions().iter().any(|e| matches!(
             e.parsed_extension(),
             x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(_)
@@ -230,10 +227,25 @@ mod tests {
             .unwrap()
             .unwrap();
         let (_, parsed_leaf) = x509_parser::parse_x509_certificate(&leaf_der).unwrap();
-        assert!(parsed_leaf.extensions().iter().any(|e| matches!(
-            e.parsed_extension(),
-            x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(_)
-        )));
+        let leaf_aki = parsed_leaf
+            .extensions()
+            .iter()
+            .find_map(|e| match e.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    aki.key_identifier.as_ref().map(|identifier| identifier.0)
+                }
+                _ => None,
+            })
+            .expect("leaf AKI must contain the issuer key identifier");
+        let root_ski = root
+            .extensions()
+            .iter()
+            .find_map(|e| match e.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(ski) => Some(ski.0),
+                _ => None,
+            })
+            .expect("root must contain an SKI");
+        assert_eq!(leaf_aki, root_ski);
         assert!(parsed_leaf.extensions().iter().any(|e| matches!(
             e.parsed_extension(),
             x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(_)
