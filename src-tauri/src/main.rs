@@ -226,13 +226,26 @@ async fn check_for_updates(
     }
     use tauri_plugin_updater::UpdaterExt;
     #[cfg(feature = "native-smoke")]
-    let updater = if smoke() {
-        updater_builder(&app)?
+    let updater_result = if smoke() {
+        updater_builder(&app)
     } else {
-        app.updater().map_err(|e| e.to_string())?
+        app.updater().map_err(|e| e.to_string())
     };
     #[cfg(not(feature = "native-smoke"))]
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater_result = app.updater().map_err(|e| e.to_string());
+    let updater = match updater_result {
+        Ok(updater) => updater,
+        Err(message) => {
+            let status = UpdateStatus {
+                version: env!("CARGO_PKG_VERSION").into(),
+                channel: "stable".into(),
+                status: "error".into(),
+                message: message.clone(),
+            };
+            *state.updater.lock().map_err(|e| e.to_string())? = status;
+            return Err(message);
+        }
+    };
     let result = updater.check().await;
     match result {
         Ok(Some(update)) => {

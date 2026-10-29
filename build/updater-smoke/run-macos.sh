@@ -35,42 +35,42 @@ export MUNINN_NATIVE_UI_SMOKE=1
 PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 export MUNINN_UPDATER_SMOKE_ENDPOINT="http://127.0.0.1:$PORT/latest.json"
 APP="$(cd "$(dirname "$MUNINN_UPDATER_SMOKE_APP")" && pwd)/$(basename "$MUNINN_UPDATER_SMOKE_APP")"
-# Compile real binaries with independent package versions and target dirs. Restore
-# the tracked manifest even on errors/signals; no plist-only version simulation.
+# Compile genuine binaries with all package version sources aligned. Restore all
+# temporarily edited inputs on errors/signals; no plist-only version simulation.
 MANIFEST="$ROOT/src-tauri/Cargo.toml"
+ROOT_MANIFEST="$ROOT/Cargo.toml"; ROOT_MANIFEST_BACKUP="$TMP/root-Cargo.toml"
 MANIFEST_BACKUP="$TMP/Cargo.toml"
-cp "$MANIFEST" "$MANIFEST_BACKUP"
-restore_manifest() { cp "$MANIFEST_BACKUP" "$MANIFEST"; }
+CONF="$ROOT/src-tauri/tauri.conf.json"; CONF_BACKUP="$TMP/tauri.conf.json"
+PKG="$ROOT/package.json"; PKG_BACKUP="$TMP/package.json"
+LOCK="$ROOT/src-tauri/Cargo.lock"; LOCK_BACKUP="$TMP/Cargo.lock"
+cp "$ROOT_MANIFEST" "$ROOT_MANIFEST_BACKUP"; cp "$MANIFEST" "$MANIFEST_BACKUP"; cp "$CONF" "$CONF_BACKUP"; cp "$PKG" "$PKG_BACKUP"; cp "$LOCK" "$LOCK_BACKUP"
+restore_manifest() { cp "$ROOT_MANIFEST_BACKUP" "$ROOT_MANIFEST"; cp "$MANIFEST_BACKUP" "$MANIFEST"; cp "$CONF_BACKUP" "$CONF"; cp "$PKG_BACKUP" "$PKG"; cp "$LOCK_BACKUP" "$LOCK"; }
 trap restore_manifest EXIT
 build_fixture() {
   local version="$1" target="$TMP/target-$1"
-  python3 - "$MANIFEST" "$version" <<'PY'
-import pathlib,re,sys
-p=pathlib.Path(sys.argv[1]); s=p.read_text()
-s,n=re.subn(r'(?m)^version = "[^"]+"$',f'version = "{sys.argv[2]}"',s,count=1)
-assert n==1
-p.write_text(s)
-PY
-  # The isolated fixture has a different root package version than the tracked
-  # lockfile. Regenerate only this private fixture lock offline, then retain the
-  # locked build so dependency drift still fails closed.
-  CARGO_TARGET_DIR="$target" cargo generate-lockfile --offline --manifest-path "$MANIFEST"
-  CARGO_TARGET_DIR="$target" cargo build --locked --manifest-path "$MANIFEST" --target aarch64-apple-darwin --features native-smoke
-  local app="$TMP/build-$version/Muninn.app" exe
+  CARGO_TARGET_DIR="$target" cargo build --locked --offline --manifest-path "$MANIFEST" --target aarch64-apple-darwin --features native-smoke
+  local app="$TMP/build-$version/Chat Hub-$version.app" exe
   mkdir -p "$(dirname "$app")"
   ditto "$MUNINN_UPDATER_SMOKE_APP" "$app"
   exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
   cp "$target/aarch64-apple-darwin/debug/chat-hub-desktop" "$app/Contents/MacOS/$exe"
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
+  python3 - "$app" "$version" <<'PY'
+import pathlib,plistlib,sys
+p=pathlib.Path(sys.argv[1]); info=p/'Contents/Info.plist'
+with info.open('rb') as f: data=plistlib.load(f)
+assert data.get('CFBundleShortVersionString') == sys.argv[2], (data.get('CFBundleShortVersionString'),sys.argv[2])
+PY
   codesign --force --deep --sign - "$app"
 }
 OLD="0.1.0"
 NEW="0.1.1"
+# Each fixture's desktop manifest/config/package and locked package record match.
 build_fixture "$OLD"
 build_fixture "$NEW"
 restore_manifest
 # Use the genuinely compiled old-version app as both isolated starting copies.
-APP="$TMP/build-$OLD/Muninn.app"
+APP="$TMP/build-$OLD/Chat Hub-$OLD.app"
 for bundle in "$TMP/healthy/Muninn.app" "$TMP/tampered/Muninn.app"; do
   codesign --force --deep --sign - "$bundle"
 done
@@ -83,7 +83,7 @@ export MUNINN_UPDATER_SMOKE_PUBKEY="$(cat "$PUB")"
 # Produce genuine gzip/tar updater payloads rooted at Muninn.app.
 make_archive() {
   local version="$1" out="$2" copy="$TMP/Muninn.app"
-  rm -rf "$copy"; ditto "$TMP/build-$version/Muninn.app" "$copy"
+  rm -rf "$copy"; ditto "$TMP/build-$version/Chat Hub-$version.app" "$copy"
   codesign --force --deep --sign - "$copy"
   mkdir -p "$out"
   tar -czf "$out/Muninn.app.tar.gz" -C "$TMP" Muninn.app
