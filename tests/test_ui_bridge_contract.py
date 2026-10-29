@@ -53,7 +53,11 @@ class UiBridgeContract(unittest.TestCase):
         self.assertIn('url.scheme() == "http" && url.host_str() == Some("tauri.localhost")', guard)
         self.assertIn('if !local', guard)
         self.assertNotIn("https://", guard)
-        self.assertNotIn("e2e_result,", source.split(".invoke_handler", 1)[-1])
+        handlers = source.split(".invoke_handler", 1)[-1]
+        self.assertIn("e2e_result,", handlers)
+        production_handlers = handlers.split("#[cfg(not(feature = \"native-smoke\"))]", 1)[-1]
+        self.assertNotIn("e2e_result", production_handlers)
+        self.assertNotIn("e2e_provider_result", production_handlers)
 
 
 if __name__ == "__main__":

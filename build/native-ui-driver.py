@@ -57,6 +57,15 @@ try:
     if not isinstance(result,dict) or result.get('clicked') is not True or not result.get('version') or not result.get('message'):
         raise RuntimeError(f'update UI assertion failed: {result!r}')
     record['interaction']=result
+    # Ask native automation to execute a real JS Tauri invoke in the external provider webview.
+    denial=bridge('provider_denial')
+    deadline=time.monotonic()+15
+    report=e2e/'provider-denial.res.json'
+    while time.monotonic()<deadline and not report.exists(): time.sleep(.1)
+    if not report.exists(): raise RuntimeError('provider denial result was not reported')
+    denial=json.loads(report.read_text())
+    if denial.get('denied') is not True: raise RuntimeError(f'provider service_info was not denied: {denial!r}')
+    record['provider_denial']=denial
     record['passed']=True
 except Exception as exc:
     record.update(passed=False,error=f'{type(exc).__name__}: {exc}')

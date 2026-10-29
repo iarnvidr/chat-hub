@@ -94,6 +94,17 @@ mod e2e {
     }
     fn run(app: &tauri::AppHandle, c: &Value) -> Value {
         match c["op"].as_str().unwrap_or("") {
+            "provider_denial" => {
+                let w = app.get_webview_window("provider");
+                let Some(w) = w else {
+                    return json!({"ok":false,"error":"provider webview missing"});
+                };
+                let code = "(async()=>{for(let i=0;i<100&&!window.__TAURI_INTERNALS__?.invoke;i++)await new Promise(r=>setTimeout(r,100));let denied=false;let category='';try{await window.__TAURI_INTERNALS__.invoke('service_info')}catch(e){denied=true;category=String(e).slice(0,120)}window.__TAURI_INTERNALS__.invoke('e2e_provider_result',{denied,category})})()";
+                match w.eval(code) {
+                    Ok(()) => json!({"ok":true}),
+                    Err(e) => json!({"ok":false,"error":e.to_string()}),
+                }
+            }
             "state" => {
                 let window = app.get_webview_window("main");
                 json!({"ok":true,"process_id":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"executable_path":std::env::current_exe().ok().map(|p|p.to_string_lossy().into_owned()),"window_visible":window.and_then(|w|w.is_visible().ok()).unwrap_or(false)})
@@ -113,6 +124,25 @@ mod e2e {
             }
             _ => json!({"ok":false,"error":"unknown operation"}),
         }
+    }
+    pub fn provider_result(denied: bool, category: String) -> Result<(), String> {
+        let Some(d) = dir() else {
+            return Err("automation disabled".into());
+        };
+        if !denied {
+            return Err("provider service_info unexpectedly resolved".into());
+        }
+        let category: String = category
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
+        respond(
+            &d,
+            "provider-denial",
+            &json!({"ok":true,"denied":true,"category":category}),
+        );
+        Ok(())
     }
     pub fn e2e_result(id: String, value: String) -> Result<(), String> {
         let Some(d) = dir() else {
@@ -148,6 +178,22 @@ fn update_status(
 ) -> Result<UpdateStatus, String> {
     authorize_local_main(&window)?;
     Ok(s.updater.lock().map_err(|e| e.to_string())?.clone())
+}
+#[cfg(feature = "native-smoke")]
+#[tauri::command]
+fn e2e_provider_result(
+    window: tauri::WebviewWindow,
+    denied: bool,
+    category: String,
+) -> Result<(), String> {
+    if !smoke() || window.label() != "provider" {
+        return Err("provider denial report is restricted to native smoke provider window".into());
+    }
+    let url = window.url().map_err(|e| e.to_string())?;
+    if url.scheme() != "https" || url.host_str() != Some("chatgpt.com") {
+        return Err("provider denial report requires provider origin".into());
+    }
+    e2e::provider_result(denied, category)
 }
 #[cfg(feature = "native-smoke")]
 #[tauri::command]
@@ -436,7 +482,8 @@ fn main() {
             service_info,
             check_for_updates,
             install_update,
-            e2e_result
+            e2e_result,
+            e2e_provider_result
         ])
         .run(tauri::generate_context!());
     #[cfg(not(feature = "native-smoke"))]
