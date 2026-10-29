@@ -51,6 +51,10 @@ s,n=re.subn(r'(?m)^version = "[^"]+"$',f'version = "{sys.argv[2]}"',s,count=1)
 assert n==1
 p.write_text(s)
 PY
+  # The isolated fixture has a different root package version than the tracked
+  # lockfile. Regenerate only this private fixture lock offline, then retain the
+  # locked build so dependency drift still fails closed.
+  CARGO_TARGET_DIR="$target" cargo generate-lockfile --offline --manifest-path "$MANIFEST"
   CARGO_TARGET_DIR="$target" cargo build --locked --manifest-path "$MANIFEST" --target aarch64-apple-darwin --features native-smoke
   local app="$TMP/build-$version/Muninn.app" exe
   mkdir -p "$(dirname "$app")"
