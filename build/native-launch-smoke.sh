@@ -17,15 +17,35 @@ fixture="$e2e/upstream.pem"
 # subjectAltName=DNS:chatgpt.com is configured there.
 python3 "$(dirname "$0")/native-tls-cert.py" "$fixture"
 addrfile="$e2e/upstream.addr"
-python3 "$(dirname "$0")/native-tls-fixture.py" "$fixture" "$evidence/provider-fixture.json" "$addrfile" >"$evidence/provider-fixture.log" 2>&1 &
+fixture_script="$(dirname "$0")/native-tls-fixture.py"
+python3 "$fixture_script" "$fixture" "$evidence/provider-fixture.json" "$addrfile" >"$evidence/provider-fixture.log" 2>&1 &
 fixture_pid=$!
 cleanup_fixture() { kill "$fixture_pid" 2>/dev/null || true; wait "$fixture_pid" 2>/dev/null || true; }
 trap cleanup_fixture EXIT
-for _ in $(seq 1 100); do [[ -s "$addrfile" ]] && break; sleep .1; done
-if [[ ! -s "$addrfile" ]]; then
-  echo 'TLS fixture failed to start; bounded fixture diagnostic follows:' >&2
-  cat "$evidence/provider-fixture.log" >&2 || true
+report_fixture_failure() {
+  local status=unknown reason='address file not published before timeout'
+  if kill -0 "$fixture_pid" 2>/dev/null; then
+    reason='fixture still alive but address file not published before timeout'
+    kill "$fixture_pid" 2>/dev/null || true
+  else
+    if wait "$fixture_pid" 2>/dev/null; then status=0; else status=$?; fi
+    reason='fixture exited before publishing address file'
+  fi
+  echo 'TLS fixture startup failed; complete bounded diagnostics follow:' >&2
+  printf 'reason: %s\n' "$reason" >&2
+  printf 'command: %q %q %q %q %q\npid: %s\nwait_exit_status: %s\n' "$(command -v python3 || echo '<python3-not-found>')" "$fixture_script" "$fixture" "$evidence/provider-fixture.json" "$addrfile" "$fixture_pid" "$status" >&2
+  printf 'python: ' >&2; python3 --version >&2 || true
+  for path in "$fixture_script" "$fixture" "${fixture%.pem}.key" "$(dirname "$fixture")" "$addrfile" "$evidence/provider-fixture.log"; do
+    if [[ -e "$path" ]]; then ls -ld "$path" >&2; else printf 'missing: %s\n' "$path" >&2; fi
+  done
+  if [[ -s "$evidence/provider-fixture.log" ]]; then cat "$evidence/provider-fixture.log" >&2; else echo '(fixture stdout/stderr log empty)' >&2; fi
   exit 1
-fi
+}
+for _ in $(seq 1 100); do
+  [[ -s "$addrfile" ]] && break
+  if ! kill -0 "$fixture_pid" 2>/dev/null; then report_fixture_failure; fi
+  sleep .1
+done
+[[ -s "$addrfile" ]] || report_fixture_failure
 export MUNINN_PROVIDER_SMOKE_UPSTREAM="$(cat "$addrfile")" MUNINN_PROVIDER_SMOKE_ROOTS="$fixture"
 python3 "$(dirname "$0")/native-launch-driver.py" "$app" "$evidence"
