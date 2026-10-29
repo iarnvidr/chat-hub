@@ -54,7 +54,7 @@ class UiBridgeContract(unittest.TestCase):
         self.assertIn('if !local', guard)
         self.assertNotIn("https://", guard)
         handlers = source.split(".invoke_handler", 1)[-1]
-        self.assertIn("e2e_result,", handlers)
+        self.assertRegex(handlers, r"e2e_result\s*,?")
         production_handlers = handlers.split("#[cfg(not(feature = \"native-smoke\"))]", 1)[-1]
         self.assertNotIn("e2e_result", production_handlers)
         self.assertNotIn("e2e_provider_result", production_handlers)

@@ -26,8 +26,8 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
             (root / "app/Contents/Info.plist").write_bytes(__import__('plistlib').dumps({'CFBundleShortVersionString': '0.2.0'}))
             (root / "feed").mkdir()
             (root / "new").mkdir()
-            (root / "feed/Muninn.app.tar.gz").write_bytes(b"feed payload")
-            (root / "new/Muninn.app.tar.gz").write_bytes(b"signed payload")
+            (root / "feed/Chat-Hub.app.tar.gz").write_bytes(b"feed payload")
+            (root / "new/Chat-Hub.app.tar.gz").write_bytes(b"signed payload")
             tls_cert = root / "upstream.pem"
             subprocess.run([sys.executable, str(ROOT / "build/native-tls-cert.py"), str(tls_cert)], check=True)
             tls_addr = root / "upstream.addr"
@@ -74,7 +74,7 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
                 self.assertTrue((root / "old.json").is_file())
                 self.assertTrue((root / "new.json").is_file())
                 self.assertTrue((root / "feed/latest.json").is_file())
-                self.assertNotEqual((root / "feed/Muninn.app.tar.gz").read_bytes(), b"feed payload")
+                self.assertNotEqual((root / "feed/Chat-Hub.app.tar.gz").read_bytes(), b"feed payload")
             finally:
                 tls_process.terminate()
                 tls_process.wait(timeout=3)

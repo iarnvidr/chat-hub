@@ -20,7 +20,7 @@ class NativeLaunchSmoke(unittest.TestCase):
   self.assertLess(reopen,quit_call)
   self.assertEqual(driver.count("to quit']"),1)
   self.assertIn("info2.get('api')!=info.get('api')",driver)
-  self.assertIn("denial=bridge('provider_denial')",driver)
+  self.assertIn("denial_result=bridge('provider_denial')",driver)
   self.assertIn("denial_result.get('denied') is not True",driver)
   self.assertIn("return proc.poll() is None",driver)
  def test_synthetic_tls_fixture_is_local_and_narrowly_claimed(self):
