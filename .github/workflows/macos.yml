@@ -76,6 +76,7 @@ jobs:
         run: bash build/native-ui-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-debug-ui-evidence"
       - name: Upload release startup evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: chat-hub-macos-release-evidence

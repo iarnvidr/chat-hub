@@ -14,8 +14,24 @@ codesign --verify --deep --strict "$app"
 exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
 "$app/Contents/MacOS/$exe" >"$evidence/app.log" 2>&1 & app_pid=$!
 printf '%s\n' "$app_pid" >"$evidence/app.pid"
-finish() { local code=$?; kill "$app_pid" 2>/dev/null || true; wait "$app_pid" 2>/dev/null || true; find "$HOME" "$HOME/Library/Logs/DiagnosticReports" "$HOME/Library/Logs/DiagnosticReports"/../.. -type f \( -name 'chat-hub-desktop*.ips' -o -name 'chat-hub-desktop*.crash' \) -print 2>/dev/null | sort -u >"$evidence/crash-reports.txt"; exit "$code"; }
-trap finish EXIT
+on_exit() {
+  local app_exitcode=$? app_alive=false
+  trap - EXIT
+  if kill -0 "$app_pid" 2>/dev/null; then
+    app_alive=true
+    kill "$app_pid" 2>/dev/null || true
+  fi
+  wait "$app_pid" 2>/dev/null || true
+  service_json_path="$app_data/service.json"
+  find "$HOME" "$HOME/Library/Logs/DiagnosticReports" "$HOME/Library/Logs/DiagnosticReports"/../.. -type f \( -name 'chat-hub-desktop*.ips' -o -name 'chat-hub-desktop*.crash' \) -print 2>/dev/null | sort -u >"$evidence/crash-reports.txt" || true
+  python3 - "$evidence/diagnostics.json" "$service_json_path" "$app_alive" "$app_exitcode" <<'PY'
+import json, pathlib, sys
+path, service, alive, code = sys.argv[1:]
+pathlib.Path(path).write_text(json.dumps({"service_json_path": service, "app_alive": alive == "true", "app_exitcode": int(code)}, indent=2) + "\n")
+PY
+  exit "$app_exitcode"
+}
+trap on_exit EXIT
 python3 - "$evidence" "$app_data" "$app_pid" <<'PY'
 import json, os, sys, time, urllib.request, urllib.error
 from pathlib import Path
