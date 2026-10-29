@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the real ChatHub updater IPC through the gated native eval bridge."""
-import json, os, pathlib, plistlib, subprocess, sys, time
+import json, os, pathlib, plistlib, subprocess, sys, time, traceback
 mode, root_arg, app_arg = sys.argv[1:]
 root, app = pathlib.Path(root_arg), pathlib.Path(app_arg)
 e2e = pathlib.Path(os.environ['MUNINN_E2E_DIR'])
@@ -38,7 +38,9 @@ def native_state():
             time.sleep(.1)
         raise RuntimeError('native state bridge timed out')
     finally: command.unlink(missing_ok=True); result.unlink(missing_ok=True)
-def launch(): return subprocess.Popen([str(executable(app)),'--native-ui-smoke','--updater-smoke'],env=os.environ.copy(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+def launch():
+    out=open(root/(mode+'.stdout.log'),'w'); err=open(root/(mode+'.stderr.log'),'w')
+    return subprocess.Popen([str(executable(app)),'--native-ui-smoke','--updater-smoke'],env=os.environ.copy(),stdout=out,stderr=err)
 def wait_ready(proc):
     end=time.monotonic()+90
     while time.monotonic()<end:
@@ -98,6 +100,11 @@ try:
         evidence={'tamper_rejected':rejected,'tamper_status':{'state':'failed' if rejected else 'unknown','reason':'signature_verification_failed' if rejected else 'unclassified','detail':failure,'backend_status':observed_status.get('status') if isinstance(observed_status,dict) else None},'old_version_retained':still,'app_usable':live}
         (root/'tampered-result.json').write_text(json.dumps(evidence,sort_keys=True)+'\n')
         if not all((rejected,still,live)): raise RuntimeError(f'tamper rejection assertions failed: {evidence}')
+except Exception:
+    detail=traceback.format_exc()
+    print(detail,file=sys.stderr,flush=True)
+    (root/(mode+'-failure-traceback.txt')).write_text(detail)
+    raise
 finally:
     if proc.poll() is None: proc.terminate()
     try: proc.wait(timeout=10)

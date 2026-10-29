@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/native-smoke-wrapper.sh"
 # Preserve the runner's real Rust toolchain home before tests isolate HOME.
 REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
@@ -66,4 +67,4 @@ PY
 done
 [[ "$ready" == 1 ]] || report_fixture_failure
 export MUNINN_PROVIDER_SMOKE_UPSTREAM="$(cat "$addrfile")" MUNINN_PROVIDER_SMOKE_ROOTS="$fixture"
-python3 "$(dirname "$0")/native-launch-driver.py" "$app" "$evidence"
+run_smoke 16 "$evidence" "$evidence/app.log:$evidence/open.log:$evidence/provider-fixture.log" -- python3 "$(dirname "$0")/native-launch-driver.py" "$app" "$evidence"

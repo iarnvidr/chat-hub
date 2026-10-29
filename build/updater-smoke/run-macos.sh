@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Real debug Tauri updater integration. Requires hosted Apple Silicon macOS.
 set -euo pipefail
+source "$(dirname "$0")/../native-smoke-wrapper.sh"
+SMOKE_LOGS=""
 # HOME is replaced below for updater isolation; resolve Rust's real homes first.
 REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
@@ -21,6 +23,9 @@ cleanup() {
     for name in healthy-result tampered-result evidence; do
       if [[ -s "$TMP/$name.json" ]]; then install -m 600 "$TMP/$name.json" "$EVIDENCE_DIR/$name.json"; fi
     done
+  fi
+  if [[ "$rc" != 0 ]]; then
+    python3 "$ROOT/build/native-smoke-report.py" 17 "$rc" "run-macos.sh" "${EVIDENCE_DIR:-$TMP}" "$TMP/healthy.stdout.log:$TMP/healthy.stderr.log:$TMP/tampered.stdout.log:$TMP/tampered.stderr.log:$TMP/http.log:$TMP/keygen.log:$TMP/sign.log" ''
   fi
   [[ "${MUNINN_UPDATER_SMOKE_KEEP:-0}" == 1 ]] || rm -rf "$TMP"
   return "$rc"
@@ -129,7 +134,7 @@ if [[ "$ready" != 1 ]]; then
   exit 2
 fi
 # Run actual installed bundle; launcher itself accesses bridge via E2E command files.
-python3 "$ROOT/build/updater-smoke/driver.py" healthy "$TMP" "$TMP/healthy/Chat Hub.app"
+run_smoke 17 "$TMP" "$TMP/healthy.stdout.log:$TMP/healthy.stderr.log:$TMP/http.log" -- python3 "$ROOT/build/updater-smoke/driver.py" healthy "$TMP" "$TMP/healthy/Chat Hub.app"
 # Tamper distinct copy, keep healthy candidate/evidence untouched, and retain genuine NEW signature/version.
 python3 - "$TMP" "$NEW" <<'PY'
 import json,pathlib,sys
@@ -138,6 +143,6 @@ archive=p/'feed/Chat-Hub.app.tar.gz'
 source=p/'new/Chat-Hub.app.tar.gz'; b=bytearray(source.read_bytes()); b[len(b)//2]^=1; archive.write_bytes(b)
 # Keep the original signed metadata and same in-feed URL: only payload bytes are tampered.
 PY
-python3 "$ROOT/build/updater-smoke/driver.py" tampered "$TMP" "$TMP/tampered/Chat Hub.app"
+run_smoke 17 "$TMP" "$TMP/tampered.stdout.log:$TMP/tampered.stderr.log:$TMP/http.log" -- python3 "$ROOT/build/updater-smoke/driver.py" tampered "$TMP" "$TMP/tampered/Chat Hub.app"
 python3 "$ROOT/build/updater-smoke/verify_evidence.py" "$TMP"
 echo 'PASS: native updater smoke; boolean-only evidence generated'

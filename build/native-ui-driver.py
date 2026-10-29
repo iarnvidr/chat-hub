@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise update controls in the actual app window using its gated Tauri IPC."""
-import json, os, pathlib, plistlib, subprocess, sys, time
+import json, os, pathlib, plistlib, subprocess, sys, time, traceback
 app, evidence = map(pathlib.Path, sys.argv[1:3])
 evidence.mkdir(parents=True, exist_ok=True)
 e2e = pathlib.Path(os.environ['MUNINN_E2E_DIR'])
@@ -64,9 +64,8 @@ try:
     record['provider_denial']=denial
     record['passed']=True
 except Exception as exc:
-    record.update(passed=False,error=f'{type(exc).__name__}: {exc}')
-    print(record['error'],file=sys.stderr)
-    sys.exit(1)
+    record.update(passed=False,error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc())
+    print(record['traceback'],file=sys.stderr,flush=True)
 finally:
     (evidence/'native-ui-result.json').write_text(json.dumps(record,sort_keys=True,indent=2)+'\n')
     if proc is not None and proc.poll() is None:

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/native-smoke-wrapper.sh"
 # Preserve the runner's Rust installation despite isolated application HOME.
 REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
@@ -44,4 +45,4 @@ PY
 done
 [[ "$ready" == 1 ]] || { cat "$evidence/provider-fixture.log" >&2; echo 'TLS fixture readiness timed out' >&2; exit 1; }
 export MUNINN_PROVIDER_SMOKE_UPSTREAM="$(cat "$addrfile")" MUNINN_PROVIDER_SMOKE_ROOTS="$fixture"
-python3 "$(dirname "$0")/native-ui-driver.py" "$app" "$evidence"
+run_smoke 17 "$evidence" "$evidence/app.stdout.log:$evidence/provider-fixture.log" -- python3 "$(dirname "$0")/native-ui-driver.py" "$app" "$evidence"

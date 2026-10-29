@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Required real-bundle WKWebView, API, relaunch, and shutdown smoke."""
-import json, os, pathlib, plistlib, signal, socket, subprocess, sys, time, urllib.error, urllib.request
+import json, os, pathlib, plistlib, signal, socket, subprocess, sys, time, traceback, urllib.error, urllib.request
 app, evidence = map(pathlib.Path, sys.argv[1:3]); evidence.mkdir(parents=True, exist_ok=True)
 data = pathlib.Path(os.environ['MUNINN_E2E_DATA_DIR']).resolve()
 e2e=pathlib.Path(os.environ['MUNINN_E2E_DIR']); bundle=plistlib.loads((app/'Contents/Info.plist').read_bytes()); bid=bundle['CFBundleIdentifier']
@@ -164,7 +164,7 @@ try:
  ports_closed(info2); record['ports_closed_after_quit']=True
  record['passed']=True
 except Exception as exc:
- record.update(passed=False,error=f'{type(exc).__name__}: {exc}'); print(record['error'],file=sys.stderr)
+ record.update(passed=False,error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc()); print(record['traceback'],file=sys.stderr,flush=True)
 finally:
  (evidence/'native-launch-result.json').write_text(json.dumps(record,sort_keys=True,indent=2)+'\n')
  if proc is not None and proc.poll() is None:
