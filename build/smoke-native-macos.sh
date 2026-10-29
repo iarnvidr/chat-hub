@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "$0")/macos-smoke-diagnostics.sh"
+SMOKE_EVIDENCE_DIR="${SMOKE_EVIDENCE_DIR:-${RUNNER_TEMP:-/tmp}/macos-smoke-evidence}"
+mkdir -p "$SMOKE_EVIDENCE_DIR"
+smoke_diag_init
 app="${1:?usage: smoke-native-macos.sh APP}"
+smoke_diag_command "native smoke setup for $app"
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'requires macos arm64' >&2; exit 2; }
 [[ -d "$app/Contents/MacOS" ]] || { echo "app missing: $app" >&2; exit 2; }
 evidence="${SMOKE_EVIDENCE_DIR:-${RUNNER_TEMP:-/tmp}/macos-smoke-evidence}"
@@ -12,7 +17,9 @@ mkdir -p "$app_data"
 chmod 700 "$HOME" "$HOME/Library" "$HOME/Library/Application Support" "$app_data"
 codesign --verify --deep --strict "$app"
 exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
-"$app/Contents/MacOS/$exe" >"$evidence/app.log" 2>&1 & app_pid=$!
+"$app/Contents/MacOS/$exe" >"$evidence/app.stdout.log" 2>"$evidence/app.stderr.log" & app_pid=$!
+echo "$app_pid" >"$evidence/app.pid"
+smoke_diag_command "launch/authenticated-health/activation smoke (pid $app_pid)"
 printf '%s\n' "$app_pid" >"$evidence/app.pid"
 service_json_path="$app_data/service.json"
 
@@ -30,6 +37,7 @@ import json, pathlib, sys
 path, service, alive, code = sys.argv[1:]
 pathlib.Path(path).write_text(json.dumps({"service_json_path": service, "app_alive": alive == "true", "app_exitcode": int(code)}, indent=2) + "\n")
 PY
+  if (( app_exitcode != 0 )); then smoke_diag_exit "$app_exitcode"; fi
   exit "$app_exitcode"
 }
 trap on_exit EXIT
@@ -55,7 +63,8 @@ else: raise SystemExit('packaged app authenticated health endpoint not ready')
 # Exercise LaunchServices activation and an explicit Apple event while retaining
 # the original direct-child PID; do not quit until EXIT cleanup.
 subprocess.run(['open','-a',str(app)],check=True,timeout=15)
-subprocess.run(['osascript','-e',f'tell application id "{info["bundle_id"]}" to activate'],check=True,timeout=15)
+with (evidence/'osascript.stderr.log').open('a') as err:
+ subprocess.run(['osascript','-e',f'tell application id "{info["bundle_id"]}" to activate'],check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=err)
 current=json.loads(info_path.read_text())
 if not alive(pid): raise SystemExit('app exited during startup poke')
 if current.get('process_id') != int(pid): raise SystemExit('service PID changed after activation')

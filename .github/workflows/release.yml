@@ -59,6 +59,17 @@ jobs:
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
+      - name: Upload required smoke diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chat-hub-release-smoke-evidence
+          path: |
+            ${{ runner.temp }}/chat-hub-release-evidence/**
+            ${{ runner.temp }}/chat-hub-native-launch-evidence/**
+          if-no-files-found: warn
+          retention-days: 30
       - name: Resolve native-smoke Cargo artifact path
         id: native-smoke-artifact
         run: |
