@@ -23,6 +23,7 @@ jobs:
           curl --fail --location "$base/gitleaks_${VERSION}_checksums.txt" -o checksums.txt
           grep "  $archive$" checksums.txt | sha256sum --check
           tar -xzf "$archive" gitleaks
+          mkdir -p "$HOME/.local/bin"
           install gitleaks "$HOME/.local/bin/gitleaks"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: gitleaks detect --source . --no-git --redact
