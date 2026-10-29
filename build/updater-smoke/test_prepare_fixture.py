@@ -24,7 +24,10 @@ class PrepareFixture(unittest.TestCase):
                 lock = (fixture / "src-tauri/Cargo.lock").read_text()
                 section = lock.split('name = "chat-hub-desktop"', 1)[1].split("[[package]]", 1)[0]
                 self.assertIn(f'version = "{version}"', section)
+                root_lock = (fixture / "Cargo.lock").read_text()
+                self.assertIn('name = "chat-hub"\nversion = "' + version + '"', root_lock)
                 subprocess.run(["cargo", "metadata", "--format-version", "1", "--locked", "--offline", "--no-deps", "--manifest-path", str(fixture / "src-tauri/Cargo.toml")], check=True, stdout=subprocess.DEVNULL)
+                subprocess.run(["cargo", "metadata", "--format-version", "1", "--locked", "--offline", "--no-deps", "--manifest-path", str(fixture / "Cargo.toml")], check=True, stdout=subprocess.DEVNULL)
 
 if __name__ == "__main__":
     unittest.main()

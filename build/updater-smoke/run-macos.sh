@@ -22,11 +22,6 @@ cleanup() {
       if [[ -s "$TMP/$name.json" ]]; then install -m 600 "$TMP/$name.json" "$EVIDENCE_DIR/$name.json"; fi
     done
   fi
-  if [[ -n "${ROOT_MANIFEST_BACKUP:-}" && -f "$ROOT_MANIFEST_BACKUP" ]]; then cp "$ROOT_MANIFEST_BACKUP" "$ROOT_MANIFEST"; fi
-  if [[ -n "${MANIFEST_BACKUP:-}" && -f "$MANIFEST_BACKUP" ]]; then cp "$MANIFEST_BACKUP" "$MANIFEST"; fi
-  if [[ -n "${CONF_BACKUP:-}" && -f "$CONF_BACKUP" ]]; then cp "$CONF_BACKUP" "$CONF"; fi
-  if [[ -n "${PKG_BACKUP:-}" && -f "$PKG_BACKUP" ]]; then cp "$PKG_BACKUP" "$PKG"; fi
-  if [[ -n "${LOCK_BACKUP:-}" && -f "$LOCK_BACKUP" ]]; then cp "$LOCK_BACKUP" "$LOCK"; fi
   [[ "${MUNINN_UPDATER_SMOKE_KEEP:-0}" == 1 ]] || rm -rf "$TMP"
   return "$rc"
 }
@@ -37,19 +32,18 @@ export HOME="$TMP/home" MUNINN_DATA_DIR="$TMP/data" MUNINN_E2E_DIR="$TMP/e2e"
 export MUNINN_NATIVE_UI_SMOKE=1
 PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 export MUNINN_UPDATER_SMOKE_ENDPOINT="http://127.0.0.1:$PORT/latest.json"
-# Compile genuine binaries with all package version sources aligned. Restore all
-# temporarily edited inputs on errors/signals; no plist-only version simulation.
-MANIFEST="$ROOT/src-tauri/Cargo.toml"
-ROOT_MANIFEST="$ROOT/Cargo.toml"; ROOT_MANIFEST_BACKUP="$TMP/root-Cargo.toml"
-MANIFEST_BACKUP="$TMP/Cargo.toml"
-CONF="$ROOT/src-tauri/tauri.conf.json"; CONF_BACKUP="$TMP/tauri.conf.json"
-PKG="$ROOT/package.json"; PKG_BACKUP="$TMP/package.json"
-LOCK="$ROOT/src-tauri/Cargo.lock"; LOCK_BACKUP="$TMP/Cargo.lock"
-cp "$ROOT_MANIFEST" "$ROOT_MANIFEST_BACKUP"; cp "$MANIFEST" "$MANIFEST_BACKUP"; cp "$CONF" "$CONF_BACKUP"; cp "$PKG" "$PKG_BACKUP"; cp "$LOCK" "$LOCK_BACKUP"
+# Build each version from an independent temporary source archive. Never
+# version-bump, regenerate locks, or compile into the operator's checkout.
 build_fixture() {
-  local version="$1" target="$TMP/target-$1"
-  python3 "$ROOT/build/updater-smoke/prepare_fixture.py" "$ROOT" "$version"
-  CARGO_TARGET_DIR="$target" cargo build --locked --offline --manifest-path "$MANIFEST" --target aarch64-apple-darwin --features native-smoke
+  local version="$1" target="$TMP/target-$1" source="$TMP/source-$1"
+  mkdir -p "$source"
+  git -C "$ROOT" archive HEAD | tar -x -C "$source"
+  # Include the assigned smoke harness changes, which may not yet be committed.
+  rm -rf "$source/build/updater-smoke"
+  mkdir -p "$source/build"
+  cp -R "$ROOT/build/updater-smoke" "$source/build/updater-smoke"
+  python3 "$ROOT/build/updater-smoke/prepare_fixture.py" "$source" "$version"
+  CARGO_TARGET_DIR="$target" cargo build --locked --offline --manifest-path "$source/src-tauri/Cargo.toml" --target aarch64-apple-darwin --features native-smoke
   local app="$TMP/build-$version/Chat Hub-$version.app" exe
   mkdir -p "$(dirname "$app")"
   ditto "$MUNINN_UPDATER_SMOKE_APP" "$app"
