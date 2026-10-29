@@ -8,4 +8,5 @@ PR1 implements a localhost API/CLI, SQLite initialization, and a selective CONNE
 - Search is currently title matching, not full-text search over conversation content.
 - The API uses plaintext HTTP with bearer authentication on loopback. It is trusted-local-only, not suitable for exposure to untrusted networks or as protection from local users/processes.
 - CA trust is not installed automatically; CA lifecycle and user-guided trust management need further review.
-- Synthetic Linux tests are not evidence of live ChatGPT/provider compatibility. macOS and WKWebView behavior have not been tested.
+- PR2's mandatory packaged-app updater acceptance on hosted `macos-15` remains pending: real app update 0.1.0→0.1.1, tamper/wrong-key rejection, native UI screenshots, and WKWebView proxy capture/ingest plus undecrypted auth tunnel evidence must be linked before claiming success.
+- Real ChatGPT login/account behavior and downloaded-app quarantine/Gatekeeper behavior remain manual acceptance items. Do not characterize all macOS behavior as untested; the hosted macos-15 evidence gate is specific and pending.

@@ -1,0 +1,5 @@
+# Native updater smoke bridge (synthetic only)
+
+Build with `--features native-smoke`, launch with `--native-ui-smoke --updater-smoke` and `MUNINN_NATIVE_UI_SMOKE=1`. This gate is debug-only. The native bridge uses normal Tauri IPC commands: `update_status` returns `{version,channel,status,message}`, `check_for_updates` checks the configured signed feed via the real Tauri updater plugin and returns that shape, and `install_update` performs plugin `download_and_install` then restarts. `service_info` reports application/API/proxy addresses for driver readiness.
+
+Optional synthetic driver inputs: `NATIVE_SMOKE_FEED` and `NATIVE_SMOKE_VERSION` are accepted only in gated smoke builds. They do not bypass signature checking or cause an install; installation always uses the signed updater plugin configured endpoint/key. Drivers must use a disposable test app/feed and never a production release. Native platform signing/trust is outside this bridge; verify macOS notarization and updater signature trust separately.

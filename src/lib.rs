@@ -1,4 +1,5 @@
 pub mod ca;
+pub mod capture;
 pub mod config;
 pub mod error;
 pub mod proxy;
