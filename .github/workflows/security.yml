@@ -35,4 +35,7 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
+      # Narrow macOS-only exception: glib is GTK/Linux-only in this Tauri app; see docs/SECURITY-EXCEPTIONS.md.
       - uses: actions/dependency-review-action@v4
+        with:
+          allow-ghsas: GHSA-wrw7-89jp-8q8g
