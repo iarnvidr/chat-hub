@@ -1,0 +1,7 @@
+This product includes architectural ideas informed by Muninn
+(https://github.com/iarnvidr/muninn), Copyright 2024–2026 iarnvidr,
+licensed under the Apache License, Version 2.0.
+
+Huginn is an independent project. The architecture reference describes a local
+Rust service, capture and ingestion pipeline, and library-oriented user
+experience; it is not a claim that Muninn code is included here.
