@@ -61,6 +61,25 @@ jobs:
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
       - name: Required native-smoke feature compilation
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
+      - name: Build native-smoke binary for required launch harness
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
+      - name: Prepare isolated debug bundle for required launch harness
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app"
+          mkdir -p "$(dirname "$app")"
+          ditto "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$app"
+          exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          binary="${CARGO_TARGET_DIR:-target}/aarch64-apple-darwin/debug/chat-hub-desktop"
+          test -x "$binary"
+          cp "$binary" "$app/Contents/MacOS/$exe"
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+      - name: Required native UI, health, relaunch, and shutdown smoke
+        env:
+          HOME: ${{ runner.temp }}/chat-hub-launch-home
+          NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-launch-evidence
+        run: bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-native-launch-evidence"
       - name: Create updater archive, sign and verify
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

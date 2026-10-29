@@ -68,7 +68,12 @@ jobs:
           MUNINN_UPDATER_SMOKE_APP: ${{ runner.temp }}/chat-hub-debug-smoke/Chat Hub.app
           MUNINN_UPDATER_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-updater-evidence
         run: bash build/updater-smoke/run-macos.sh
-      - name: Native UI interaction smoke (debug bundle only)
+      - name: Required native launch, UI, API, reopen, shutdown smoke (debug bundle)
+        env:
+          HOME: ${{ runner.temp }}/chat-hub-launch-home
+          NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-launch-evidence
+        run: bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-native-launch-evidence"
+      - name: Optional updater UI interaction smoke (debug bundle only)
         continue-on-error: true
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         env:

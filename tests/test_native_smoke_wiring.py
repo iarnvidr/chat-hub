@@ -9,7 +9,7 @@ class NativeSmokeWiring(unittest.TestCase):
     def test_existing_native_smokes_remain_debug_only(self):
         workflow = (ROOT / ".github/workflows/macos.yml").read_text()
         self.assertIn("Native signed updater integration smoke (debug bundle)", workflow)
-        self.assertIn("Native UI interaction smoke (debug bundle only)", workflow)
+        self.assertIn("Optional updater UI interaction smoke (debug bundle only)", workflow)
         self.assertIn("build/updater-smoke/run-macos.sh", workflow)
         self.assertIn("build/native-ui-smoke.sh", workflow)
         harness = (ROOT / "build/native-ui-smoke.sh").read_text()
