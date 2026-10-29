@@ -148,14 +148,8 @@ try:
   time.sleep(.2)
  else: raise RuntimeError('same-PID app/window did not reopen')
  info2,token2=wait_service()
- # Exercise the provider-window denial through the native automation bridge and
- # require its runtime report (static source checks are not behavioral evidence).
- denial=bridge('provider_denial')
- denial_report=e2e/'provider-denial.res.json'
- end=time.monotonic()+15
- while time.monotonic()<end and not denial_report.exists(): time.sleep(.1)
- if not denial_report.exists(): raise RuntimeError('provider denial result was not reported')
- denial_result=json.loads(denial_report.read_text())
+ # Native callback returns only after the actual provider invoke rejects.
+ denial_result=bridge('provider_denial')
  if denial_result.get('denied') is not True: raise RuntimeError(f'provider service_info was not denied: {denial_result!r}')
  record['provider_denial']=denial_result
  if state2.get('process_id')!=pid: raise RuntimeError('reopen changed process PID')

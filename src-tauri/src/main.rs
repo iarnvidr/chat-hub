@@ -99,10 +99,63 @@ mod e2e {
                 let Some(w) = w else {
                     return json!({"ok":false,"error":"provider webview missing"});
                 };
-                let code = "(async()=>{for(let i=0;i<100&&!window.__TAURI_INTERNALS__?.invoke;i++)await new Promise(r=>setTimeout(r,100));let denied=false;let category='';try{await window.__TAURI_INTERNALS__.invoke('service_info')}catch(e){denied=true;category=String(e).slice(0,120)}window.__TAURI_INTERNALS__.invoke('e2e_provider_result',{denied,category})})()";
-                match w.eval(code) {
-                    Ok(()) => json!({"ok":true}),
-                    Err(e) => json!({"ok":false,"error":e.to_string()}),
+                if !super::smoke() {
+                    return json!({"ok":false,"error":"native smoke automation disabled"});
+                }
+                let Ok(url) = w.url() else {
+                    return json!({"ok":false,"error":"provider URL unavailable"});
+                };
+                if url.scheme() != "https" || url.host_str() != Some("chatgpt.com") {
+                    return json!({"ok":false,"error":"provider webview is not at https://chatgpt.com"});
+                }
+                let nonce = format!(
+                    "{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                );
+                let key = format!("__chatHubDenialProbe_{}", nonce);
+                let escaped_key =
+                    serde_json::to_string(&key).unwrap_or_else(|_| "\"invalid\"".into());
+                let start = format!("(()=>{{const k={escaped_key};const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke!==\"function\"){{window[k]={{nonce:{escaped_key},attempted:false,error:\"invoke unavailable\"}};return}};window[k]={{nonce:{escaped_key},pending:true}};Promise.resolve().then(()=>invoke(\"service_info\")).then(()=>{{window[k]={{nonce:{escaped_key},attempted:true,denied:false}}}},e=>{{window[k]={{nonce:{escaped_key},attempted:true,denied:true,error:String(e).slice(0,120)}}}})}})()");
+                if let Err(e) = w.eval(start) {
+                    return json!({"ok":false,"error":format!("provider probe start failed: {e}")});
+                }
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let poll = format!("window[{escaped_key}]||null");
+                    if let Err(e) = w.eval_with_callback(poll, move |value| {
+                        let _ = tx.send(value);
+                    }) {
+                        return json!({"ok":false,"error":format!("provider probe poll failed: {e}")});
+                    }
+                    match rx.recv_timeout(Duration::from_secs(2)) {
+                        Ok(value) => {
+                            if let Ok(result) = serde_json::from_str::<Value>(&value) {
+                                if result["nonce"].as_str() != Some(&key) {
+                                    continue;
+                                }
+                                if result["attempted"].as_bool() == Some(false) {
+                                    return json!({"ok":false,"error":result["error"].as_str().unwrap_or("invoke unavailable")});
+                                }
+                                if result["attempted"].as_bool() == Some(true) {
+                                    let denied = result["denied"].as_bool() == Some(true);
+                                    return json!({"ok":denied,"denied":denied,"category":result["error"].as_str().unwrap_or("")});
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(_) => {
+                            return json!({"ok":false,"error":"provider probe callback disconnected"})
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return json!({"ok":false,"error":"timed out waiting for provider service_info result"});
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
             "state" => {
@@ -124,25 +177,6 @@ mod e2e {
             }
             _ => json!({"ok":false,"error":"unknown operation"}),
         }
-    }
-    pub fn provider_result(denied: bool, category: String) -> Result<(), String> {
-        let Some(d) = dir() else {
-            return Err("automation disabled".into());
-        };
-        if !denied {
-            return Err("provider service_info unexpectedly resolved".into());
-        }
-        let category: String = category
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(120)
-            .collect();
-        respond(
-            &d,
-            "provider-denial",
-            &json!({"ok":true,"denied":true,"category":category}),
-        );
-        Ok(())
     }
     pub fn e2e_result(id: String, value: String) -> Result<(), String> {
         let Some(d) = dir() else {
@@ -178,22 +212,6 @@ fn update_status(
 ) -> Result<UpdateStatus, String> {
     authorize_local_main(&window)?;
     Ok(s.updater.lock().map_err(|e| e.to_string())?.clone())
-}
-#[cfg(feature = "native-smoke")]
-#[tauri::command]
-fn e2e_provider_result(
-    window: tauri::WebviewWindow,
-    denied: bool,
-    category: String,
-) -> Result<(), String> {
-    if !smoke() || window.label() != "provider" {
-        return Err("provider denial report is restricted to native smoke provider window".into());
-    }
-    let url = window.url().map_err(|e| e.to_string())?;
-    if url.scheme() != "https" || url.host_str() != Some("chatgpt.com") {
-        return Err("provider denial report requires provider origin".into());
-    }
-    e2e::provider_result(denied, category)
 }
 #[cfg(feature = "native-smoke")]
 #[tauri::command]
@@ -495,8 +513,7 @@ fn main() {
             service_info,
             check_for_updates,
             install_update,
-            e2e_result,
-            e2e_provider_result
+            e2e_result
         ])
         .run(tauri::generate_context!());
     #[cfg(not(feature = "native-smoke"))]
