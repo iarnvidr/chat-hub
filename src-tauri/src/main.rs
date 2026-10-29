@@ -345,6 +345,15 @@ async fn main() {
         tauri::async_runtime::spawn(async move {
             let _ = axum::serve(api_listener, router).await;
         });
+        let service_info = serde_json::json!({
+            "service": APP_NAME,
+            "version": env!("CARGO_PKG_VERSION"),
+            "api": format!("http://{api}"),
+            "process_id": std::process::id(),
+        });
+        let info_tmp = dir.join("service.json.tmp");
+        std::fs::write(&info_tmp, serde_json::to_vec(&service_info)?)?;
+        std::fs::rename(info_tmp, dir.join("service.json"))?;
         app.manage(AppState {
             pending_update: Arc::new(Mutex::new(None)),
             updater: Arc::new(Mutex::new(UpdateStatus {

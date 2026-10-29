@@ -26,6 +26,18 @@ class NativeSmokeWiring(unittest.TestCase):
         self.assertIn("button.click()", interaction)
         self.assertIn("update_status", interaction)
 
+    def test_release_smoke_discovers_and_authenticates_real_service(self):
+        script = (ROOT / "build/smoke-native-macos.sh").read_text()
+        main = (ROOT / "src-tauri/src/main.rs").read_text()
+        self.assertIn("service.json", script)
+        self.assertIn("service.token", script)
+        self.assertIn("Authorization", script)
+        self.assertIn("/api/health", script)
+        self.assertNotIn("47871", script)
+        self.assertNotIn("/health", script.replace("/api/health", ""))
+        self.assertIn('dir.join("service.json")', main)
+        self.assertNotIn('"token": token', main)
+
     def test_no_smoke_claim_in_artifact_summary(self):
         workflow = (ROOT / ".github/workflows/macos.yml").read_text()
         self.assertIn("ad-hoc signed and not notarized", workflow)
