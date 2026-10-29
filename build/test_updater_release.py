@@ -1,7 +1,7 @@
 import json, unittest, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
-from updater_release import stable, make_feed, validate_feed, verify_source_version, parse_public_key, minisign_public_key
+from updater_release import stable, make_feed, validate_feed, verify_source_version, parse_public_key, minisign_public_key, updater_url, UPDATER_ARCHIVE
 import base64
 
 class UpdaterReleaseTests(unittest.TestCase):
@@ -26,11 +26,16 @@ class UpdaterReleaseTests(unittest.TestCase):
         for bundle, requested in (("1.2.4", "1.2.3"), ("1.2.3-beta", "1.2.3"), ("1.2.3", "1.2.3-beta")):
             with self.assertRaises(ValueError): verify_source_version(bundle, requested)
     def test_valid_feed(self):
-        f=make_feed('1.2.3','https://github.com/o/r/releases/download/v1.2.3/Chat Hub.app.tar.gz','signed')
-        self.assertEqual(f['platforms']['darwin-aarch64']['url'].split('/')[-1], 'Chat Hub.app.tar.gz')
+        url=updater_url('o/r','v1.2.3')
+        f=make_feed('1.2.3',url,'signed')
+        self.assertEqual(f['platforms']['darwin-aarch64']['url'], 'https://github.com/o/r/releases/download/v1.2.3/Chat-Hub.app.tar.gz')
+        self.assertNotIn(' ', UPDATER_ARCHIVE)
+        for invalid in ('https://github.com/o/r/releases/download/v1.2.3/Chat%20Hub.app.tar.gz', 'https://github.com/x/r/releases/download/v1.2.3/Chat-Hub.app.tar.gz', 'https://github.com/o/r/releases/download/v1.2.4/Chat-Hub.app.tar.gz'):
+            with self.assertRaises(ValueError): make_feed('1.2.3',invalid,'signed','o/r','v1.2.3')
+        with self.assertRaises(ValueError): make_feed('1.2.3',url,'signed','o/r','v1.2.4')
         validate_feed(f)
     def test_malformed_schema(self):
-        for f in ({}, {'platforms':[]}, {'version':'1.2.3','notes':'x','platforms':{'darwin-aarch64':{'url':'http://x/Chat Hub.app.tar.gz','signature':'s'}}}, {'version':'1.2.3','notes':'x','platforms':{'darwin-aarch64':{'url':'https://x/Chat Hub.app.tar.gz'}}}):
+        for f in ({}, {'platforms':[]}, {'version':'1.2.3','notes':'x','platforms':{'darwin-aarch64':{'url':'http://x/Chat-Hub.app.tar.gz','signature':'s'}}}, {'version':'1.2.3','notes':'x','platforms':{'darwin-aarch64':{'url':'https://x/Chat-Hub.app.tar.gz'}}}):
             with self.assertRaises(ValueError): validate_feed(f)
     def test_path_and_signature_requirements(self):
         with self.assertRaises(ValueError): make_feed('1.2.3','file:///tmp/app.tar.gz','sig')

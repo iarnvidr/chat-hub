@@ -68,22 +68,22 @@ jobs:
           brew install minisign
           npx --yes @tauri-apps/cli@2.10.1 signer --help
           cd "$RUNNER_TEMP/chat-hub"
-          rm -f 'Chat Hub.app.tar.gz' 'Chat Hub.app.tar.gz.sig'
-          tar -czf 'Chat Hub.app.tar.gz' 'Chat Hub.app'
-          npx --yes @tauri-apps/cli@2.10.1 signer sign 'Chat Hub.app.tar.gz'
-          test -s 'Chat Hub.app.tar.gz.sig'
+          rm -f 'Chat-Hub.app.tar.gz' 'Chat-Hub.app.tar.gz.sig'
+          tar -czf 'Chat-Hub.app.tar.gz' 'Chat Hub.app'
+          npx --yes @tauri-apps/cli@2.10.1 signer sign 'Chat-Hub.app.tar.gz'
+          test -s 'Chat-Hub.app.tar.gz.sig'
           python3 - "$GITHUB_WORKSPACE/src-tauri/tauri.conf.json" "$GITHUB_WORKSPACE/build/updater_release.py" <<'PY'
           import base64, importlib.util, json, pathlib, sys
           spec=importlib.util.spec_from_file_location('updater_release', sys.argv[2])
           module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
           configured=json.load(open(sys.argv[1]))['plugins']['updater']['pubkey']
           pathlib.Path('updater.pub').write_bytes(module.minisign_public_key(configured))
-          sig=base64.b64decode(pathlib.Path('Chat Hub.app.tar.gz.sig').read_bytes(), validate=True)
-          pathlib.Path('Chat Hub.app.tar.gz.sig.minisig').write_bytes(sig)
+          sig=base64.b64decode(pathlib.Path('Chat-Hub.app.tar.gz.sig').read_bytes(), validate=True)
+          pathlib.Path('Chat-Hub.app.tar.gz.sig.minisig').write_bytes(sig)
           PY
-          minisign -Vm 'Chat Hub.app.tar.gz' -p updater.pub -x 'Chat Hub.app.tar.gz.sig.minisig'
+          minisign -Vm 'Chat-Hub.app.tar.gz' -p updater.pub -x 'Chat-Hub.app.tar.gz.sig.minisig'
           echo "version=$INPUT_VERSION tag=$INPUT_TAG commit=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" > release-review.txt
-          shasum -a 256 'Chat Hub.app.tar.gz' 'Chat Hub.app.tar.gz.sig' > SHA256SUMS
+          shasum -a 256 'Chat-Hub.app.tar.gz' 'Chat-Hub.app.tar.gz.sig' > SHA256SUMS
       - name: Prepare corresponding source and notices
         run: python3 build/release_sources.py prepare "$RUNNER_TEMP/chat-hub/corresponding-source"
       - name: Generate updater manifest
@@ -92,8 +92,8 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${INPUT_TAG}/Chat%20Hub.app.tar.gz"
-          python3 build/updater_release.py generate "$INPUT_VERSION" "$url" "$(cat "$RUNNER_TEMP/chat-hub/Chat Hub.app.tar.gz.sig")" "$RUNNER_TEMP/chat-hub/latest.json"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${INPUT_TAG}/Chat-Hub.app.tar.gz"
+          python3 build/updater_release.py generate "$INPUT_VERSION" "$url" "$(cat "$RUNNER_TEMP/chat-hub/Chat-Hub.app.tar.gz.sig")" "$RUNNER_TEMP/chat-hub/latest.json" --repo "$GITHUB_REPOSITORY" --tag "$INPUT_TAG"
           python3 build/updater_release.py validate "$RUNNER_TEMP/chat-hub/latest.json"
       - name: Create and mount-verify DMG
         env:
@@ -104,8 +104,8 @@ jobs:
           name: release-review-${{ inputs.tag }}
           path: |
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.dmg
-            ${{ runner.temp }}/chat-hub/Chat Hub.app.tar.gz
-            ${{ runner.temp }}/chat-hub/Chat Hub.app.tar.gz.sig
+            ${{ runner.temp }}/chat-hub/Chat-Hub.app.tar.gz
+            ${{ runner.temp }}/chat-hub/Chat-Hub.app.tar.gz.sig
             ${{ runner.temp }}/chat-hub/latest.json
             ${{ runner.temp }}/chat-hub/SHA256SUMS
             ${{ runner.temp }}/chat-hub/release-review.txt
@@ -136,6 +136,6 @@ jobs:
           set -euo pipefail
           gh release view "$INPUT_TAG" >/dev/null
           dmg="release-assets/Chat_Hub_${INPUT_VERSION}_macos-arm64.dmg"
-          assets=("$dmg" release-assets/latest.json 'release-assets/Chat Hub.app.tar.gz')
+          assets=("$dmg" release-assets/latest.json 'release-assets/Chat-Hub.app.tar.gz')
           for file in "${assets[@]}"; do test -s "$file"; done
           gh release upload "$INPUT_TAG" "${assets[@]}" --clobber
