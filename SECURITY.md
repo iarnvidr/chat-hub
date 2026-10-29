@@ -1,6 +1,6 @@
 # Security policy
 
-Huginn is planned to run locally and handle sensitive conversation content.
+Chat Hub is planned to run locally and handle sensitive conversation content.
 The current scaffold is not a production-ready security boundary; do not use it
 to capture sensitive data.
 

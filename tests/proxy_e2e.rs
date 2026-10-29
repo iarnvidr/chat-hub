@@ -13,7 +13,7 @@ use tokio::{
 #[tokio::test]
 async fn connect_mitm_forwards_tls_response_and_emits_capture() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let dir = std::env::temp_dir().join(format!("huginn-e2e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("chat-hub-e2e-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let upstream_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();

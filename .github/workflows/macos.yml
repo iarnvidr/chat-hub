@@ -23,8 +23,8 @@ jobs:
       - name: Restore helper tool cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cache/muninn-tools
-          key: muninn-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build/tools.lock.json', 'build/ffmpeg_lgpl.py') }}
+          path: ~/.cache/chat-hub-tools
+          key: chat-hub-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build/tools.lock.json', 'build/ffmpeg_lgpl.py') }}
       - name: Install helper build tools
         run: brew install meson ninja pkgconf
       - name: Select the pinned Rust toolchain
@@ -32,28 +32,28 @@ jobs:
       # This release build/package and its launch-health check intentionally do not
       # run the debug-only e2e harness.
       - name: Build, test and sign release artifact
-        run: bash build/build-native-macos.sh "$RUNNER_TEMP/muninn"
+        run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
       - name: Build and mount-verify the DMG with corresponding sources
         run: |
           set -euo pipefail
-          python3 build/release_sources.py prepare "$RUNNER_TEMP/muninn/corresponding-source"
+          python3 build/release_sources.py prepare "$RUNNER_TEMP/chat-hub/corresponding-source"
           version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
-          bash build/package-dmg.sh "$RUNNER_TEMP/muninn/Muninn.app" "$RUNNER_TEMP/muninn/corresponding-source" "$RUNNER_TEMP/muninn/Muninn_${version}_macos-arm64.dmg"
+          bash build/package-dmg.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$RUNNER_TEMP/chat-hub/corresponding-source" "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg"
       - name: Release app launch and localhost health smoke
         env:
-          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/muninn-release-evidence
-        run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/muninn/Muninn.app"
+          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
+        run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
       - name: Build debug binary for native UI interactions
-        run: cargo build --locked -p muninn --target aarch64-apple-darwin
+        run: cargo build --locked -p chat-hub-desktop --target aarch64-apple-darwin
       - id: prepare-debug-smoke
         name: Prepare isolated debug bundle for native smokes
         run: |
           set -euo pipefail
-          app="$RUNNER_TEMP/muninn-debug-smoke/Muninn.app"
+          app="$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app"
           mkdir -p "$(dirname "$app")"
-          ditto "$RUNNER_TEMP/muninn/Muninn.app" "$app"
+          ditto "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$app"
           exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
-          debug_binary="${CARGO_TARGET_DIR:-target}/aarch64-apple-darwin/debug/muninn"
+          debug_binary="${CARGO_TARGET_DIR:-target}/aarch64-apple-darwin/debug/chat-hub"
           test -x "$debug_binary"
           cp "$debug_binary" "$app/Contents/MacOS/$exe"
           codesign --force --sign - "$app"
@@ -62,27 +62,27 @@ jobs:
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         name: Native signed updater integration smoke (debug bundle)
         env:
-          MUNINN_UPDATER_SMOKE_APP: ${{ runner.temp }}/muninn-debug-smoke/Muninn.app
-          MUNINN_UPDATER_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/muninn-updater-evidence
+          MUNINN_UPDATER_SMOKE_APP: ${{ runner.temp }}/chat-hub-debug-smoke/Chat Hub.app
+          MUNINN_UPDATER_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-updater-evidence
         run: bash build/updater-smoke/run-macos.sh
       - name: Native UI interaction smoke (debug bundle only)
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         env:
-          NATIVE_UI_EVIDENCE_DIR: ${{ runner.temp }}/muninn-debug-ui-evidence
-        run: bash build/native-ui-smoke.sh "$RUNNER_TEMP/muninn-debug-smoke/Muninn.app" "$RUNNER_TEMP/muninn-debug-ui-evidence"
+          NATIVE_UI_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-debug-ui-evidence
+        run: bash build/native-ui-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-debug-ui-evidence"
       - id: upload
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: muninn-macos-arm64
+          name: chat-hub-macos-arm64
           path: |
-            ${{ runner.temp }}/muninn/Muninn_*.zip
-            ${{ runner.temp }}/muninn/Muninn_*.zip.sha256
-            ${{ runner.temp }}/muninn/Muninn_*.dmg
-            ${{ runner.temp }}/muninn/verify-macos.txt
-            ${{ runner.temp }}/muninn-release-evidence/**
-            ${{ runner.temp }}/muninn-debug-ui-evidence/**
-            ${{ runner.temp }}/muninn-updater-evidence/**
+            ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip
+            ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip.sha256
+            ${{ runner.temp }}/chat-hub/Chat_Hub_*.dmg
+            ${{ runner.temp }}/chat-hub/verify-macos.txt
+            ${{ runner.temp }}/chat-hub-release-evidence/**
+            ${{ runner.temp }}/chat-hub-debug-ui-evidence/**
+            ${{ runner.temp }}/chat-hub-updater-evidence/**
           if-no-files-found: error
           # Builds of main stay downloadable for a month; PR builds for a week.
           retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
@@ -91,9 +91,9 @@ jobs:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
         run: |
           {
-            echo "### Muninn test build (Apple Silicon)"
+            echo "### Chat Hub test build (Apple Silicon)"
             echo
-            echo "Download: [muninn-macos-arm64]($ARTIFACT_URL) (sign in to GitHub; includes release archive/checksum and separate debug UI smoke evidence)."
+            echo "Download: [chat-hub-macos-arm64]($ARTIFACT_URL) (sign in to GitHub; includes release archive/checksum and separate debug UI smoke evidence)."
             echo "Not a release: ad-hoc signed and not notarized. See README, Install on the Mac."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Download: $ARTIFACT_URL"

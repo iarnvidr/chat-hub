@@ -1,6 +1,6 @@
-# Huginn
+# Chat Hub
 
-Huginn is an early local-first conversation hub. PR1 provides a localhost Rust service and CLI, SQLite schema migration, and a selective TLS-intercepting CONNECT proxy. It is infrastructure, not yet a usable conversation library: provider ingestion, a browser UI, and the normalized conversation/message model are later-PR work.
+Chat Hub is an early local-first conversation hub. PR1 provides a localhost Rust service and CLI, SQLite schema migration, and a selective TLS-intercepting CONNECT proxy. It is infrastructure, not yet a usable conversation library: provider ingestion, a browser UI, and the normalized conversation/message model are later-PR work.
 
 ## PR1 status
 

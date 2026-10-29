@@ -2,4 +2,4 @@ This product includes architectural ideas informed by Muninn
 (https://github.com/iarnvidr/muninn), Copyright 2024–2026 iarnvidr,
 licensed under the Apache License, Version 2.0.
 
-Huginn is an independent project. Its architecture and desktop updater documentation also draw on design and release-process references in Muninn's public documentation, including `docs/UPDATES.md` and `docs/RELEASE-CHECKLIST.md`. These references are attributed for design guidance; this notice does not assert that Muninn source code is included. Consult the linked Muninn repository for its license and notices.
+Chat Hub is an independent project. Its architecture and desktop updater documentation also draw on design and release-process references in Muninn's public documentation, including `docs/UPDATES.md` and `docs/RELEASE-CHECKLIST.md`. These references are attributed for design guidance; this notice does not assert that Muninn source code is included. Consult the linked Muninn repository for its license and notices.

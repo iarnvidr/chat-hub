@@ -1,6 +1,6 @@
 # Public API (design contract; not yet implemented)
 
-Huginn is local-first and standalone by default. The macOS app embeds the shared Rust + SQLite core and works offline; it does not require a server, account, network connection, or remote service. The current localhost in-app HTTP server is an implementation detail, not a deployment requirement or promise of a remote dependency. Existing PR1 routes (`/api/health`, `/api/search`, `/api/conversations/{id}`) are early internal endpoints, not this stable contract.
+Chat Hub is local-first and standalone by default. The macOS app embeds the shared Rust + SQLite core and works offline; it does not require a server, account, network connection, or remote service. The current localhost in-app HTTP server is an implementation detail, not a deployment requirement or promise of a remote dependency. Existing PR1 routes (`/api/health`, `/api/search`, `/api/conversations/{id}`) are early internal endpoints, not this stable contract.
 
 ## Versioning and transport
 

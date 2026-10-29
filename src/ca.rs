@@ -160,7 +160,7 @@ mod tests {
     }
     #[test]
     fn persists_ca_and_signs_after_reload() {
-        let dir = std::env::temp_dir().join(format!("huginn-ca-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("chat-hub-ca-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let ca = Ca::load_or_create(&dir).unwrap();
         #[cfg(unix)]
