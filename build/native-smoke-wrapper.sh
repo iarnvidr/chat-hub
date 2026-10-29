@@ -10,7 +10,7 @@ run_smoke() {
   local rc=$?
   set -e
   if (( rc != 0 )); then
-    python3 "$(dirname "${BASH_SOURCE[0]}")/native-smoke-report.py" "$step" "$rc" "$cmd" "$evidence" "$logs" "$([[ "$step" == 16 ]] && echo namespace || echo '')"
+    python3 "$(dirname "${BASH_SOURCE[0]}")/native-smoke-report.py" "$step" "$rc" "$cmd" "$evidence" "$logs" "$([[ "$step" == 16 || "$step" == 17 ]] && echo namespace || echo '')"
     return "$rc"
   fi
 }

@@ -22,7 +22,17 @@ for name in logfiles.split(':'):
 lines += ['### Evidence directory (names and metadata only)']
 for p in pathlib.Path(evidence).glob('**/*') if pathlib.Path(evidence).exists() else []:
  lines.append(f'- `{p}` ({"directory" if p.is_dir() else "file"})')
-if namespace: lines += ['### Webview namespace evidence (unavailable: smoke failed before bridge metadata was captured)','`typeof ChatHub`/`invoke`: unavailable; `href`, `readyState`, `title`, window-key matches and Tauri globals: unavailable.']
+if namespace:
+ diagfiles=[p for p in pathlib.Path(evidence).glob('*.diag.json')]
+ if diagfiles:
+  for p in sorted(diagfiles):
+   try:
+    import json
+    d=json.loads(p.read_text())
+    # Side-channel contains only bounded URL/readiness/stage metadata, never page content.
+    lines += ['### Native bridge progress',f'- Request: `{d.get("id", "unknown")}`',f'- Stage: `{d.get("stage", "unknown")}`',f'- Metadata: `{json.dumps(d.get("detail", {}), sort_keys=True)}`']
+   except (OSError, ValueError): lines += [f'- Diagnostic metadata unreadable: `{p.name}`']
+ else: lines += ['### Webview namespace evidence (unavailable: native bridge did not publish progress metadata)','`typeof ChatHub`/`invoke`, `href`, `readyState`, title, window-key matches and Tauri globals: unavailable.']
 text='\n'.join(lines)+'\n'
 if summary:
  with open(summary,'a') as f: f.write(text); f.flush(); os.fsync(f.fileno())

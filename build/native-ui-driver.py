@@ -25,9 +25,16 @@ def bridge(op, **fields):
                     continue
                 return value.get('value', value)
             time.sleep(.1)
-        raise RuntimeError(f'native E2E {op} IPC timed out')
+        diag=e2e/f'{ident}.diag.json'
+        try:
+            progress=json.loads(diag.read_text()) if diag.exists() else {'stage':'unavailable','reason':'native side-channel not published'}
+            if diag.exists(): (evidence/f'{ident}.diag.json').write_text(json.dumps(progress,sort_keys=True))
+        except (OSError,ValueError) as exc: progress={'stage':'unreadable','reason':str(exc)}
+        raise RuntimeError(f'native E2E {op} IPC timed out; request={ident}; progress={progress!r}')
     finally:
         cmd.unlink(missing_ok=True); result.unlink(missing_ok=True)
+        # Preserve progress metadata in evidence; the temporary directory is private and cleaned on exit.
+
 
 record={'app': str(app), 'binary': str(binary)}
 try:

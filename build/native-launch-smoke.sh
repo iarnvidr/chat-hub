@@ -22,7 +22,8 @@ fixture_script="$(dirname "$0")/native-tls-fixture.py"
 python3 "$fixture_script" "$fixture" "$evidence/provider-fixture.json" "$addrfile" >"$evidence/provider-fixture.log" 2>&1 &
 fixture_pid=$!
 cleanup_fixture() { kill "$fixture_pid" 2>/dev/null || true; wait "$fixture_pid" 2>/dev/null || true; }
-trap cleanup_fixture EXIT
+cleanup_launch() { local rc=$?; cleanup_fixture; rm -rf "$e2e"; return "$rc"; }
+trap cleanup_launch EXIT
 report_fixture_failure() {
   local status=unknown reason='address file not published before timeout'
   if kill -0 "$fixture_pid" 2>/dev/null; then

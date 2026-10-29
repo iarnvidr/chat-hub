@@ -55,7 +55,20 @@ mod e2e {
     fn respond(d: &std::path::Path, id: &str, v: &Value) {
         let p = d.join(format!("{id}.res.json"));
         let t = d.join(format!("{id}.res.json.tmp"));
-        if std::fs::write(&t, v.to_string()).is_ok() {
+        if let Err(e) = std::fs::write(&t, v.to_string()) {
+            eprintln!("native E2E response write failed id={id}: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&t, &p) {
+            eprintln!("native E2E response publish failed id={id}: {e}");
+            let _ = std::fs::remove_file(t);
+        }
+    }
+    fn progress(d: &std::path::Path, id: &str, stage: &str, detail: Value) {
+        let value = json!({"id":id,"stage":stage,"detail":detail});
+        let p = d.join(format!("{id}.diag.json"));
+        let t = d.join(format!("{id}.diag.json.tmp"));
+        if std::fs::write(&t, value.to_string()).is_ok() {
             let _ = std::fs::rename(t, p);
         }
     }
@@ -87,12 +100,15 @@ mod e2e {
                 {
                     continue;
                 }
-                let result = run(&app, &c);
+                progress(&d, &id, "dispatch", json!({"op":c["op"]}));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&app, &c, &d, &id)))
+                    .unwrap_or_else(|_| json!({"ok":false,"error":"native E2E operation panicked"}));
+                progress(&d, &id, "response", json!({"ok":result["ok"]}));
                 respond(&d, &id, &result);
             }
         });
     }
-    fn run(app: &tauri::AppHandle, c: &Value) -> Value {
+    fn run(app: &tauri::AppHandle, c: &Value, d: &std::path::Path, id: &str) -> Value {
         match c["op"].as_str().unwrap_or("") {
             "provider_denial" => {
                 let w = app.get_webview_window("provider");
@@ -106,9 +122,15 @@ mod e2e {
                 // have committed its initial navigation when the driver asks.
                 // Wait for the real expected origin and a live JS context, bounded
                 // so an actual navigation failure has useful diagnostics.
-                let ready_deadline = std::time::Instant::now() + Duration::from_secs(20);
+                // Keep the entire two-phase operation inside the Python driver's 40s IPC
+                // deadline, leaving time to publish a response even on a stalled WebView.
+                let operation_deadline = std::time::Instant::now() + Duration::from_secs(28);
+                let ready_deadline = operation_deadline.min(std::time::Instant::now() + Duration::from_secs(10));
                 let mut readiness = json!({"href":null,"readyState":null,"windowLabel":w.label()});
+                let mut readiness_polls = 0u64;
                 loop {
+                    readiness_polls += 1;
+                    progress(d, id, "provider_readiness", json!({"polls":readiness_polls,"href":readiness["href"],"readyState":readiness["readyState"]}));
                     if let Ok(url) = w.url() {
                         readiness["href"] = json!(url.as_str());
                         if url.scheme() == "https" && url.host_str() == Some("chatgpt.com") {
@@ -126,10 +148,11 @@ mod e2e {
                         }
                     }
                     if std::time::Instant::now() >= ready_deadline {
-                        return json!({"ok":false,"error":"provider webview readiness timed out","readiness":readiness});
+                        return json!({"ok":false,"error":"provider webview readiness timed out","readiness":readiness,"polls":readiness_polls,"deadline_ms":28000});
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
+                progress(d, id, "provider_probe_started", json!({"href":readiness["href"],"readyState":readiness["readyState"]}));
                 let nonce = format!(
                     "{}-{}",
                     std::process::id(),
@@ -145,8 +168,11 @@ mod e2e {
                 if let Err(e) = w.eval(start) {
                     return json!({"ok":false,"error":format!("provider probe start failed: {e}")});
                 }
-                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                let deadline = operation_deadline;
+                let mut probe_polls = 0u64;
                 loop {
+                    probe_polls += 1;
+                    progress(d, id, "provider_probe_poll", json!({"polls":probe_polls,"remaining_ms":deadline.saturating_duration_since(std::time::Instant::now()).as_millis()}));
                     let (tx, rx) = std::sync::mpsc::channel();
                     let poll = format!("window[{escaped_key}]||null");
                     if let Err(e) = w.eval_with_callback(poll, move |value| {
@@ -154,9 +180,12 @@ mod e2e {
                     }) {
                         return json!({"ok":false,"error":format!("provider probe poll failed: {e}")});
                     }
-                    match rx.recv_timeout(Duration::from_secs(2)) {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
                         Ok(value) => {
-                            if let Ok(result) = serde_json::from_str::<Value>(&value) {
+                            let decoded = serde_json::from_str::<Value>(&value).ok();
+                            let result = decoded.as_ref().and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).or_else(|| Some(v.clone())));
+                            if let Some(result) = result {
                                 if result["nonce"].as_str() != Some(&key) {
                                     continue;
                                 }
@@ -175,7 +204,7 @@ mod e2e {
                         }
                     }
                     if std::time::Instant::now() >= deadline {
-                        return json!({"ok":false,"error":"timed out waiting for provider service_info result"});
+                        return json!({"ok":false,"error":"timed out waiting for provider service_info result","href":readiness["href"],"readyState":readiness["readyState"],"polls":probe_polls});
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
