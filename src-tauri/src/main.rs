@@ -11,7 +11,14 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::mpsc;
+#[cfg(target_os = "macos")]
+mod trust_mac;
 
+#[cfg(target_os = "macos")]
+struct ProviderProxy {
+    url: String,
+    ca_der: Vec<u8>,
+}
 #[derive(Clone)]
 struct AppState {
     updater: Arc<Mutex<UpdateStatus>>,
@@ -285,7 +292,16 @@ async fn main() {
                 }
             }
         });
-        let cfg = ProxyConfig::loopback(&ca);
+        let mut cfg = ProxyConfig::loopback(&ca);
+        #[cfg(feature = "native-smoke")]
+        if smoke() {
+            if let Ok(upstream) = std::env::var("MUNINN_PROVIDER_SMOKE_UPSTREAM") {
+                cfg.test_upstream = Some(upstream.parse().map_err(std::io::Error::other)?);
+            }
+            if let Ok(roots) = std::env::var("MUNINN_PROVIDER_SMOKE_ROOTS") {
+                cfg.test_roots = Some(PathBuf::from(roots));
+            }
+        }
         let (proxy, _) =
             tauri::async_runtime::block_on(proxy::run(cfg, tx)).map_err(std::io::Error::other)?;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -311,6 +327,20 @@ async fn main() {
             api: format!("http://{api}"),
             proxy: proxy.addr.to_string(),
         });
+        #[cfg(target_os = "macos")]
+        {
+            let proxy_url = format!("http://{}", proxy.addr);
+            let ca_der = proxy.ca.cert_der().to_vec();
+            let provider = tauri::WebviewWindowBuilder::new(
+                app,
+                "provider",
+                tauri::WebviewUrl::External("https://chatgpt.com".parse().unwrap()),
+            )
+            .title("Provider")
+            .proxy_url(proxy_url.parse().unwrap())
+            .build()?;
+            crate::trust_mac::prepare(&ca_der, &provider);
+        }
         Ok(())
     });
     #[cfg(feature = "native-smoke")]
