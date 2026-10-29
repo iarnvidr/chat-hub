@@ -12,7 +12,7 @@ out="$(cd "$out" && pwd)"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 npm ci --ignore-scripts
 cargo test --locked --manifest-path src-tauri/Cargo.toml --workspace
-npm run tauri -- build --locked --config src-tauri/tauri.conf.json --target aarch64-apple-darwin --bundles app
+npm run tauri -- build --config src-tauri/tauri.conf.json --target aarch64-apple-darwin --bundles app -- --locked
 app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Chat Hub.app"
 if [[ ! -d "$app" ]]; then app="target/aarch64-apple-darwin/release/bundle/macos/Chat Hub.app"; fi
 test -d "$app"

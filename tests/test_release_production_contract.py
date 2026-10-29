@@ -10,6 +10,8 @@ class ProductionContract(unittest.TestCase):
         build = (ROOT / "build/build-native-macos.sh").read_text()
         config = (ROOT / "src-tauri/tauri.conf.json").read_text()
         self.assertIn("npm run tauri -- build", build)
+        self.assertIn("--target aarch64-apple-darwin --bundles app -- --locked", build)
+        self.assertNotIn("build --locked", build)
         self.assertIn("--bundles app", build)
         self.assertIn("codesign --force --deep --sign -", build)
         self.assertIn("codesign --verify --deep --strict", build)
