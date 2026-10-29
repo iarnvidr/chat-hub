@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Real debug Tauri updater integration. Requires hosted Apple Silicon macOS.
 set -euo pipefail
+# HOME is replaced below for updater isolation; resolve Rust's real homes first.
+REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 : "${MUNINN_UPDATER_SMOKE_APP:?set to built debug Muninn.app}"
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'FAIL: Apple Silicon macOS required' >&2; exit 2; }

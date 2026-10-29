@@ -27,8 +27,12 @@ jobs:
           key: chat-hub-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build/tools.lock.json', 'build/ffmpeg_lgpl.py') }}
       - name: Install helper build tools
         run: brew install meson ninja pkgconf
-      - name: Select the pinned Rust toolchain
-        run: rustup show active-toolchain
+      - name: Select the pinned Rust toolchain and preserve real homes for isolated smoke steps
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
       - name: Install locked frontend dependencies
         run: npm ci
       - name: Build real Tauri app, ad-hoc signed (not notarized)
@@ -80,6 +84,8 @@ jobs:
       - name: Required native launch, UI, API, reopen, shutdown smoke (debug bundle)
         env:
           HOME: ${{ runner.temp }}/chat-hub-launch-home
+          RUSTUP_HOME: ${{ env.RUSTUP_HOME }}
+          CARGO_HOME: ${{ env.CARGO_HOME }}
           NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-launch-evidence
         run: bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-native-launch-evidence"
       - name: Optional updater UI interaction smoke (debug bundle only)

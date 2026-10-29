@@ -52,8 +52,9 @@ try:
     if not shot.is_file() or shot.stat().st_size<1000: raise RuntimeError('native screenshot missing or empty')
     record['screenshot']=str(shot)
     js=pathlib.Path(__file__).with_name('native-ui-interactions.js').read_text()
-    expression='(async()=>{'+js+'})()'
-    result=bridge('eval', js='return await ('+expression+');')
+    # The automation wrapper runs an async function body; the interaction file
+    # itself is an IIFE expression, so explicitly return its value to IPC.
+    result=bridge('eval', js='return await ('+js.strip().rstrip(';')+');')
     if not isinstance(result,dict) or result.get('clicked') is not True or not result.get('version') or not result.get('message'):
         raise RuntimeError(f'update UI assertion failed: {result!r}')
     record['interaction']=result

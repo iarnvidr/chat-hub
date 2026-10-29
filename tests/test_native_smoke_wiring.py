@@ -32,7 +32,14 @@ class NativeSmokeWiring(unittest.TestCase):
         self.assertIn("service.json", script)
         self.assertIn("service.token", script)
         self.assertIn("Authorization", script)
-        self.assertIn("/api/health", script)
+        # Assert production behavior in the embedded Python runner, not a
+        # brittle spelling of a URL literal.
+        self.assertIn("health_path='/api/health'", script)
+        self.assertIn("subprocess.run(['open','-a',str(app)],check=True,timeout=15)", script)
+        self.assertIn("tell application id", script)
+        self.assertIn("service PID changed", script)
+        self.assertIn("for _ in range(15):", script)
+        self.assertIn("after startup poke", script)
         self.assertNotIn("47871", script)
         self.assertNotIn("/health", script.replace("/api/health", ""))
         self.assertIn('dir.join("service.json")', main)

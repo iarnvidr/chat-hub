@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Preserve the runner's Rust installation despite isolated application HOME.
+REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
+export CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
 app="${1:?usage: native-ui-smoke.sh APP [evidence-dir]}"
 evidence="${2:-${NATIVE_UI_EVIDENCE_DIR:-${RUNNER_TEMP:-/tmp}/native-ui-evidence}}"
 mkdir -p "$evidence"

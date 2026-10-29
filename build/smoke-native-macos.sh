@@ -14,6 +14,8 @@ codesign --verify --deep --strict "$app"
 exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
 "$app/Contents/MacOS/$exe" >"$evidence/app.log" 2>&1 & app_pid=$!
 printf '%s\n' "$app_pid" >"$evidence/app.pid"
+service_json_path="$app_data/service.json"
+
 on_exit() {
   local app_exitcode=$? app_alive=false
   trap - EXIT
@@ -22,7 +24,6 @@ on_exit() {
     kill "$app_pid" 2>/dev/null || true
   fi
   wait "$app_pid" 2>/dev/null || true
-  service_json_path="$app_data/service.json"
   find "$HOME" "$HOME/Library/Logs/DiagnosticReports" "$HOME/Library/Logs/DiagnosticReports"/../.. -type f \( -name 'chat-hub-desktop*.ips' -o -name 'chat-hub-desktop*.crash' \) -print 2>/dev/null | sort -u >"$evidence/crash-reports.txt" || true
   python3 - "$evidence/diagnostics.json" "$service_json_path" "$app_alive" "$app_exitcode" <<'PY'
 import json, pathlib, sys
@@ -33,21 +34,37 @@ PY
 }
 trap on_exit EXIT
 python3 - "$evidence" "$app_data" "$app_pid" <<'PY'
-import json, os, sys, time, urllib.request, urllib.error
+import json, os, sys, time, urllib.request, urllib.error, subprocess
 from pathlib import Path
+
+def alive(pid):
+ try: os.kill(pid,0); return True
+ except ProcessLookupError: return False
 evidence,data,pid=Path(sys.argv[1]),Path(sys.argv[2]),int(sys.argv[3]); info_path=data/'service.json'; token_path=data/'service.token'
 for _ in range(120):
  try:
   info=json.loads(info_path.read_text()); token=token_path.read_text().strip()
   if len(token)>=64 and info.get('api','').startswith('http://127.0.0.1:'):
-   req=urllib.request.Request(info['api']+'/api/health',headers={'Authorization':'Bearer '+token})
+   health_path='/api/health'
+   req=urllib.request.Request(info['api']+health_path,headers={'Authorization':'Bearer '+token})
    with urllib.request.urlopen(req,timeout=3) as r: health=json.load(r)
    if health.get('status')=='ok': break
  except (OSError,ValueError,KeyError,urllib.error.URLError): time.sleep(.5)
 else: raise SystemExit('packaged app authenticated health endpoint not ready')
 (evidence/'health.json').write_text(json.dumps({'status':health['status'],'version':info.get('version'),'process_id':info.get('process_id')},indent=2)+'\n')
+# Exercise LaunchServices activation and an explicit Apple event while retaining
+# the original direct-child PID; do not quit until EXIT cleanup.
+subprocess.run(['open','-a',str(app)],check=True,timeout=15)
+subprocess.run(['osascript','-e',f'tell application id "{info["bundle_id"]}" to activate'],check=True,timeout=15)
+current=json.loads(info_path.read_text())
+if not alive(pid): raise SystemExit('app exited during startup poke')
+if current.get('process_id') != int(pid): raise SystemExit('service PID changed after activation')
 for _ in range(15):
- os.kill(pid,0); time.sleep(1)
-with urllib.request.urlopen(req,timeout=3) as r: assert json.load(r).get('status')=='ok'
-print('Packaged app authenticated health, startup poke, 15-second survival passed')
+ if not alive(pid): raise SystemExit('app exited after startup poke')
+ with urllib.request.urlopen(req,timeout=3) as r: assert json.load(r).get('status')=='ok'
+ time.sleep(1)
+if not alive(pid): raise SystemExit('app did not survive 15 seconds after poke')
+current=json.loads(info_path.read_text())
+if current.get('process_id') != int(pid): raise SystemExit('service PID changed during survival')
+print('Packaged app authenticated health, LaunchServices/Apple-event activation, same PID and 15-second post-poke survival passed')
 PY
