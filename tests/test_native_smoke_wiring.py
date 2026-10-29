@@ -38,6 +38,20 @@ class NativeSmokeWiring(unittest.TestCase):
         self.assertIn('dir.join("service.json")', main)
         self.assertNotIn('"token": token', main)
 
+    def test_release_startup_evidence_is_retained_and_uploaded(self):
+        script = (ROOT / "build/smoke-native-macos.sh").read_text()
+        workflow = (ROOT / ".github/workflows/macos.yml").read_text()
+        self.assertIn('"$evidence/app.log"', script)
+        self.assertIn("trap on_exit EXIT", script)
+        self.assertIn("diagnostics.json", script)
+        self.assertIn("service_json_path", script)
+        self.assertIn("app_alive", script)
+        self.assertIn("app_exitcode", script)
+        self.assertIn("chat-hub-release-evidence/**", workflow)
+        self.assertIn("release-evidence/**", workflow)
+        self.assertIn("if-no-files-found: error", workflow)
+        self.assertNotIn("service.token", workflow)
+
     def test_no_smoke_claim_in_artifact_summary(self):
         workflow = (ROOT / ".github/workflows/macos.yml").read_text()
         self.assertIn("ad-hoc signed and not notarized", workflow)

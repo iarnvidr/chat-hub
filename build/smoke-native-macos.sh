@@ -11,8 +11,57 @@ app_data="$HOME/Library/Application Support/io.github.iarnvidr.chat-hub"
 mkdir -p "$app_data"
 chmod 700 "$HOME" "$HOME/Library" "$HOME/Library/Application Support" "$app_data"
 codesign --verify --deep --strict "$app"
-open -n "$app"
-trap 'osascript -e '\''tell application "Chat Hub" to quit'\'' >/dev/null 2>&1 || true' EXIT
+exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+app_binary="$app/Contents/MacOS/$exe"
+"$app_binary" >"$evidence/app.log" 2>&1 &
+app_pid=$!
+printf '%s\n' "$app_pid" >"$evidence/app.pid"
+write_diagnostics() {
+  python3 - "$evidence" "$app_data" "$app_pid" <<'PYDIAG'
+import json, os, sys
+from pathlib import Path
+evidence, data, pid = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+info = data / 'service.json'
+try:
+    parsed = json.loads(info.read_text())
+    safe = {k: parsed[k] for k in ('version','process_id') if isinstance(parsed.get(k), (str,int,float,bool))}
+    api = parsed.get('api')
+    if isinstance(api, str) and api.startswith('http://127.0.0.1:'):
+        safe['api'] = api
+except Exception:
+    safe = {}
+try:
+    os.kill(pid, 0); alive = True
+except OSError:
+    alive = False
+try:
+    exitcode = Path(evidence/'app.exitcode').read_text().strip()
+except OSError:
+    exitcode = None
+(evidence/'diagnostics.json').write_text(json.dumps({'app_pid':pid,'app_alive':alive,'app_exitcode':exitcode,'service_json_path':str(info),'service_token_path':str(data/'service.token'),'service':safe},indent=2)+'\\n')
+PYDIAG
+}
+on_exit() {
+  rc=$?
+  trap - EXIT
+  app_rc=0
+  if kill -0 "$app_pid" 2>/dev/null; then kill "$app_pid" 2>/dev/null || true; fi
+  wait "$app_pid" 2>/dev/null || app_rc=$?
+  printf '%s\\n' "$app_rc" >"$evidence/app.exitcode"
+  write_diagnostics || true
+  if (( rc != 0 )); then
+    echo "Native app startup failed; sanitized diagnostic log follows (evidence: $evidence)" >&2
+    python3 - "$evidence/app.log" <<'PYSAN'
+import re,sys
+from pathlib import Path
+text=Path(sys.argv[1]).read_text(errors='replace')
+text=re.sub(r'(?im)^.*(?:authorization|bearer|service\\.token|access[_ -]?token|password|secret).*$', '[redacted sensitive log line]', text)
+print(text[-12000:])
+PYSAN
+  fi
+  exit "$rc"
+}
+trap on_exit EXIT
 python3 - "$evidence" "$app_data" <<'PY'
 import json,sys,time,urllib.request,urllib.error
 from pathlib import Path
