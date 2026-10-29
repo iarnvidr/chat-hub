@@ -46,15 +46,17 @@ for _ in $(seq 1 100); do
   if [[ -s "$addrfile" ]]; then
     host="${MUNINN_PROVIDER_SMOKE_HOSTNAME:-chatgpt.com}"
     if python3 - "$addrfile" "$fixture" "$host" <<'PY'
-import pathlib, socket, ssl, sys
+import http.client, pathlib, socket, ssl, sys
 host, port = pathlib.Path(sys.argv[1]).read_text().strip().split(':')
 context = ssl.create_default_context(cafile=sys.argv[2])
 with socket.create_connection((host, int(port)), timeout=1) as raw:
     with context.wrap_socket(raw, server_hostname=sys.argv[3]) as tls:
-        tls.sendall(b'GET / HTTP/1.1\\r\\nHost: chatgpt.com\\r\\nConnection: close\\r\\n\\r\\n')
-        response = tls.recv(4096)
-        if b'200 OK' not in response or b'synthetic-native-smoke' not in response:
-            raise SystemExit('TLS fixture returned unexpected HTTP response')
+        tls.sendall(b'GET / HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\n\r\n')
+        response = http.client.HTTPResponse(tls)
+        response.begin()
+        body = response.read()
+        if response.status != 200 or b'synthetic-native-smoke' not in body:
+            raise SystemExit(f'TLS fixture returned unexpected HTTP status {response.status}')
 PY
     then ready=1; break; fi
   fi
