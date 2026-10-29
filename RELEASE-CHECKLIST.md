@@ -15,7 +15,7 @@ Record actual evidence; do not infer success from synthetic/Linux tests. The rel
 
 - [ ] Record run/artifact evidence for real Tauri app build with ad-hoc signature (not notarization).
 - [ ] Record successful DMG create, verification, mount, and app-bundle checks.
-- [ ] Record signed `Chat Hub.app.tar.gz` and independent minisign verification against the pinned updater public key.
+- [ ] Record signed `Chat-Hub.app.tar.gz` and independent minisign verification against the pinned updater public key.
 - [ ] Validate generated `latest.json` schema and payload signature; publish remains manual and defaults false.
 
 ## Diagnostic native smokes (nonblocking)
