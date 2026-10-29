@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # Build and mount-verify an ad-hoc signed Chat Hub DMG with source and NOTICE.
 set -euo pipefail
-app="$(cd "$1" && pwd)"
-sources="$(cd "$2" && pwd)"
+app_input="$1"
+sources_input="$2"
+if [[ ! -d "$app_input" ]]; then
+  echo "DMG packaging app bundle does not exist: $app_input" >&2
+  exit 1
+fi
+if [[ ! -d "$sources_input" ]]; then
+  echo "DMG packaging source bundle does not exist: $sources_input" >&2
+  exit 1
+fi
+app="$(cd "$app_input" && pwd)"
+sources="$(cd "$sources_input" && pwd)"
 image_dir="$(dirname "$3")"
 mkdir -p "$image_dir"
 image="$(cd "$image_dir" && pwd)/$(basename "$3")"

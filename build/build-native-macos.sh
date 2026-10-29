@@ -16,6 +16,21 @@ npm run tauri -- build --config src-tauri/tauri.conf.json --target aarch64-apple
 app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Chat Hub.app"
 if [[ ! -d "$app" ]]; then app="target/aarch64-apple-darwin/release/bundle/macos/Chat Hub.app"; fi
 test -d "$app"
+resources="$app/Contents/Resources"
+mkdir -p "$resources"
+for file in NOTICE LICENSE; do
+  if [[ ! -f "$file" ]]; then
+    echo "macOS app packaging required file missing: $file" >&2
+    exit 1
+  fi
+  cp "$file" "$resources/$file"
+done
+for file in NOTICE LICENSE; do
+  if [[ ! -f "$resources/$file" ]]; then
+    echo "macOS app packaging copy missing: $resources/$file" >&2
+    exit 1
+  fi
+done
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict --verbose=2 "$app" > "$out/verify-macos.txt" 2>&1
 lipo "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" -verify_arch arm64
