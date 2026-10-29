@@ -20,9 +20,7 @@ pub fn parse_event(event: &CaptureEvent) -> Option<Value> {
     {
         value["conversation_id"] = Value::String(id.to_owned());
     }
-    if value.get("mapping").and_then(Value::as_object).is_none() {
-        return None;
-    }
+    value.get("mapping").and_then(Value::as_object)?;
     Some(value)
 }
 
