@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 struct AppState {
     updater: Arc<Mutex<UpdateStatus>>,
+    pending_update: Arc<Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>>,
     token: String,
     api: String,
     proxy: String,
@@ -27,11 +28,10 @@ struct UpdateStatus {
     message: String,
 }
 fn smoke() -> bool {
-    cfg!(feature = "native-smoke")
-        && cfg!(debug_assertions)
+    cfg!(all(feature = "native-smoke", debug_assertions))
         && std::env::args().any(|a| a == "--native-ui-smoke")
         && std::env::args().any(|a| a == "--updater-smoke")
-        && std::env::var("MUNINN_NATIVE_UI_SMOKE").ok().as_deref() == Some("1")
+        && std::env::var_os("MUNINN_NATIVE_UI_SMOKE").is_some()
 }
 #[cfg(feature = "native-smoke")]
 mod e2e {
@@ -87,7 +87,8 @@ mod e2e {
     fn run(app: &tauri::AppHandle, c: &Value) -> Value {
         match c["op"].as_str().unwrap_or("") {
             "state" => {
-                json!({"ok":true,"process_id":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"executable":std::env::current_exe().ok()})
+                let window = app.get_webview_window("main");
+                json!({"ok":true,"process_id":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"executable_path":std::env::current_exe().ok().map(|p|p.to_string_lossy().into_owned()),"window_visible":window.and_then(|w|w.is_visible().ok()).unwrap_or(false)})
             }
             "eval" => {
                 let w = app.get_webview_window("main");
@@ -102,7 +103,6 @@ mod e2e {
                     Err(e) => json!({"ok":false,"error":e.to_string()}),
                 }
             }
-            "call" => json!({"ok":false,"error":"only eval and state are supported"}),
             _ => json!({"ok":false,"error":"unknown operation"}),
         }
     }
@@ -147,48 +147,92 @@ async fn check_for_updates(
         s.message = "Checking signed synthetic feed".into();
     }
     use tauri_plugin_updater::UpdaterExt;
-    let result = async {
-        let updater = app.updater().map_err(|e| e.to_string())?;
-        let update = updater.check().await.map_err(|e| e.to_string())?;
-        Ok::<_, String>(
-            update
-                .map(|u| u.version)
-                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
-        )
-    }
-    .await;
-    let mut status = state.updater.lock().map_err(|e| e.to_string())?;
+    #[cfg(feature = "native-smoke")]
+    let updater = if smoke() {
+        updater_builder(&app)?
+    } else {
+        app.updater().map_err(|e| e.to_string())?
+    };
+    #[cfg(not(feature = "native-smoke"))]
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let result = updater.check().await;
     match result {
-        Ok(version) => {
-            status.version = version;
-            status.status = "checked".into();
-            status.message = if status.version == env!("CARGO_PKG_VERSION") {
-                "No update available"
-            } else {
-                "Update available"
-            }
-            .into();
+        Ok(Some(update)) => {
+            let status = UpdateStatus {
+                version: update.version.clone(),
+                channel: "stable".into(),
+                status: "available".into(),
+                message: "Update available".into(),
+            };
+            *state.updater.lock().map_err(|e| e.to_string())? = status.clone();
+            *state.pending_update.lock().map_err(|e| e.to_string())? = Some((update, Vec::new()));
+            Ok(status)
         }
-        Err(e) => {
-            status.status = "error".into();
-            status.message = e;
+        Ok(None) => {
+            let status = UpdateStatus {
+                version: env!("CARGO_PKG_VERSION").into(),
+                channel: "stable".into(),
+                status: "current".into(),
+                message: "No update available".into(),
+            };
+            *state.updater.lock().map_err(|e| e.to_string())? = status.clone();
+            *state.pending_update.lock().map_err(|e| e.to_string())? = None;
+            Ok(status)
+        }
+        Err(error) => {
+            let status = UpdateStatus {
+                version: env!("CARGO_PKG_VERSION").into(),
+                channel: "stable".into(),
+                status: "error".into(),
+                message: error.to_string(),
+            };
+            *state.updater.lock().map_err(|e| e.to_string())? = status.clone();
+            Err(status.message)
         }
     }
-    Ok(status.clone())
+}
+#[cfg(feature = "native-smoke")]
+fn updater_builder(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let endpoint =
+        std::env::var("MUNINN_UPDATER_SMOKE_ENDPOINT").map_err(|_| "missing smoke endpoint")?;
+    let pubkey =
+        std::env::var("MUNINN_UPDATER_SMOKE_PUBKEY").map_err(|_| "missing smoke public key")?;
+    let current = std::env::var("MUNINN_UPDATER_SMOKE_CURRENT_VERSION")
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
+    let endpoint = url::Url::parse(&endpoint).map_err(|e| e.to_string())?;
+    app.updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|e| e.to_string())?
+        .pubkey(pubkey)
+        .version_comparator(move |_, release| {
+            semver::Version::parse(&release.version)
+                .ok()
+                .zip(semver::Version::parse(&current).ok())
+                .is_some_and(|(r, c)| r > c)
+        })
+        .build()
+        .map_err(|e| e.to_string())
 }
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri_plugin_updater::UpdaterExt;
-    let u = app
-        .updater()
+async fn install_update(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let pending = state
+        .pending_update
+        .lock()
         .map_err(|e| e.to_string())?
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("No signed update available")?;
-    u.download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|e| e.to_string())?;
+        .take()
+        .ok_or("No checked signed update available")?;
+    let (update, bytes) = pending;
+    let bytes = if bytes.is_empty() {
+        update
+            .download(|_, _| {}, || {})
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        bytes
+    };
+    update.verify(&bytes).map_err(|e| e.to_string())?;
+    update.install(&bytes).map_err(|e| e.to_string())?;
     app.restart();
 }
 fn persistent_token(path: &std::path::Path) -> Result<String, String> {
@@ -223,59 +267,69 @@ fn persistent_token(path: &std::path::Path) -> Result<String, String> {
 async fn main() {
     let updater_builder = tauri_plugin_updater::Builder::new();
     let builder = tauri::Builder::default().plugin(updater_builder.build());
-    let result = builder
-        .setup(|app| {
-            let dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&dir)?;
-            let token = persistent_token(&dir).map_err(std::io::Error::other)?;
-            let db = dir.join("chat-hub.sqlite3");
-            let ca = dir.join("ca");
-            let (tx, mut rx) = mpsc::channel::<CaptureEvent>(128);
-            let store = Arc::new(Mutex::new(
-                Store::open(db.to_str().unwrap()).map_err(std::io::Error::other)?,
-            ));
-            let ingest = store.clone();
-            tauri::async_runtime::spawn(async move {
-                while let Some(e) = rx.recv().await {
-                    if let Ok(mut s) = ingest.lock() {
-                        let _ = s.ingest_capture(e);
-                    }
+    let builder = builder.setup(|app| {
+        let dir = app.path().app_data_dir()?;
+        std::fs::create_dir_all(&dir)?;
+        let token = persistent_token(&dir).map_err(std::io::Error::other)?;
+        let db = dir.join("chat-hub.sqlite3");
+        let ca = dir.join("ca");
+        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(128);
+        let store = Arc::new(Mutex::new(
+            Store::open(db.to_str().unwrap()).map_err(std::io::Error::other)?,
+        ));
+        let ingest = store.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(e) = rx.recv().await {
+                if let Ok(mut s) = ingest.lock() {
+                    let _ = s.ingest_capture(e);
                 }
-            });
-            let cfg = ProxyConfig::loopback(&ca);
-            let (proxy, _) = tauri::async_runtime::block_on(proxy::run(cfg, tx))
-                .map_err(std::io::Error::other)?;
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let api = listener.local_addr()?;
-            drop(listener);
-            let api_listener = tauri::async_runtime::block_on(tokio::net::TcpListener::bind(api))?;
-            let router = server::router(
-                Store::open(db.to_str().unwrap()).map_err(std::io::Error::other)?,
-                token.clone(),
-            );
-            tauri::async_runtime::spawn(async move {
-                let _ = axum::serve(api_listener, router).await;
-            });
-            app.manage(AppState {
-                updater: Arc::new(Mutex::new(UpdateStatus {
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    channel: "stable".into(),
-                    status: "ready".into(),
-                    message: "Ready".into(),
-                })),
-                token,
-                api: format!("http://{api}"),
-                proxy: proxy.addr.to_string(),
-            });
-            Ok(())
-        })
+            }
+        });
+        let cfg = ProxyConfig::loopback(&ca);
+        let (proxy, _) =
+            tauri::async_runtime::block_on(proxy::run(cfg, tx)).map_err(std::io::Error::other)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let api = listener.local_addr()?;
+        drop(listener);
+        let api_listener = tauri::async_runtime::block_on(tokio::net::TcpListener::bind(api))?;
+        let router = server::router(
+            Store::open(db.to_str().unwrap()).map_err(std::io::Error::other)?,
+            token.clone(),
+        );
+        tauri::async_runtime::spawn(async move {
+            let _ = axum::serve(api_listener, router).await;
+        });
+        app.manage(AppState {
+            pending_update: Arc::new(Mutex::new(None)),
+            updater: Arc::new(Mutex::new(UpdateStatus {
+                version: env!("CARGO_PKG_VERSION").into(),
+                channel: "stable".into(),
+                status: "ready".into(),
+                message: "Ready".into(),
+            })),
+            token,
+            api: format!("http://{api}"),
+            proxy: proxy.addr.to_string(),
+        });
+        Ok(())
+    });
+    #[cfg(feature = "native-smoke")]
+    let result = builder
         .invoke_handler(tauri::generate_handler![
             update_status,
             service_info,
             check_for_updates,
             install_update,
-            #[cfg(feature = "native-smoke")]
             e2e_result
+        ])
+        .run(tauri::generate_context!());
+    #[cfg(not(feature = "native-smoke"))]
+    let result = builder
+        .invoke_handler(tauri::generate_handler![
+            update_status,
+            service_info,
+            check_for_updates,
+            install_update
         ])
         .run(tauri::generate_context!());
     if let Err(e) = result {
