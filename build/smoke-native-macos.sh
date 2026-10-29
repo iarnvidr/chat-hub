@@ -38,6 +38,10 @@ on_exit() {
     kill "$app_pid" 2>/dev/null || true
     set +e; wait "$app_pid"; local cleanup_exitcode=$?; set -e
   else cleanup_exitcode=null; fi
+  # Failure-only secondary launch after primary diagnostics and cleanup wait.
+  if (( harness_exitcode != 0 )); then
+    python3 "$(dirname "$0")/macos-process-probe.py" "$app/Contents/MacOS/$exe" "$evidence" --duration 10 || echo 'secondary process probe failed; primary smoke status preserved' >&2
+  fi
   python3 - "$evidence/diagnostics.json" "$service_json_path" "$app_alive" "$app_exitcode" "$cleanup_started" "$cleanup_exitcode" <<'PY'
 import json, pathlib, sys, time
 path, service, alive, code, cleanup, cleanupcode = sys.argv[1:]
