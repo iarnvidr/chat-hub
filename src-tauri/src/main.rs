@@ -301,8 +301,7 @@ fn persistent_token(path: &std::path::Path) -> Result<String, String> {
     }
     Ok(token)
 }
-#[tokio::main]
-async fn main() {
+fn main() {
     crash_diagnostics::install();
     let updater_builder = tauri_plugin_updater::Builder::new();
     let builder = tauri::Builder::default().plugin(updater_builder.build());
