@@ -1,10 +1,21 @@
 //! Selective loopback CONNECT TLS interception proxy.
 use crate::ca::{allowed_capture_host, Ca};
+use crate::capture_lane::{
+    Accumulator, CaptureContext, CaptureLane, CaptureLimits, CaptureMetadata,
+};
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::{body::Incoming, Request, Response};
+use hyper::{
+    body::{Body as _, Frame, Incoming},
+    Request, Response,
+};
 use hyper_util::rt::TokioIo;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 fn rustls_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -71,50 +82,139 @@ pub async fn run(
     config: ProxyConfig,
     events: mpsc::Sender<CaptureEvent>,
 ) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
+    let (observations, receiver) = mpsc::channel(CaptureLimits::default().queue);
+    drop(receiver);
+    run_with_capture(config, events, CaptureLimits::default(), observations).await
+}
+/// Start the proxy with capture and a fixed profile scope for every intercepted request.
+///
+/// The scope is bounded by [`CaptureContext::at_entry`] and injected when a request
+/// enters the proxy, before waiting for the upstream response. Existing [`run_with_capture`]
+/// remains the provisional-scope convenience API. EOS in capture observations means the
+/// upstream response body completed cleanly; it does not imply downstream delivery.
+pub async fn run_with_capture_context(
+    config: ProxyConfig,
+    events: mpsc::Sender<CaptureEvent>,
+    limits: CaptureLimits,
+    observations: mpsc::Sender<crate::capture_lane::CaptureObservation>,
+    profile_scope: impl Into<String>,
+) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
     if !config.bind.ip().is_loopback() {
         return Err(ProxyError::NonLoopback);
     }
     let ca = Arc::new(Ca::load_or_create(&config.ca_dir)?);
     let listener = TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
+    let lane = CaptureLane::new(events.clone(), observations, limits);
     let c = ca.clone();
     let test = config.test_upstream;
     let roots = config.test_roots;
+    let profile_scope = CaptureContext::at_entry(profile_scope.into(), "", "").profile_scope;
     let task = tokio::spawn(async move {
         while let Ok((s, _)) = listener.accept().await {
             let ca = c.clone();
-            let ev = events.clone();
+            let lane = lane.clone();
             let roots = roots.clone();
+            let profile_scope = profile_scope.clone();
             tokio::spawn(async move {
-                let _ = client(s, ca, ev, test, roots).await;
+                let _ = client(s, ca, lane, test, roots, profile_scope).await;
             });
         }
     });
     Ok((RunningProxy { addr, ca }, task))
 }
-async fn bounded_body<B>(mut body: B) -> Result<Bytes, ()>
-where
-    B: hyper::body::Body<Data = Bytes> + Unpin,
-{
-    let mut bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| ())?;
-        if let Ok(data) = frame.into_data() {
-            if bytes.len().saturating_add(data.len()) > MAX_CAPTURE_BODY {
-                return Err(());
+/// Start capture using the temporary `provisional:unknown` profile scope.
+pub async fn run_with_capture(
+    config: ProxyConfig,
+    events: mpsc::Sender<CaptureEvent>,
+    limits: CaptureLimits,
+    observations: mpsc::Sender<crate::capture_lane::CaptureObservation>,
+) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
+    run_with_capture_context(config, events, limits, observations, "provisional:unknown").await
+}
+/// Forwards every upstream response frame as-is while retaining bounded data-only bytes.
+struct TeeBody {
+    inner: Incoming,
+    capture: Option<Accumulator>,
+    finished: bool,
+}
+impl TeeBody {
+    fn new(inner: Incoming, capture: Accumulator) -> Self {
+        let mut body = Self {
+            inner,
+            capture: Some(capture),
+            finished: false,
+        };
+        if body.inner.is_end_stream() {
+            body.finish();
+        }
+        body
+    }
+    fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            if let Some(capture) = self.capture.take() {
+                capture.finish();
             }
-            bytes.extend_from_slice(&data);
         }
     }
-    Ok(Bytes::from(bytes))
+}
+impl Drop for TeeBody {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Some(capture) = self.capture.take() {
+                capture.interrupt();
+            }
+        }
+    }
+}
+impl hyper::body::Body for TeeBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if let Some(capture) = &mut self.capture {
+                        capture.observe(data);
+                    }
+                }
+                if self.inner.is_end_stream() {
+                    self.finish();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => {
+                self.finish();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+fn empty_body() -> UnsyncBoxBody<Bytes, hyper::Error> {
+    Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }
 
 async fn client(
     mut s: TcpStream,
     ca: Arc<Ca>,
-    events: mpsc::Sender<CaptureEvent>,
+    lane: CaptureLane,
     test: Option<SocketAddr>,
     roots: Option<PathBuf>,
+    profile_scope: String,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
     let mut b = [0; 1];
@@ -206,7 +306,6 @@ async fn client(
         .serve_connection(
             TokioIo::new(incoming),
             hyper::service::service_fn(move |req: Request<Incoming>| {
-                let ev = events.clone();
                 let host = host.to_owned();
                 let path = req
                     .uri()
@@ -214,50 +313,42 @@ async fn client(
                     .map(|u| u.as_str())
                     .unwrap_or("/")
                     .to_owned();
+                let context = CaptureContext::at_entry(
+                    profile_scope.clone(),
+                    req.method().as_str(),
+                    path.clone(),
+                );
                 let sender = sender.clone();
+                let lane = lane.clone();
                 async move {
                     let (parts, body) = req.into_parts();
-                    let bytes = match bounded_body(body).await {
-                        Ok(b) => b,
-                        Err(()) => {
-                            return Ok(Response::builder()
-                                .status(413)
-                                .body(Full::new(Bytes::new()))
-                                .unwrap())
-                        }
-                    };
-                    let upstream_req = Request::from_parts(parts, Full::new(bytes));
+                    let upstream_req = Request::from_parts(parts, body);
                     let result = sender.lock().await.send_request(upstream_req).await;
                     match result {
                         Ok(resp) => {
                             let (parts, body) = resp.into_parts();
-                            let response_bytes = match bounded_body(body).await {
-                                Ok(b) => b,
-                                Err(()) => {
-                                    return Ok(Response::builder()
-                                        .status(413)
-                                        .body(Full::new(Bytes::new()))
-                                        .unwrap())
-                                }
+                            let metadata = CaptureMetadata {
+                                host,
+                                status: parts.status.as_u16(),
+                                content_type: parts
+                                    .headers
+                                    .get(hyper::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned),
+                                content_encoding: parts
+                                    .headers
+                                    .get(hyper::header::CONTENT_ENCODING)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned),
                             };
-                            let status = parts.status.as_u16();
-                            let _ = ev
-                                .send(CaptureEvent {
-                                    host,
-                                    path,
-                                    status,
-                                    body: response_bytes.to_vec(),
-                                })
-                                .await;
+                            let capture = lane.begin(context, metadata);
+                            let tee = TeeBody::new(body, capture);
                             Ok::<_, std::convert::Infallible>(Response::from_parts(
                                 parts,
-                                Full::new(response_bytes),
+                                tee.boxed_unsync(),
                             ))
                         }
-                        Err(_) => Ok(Response::builder()
-                            .status(502)
-                            .body(Full::new(Bytes::new()))
-                            .unwrap()),
+                        Err(_) => Ok(Response::builder().status(502).body(empty_body()).unwrap()),
                     }
                 }
             }),
