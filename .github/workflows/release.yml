@@ -51,7 +51,9 @@ jobs:
           import re, sys
           assert re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", sys.argv[1]), "release version must be plain SemVer"
           PY
-      - name: Build ad-hoc Apple Silicon app (not notarized)
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Build ad-hoc Apple Silicon Tauri app (not notarized; no Apple account)
         run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
       - name: Create updater archive, sign and verify
         env:

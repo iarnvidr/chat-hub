@@ -29,9 +29,9 @@ jobs:
         run: brew install meson ninja pkgconf
       - name: Select the pinned Rust toolchain
         run: rustup show active-toolchain
-      # This release build/package and its launch-health check intentionally do not
-      # run the debug-only e2e harness.
-      - name: Build, test and sign release artifact
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Build real Tauri app, ad-hoc signed (not notarized)
         run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
       - name: Build and mount-verify the DMG with corresponding sources
         run: |
@@ -44,7 +44,7 @@ jobs:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
       - name: Build debug binary for native UI interactions
-        run: cargo build --locked -p chat-hub-desktop --target aarch64-apple-darwin
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin
       - id: prepare-debug-smoke
         name: Prepare isolated debug bundle for native smokes
         run: |
@@ -76,6 +76,7 @@ jobs:
         with:
           name: chat-hub-macos-arm64
           path: |
+            ${{ runner.temp }}/chat-hub/Chat Hub.app/**
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip.sha256
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.dmg

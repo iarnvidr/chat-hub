@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="224" fill="#14161c"/>
+  <circle cx="512" cy="512" r="330" fill="#232838"/>
+  <!-- raven: body, wing and beak in one stylised mark -->
+  <path d="M250 640 C250 470 380 330 560 330 C650 330 720 372 770 440 L860 470 L770 505 C760 640 660 740 520 740 C400 740 300 710 250 640 Z" fill="#e9ecf5"/>
+  <path d="M330 600 C420 500 520 470 640 480 C570 560 470 620 330 600 Z" fill="#14161c"/>
+  <circle cx="650" cy="445" r="22" fill="#14161c"/>
+</svg>
