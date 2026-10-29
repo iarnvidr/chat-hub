@@ -5,5 +5,8 @@ evidence="${2:-${NATIVE_UI_EVIDENCE_DIR:-${RUNNER_TEMP:-/tmp}/native-ui-evidence
 mkdir -p "$evidence"
 if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then echo 'requires macos arm64' >&2; exit 2; fi
 [[ -d "$app/Contents/MacOS" ]] || { echo "app missing: $app" >&2; exit 2; }
-printf '%s\n' 'BLOCKED: native UI automation bridge/screenshots not implemented in this checkout.' | tee "$evidence/blocker.txt" >&2
-exit 2
+e2e="$(mktemp -d "${RUNNER_TEMP:-/tmp}/native-ui-e2e.XXXXXX")"
+chmod 700 "$e2e"
+trap 'rm -rf "$e2e"' EXIT
+export MUNINN_E2E_DIR="$e2e" MUNINN_NATIVE_UI_SMOKE=1
+python3 "$(dirname "$0")/native-ui-driver.py" "$app" "$evidence"

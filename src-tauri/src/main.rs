@@ -327,6 +327,8 @@ async fn main() {
             api: format!("http://{api}"),
             proxy: proxy.addr.to_string(),
         });
+        #[cfg(feature = "native-smoke")]
+        e2e::start(app.handle().clone());
         #[cfg(target_os = "macos")]
         {
             let proxy_url = format!("http://{}", proxy.addr);
