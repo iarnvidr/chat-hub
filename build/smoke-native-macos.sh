@@ -41,14 +41,14 @@ PY
   exit "$app_exitcode"
 }
 trap on_exit EXIT
-python3 - "$evidence" "$app_data" "$app_pid" <<'PY'
+python3 - "$evidence" "$app_data" "$app_pid" "$app" <<'PY'
 import json, os, sys, time, urllib.request, urllib.error, subprocess
 from pathlib import Path
 
 def alive(pid):
  try: os.kill(pid,0); return True
  except ProcessLookupError: return False
-evidence,data,pid=Path(sys.argv[1]),Path(sys.argv[2]),int(sys.argv[3]); info_path=data/'service.json'; token_path=data/'service.token'
+evidence,data,pid,app=Path(sys.argv[1]),Path(sys.argv[2]),int(sys.argv[3]),sys.argv[4]; info_path=data/'service.json'; token_path=data/'service.token'
 for _ in range(120):
  try:
   info=json.loads(info_path.read_text()); token=token_path.read_text().strip()
