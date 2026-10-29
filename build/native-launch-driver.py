@@ -32,6 +32,42 @@ def health(info,token):
  if body.get('status')!='ok': raise RuntimeError('authenticated API health failed')
  return body
 
+def synthetic_tls_fixture(info, token):
+ # Exercise the app's advertised CONNECT proxy against loopback HTTPS override;
+ # trust only the newly created per-install CA, never system roots.
+ import ssl
+ proxy_host, proxy_port = info['proxy'].rsplit(':',1)
+ ca=data/'ca'/'ca.pem'
+ if not ca.is_file(): raise RuntimeError('per-install CA certificate missing')
+ context=ssl.create_default_context(cafile=str(ca))
+ with socket.create_connection((proxy_host.strip('[]'),int(proxy_port)),timeout=5) as raw:
+  raw.sendall(b'CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n')
+  response=b''
+  while b'\r\n\r\n' not in response:
+   chunk=raw.recv(1)
+   if not chunk: raise RuntimeError('proxy closed before CONNECT response')
+   response+=chunk
+  if not response.startswith(b'HTTP/1.1 200'): raise RuntimeError('CONNECT rejected: '+response.decode(errors='replace'))
+  with context.wrap_socket(raw,server_hostname='chatgpt.com') as tls:
+   tls.sendall(b'GET /backend-api/conversation/native-smoke-synthetic HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\n\r\n')
+   data_bytes=b''
+   while True:
+    chunk=tls.recv(65536)
+    if not chunk: break
+    data_bytes+=chunk
+ if b'fixture response; no provider login' not in data_bytes: raise RuntimeError('synthetic fixture body did not traverse proxy')
+ end=time.monotonic()+10
+ while time.monotonic()<end:
+  req=urllib.request.Request(info['api']+'/api/conversations/native-smoke-synthetic',headers={'Authorization':'Bearer '+token})
+  try:
+   with urllib.request.urlopen(req,timeout=2) as r: record=json.load(r)
+   if record.get('provider')=='chatgpt' and 'fixture response; no provider login' in record['messages'][0]['content']:
+    return {'host':'chatgpt.com','fixture':'synthetic; not ChatGPT login','persisted_conversation_id':record['id'],'message_content':'fixture response; no provider login'}
+  except urllib.error.HTTPError as exc:
+   if exc.code!=404: raise
+  time.sleep(.2)
+ raise RuntimeError('synthetic capture missing from persisted conversation API')
+
 def wait_service():
  end=time.monotonic()+90
  while time.monotonic()<end:
@@ -60,6 +96,7 @@ try:
  service=bridge('eval',js="return await window.ChatHub.invoke('service_info');")
  record['service_info']={'api':service.get('api'),'proxy':service.get('proxy'),'version':service.get('version'),'process_id':service.get('process_id')}
  if not isinstance(service,dict) or service.get('process_id')!=proc.pid or not service.get('api') or not service.get('proxy'): raise RuntimeError(f'service_info assertion failed: {service!r}')
+ record['synthetic_tls_capture']=synthetic_tls_fixture(service,token)
  js="const text=document.body.innerText; if(!text.includes('Chat Hub')||!document.querySelector('[data-testid=app-version]')?.textContent.includes('Version')||!document.querySelector('[data-testid=check-updates]')) throw Error('Chat Hub UI/version/control not rendered'); const s=await window.ChatHub.invoke('service_info'); if(!s.api||!s.proxy) throw Error('service addresses missing'); return {rendered:true,title:document.title,version:document.querySelector('[data-testid=app-version]').textContent,service:s};"
  rendered=bridge('eval',js='return await (async()=>{'+js+'})();')
  if not isinstance(rendered,dict) or rendered.get('rendered') is not True: raise RuntimeError(f'DOM assertion failed: {rendered!r}')

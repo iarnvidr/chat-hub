@@ -13,4 +13,14 @@ class NativeLaunchSmoke(unittest.TestCase):
   for required in ('window.ChatHub.invoke','document.body.innerText','/api/health','Authorization','survival_seconds','osascript','ports_closed','screencapture','native-launch.png','service.token','native-launch-result.json'):
    self.assertIn(required,driver)
   self.assertNotIn("print(token",driver)
+ def test_synthetic_tls_fixture_is_local_and_narrowly_claimed(self):
+  harness=(ROOT/'build/native-launch-smoke.sh').read_text()
+  fixture=(ROOT/'build/native-tls-fixture.py').read_text()
+  driver=(ROOT/'build/native-launch-driver.py').read_text()
+  self.assertIn('127.0.0.1',fixture)
+  self.assertIn('subjectAltName=DNS:chatgpt.com',harness)
+  self.assertIn('MUNINN_PROVIDER_SMOKE_UPSTREAM',harness)
+  self.assertIn('wrap_socket(raw,server_hostname=\'chatgpt.com\')',driver)
+  self.assertIn("info['api']+'/api/conversations/native-smoke-synthetic'",driver)
+  self.assertIn('not ChatGPT login',driver)
 if __name__=='__main__': unittest.main()
