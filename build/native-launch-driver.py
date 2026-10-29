@@ -15,11 +15,30 @@ def bridge(op, **fields):
    if result.exists():
     v=json.loads(result.read_text())
     if v.get('error') or v.get('ok') is False: raise RuntimeError(str(v))
-    if op=='eval' and 'value' not in v: time.sleep(.1); continue
-    return v.get('value',v)
+    if op=='eval' and 'value' in v:
+     value=v['value']
+     if isinstance(value,dict) and value.get('error'): raise RuntimeError(f'JavaScript evaluation failed: {value["error"]}')
+     return value
+    if op=='eval': time.sleep(.1); continue
+    return v
    time.sleep(.1)
   raise RuntimeError(f'{op} IPC timed out')
  finally: cmd.unlink(missing_ok=True); result.unlink(missing_ok=True)
+
+def wait_ui_bridge(timeout=20):
+ # Tauri's frontend is a module script; native window creation can precede
+ # module evaluation. Poll the actual packaged DOM rather than assuming startup.
+ end=time.monotonic()+timeout
+ last=None
+ while time.monotonic()<end:
+  try:
+   last=bridge('eval',js="return {ready:typeof window.ChatHub?.invoke==='function',href:location.href,readyState:document.readyState,title:document.title,keys:Object.keys(window).filter(k=>/chat|tauri|invoke|ipc/i.test(k)).slice(0,30),tauri:typeof window.__TAURI__,internals:typeof window.__TAURI_INTERNALS__,invoke:typeof window.__TAURI_INTERNALS__?.invoke};")
+   if isinstance(last,dict) and last.get('ready'):
+    return last
+  except (RuntimeError,OSError,ValueError):
+   pass
+  time.sleep(.2)
+ raise RuntimeError(f'UI bridge readiness timeout after {timeout}s; last DOM evidence={last!r}')
 
 def alive(pid):
  # For our direct child, poll() performs waitpid and reaps an exited process;
@@ -99,6 +118,7 @@ try:
  proc=subprocess.Popen([str(binary),'--native-ui-smoke','--updater-smoke'],stdout=(evidence/'app.log').open('w'),stderr=subprocess.STDOUT)
  info,token=wait_service(); state=bridge('state');
  if state.get('process_id')!=proc.pid or not state.get('window_visible'): raise RuntimeError('native main window not visible or PID mismatch')
+ record['ui_bridge_readiness']=wait_ui_bridge()
  service=bridge('eval',js="return await window.ChatHub.invoke('service_info');")
  record['service_info']={'api':service.get('api'),'proxy':service.get('proxy'),'version':service.get('version'),'process_id':service.get('process_id')}
  if not isinstance(service,dict) or service.get('process_id')!=proc.pid or not service.get('api') or not service.get('proxy'): raise RuntimeError(f'service_info assertion failed: {service!r}')
