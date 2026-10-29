@@ -13,6 +13,16 @@ class NativeLaunchSmoke(unittest.TestCase):
   for required in ('window.ChatHub.invoke','document.body.innerText','/api/health','Authorization','survival_seconds','osascript','ports_closed','screencapture','native-launch.png','service.token','native-launch-result.json'):
    self.assertIn(required,driver)
   self.assertNotIn("print(token",driver)
+ def test_reopen_precedes_single_final_quit_and_checks_same_service(self):
+  driver=(ROOT/'build/native-launch-driver.py').read_text()
+  reopen=driver.index("subprocess.run(['open','-a',str(app)]")
+  quit_call=driver.index("subprocess.run(['osascript','-e',f'tell application id")
+  self.assertLess(reopen,quit_call)
+  self.assertEqual(driver.count("to quit']"),1)
+  self.assertIn("info2.get('api')!=info.get('api')",driver)
+  self.assertIn("denial=bridge('provider_denial')",driver)
+  self.assertIn("denial_result.get('denied') is not True",driver)
+  self.assertIn("return proc.poll() is None",driver)
  def test_synthetic_tls_fixture_is_local_and_narrowly_claimed(self):
   harness=(ROOT/'build/native-launch-smoke.sh').read_text()
   fixture=(ROOT/'build/native-tls-fixture.py').read_text()

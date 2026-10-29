@@ -22,6 +22,10 @@ def bridge(op, **fields):
  finally: cmd.unlink(missing_ok=True); result.unlink(missing_ok=True)
 
 def alive(pid):
+ # For our direct child, poll() performs waitpid and reaps an exited process;
+ # kill(pid, 0) alone reports unreaped zombies as alive.
+ if proc is not None and proc.pid == pid:
+  return proc.poll() is None
  try: os.kill(pid,0); return True
  except ProcessLookupError: return False
 
@@ -112,12 +116,9 @@ try:
   if not alive(pid): raise RuntimeError('app did not survive 15 seconds')
   health(info,token); time.sleep(1)
  record['survival_seconds']=15
- subprocess.run(['osascript','-e',f'tell application id "{bid}" to quit'],check=True,timeout=15)
- time.sleep(1)
- if not alive(pid): raise RuntimeError('graceful quit terminated app; cannot verify same-PID reopen')
- record['graceful_quit_requested']=True
- # The same app process must survive the graceful-quit request. Reopen its native
- # window through the bridge; never launch a second PID or mutate launchd globals.
+ # Reopen/activate while still running. Do not send quit here: quit is the
+ # final shutdown assertion, not a substitute for testing the app reopen event.
+ subprocess.run(['open','-a',str(app)],check=True,timeout=15)
  end=time.monotonic()+30
  while time.monotonic()<end:
   try:
@@ -127,7 +128,18 @@ try:
   time.sleep(.2)
  else: raise RuntimeError('same-PID app/window did not reopen')
  info2,token2=wait_service()
+ # Exercise the provider-window denial through the native automation bridge and
+ # require its runtime report (static source checks are not behavioral evidence).
+ denial=bridge('provider_denial')
+ denial_report=e2e/'provider-denial.res.json'
+ end=time.monotonic()+15
+ while time.monotonic()<end and not denial_report.exists(): time.sleep(.1)
+ if not denial_report.exists(): raise RuntimeError('provider denial result was not reported')
+ denial_result=json.loads(denial_report.read_text())
+ if denial_result.get('denied') is not True: raise RuntimeError(f'provider service_info was not denied: {denial_result!r}')
+ record['provider_denial']=denial_result
  if state2.get('process_id')!=pid: raise RuntimeError('reopen changed process PID')
+ if info2.get('api')!=info.get('api') or info2.get('proxy')!=info.get('proxy'): raise RuntimeError('reopen changed same-PID service endpoints')
  health(info2,token2); record['reopen_pid']=pid; record['reopen_health']='ok'
  subprocess.run(['osascript','-e',f'tell application id "{bid}" to quit'],check=True,timeout=15)
  end=time.monotonic()+20
