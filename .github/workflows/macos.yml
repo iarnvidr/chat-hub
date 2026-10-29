@@ -43,12 +43,12 @@ jobs:
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
+      - name: Compile native-smoke feature (required)
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
       - name: Build debug binary for native UI interactions
-        continue-on-error: true
         run: cargo build --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
       - id: prepare-debug-smoke
         name: Prepare isolated debug bundle for native smokes
-        continue-on-error: true
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app"

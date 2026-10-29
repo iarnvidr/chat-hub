@@ -26,7 +26,7 @@ Record actual evidence; do not infer success from synthetic/Linux tests. The rel
 ## Diagnostic native smokes (nonblocking)
 
 - [ ] Native UI/WKWebView/updater integration smokes remain nonblocking diagnostics.
-- [ ] Stable feed is `releases/latest` only; preview prereleases are explicitly opt-in. Verify pinned public key applies to both channels.
+- [ ] Stable feed is `releases/latest` only; preview prereleases require manual installation (no app preview-update support). Verify pinned public key applies to both channels.
 - [ ] Release notes identify ad-hoc builds as not notarized and disclose possible Gatekeeper block. Do not treat ad-hoc code signing as updater signing.
 - [ ] Prepare protected manual publication with `publish=false`; publish only after review and authorization.
 

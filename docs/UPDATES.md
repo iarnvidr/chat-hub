@@ -2,7 +2,7 @@
 
 ## Channel policy
 
-The desktop app's stable updater feed is GitHub's `releases/latest` endpoint. Only published, non-prerelease releases participate in that feed. Preview updates are opt-in and come from published prereleases; preview builds are not stable releases and release notes must identify them as previews. A pinned repository-owned updater public key is mandatory for signature verification in either channel. An ad-hoc code signature is not a substitute for the updater signature.
+The desktop app's updater is stable-only and uses GitHub's `releases/latest` endpoint. Only published, non-prerelease releases participate in that feed. Preview prereleases are unsupported by the app updater and require manual installation; do not imply preview update discovery or installation is available. A pinned repository-owned updater public key is mandatory for signature verification. An ad-hoc code signature is not a substitute for the updater signature.
 
 Ad-hoc builds are not notarized. Release notes must say so and warn that macOS may block first launch through Gatekeeper/quarantine. Do not imply that publishing a prerelease activates the stable feed.
 

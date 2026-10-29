@@ -59,6 +59,8 @@ jobs:
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
+      - name: Required native-smoke feature compilation
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
       - name: Create updater archive, sign and verify
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

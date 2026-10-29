@@ -50,9 +50,15 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn('for file in NOTICE LICENSE', native)
         self.assertIn('macOS app packaging copy missing:', native)
 
-    def test_native_smokes_are_nonblocking(self):
+    def test_native_smoke_compilation_is_blocking_but_runtime_diagnostics_are_nonblocking(self):
         workflow = (ROOT / ".github/workflows/macos.yml").read_text()
-        self.assertGreaterEqual(workflow.count("continue-on-error: true"), 5)
+        compile_step = workflow.index("Compile native-smoke feature (required)")
+        build_step = workflow.index("Build debug binary for native UI interactions")
+        self.assertLess(compile_step, build_step)
+        self.assertNotIn("continue-on-error", workflow[compile_step:workflow.index("Prepare isolated debug bundle")])
+        self.assertGreaterEqual(workflow.count("continue-on-error: true"), 2)
+        release = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("Required native-smoke feature compilation", release)
         self.assertIn("Build real Tauri app, ad-hoc signed", workflow)
         self.assertIn("Build and mount-verify the DMG", workflow)
 

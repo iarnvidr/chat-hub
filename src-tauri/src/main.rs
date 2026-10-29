@@ -114,7 +114,6 @@ mod e2e {
             _ => json!({"ok":false,"error":"unknown operation"}),
         }
     }
-    #[tauri::command]
     pub fn e2e_result(id: String, value: String) -> Result<(), String> {
         let Some(d) = dir() else {
             return Err("automation disabled".into());
@@ -206,19 +205,12 @@ fn updater_builder(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updat
         std::env::var("MUNINN_UPDATER_SMOKE_ENDPOINT").map_err(|_| "missing smoke endpoint")?;
     let pubkey =
         std::env::var("MUNINN_UPDATER_SMOKE_PUBKEY").map_err(|_| "missing smoke public key")?;
-    let current = std::env::var("MUNINN_UPDATER_SMOKE_CURRENT_VERSION")
-        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
-    let endpoint = url::Url::parse(&endpoint).map_err(|e| e.to_string())?;
+    let endpoint = tauri::Url::parse(&endpoint).map_err(|e| e.to_string())?;
     app.updater_builder()
         .endpoints(vec![endpoint])
         .map_err(|e| e.to_string())?
         .pubkey(pubkey)
-        .version_comparator(move |_, release| {
-            semver::Version::parse(&release.version)
-                .ok()
-                .zip(semver::Version::parse(&current).ok())
-                .is_some_and(|(r, c)| r > c)
-        })
+        .version_comparator(|current, release| release.version > current)
         .build()
         .map_err(|e| e.to_string())
 }
