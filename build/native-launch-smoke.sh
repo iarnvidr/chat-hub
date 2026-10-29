@@ -9,11 +9,7 @@ e2e="$(mktemp -d "${RUNNER_TEMP:-/tmp}/native-launch-e2e.XXXXXX")"
 chmod 700 "$e2e"
 export MUNINN_E2E_DIR="$e2e" MUNINN_E2E_DATA_DIR="$e2e/data" MUNINN_NATIVE_UI_SMOKE=1
 fixture="$e2e/upstream.pem"
-python3 - "$fixture" <<'PY'
-import pathlib, subprocess, sys
-cert, key = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[1]).with_suffix('.key')
-subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','2','-keyout',str(key),'-out',str(cert),'-subj','/CN=chatgpt.com','-addext','subjectAltName=DNS:chatgpt.com,DNS:localhost,IP:127.0.0.1'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-PY
+python3 "$(dirname "$0")/native-tls-cert.py" "$fixture"
 addrfile="$e2e/upstream.addr"
 python3 "$(dirname "$0")/native-tls-fixture.py" "$fixture" "$evidence/provider-fixture.json" "$addrfile" &
 fixture_pid=$!
