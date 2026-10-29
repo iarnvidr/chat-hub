@@ -229,15 +229,18 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tokio-rustls",
  "tower",
  "webpki-roots 0.26.11",
+ "x509-parser",
 ]
 
 [[package]]

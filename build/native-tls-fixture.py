@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Loopback-only deterministic HTTPS fixture; synthetic content, not ChatGPT login."""
 import faulthandler, http.server, pathlib, socketserver, ssl, sys, threading, time
-cert, evidence, addrfile = map(pathlib.Path, sys.argv[1:4])
+ca, evidence, addrfile = map(pathlib.Path, sys.argv[1:4])
+cert = ca.with_name(ca.stem + "-leaf.pem")
 def stage(message):
  print(f"fixture_stage={message} monotonic={time.monotonic():.6f}", file=sys.stderr, flush=True)
 faulthandler.enable(file=sys.stderr)
@@ -21,7 +22,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 server=LoopbackHTTPServer(('127.0.0.1',0),Handler)
 stage('bound')
 stage('before_tls_context')
-ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); stage('before_load_cert_chain'); ctx.load_cert_chain(str(cert),str(cert.with_suffix('.key')))
+ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); stage('before_load_cert_chain'); ctx.load_cert_chain(str(cert),str(ca.with_name(ca.stem + "-leaf.key")))
 stage('before_wrap_socket')
 server.socket=ctx.wrap_socket(server.socket,server_side=True)
 stage('before_write_addr')

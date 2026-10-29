@@ -47,6 +47,7 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
                 self.assertTrue(tls_addr.exists() and tls_addr.stat().st_size, "TLS fixture startup timed out")
                 cases = {
                     "build/native-launch-smoke.sh": [[str(tls_addr), str(tls_cert), "chatgpt.com"]],
+                    "build/native-ui-smoke.sh": [[f"{tls_addr.read_text().strip()}", str(tls_cert)]],
                     "build/updater-smoke/run-macos.sh": [
                         [str(root / "app"), "0.2.0"],
                         [str(root), "0.1.0", "old-signature", "0.1.1", "new-signature", "8765"],
@@ -55,7 +56,7 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
                 }
                 for script in SCRIPTS:
                     text = script.read_text()
-                    blocks = re.findall(r"python3\s+-[^\n]*<<'PY'\s*\n(.*?)\nPY\s*$", text, re.M | re.S)
+                    blocks = re.findall(r"python3\s+-[^\n]*<<'PY'\s*\n(.*?)\nPY(?=\s|$)", text, re.M | re.S)
                     if not blocks:
                         # The native launcher/UI wrappers delegate Python to standalone drivers.
                         self.assertNotRegex(text, r"python3\s+-[^\n]*<<")
@@ -69,7 +70,7 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
                         proc = subprocess.run([sys.executable, "-c", block, *args], text=True, capture_output=True)
                         self.assertEqual(proc.returncode, 0, f"{script}: {proc.stderr}")
                         exercised.append((script, block))
-                self.assertEqual(len(exercised), 4)
+                self.assertEqual(len(exercised), 5)
                 self.assertEqual((root / "Cargo.toml").read_text(), 'version = "0.0.1"\n')
                 self.assertTrue((root / "old.json").is_file())
                 self.assertTrue((root / "new.json").is_file())

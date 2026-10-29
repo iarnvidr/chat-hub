@@ -102,11 +102,33 @@ mod e2e {
                 if !super::smoke() {
                     return json!({"ok":false,"error":"native smoke automation disabled"});
                 }
-                let Ok(url) = w.url() else {
-                    return json!({"ok":false,"error":"provider URL unavailable"});
-                };
-                if url.scheme() != "https" || url.host_str() != Some("chatgpt.com") {
-                    return json!({"ok":false,"error":"provider webview is not at https://chatgpt.com"});
+                // The provider webview is created during setup and may not yet
+                // have committed its initial navigation when the driver asks.
+                // Wait for the real expected origin and a live JS context, bounded
+                // so an actual navigation failure has useful diagnostics.
+                let ready_deadline = std::time::Instant::now() + Duration::from_secs(20);
+                let mut readiness = json!({"href":null,"readyState":null,"windowLabel":w.label()});
+                loop {
+                    if let Ok(url) = w.url() {
+                        readiness["href"] = json!(url.as_str());
+                        if url.scheme() == "https" && url.host_str() == Some("chatgpt.com") {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            if w.eval_with_callback("JSON.stringify({href:location.href,readyState:document.readyState,label:window.__TAURI_INTERNALS__?'tauri':'no-tauri'})".into(), move |v| { let _ = tx.send(v); }).is_ok() {
+                                if let Ok(Ok(value)) = rx.recv_timeout(Duration::from_secs(1)).map(|v| serde_json::from_str::<Value>(&v)) {
+                                    if let Some(parsed) = value.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                                        readiness = parsed;
+                                        if readiness["href"].as_str().is_some_and(|h| h.starts_with("https://chatgpt.com/")) && readiness["readyState"].as_str().is_some() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if std::time::Instant::now() >= ready_deadline {
+                        return json!({"ok":false,"error":"provider webview readiness timed out","readiness":readiness});
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
                 }
                 let nonce = format!(
                     "{}-{}",

@@ -49,6 +49,7 @@ for _ in $(seq 1 100); do
 import http.client, pathlib, socket, ssl, sys
 host, port = pathlib.Path(sys.argv[1]).read_text().strip().split(':')
 context = ssl.create_default_context(cafile=sys.argv[2])
+context.verify_flags |= ssl.VERIFY_X509_STRICT
 with socket.create_connection((host, int(port)), timeout=1) as raw:
     with context.wrap_socket(raw, server_hostname=sys.argv[3]) as tls:
         tls.sendall(b'GET / HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\n\r\n')

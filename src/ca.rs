@@ -73,6 +73,7 @@ impl Ca {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
+        p.use_authority_key_identifier_extension = true;
         let cert = p.clone().self_signed(&key)?;
         let pem = cert.pem();
         // Stage each file under a unique create_new name, then rename into place.
@@ -99,7 +100,29 @@ impl Ca {
             return Err(CaError::Invalid("host is not interceptable".into()));
         }
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-        let params = CertificateParams::new(vec![host.to_owned()])?;
+        let mut params = CertificateParams::new(vec![host.to_owned()])?;
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        params.not_after = params.not_before + time::Duration::days(397);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.use_authority_key_identifier_extension = true;
+        // RFC 5280 method-1 SKI: SHA-1 over the subjectPublicKey BIT STRING.
+        let ski = ring::digest::digest(
+            &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+            &key.public_key_der(),
+        );
+        let mut ski_der = vec![0x04, ski.as_ref().len() as u8];
+        ski_der.extend_from_slice(ski.as_ref());
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 14],
+                ski_der,
+            ));
         let cert = params.signed_by(&key, &self.cert, &self.key)?.pem();
         Ok((cert, key.serialize_pem()))
     }
@@ -188,7 +211,47 @@ mod tests {
             );
         }
         let original = ca.cert_pem.clone();
+        let root_der = ca.cert_der().unwrap();
+        let (_, root) = x509_parser::parse_x509_certificate(&root_der).unwrap();
+        let root_bc = root.basic_constraints().unwrap().unwrap();
+        assert!(root_bc.value.ca);
+        assert_eq!(
+            root.key_usage().unwrap().unwrap().value.key_cert_sign(),
+            true
+        );
+        assert_eq!(root.key_usage().unwrap().unwrap().value.crl_sign(), true);
+        assert!(root.extensions().iter().any(|e| matches!(
+            e.parsed_extension(),
+            x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(_)
+        )));
         let (leaf, key) = ca.leaf_identity("chatgpt.com").unwrap();
+        let leaf_der = rustls_pemfile::certs(&mut leaf.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let (_, parsed_leaf) = x509_parser::parse_x509_certificate(&leaf_der).unwrap();
+        assert!(parsed_leaf.extensions().iter().any(|e| matches!(
+            e.parsed_extension(),
+            x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(_)
+        )));
+        assert!(parsed_leaf.extensions().iter().any(|e| matches!(
+            e.parsed_extension(),
+            x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(_)
+        )));
+        let leaf_bc = parsed_leaf.basic_constraints().unwrap().unwrap();
+        assert!(!leaf_bc.value.ca);
+        let eku = parsed_leaf.extended_key_usage().unwrap().unwrap();
+        assert!(eku.value.server_auth);
+        let san = parsed_leaf.subject_alternative_name().unwrap().unwrap();
+        assert!(san.value.general_names.iter().any(|n| matches!(
+            n,
+            x509_parser::extensions::GeneralName::DNSName("chatgpt.com")
+        )));
+        assert!(
+            parsed_leaf.validity().not_after.timestamp()
+                - parsed_leaf.validity().not_before.timestamp()
+                <= 397 * 86400
+        );
         assert!(leaf.contains("BEGIN CERTIFICATE"));
         let certs = rustls_pemfile::certs(&mut leaf.as_bytes())
             .collect::<Result<Vec<_>, _>>()

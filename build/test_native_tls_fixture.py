@@ -34,6 +34,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert 'fixture_stage=ready' in pathlib.Path(output).read_text(), 'fixture stage markers missing'
         host, port = addrfile.read_text().split(":")
         context = ssl.create_default_context(cafile=str(cert))
+        context.verify_flags |= ssl.VERIFY_X509_STRICT
         with socket.create_connection((host, int(port)), timeout=3) as raw:
             with context.wrap_socket(raw, server_hostname='chatgpt.com') as tls:
                 tls.sendall(b'GET / HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\n\r\n')
