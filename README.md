@@ -30,7 +30,7 @@ Set the following environment variables for CLI/service configuration:
 
 For example, run `CHAT_HUB_TOKEN=local-secret cargo run -- serve`; use `cargo run -- status`, `cargo run -- search words`, or `cargo run -- read <id>` for CLI commands. The API uses a plaintext HTTP bearer token on loopback. This is suitable only for a trusted local environment: do not expose it on an untrusted network or treat the token as protection against local processes/users.
 
-See [architecture](docs/ARCHITECTURE.md), [decisions](docs/DECISIONS.md), [known issues](KNOWN_ISSUES.md), [updater policy](docs/UPDATES.md), and [release checklist](RELEASE-CHECKLIST.md).
+See [architecture](docs/ARCHITECTURE.md), [decisions](docs/DECISIONS.md), [known issues](KNOWN_ISSUES.md), [updater policy](docs/UPDATES.md), [shared service and normalization contract](docs/SERVICE-NORMALIZATION-CONTRACT.md) (design only; not implemented), and [release checklist](RELEASE-CHECKLIST.md).
 ## Desktop app and updater (PR2)
 
 The desktop process uses Tauri's async runtime as its sole Tokio runtime. Keep desktop `main` synchronous: entering Tokio before Tauri setup makes setup's synchronous runtime bootstrap waits panic with `Cannot start a runtime from within a runtime`, which can abort the macOS process. The previously observed startup failure was a Rust runtime-nesting panic, not an Objective-C `NSException`. The source fix does not replace the required packaged-app launch, authenticated health, startup poke, and 15-second survival gate or the still-unverified manual v0.1.0 DMG upgrade acceptance.
