@@ -113,7 +113,7 @@ mod e2e {
                         readiness["href"] = json!(url.as_str());
                         if url.scheme() == "https" && url.host_str() == Some("chatgpt.com") {
                             let (tx, rx) = std::sync::mpsc::channel();
-                            if w.eval_with_callback("JSON.stringify({href:location.href,readyState:document.readyState,label:window.__TAURI_INTERNALS__?'tauri':'no-tauri'})".into(), move |v| { let _ = tx.send(v); }).is_ok() {
+                            if w.eval_with_callback("JSON.stringify({href:location.href,readyState:document.readyState,label:window.__TAURI_INTERNALS__?'tauri':'no-tauri'})", move |v| { let _ = tx.send(v); }).is_ok() {
                                 if let Ok(Ok(value)) = rx.recv_timeout(Duration::from_secs(1)).map(|v| serde_json::from_str::<Value>(&v)) {
                                     if let Some(parsed) = value.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
                                         readiness = parsed;
