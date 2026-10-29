@@ -110,19 +110,6 @@ impl Ca {
             rcgen::KeyUsagePurpose::KeyEncipherment,
         ];
         params.use_authority_key_identifier_extension = true;
-        // RFC 5280 method-1 SKI: SHA-1 over the subjectPublicKey BIT STRING.
-        let ski = ring::digest::digest(
-            &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-            &key.public_key_der(),
-        );
-        let mut ski_der = vec![0x04, ski.as_ref().len() as u8];
-        ski_der.extend_from_slice(ski.as_ref());
-        params
-            .custom_extensions
-            .push(rcgen::CustomExtension::from_oid_content(
-                &[2, 5, 29, 14],
-                ski_der,
-            ));
         let cert = params.signed_by(&key, &self.cert, &self.key)?.pem();
         Ok((cert, key.serialize_pem()))
     }
@@ -185,6 +172,32 @@ mod tests {
             assert!(!allowed_capture_host(h));
         }
     }
+    fn verify_openssl_chain(dir: &Path, label: &str, ca: &Ca) {
+        let leaf_path = dir.join(format!("{label}-leaf.pem"));
+        fs::write(&leaf_path, ca.leaf_pem("chatgpt.com").unwrap()).unwrap();
+        let output = std::process::Command::new("openssl")
+            .args([
+                "verify",
+                "-verbose",
+                "-x509_strict",
+                "-purpose",
+                "sslserver",
+                "-CAfile",
+            ])
+            .arg(dir.join("ca.pem"))
+            .arg(&leaf_path)
+            .output()
+            .expect("openssl is required for the CA chain regression test");
+        assert!(
+            output.status.success(),
+            "OpenSSL rejected {label} CA-issued leaf: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(": OK"));
+        fs::remove_file(leaf_path).unwrap();
+    }
+
     #[test]
     fn persists_ca_and_signs_after_reload() {
         let dir = std::env::temp_dir().join(format!("chat-hub-ca-{}", std::process::id()));
@@ -221,6 +234,9 @@ mod tests {
             e.parsed_extension(),
             x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(_)
         )));
+        // Exercise actual path building, not merely extension equality: strict
+        // OpenSSL server-purpose validation must trust leaves against persisted CA PEM.
+        verify_openssl_chain(&dir, "fresh", &ca);
         let (leaf, key) = ca.leaf_identity("chatgpt.com").unwrap();
         let leaf_der = rustls_pemfile::certs(&mut leaf.as_bytes())
             .next()
@@ -282,11 +298,29 @@ mod tests {
         drop(ca);
         let reloaded = Ca::load_or_create(&dir).unwrap();
         assert_eq!(reloaded.cert_pem, original);
-        // A leaf signed after reload proves the persisted certificate and private key match.
-        assert!(reloaded
-            .leaf_pem("chatgpt.com")
-            .unwrap()
-            .contains("BEGIN CERTIFICATE"));
+        let reloaded_der = reloaded.cert_der().unwrap();
+        let (_, reloaded_root) = x509_parser::parse_x509_certificate(&reloaded_der).unwrap();
+        assert_eq!(reloaded_root.subject(), root.subject());
+        assert_eq!(reloaded_root.public_key(), root.public_key());
+        let original_ski = root
+            .extensions()
+            .iter()
+            .find_map(|e| match e.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(ski) => Some(ski.0),
+                _ => None,
+            })
+            .unwrap();
+        let reloaded_ski = reloaded_root
+            .extensions()
+            .iter()
+            .find_map(|e| match e.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::SubjectKeyIdentifier(ski) => Some(ski.0),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(reloaded_ski, original_ski);
+        // Validate a newly issued post-reload leaf against the exact on-disk trust anchor.
+        verify_openssl_chain(&dir, "reloaded", &reloaded);
         assert!(Ca::load_or_create(&dir).unwrap().key_path().exists());
         fs::remove_dir_all(dir).unwrap();
     }

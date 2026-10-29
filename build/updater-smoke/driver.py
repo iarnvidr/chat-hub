@@ -41,15 +41,24 @@ def native_state():
 def launch():
     out=open(root/(mode+'.stdout.log'),'w'); err=open(root/(mode+'.stderr.log'),'w')
     return subprocess.Popen([str(executable(app)),'--native-ui-smoke','--updater-smoke'],env=os.environ.copy(),stdout=out,stderr=err)
-def wait_ready(proc):
-    end=time.monotonic()+90
+def wait_ready(proc, timeout=20):
+    # A visible native window precedes frontend module initialization. Wait for
+    # the actual application bridge, without replacing it with internal APIs.
+    end=time.monotonic()+timeout
+    last=None
     while time.monotonic()<end:
         if proc.poll() is not None: raise RuntimeError('native app exited prematurely')
         try:
-            s=native_state()
-            if s.get('window_visible'): return s
-        except (RuntimeError,OSError,ValueError): time.sleep(.2)
-    raise RuntimeError('native app state bridge did not become ready')
+            last=native_state()
+            if last.get('window_visible'):
+                try:
+                    evidence=bridge("({ready:typeof window.ChatHub?.invoke==='function',href:location.href,readyState:document.readyState,chatHub:typeof window.ChatHub})",timeout=2)
+                    if isinstance(evidence,dict) and evidence.get('ready'):
+                        return {'native_state':last,'frontend':evidence}
+                except (RuntimeError,OSError,ValueError): pass
+        except (RuntimeError,OSError,ValueError): pass
+        time.sleep(.2)
+    raise RuntimeError(f'actual ChatHub frontend bridge did not become ready within {timeout}s; last native state={last!r}')
 def version(bundle): return plistlib.loads((bundle/'Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString')
 old=json.loads((root/'old.json').read_text())['version']; new=json.loads((root/'new.json').read_text())['version']
 if mode not in ('healthy','tampered'): raise RuntimeError('mode must be healthy or tampered')
