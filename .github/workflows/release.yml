@@ -65,18 +65,23 @@ jobs:
           set -euo pipefail
           test -n "$TAURI_SIGNING_PRIVATE_KEY"
           command -v npm >/dev/null
+          brew install minisign
           npx --yes @tauri-apps/cli@2.10.1 signer --help
           cd "$RUNNER_TEMP/chat-hub"
           rm -f 'Chat Hub.app.tar.gz' 'Chat Hub.app.tar.gz.sig'
           tar -czf 'Chat Hub.app.tar.gz' 'Chat Hub.app'
           npx --yes @tauri-apps/cli@2.10.1 signer sign 'Chat Hub.app.tar.gz'
           test -s 'Chat Hub.app.tar.gz.sig'
-          printf '%s\n' 'Updater verification requires the public key configured in src-tauri/tauri.conf.json; release must fail closed if it is still a placeholder.'
           python3 - "$GITHUB_WORKSPACE/src-tauri/tauri.conf.json" <<'PY'
-          import json,sys
-          key=json.load(open(sys.argv[1]))['plugins']['updater']['pubkey']
-          assert key and 'PLACEHOLDER' not in key, 'configure pinned updater public key before release'
+          import base64, json, pathlib, sys
+          encoded=json.load(open(sys.argv[1]))['plugins']['updater']['pubkey']
+          key=base64.b64decode(encoded, validate=True)
+          assert key.startswith(b'untrusted comment: minisign public key: '), 'invalid pinned updater public key'
+          pathlib.Path('updater.pub').write_bytes(key)
+          sig=base64.b64decode(pathlib.Path('Chat Hub.app.tar.gz.sig').read_bytes(), validate=True)
+          pathlib.Path('Chat Hub.app.tar.gz.sig.minisig').write_bytes(sig)
           PY
+          minisign -Vm 'Chat Hub.app.tar.gz' -p updater.pub -x 'Chat Hub.app.tar.gz.sig.minisig'
           echo "version=$INPUT_VERSION tag=$INPUT_TAG commit=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" > release-review.txt
           shasum -a 256 'Chat Hub.app.tar.gz' 'Chat Hub.app.tar.gz.sig' > SHA256SUMS
       - name: Prepare corresponding source and notices
@@ -88,15 +93,8 @@ jobs:
         run: |
           set -euo pipefail
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${INPUT_TAG}/Chat%20Hub.app.tar.gz"
-          python3 - "$INPUT_VERSION" "$url" "$RUNNER_TEMP/chat-hub/Chat Hub.app.tar.gz.sig" "$RUNNER_TEMP/chat-hub/latest.json" <<'PY'
-          import base64,json,pathlib,re,sys
-          version,url,sig,out=sys.argv[1:]
-          assert re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)",version)
-          signature=pathlib.Path(sig).read_text().strip()
-          assert signature
-          data={'version':version,'notes':f'Chat Hub {version}','pub_date':None,'platforms':{'darwin-aarch64':{'url':url,'signature':signature}}}
-          pathlib.Path(out).write_text(json.dumps(data,indent=2)+'\n')
-          PY
+          python3 build/updater_release.py generate "$INPUT_VERSION" "$url" "$(cat "$RUNNER_TEMP/chat-hub/Chat Hub.app.tar.gz.sig")" "$RUNNER_TEMP/chat-hub/latest.json"
+          python3 build/updater_release.py validate "$RUNNER_TEMP/chat-hub/latest.json"
       - name: Create and mount-verify DMG
         env:
           INPUT_VERSION: ${{ inputs.version }}

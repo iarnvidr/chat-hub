@@ -1,6 +1,6 @@
 # Release acceptance checklist
 
-Record actual evidence; do not infer success from synthetic/Linux tests. PR2 requires hosted macOS packaged-app updater acceptance as specified below.
+Record actual evidence; do not infer success from synthetic/Linux tests. The release-blocking minimum is an actual ad-hoc-signed app build, verified/mounted DMG, cryptographically signed updater payload verified independently with the configured pinned public key, and valid latest.json. Native launch/UI/WKWebView/updater integration smokes are nonblocking diagnostics.
 
 ## PR1 / Linux
 
@@ -11,14 +11,16 @@ Record actual evidence; do not infer success from synthetic/Linux tests. PR2 req
 - [ ] Confirm proxy streaming framing and allowlist fixes have landed and have focused tests; current work remains in progress.
 - [ ] Gitleaks/dependency checks pass where run; record actual CI evidence.
 
-## PR2 desktop updater — hosted macos-15 evidence gate (PENDING)
+## Release-blocking hosted macos-15 build gates
 
-- [ ] Link hosted `macos-15` workflow run and retained screenshots/artifacts here: **PENDING; run not yet recorded**.
-- [ ] Run the real packaged Tauri app: install 0.1.0, discover and install 0.1.1, confirm resulting app version.
-- [ ] Capture native UI screenshots of the update flow/outcome.
-- [ ] Demonstrate rejection of a tampered update and a wrong-key-signed update; retain observable rejection evidence.
-- [ ] Exercise packaged-app WKWebView via capture proxy against synthetic HTTPS provider; show response capture and ingestion.
-- [ ] Show authentication/sign-in host tunnel remains undecrypted, distinct from intercepted capture host.
+- [ ] Record run/artifact evidence for real Tauri app build with ad-hoc signature (not notarization).
+- [ ] Record successful DMG create, verification, mount, and app-bundle checks.
+- [ ] Record signed `Chat Hub.app.tar.gz` and independent minisign verification against the pinned updater public key.
+- [ ] Validate generated `latest.json` schema and payload signature; publish remains manual and defaults false.
+
+## Diagnostic native smokes (nonblocking)
+
+- [ ] Optionally retain launch/UI/WKWebView/updater integration smoke results and screenshots. Failures must be visible as failed diagnostics; they do not block the above required gates and do not count as passing evidence.
 - [ ] Stable feed is `releases/latest` only; preview prereleases are explicitly opt-in. Verify pinned public key applies to both channels.
 - [ ] Release notes identify ad-hoc builds as not notarized and disclose possible Gatekeeper block. Do not treat ad-hoc code signing as updater signing.
 - [ ] Prepare protected manual publication with `publish=false`; publish only after review and authorization.

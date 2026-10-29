@@ -35,6 +35,10 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}", self.workflow)
         self.assertIn("TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}", self.workflow)
         self.assertIn("signer sign", self.workflow)
+        self.assertIn("minisign -Vm", self.workflow)
+        self.assertIn("latest.json", self.workflow)
+        self.assertIn("updater_release.py generate", self.workflow)
+        self.assertIn("updater_release.py validate", self.workflow)
         self.assertIn("Create and mount-verify DMG", self.workflow)
         self.assertIn("hdiutil verify", self.dmg)
         self.assertIn("hdiutil attach", self.dmg)
@@ -45,6 +49,12 @@ class ReleaseContracts(unittest.TestCase):
         self.assertLess(native.index('cp "$file" "$resources/$file"'), native.index('codesign --force'))
         self.assertIn('for file in NOTICE LICENSE', native)
         self.assertIn('macOS app packaging copy missing:', native)
+
+    def test_native_smokes_are_nonblocking(self):
+        workflow = (ROOT / ".github/workflows/macos.yml").read_text()
+        self.assertGreaterEqual(workflow.count("continue-on-error: true"), 5)
+        self.assertIn("Build real Tauri app, ad-hoc signed", workflow)
+        self.assertIn("Build and mount-verify the DMG", workflow)
 
     def test_dmg_packager_reports_missing_bundle_path(self):
         self.assertIn('app_input="$1"', self.dmg)

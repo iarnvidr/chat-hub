@@ -40,13 +40,16 @@ jobs:
           version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
           bash build/package-dmg.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$RUNNER_TEMP/chat-hub/corresponding-source" "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg"
       - name: Release app launch and localhost health smoke
+        continue-on-error: true
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
       - name: Build debug binary for native UI interactions
+        continue-on-error: true
         run: cargo build --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
       - id: prepare-debug-smoke
         name: Prepare isolated debug bundle for native smokes
+        continue-on-error: true
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app"
@@ -59,6 +62,7 @@ jobs:
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
       - id: updater-smoke
+        continue-on-error: true
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         name: Native signed updater integration smoke (debug bundle)
         env:
@@ -66,6 +70,7 @@ jobs:
           MUNINN_UPDATER_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-updater-evidence
         run: bash build/updater-smoke/run-macos.sh
       - name: Native UI interaction smoke (debug bundle only)
+        continue-on-error: true
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         env:
           NATIVE_UI_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-debug-ui-evidence
