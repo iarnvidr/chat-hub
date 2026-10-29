@@ -11,6 +11,7 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::mpsc;
+mod crash_diagnostics;
 #[cfg(target_os = "macos")]
 mod trust_mac;
 
@@ -302,6 +303,7 @@ fn persistent_token(path: &std::path::Path) -> Result<String, String> {
 }
 #[tokio::main]
 async fn main() {
+    crash_diagnostics::install();
     let updater_builder = tauri_plugin_updater::Builder::new();
     let builder = tauri::Builder::default().plugin(updater_builder.build());
     let builder = builder.setup(|app| {

@@ -18,9 +18,14 @@ Record actual evidence; do not infer success from synthetic/Linux tests. The rel
 - [ ] Record signed `Chat-Hub.app.tar.gz` and independent minisign verification against the pinned updater public key.
 - [ ] Validate generated `latest.json` schema and payload signature; publish remains manual and defaults false.
 
+## Required packaged-app startup gate
+
+- [ ] The actual packaged app passes launch, authenticated localhost health, startup poke, and 15-second survival smoke before release preparation can publish assets. Retain stdout/stderr and crash-report evidence; never record tokens.
+- [ ] The smoke collects relevant `chat-hub-desktop*.ips` reports from the runner's real and isolated diagnostic directories, with diagnostics enabled (`RUST_BACKTRACE=full`, `OBJC_DEBUG_MISSING_POOLS=NO`, `NSUnbufferedIO=YES`).
+
 ## Diagnostic native smokes (nonblocking)
 
-- [ ] Optionally retain launch/UI/WKWebView/updater integration smoke results and screenshots. Failures must be visible as failed diagnostics; they do not block the above required gates and do not count as passing evidence.
+- [ ] Native UI/WKWebView/updater integration smokes remain nonblocking diagnostics.
 - [ ] Stable feed is `releases/latest` only; preview prereleases are explicitly opt-in. Verify pinned public key applies to both channels.
 - [ ] Release notes identify ad-hoc builds as not notarized and disclose possible Gatekeeper block. Do not treat ad-hoc code signing as updater signing.
 - [ ] Prepare protected manual publication with `publish=false`; publish only after review and authorization.

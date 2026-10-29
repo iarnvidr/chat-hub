@@ -55,6 +55,10 @@ jobs:
         run: npm ci
       - name: Build ad-hoc Apple Silicon Tauri app (not notarized; no Apple account)
         run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
+      - name: Required startup and authenticated health smoke
+        env:
+          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
+        run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
       - name: Create updater archive, sign and verify
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

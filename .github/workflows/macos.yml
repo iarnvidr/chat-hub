@@ -39,8 +39,7 @@ jobs:
           python3 build/release_sources.py prepare "$RUNNER_TEMP/chat-hub/corresponding-source"
           version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
           bash build/package-dmg.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$RUNNER_TEMP/chat-hub/corresponding-source" "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg"
-      - name: Release app launch and localhost health smoke
-        continue-on-error: true
+      - name: Required release app launch and localhost health smoke
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
