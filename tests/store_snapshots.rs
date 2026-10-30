@@ -48,6 +48,7 @@ fn snapshots_have_revision_and_message_title_search() {
     );
     let mut changed = o.clone();
     changed.title = "New title".into();
+    changed.raw_payload = json!({"update_time": 1.0});
     changed.observed_ms = 50;
     s.ingest_observation(&changed).unwrap();
     assert_eq!(s.library_revision().unwrap(), 2);
@@ -129,7 +130,9 @@ fn retained_url_does_not_create_revision_when_input_omits_url() {
     no_op.raw_payload = json!({"update_time": 11.0});
     no_op.observed_ms += 1;
     s.ingest_observation(&no_op).unwrap();
-    assert_eq!(s.library_revision().unwrap(), 1);
+    // The source update timestamp is observable conversation metadata and advances
+    // the revision even though the omitted URL retains the prior URL value.
+    assert_eq!(s.library_revision().unwrap(), 2);
     let snapshot = s.library_snapshot().unwrap();
     assert_eq!(
         snapshot.conversations[0]["url"],
@@ -138,7 +141,7 @@ fn retained_url_does_not_create_revision_when_input_omits_url() {
 }
 
 #[test]
-fn equal_timestamp_conflict_is_rejected_but_provenance_is_recorded() {
+fn equal_timestamp_conflict_uses_deterministic_payload_order() {
     let mut s = Store::in_memory().unwrap();
     let mut first = make();
     first.raw_payload = json!({"update_time": 10.0});
@@ -148,10 +151,10 @@ fn equal_timestamp_conflict_is_rejected_but_provenance_is_recorded() {
     conflict.graph[0].parts = vec![Value::String("conflicting body".into())];
     conflict.raw_payload = json!({"update_time": 10.0, "trace": "conflict"});
     s.ingest_observation(&conflict).unwrap();
-    assert_eq!(s.library_revision().unwrap(), 1);
+    assert_eq!(s.library_revision().unwrap(), 2);
     let current = s.read_normalized(&id).unwrap().unwrap();
-    assert_eq!(current["title"], "Title words");
-    assert_eq!(current["messages"][0]["content"], "unique needle");
-    assert!(s.search("conflicting", 10).unwrap().is_empty());
-    assert_eq!(s.read(&id).unwrap().unwrap()["title"], "Title words");
+    assert_eq!(current["title"], "conflicting title");
+    assert_eq!(current["messages"][0]["content"], "conflicting body");
+    assert_eq!(s.search("conflicting", 10).unwrap().len(), 1);
+    assert_eq!(s.read(&id).unwrap().unwrap()["title"], "conflicting title");
 }

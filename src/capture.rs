@@ -17,18 +17,39 @@ pub fn normalize_chatgpt_document(
         .ok_or_else(|| Error::Configuration("missing mapping object".into()))?;
     let source_id = doc
         .get("conversation_id")
-        .or_else(|| doc.get("id"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            doc.get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
         .ok_or_else(|| Error::Configuration("missing conversation id".into()))?;
     let mut graph = Vec::new();
     for (node_id, node) in mapping {
-        let m = &node["message"];
+        let node = node
+            .as_object()
+            .ok_or_else(|| Error::Configuration("mapping node must be an object".into()))?;
+        let parent = match node.get("parent") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => {
+                return Err(Error::Configuration(
+                    "node parent must be null or a string".into(),
+                ))
+            }
+        };
+        let m = node.get("message").unwrap_or(&Value::Null);
+        if !m.is_null() && !m.is_object() {
+            return Err(Error::Configuration(
+                "node message must be null or an object".into(),
+            ));
+        }
         if m.is_null() {
             graph.push(GraphNode {
                 source_node_id: node_id.clone(),
                 source_message_id: None,
-                parent_id: node["parent"].as_str().map(str::to_owned),
+                parent_id: parent.clone(),
                 role: None,
                 author: None,
                 create_time: None,
@@ -36,10 +57,23 @@ pub fn normalize_chatgpt_document(
             });
             continue;
         }
+        let content = m.get("content").unwrap_or(&Value::Null);
+        if !content.is_null() && !content.is_object() {
+            return Err(Error::Configuration(
+                "message content must be an object".into(),
+            ));
+        }
+        if let Some(parts) = content.get("parts") {
+            if !parts.is_array() {
+                return Err(Error::Configuration(
+                    "content parts must be an array".into(),
+                ));
+            }
+        }
         graph.push(GraphNode {
             source_node_id: node_id.clone(),
             source_message_id: m["id"].as_str().map(str::to_owned),
-            parent_id: node["parent"].as_str().map(str::to_owned),
+            parent_id: parent.clone(),
             role: m["author"]["role"].as_str().map(str::to_owned),
             author: Some(m["author"].clone()),
             create_time: m["create_time"]

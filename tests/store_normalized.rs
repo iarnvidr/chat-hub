@@ -77,7 +77,7 @@ fn selection_fallback_invalid_pointer_dangling_and_cycles_are_safe() {
         ))
         .unwrap();
     let v = s.read_normalized(&id).unwrap().unwrap();
-    assert_eq!(v["selection_reason"], "lexical_leaf_fallback");
+    assert_eq!(v["selection_reason"], "fallback_leaf");
     assert_eq!(v["selected_node_id"], "a");
     assert_eq!(v["thread_node_ids"], json!(["a"]));
     assert_eq!(v["thread_complete"], true);
@@ -92,8 +92,9 @@ fn selection_fallback_invalid_pointer_dangling_and_cycles_are_safe() {
         ))
         .unwrap();
     let v = s.read_normalized(&id).unwrap().unwrap();
-    assert_eq!(v["thread_node_ids"], json!(["a", "b"]));
+    assert_eq!(v["thread_node_ids"], json!([]));
     assert_eq!(v["thread_complete"], false);
+    assert_eq!(v["selection_reason"], "source_current_node");
     assert_eq!(s.read_normalized("missing").unwrap(), None);
 }
 #[test]

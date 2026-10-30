@@ -63,7 +63,7 @@ pub struct Observation {
     pub parser: String,
     pub completeness: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct GraphNode {
     pub source_node_id: String,
     pub source_message_id: Option<String>,
@@ -166,6 +166,28 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(6)", [])?;
             tx.commit()?;
         }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 7 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch("ALTER TABLE conversations ADD COLUMN ordering_payload TEXT;")?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(7)", [])?;
+            tx.commit()?;
+        }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 8 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch("ALTER TABLE conversations ADD COLUMN ordering_observed_ms INTEGER;")?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(8)", [])?;
+            tx.commit()?;
+        }
         self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id);")?;
         Ok(())
     }
@@ -230,7 +252,7 @@ impl Store {
         let mut hits = Vec::new();
         if !terms.is_empty() {
             let q = terms.join(" AND ");
-            let mut st=tx.prepare("SELECT c.id,c.provider,c.account_scope,c.source_id,c.title,c.updated_at_ms, f.node_id,f.message_id,snippet(message_fts,3,'[',']','…',12),bm25(message_fts) FROM message_fts f JOIN conversations c ON c.id=f.conversation_id WHERE message_fts MATCH ?1 ORDER BY bm25(message_fts),c.id,f.node_id")?;
+            let mut st=tx.prepare("SELECT c.id,c.provider,c.account_scope,c.source_id,c.title,c.updated_at_ms, f.node_id,f.message_id,snippet(message_fts,3,'','','…',12),bm25(message_fts) FROM message_fts f JOIN conversations c ON c.id=f.conversation_id WHERE message_fts MATCH ?1 ORDER BY bm25(message_fts),c.id,f.node_id")?;
             let rows = st.query_map([&q], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -441,7 +463,7 @@ impl Store {
         if expected_revision.is_none_or(|v| v == revision) && !terms.is_empty() {
             let q = terms.join(" AND ");
             let lim = limit.min(101) as i64;
-            let mut st=tx.prepare("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,snippet(message_fts,3,'[',']','…',12) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1 UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1) SELECT conversation_id,node_id,message_id,snippet,score FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5")?;
+            let mut st=tx.prepare("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,snippet(message_fts,3,'','','…',12) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1 UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1) SELECT conversation_id,node_id,message_id,snippet,score FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5")?;
             let rows = st
                 .query_map(
                     params![
@@ -503,7 +525,33 @@ impl Store {
                             frontier.extend(children)
                         }
                     }
-                    leaves.into_iter().min()
+                    let selected_leaf = graph["selected_node_id"].as_str().filter(|selected| {
+                        !nodes
+                            .iter()
+                            .any(|x| x["parent_id"].as_str() == Some(*selected))
+                            && {
+                                let mut cur = Some(selected.to_string());
+                                let mut seen = std::collections::HashSet::new();
+                                let mut found = false;
+                                while let Some(c) = cur {
+                                    if !seen.insert(c.clone()) {
+                                        break;
+                                    }
+                                    if c == *n {
+                                        found = true;
+                                        break;
+                                    }
+                                    cur = nodes
+                                        .iter()
+                                        .find(|x| x["id"].as_str() == Some(c.as_str()))
+                                        .and_then(|x| x["parent_id"].as_str().map(str::to_owned));
+                                }
+                                found
+                            }
+                    });
+                    selected_leaf
+                        .map(str::to_owned)
+                        .or_else(|| leaves.into_iter().min())
                 } else {
                     None
                 };
@@ -698,19 +746,21 @@ fn read_normalized_conn(conn: &Connection, id: &str) -> Result<Option<Value>> {
             .and_then(|v| v.as_f64())
             .map(|n| (n * 1000.0).floor() as i64);
         nodes.push(
-            serde_json::json!({"id":nid,"source_id":sid,"parent_id":parent,"message_id":mid}),
+            serde_json::json!({"id":nid,"source_id":nid,"parent_id":parent,"message_id":mid}),
         );
         if let (Some(mid), Some(role)) = (mid, role) {
             messages.push(serde_json::json!({"id":mid,"source_id":sid,"node_id":nid,"role":role,"author":author.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"create_time":time.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"created_at_ms":millis,"content":content,"parts":p}));
         }
     }
-    let reason = if current
+    let reason = if nodes.is_empty() {
+        "empty"
+    } else if current
         .as_ref()
         .is_some_and(|c| nodes.iter().any(|n| n["id"] == *c))
     {
         "source_current_node"
     } else {
-        "lexical_leaf_fallback"
+        "fallback_leaf"
     };
     let selected = current
         .clone()
@@ -726,16 +776,18 @@ fn read_normalized_conn(conn: &Connection, id: &str) -> Result<Option<Value>> {
     let mut cursor = selected.clone();
     while let Some(c) = cursor {
         if ancestry.contains(&c) {
+            ancestry.clear();
             break;
         }
         ancestry.push(c.clone());
         cursor = nodes
             .iter()
             .find(|n| n["id"] == c)
-            .and_then(|n| n["parent_id"].as_str().map(str::to_owned));
+            .and_then(|n| n["parent_id"].as_str().map(str::to_owned))
+            .filter(|parent| nodes.iter().any(|n| n["id"] == *parent));
     }
     Ok(Some(
-        serde_json::json!({"id":id,"title":title,"provider":provider,"scope":scope,"source_id":source,"url":url,"updated_at_ms":updated,"source_current_node_id":current,"selected_node_id":selected,"selection_reason":reason,"thread_node_ids":ancestry,"thread_complete":ancestry.last().is_none_or(|n|nodes.iter().any(|x|x["id"]==*n&&x["parent_id"].is_null())),"nodes":nodes,"messages":messages}),
+        serde_json::json!({"id":id,"title":title,"provider":provider,"account_scope":scope,"scope":scope,"source_id":source,"url":url,"updated_at_ms":updated,"source_current_node_id":current,"selected_node_id":selected,"selection_reason":reason,"thread_node_ids":ancestry,"thread_complete":(ancestry.is_empty() && nodes.is_empty()) || ancestry.last().is_some_and(|n|nodes.iter().any(|x|x["id"]==*n&&x["parent_id"].is_null())),"nodes":nodes,"messages":messages}),
     ))
 }
 
@@ -865,7 +917,33 @@ type CanonicalGraph = Vec<(
     Option<String>,
     String,
 )>;
-type PriorState = (String, Option<String>, Option<String>, Option<i64>);
+type PriorState = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+fn canonical_ordering_payload(o: &Observation) -> String {
+    let mut graph = o
+        .graph
+        .iter()
+        .map(|n| {
+            serde_json::json!([
+                n.source_node_id,
+                n.source_message_id,
+                n.parent_id,
+                n.role,
+                n.author,
+                n.create_time,
+                n.parts
+            ])
+        })
+        .collect::<Vec<_>>();
+    graph.sort_by_key(Value::to_string);
+    serde_json::json!([o.title, o.current_node, graph]).to_string()
+}
+
 fn ingest_tx(tx: &Transaction<'_>, o: &Observation) -> Result<()> {
     let id: String = if let Some(existing) = tx
         .query_row(
@@ -887,14 +965,43 @@ fn ingest_tx(tx: &Transaction<'_>, o: &Observation) -> Result<()> {
         .map(|n| (n * 1000.0).floor() as i64);
     let prior: Option<PriorState> = tx
         .query_row(
-            "SELECT title,url,current_node,last_source_updated_ms FROM conversations WHERE id=?1",
+            "SELECT title,url,current_node,last_source_updated_ms,ordering_observed_ms FROM conversations WHERE id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let stale =
-        matches!((source_ms,prior.as_ref().and_then(|x|x.3)),(Some(new),Some(old)) if new<=old);
-    let accept = !stale;
+    let prior_ms = prior.as_ref().and_then(|x| x.3);
+    let prior_observed_ms = prior.as_ref().and_then(|x| x.4);
+    let mut ordering_observation = o.clone();
+    if ordering_observation.url.is_none() {
+        ordering_observation.url = prior.as_ref().and_then(|p| p.1.clone());
+    }
+    let incoming_key = canonical_ordering_payload(&ordering_observation);
+    let prior_key: Option<String> = tx
+        .query_row(
+            "SELECT ordering_payload FROM conversations WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let accept = match (source_ms, prior_ms) {
+        (Some(new), Some(old)) if new < old => false,
+        (None, Some(_)) => false,
+        (Some(new), Some(old)) if new == old => prior_key
+            .as_ref()
+            .is_none_or(|old_key| incoming_key > *old_key),
+        (None, None) => match prior_key.as_ref() {
+            None => true,
+            Some(old_key) => {
+                o.observed_ms > prior_observed_ms.unwrap_or(i64::MIN)
+                    || (o.observed_ms == prior_observed_ms.unwrap_or(i64::MIN)
+                        && incoming_key > *old_key)
+            }
+        },
+        (Some(_), None) => true,
+        _ => true,
+    };
     let before_graph: CanonicalGraph = {
         let mut st=tx.prepare("SELECT source_node_id,source_message_id,parent_id,role,author_json,create_time_json,parts_json FROM graph_nodes WHERE conversation_id=?1 ORDER BY source_node_id")?;
         let rows = st
@@ -913,7 +1020,7 @@ fn ingest_tx(tx: &Transaction<'_>, o: &Observation) -> Result<()> {
         rows
     };
     if accept {
-        tx.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id,url,current_node,last_source_updated_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(provider,account_scope,source_id) DO UPDATE SET title=excluded.title,url=coalesce(excluded.url,conversations.url),current_node=excluded.current_node,last_source_updated_ms=coalesce(excluded.last_source_updated_ms,conversations.last_source_updated_ms)",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node,source_ms])?;
+        tx.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id,url,current_node,last_source_updated_ms,ordering_payload,ordering_observed_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(provider,account_scope,source_id) DO UPDATE SET title=excluded.title,url=coalesce(excluded.url,conversations.url),current_node=excluded.current_node,last_source_updated_ms=coalesce(excluded.last_source_updated_ms,conversations.last_source_updated_ms),ordering_payload=excluded.ordering_payload,ordering_observed_ms=excluded.ordering_observed_ms",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node,source_ms,incoming_key,o.observed_ms])?;
     } else {
         tx.execute("INSERT OR IGNORE INTO conversations(id,title,provider,account_scope,source_id,url,current_node) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node])?;
     }
@@ -976,10 +1083,16 @@ fn ingest_tx(tx: &Transaction<'_>, o: &Observation) -> Result<()> {
         [&id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    let metadata_changed = source_ms.is_some() && source_ms != prior_ms && prior.is_some();
+    let visible_changed = prior.as_ref().map(|p| (&p.0, &p.1, &p.2))
+        != Some((&persisted.0, &persisted.1, &persisted.2))
+        || before_graph != after_graph;
     let changed = accept
-        && (prior.as_ref().map(|p| (&p.0, &p.1, &p.2))
-            != Some((&persisted.0, &persisted.1, &persisted.2))
-            || before_graph != after_graph);
+        && (metadata_changed
+            || (visible_changed
+                && (source_ms.is_none() || prior.is_none() || source_ms >= prior_ms)));
+    let changed =
+        changed || (accept && visible_changed && source_ms.is_some() && source_ms == prior_ms);
     if changed {
         tx.execute(
             "UPDATE library_state SET revision=revision+1 WHERE singleton=1",
