@@ -74,7 +74,6 @@ jobs:
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
       - id: updater-smoke
-        continue-on-error: true
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         name: Native signed updater integration smoke (debug bundle)
         env:

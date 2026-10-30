@@ -1,10 +1,40 @@
 """Host-independent checks for updater evidence contract and fail-closed cases."""
-import ast,copy,json,pathlib,subprocess,sys,tempfile,unittest
+import ast,copy,json,pathlib,subprocess,sys,tempfile,unittest,os
 HERE=pathlib.Path(__file__).resolve().parent
 BASE_H={'signature_accepted':True,'replacement_installed':True,'restart_requested':True,'restart_observed':True,'restart_process_exited':True,'before_version':'0.1.0','after_version':'0.1.1','restart_identity':{'before_pid':101,'after_pid':202,'expected_executable':'/tmp/Muninn.app/Contents/MacOS/app','actual_executable':'/tmp/Muninn.app/Contents/MacOS/app'}}
 BASE_T={'tamper_rejected':True,'tamper_status':{'state':'failed','reason':'signature_verification_failed'},'old_version_retained':True,'app_usable':True}
 def run(root): return subprocess.run([sys.executable,str(HERE/'verify_evidence.py'),str(root)],capture_output=True)
 class EvidenceProtocol(unittest.TestCase):
+ def test_restart_transport_classifier_is_narrow_and_postconditions_remain_required(self):
+  s=(HERE/'driver.py').read_text(); tree=ast.parse(s)
+  node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='restart_transport_interrupted')
+  ns={}; exec(compile(ast.Module(body=[node],type_ignores=[]),str(HERE/'driver.py'),'exec'),ns)
+  classify=ns['restart_transport_interrupted']
+  self.assertTrue(classify(RuntimeError('native E2E eval bridge timed out')))
+  self.assertTrue(classify(RuntimeError('connection closed')))
+  self.assertFalse(classify(RuntimeError('signature_rejected')))
+  self.assertFalse(classify(RuntimeError('signature verification failed')))
+  self.assertIn("candidate.get('process_id') != before_pid",s)
+  self.assertIn("post.get('version')!=new",s)
+  self.assertIn("observed_status.get('status')=='signature_rejected'",s)
+ def test_summary_is_bounded_across_reports_and_redacts_secret_file_names(self):
+  reporter=HERE.parents[0]/'native-smoke-report.py'
+  with tempfile.TemporaryDirectory() as d:
+   root=pathlib.Path(d); log=root/'huge.log'; log.write_text(('x'*500+'\\n')*2000)
+   evidence=root/'evidence'; evidence.mkdir(); (evidence/'service.token').write_text('TOKEN_SECRET_CONTENT'); (evidence/'privatekey.pem').write_text('PRIVATE_KEY_CONTENT'); (evidence/'ordinary.txt').write_text('ok')
+   summary=root/'summary.md'
+   args=[sys.executable,str(reporter),'--step','15','--status','1','--command','x','--reason','test','--logfiles',str(log),'--evidence',str(evidence),'--summary',str(summary)]
+   # Use the script's positional interface as used by the workflow wrapper.
+   args=[sys.executable,str(reporter),'15','1','x',str(evidence),str(log), '']
+   for _ in range(8):
+    env=dict(os.environ,GITHUB_STEP_SUMMARY=str(summary))
+    result=subprocess.run(args,capture_output=True,text=True,check=True,env=env)
+    self.assertLessEqual(len(result.stdout.encode()),400*1024)
+   content=summary.read_bytes(); self.assertLessEqual(len(content),400*1024)
+   self.assertNotIn(b'TOKEN_SECRET_CONTENT',content); self.assertNotIn(b'PRIVATE_KEY_CONTENT',content)
+   self.assertNotIn(b'service.token',content); self.assertNotIn(b'privatekey.pem',content)
+   self.assertIn(b'ordinary.txt',content)
+   self.assertLessEqual(max(map(len,content.splitlines()),default=0),400*1024)
  def test_real_app_api_names_and_no_invented_commands(self):
   s=(HERE/'driver.py').read_text()
   for token in ('window.ChatHub.invoke(',"invoke('update_status')","invoke('check_for_updates'","invoke('install_update')","post.get('version')!=new"):

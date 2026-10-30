@@ -15,13 +15,23 @@ for name in logfiles.split(':'):
 safe=html.escape(first or reason)
 print(f'::error title={step}::{safe}', flush=True)
 if step in ('15','17'): print(f'::warning title={step}::Smoke test failed internally with exit code {status}; continue-on-error does not indicate success.',flush=True)
+MAX_SUMMARY=400*1024
+def bounded(lines):
+ out=[]
+ for line in lines:
+  line=str(line)
+  out.append(line[:200] + ('…[line truncated]' if len(line)>200 else ''))
+ return out
 lines=[f'## Native smoke step {step}: FAILED',f'- Exit code: `{status}`',f'- Command: `{command}`',f'- Failure: {first or reason}', '### Captured output (last 80 lines per stream)']
 for name in logfiles.split(':'):
  p=pathlib.Path(name)
- if p.is_file(): lines += [f'#### `{p.name}`','```text',*p.read_text(errors='replace').splitlines()[-80:],'```']
+ if p.is_file(): lines += [f'#### `{p.name}`','```text',*bounded(p.read_text(errors='replace').splitlines()[-80:]),'```']
 lines += ['### Evidence directory (names and metadata only)']
-for p in pathlib.Path(evidence).glob('**/*') if pathlib.Path(evidence).exists() else []:
- lines.append(f'- `{p}` ({"directory" if p.is_dir() else "file"})')
+for p in sorted(pathlib.Path(evidence).glob('**/*'))[:80] if pathlib.Path(evidence).exists() else []:
+  if p.is_dir(): continue
+  name=p.name.lower()
+  if any(secret in name for secret in ('key','token','secret','credential')): continue
+  lines.append(f'- `{p.name}` (file)')
 if namespace:
  diagfiles=[p for p in pathlib.Path(evidence).glob('*.diag.json')]
  if diagfiles:
@@ -33,7 +43,15 @@ if namespace:
     lines += ['### Native bridge progress',f'- Request: `{d.get("id", "unknown")}`',f'- Stage: `{d.get("stage", "unknown")}`',f'- Metadata: `{json.dumps(d.get("detail", {}), sort_keys=True)}`']
    except (OSError, ValueError): lines += [f'- Diagnostic metadata unreadable: `{p.name}`']
  else: lines += ['### Webview namespace evidence (unavailable: native bridge did not publish progress metadata)','`typeof ChatHub`/`invoke`, `href`, `readyState`, title, window-key matches and Tauri globals: unavailable.']
-text='\n'.join(lines)+'\n'
+text='\n'.join(bounded(lines))+'\n'
+if len(text.encode())>MAX_SUMMARY: text=text.encode()[:MAX_SUMMARY-40].decode(errors='ignore')+'\n…[summary truncated to 400 KiB]\n'
 if summary:
- with open(summary,'a') as f: f.write(text); f.flush(); os.fsync(f.fileno())
+ import tempfile
+ target=pathlib.Path(summary); target.parent.mkdir(parents=True,exist_ok=True)
+ previous=target.read_bytes() if target.exists() else b''
+ combined=previous+text.encode()
+ if len(combined)>MAX_SUMMARY: combined=combined[-MAX_SUMMARY:]
+ fd,tmp=tempfile.mkstemp(prefix=target.name+'.',dir=target.parent)
+ with os.fdopen(fd,'wb') as f: f.write(combined); f.flush(); os.fsync(f.fileno())
+ os.replace(tmp,target)
 print(text,flush=True)

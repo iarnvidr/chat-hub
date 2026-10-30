@@ -101,8 +101,10 @@ mod e2e {
                     continue;
                 }
                 progress(&d, &id, "dispatch", json!({"op":c["op"]}));
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&app, &c, &d, &id)))
-                    .unwrap_or_else(|_| json!({"ok":false,"error":"native E2E operation panicked"}));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(&app, &c, &d, &id)
+                }))
+                .unwrap_or_else(|_| json!({"ok":false,"error":"native E2E operation panicked"}));
                 progress(&d, &id, "response", json!({"ok":result["ok"]}));
                 respond(&d, &id, &result);
             }
@@ -125,12 +127,18 @@ mod e2e {
                 // Keep the entire two-phase operation inside the Python driver's 40s IPC
                 // deadline, leaving time to publish a response even on a stalled WebView.
                 let operation_deadline = std::time::Instant::now() + Duration::from_secs(28);
-                let ready_deadline = operation_deadline.min(std::time::Instant::now() + Duration::from_secs(10));
+                let ready_deadline =
+                    operation_deadline.min(std::time::Instant::now() + Duration::from_secs(10));
                 let mut readiness = json!({"href":null,"readyState":null,"windowLabel":w.label()});
                 let mut readiness_polls = 0u64;
                 loop {
                     readiness_polls += 1;
-                    progress(d, id, "provider_readiness", json!({"polls":readiness_polls,"href":readiness["href"],"readyState":readiness["readyState"]}));
+                    progress(
+                        d,
+                        id,
+                        "provider_readiness",
+                        json!({"polls":readiness_polls,"href":readiness["href"],"readyState":readiness["readyState"]}),
+                    );
                     if let Ok(url) = w.url() {
                         readiness["href"] = json!(url.as_str());
                         if url.scheme() == "https" && url.host_str() == Some("chatgpt.com") {
@@ -152,7 +160,12 @@ mod e2e {
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                progress(d, id, "provider_probe_started", json!({"href":readiness["href"],"readyState":readiness["readyState"]}));
+                progress(
+                    d,
+                    id,
+                    "provider_probe_started",
+                    json!({"href":readiness["href"],"readyState":readiness["readyState"]}),
+                );
                 let nonce = format!(
                     "{}-{}",
                     std::process::id(),
@@ -172,7 +185,12 @@ mod e2e {
                 let mut probe_polls = 0u64;
                 loop {
                     probe_polls += 1;
-                    progress(d, id, "provider_probe_poll", json!({"polls":probe_polls,"remaining_ms":deadline.saturating_duration_since(std::time::Instant::now()).as_millis()}));
+                    progress(
+                        d,
+                        id,
+                        "provider_probe_poll",
+                        json!({"polls":probe_polls,"remaining_ms":deadline.saturating_duration_since(std::time::Instant::now()).as_millis()}),
+                    );
                     let (tx, rx) = std::sync::mpsc::channel();
                     let poll = format!("window[{escaped_key}]||null");
                     if let Err(e) = w.eval_with_callback(poll, move |value| {
@@ -184,7 +202,11 @@ mod e2e {
                     match rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
                         Ok(value) => {
                             let decoded = serde_json::from_str::<Value>(&value).ok();
-                            let result = decoded.as_ref().and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).or_else(|| Some(v.clone())));
+                            let result = decoded.as_ref().and_then(|v| {
+                                v.as_str()
+                                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                    .or_else(|| Some(v.clone()))
+                            });
                             if let Some(result) = result {
                                 if result["nonce"].as_str() != Some(&key) {
                                     continue;

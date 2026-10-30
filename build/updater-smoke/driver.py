@@ -25,6 +25,10 @@ def bridge(expression, timeout=40):
         raise RuntimeError('native E2E eval bridge timed out')
     finally: command.unlink(missing_ok=True); result.unlink(missing_ok=True)
 def invoke(name,args=None): return bridge('window.ChatHub.invoke('+json.dumps(name)+','+json.dumps(args or {})+')')
+def restart_transport_interrupted(exc):
+    """Only bridge/transport failures can be explained by app.restart() closing IPC."""
+    text=str(exc).lower()
+    return any(token in text for token in ('timed out','timeout','bridge','connection','transport','native e2e'))
 def native_state():
     ident='updater-state-'+str(time.time_ns()); command=e2e/(ident+'.cmd.json'); result=e2e/(ident+'.res.json')
     tmp=command.with_suffix('.tmp'); tmp.write_text(json.dumps({'id':ident,'op':'state','target':'chrome','args':{}})); os.replace(tmp,command)
@@ -74,12 +78,19 @@ try:
     checked=invoke('check_for_updates',{'includePreviews':False})
     if not isinstance(checked,dict) or checked.get('status')!='available' or checked.get('version')!=new: raise RuntimeError(f'signed update was not offered: {checked}')
     if mode=='healthy':
-        # Native command performs download, signature verification, install and app.restart().
-        try: invoke('install_update')
-        except RuntimeError as exc: raise RuntimeError(f'healthy signed install failed: {exc}')
-        try: proc.wait(timeout=120)
-        except subprocess.TimeoutExpired: raise RuntimeError('updater install did not exit/relaunch')
-        end=time.monotonic()+180; after=None
+        # app.restart() may terminate the IPC bridge before its successful response arrives.
+        # Only classify explicit transport/eval/bridge loss as an interrupted call; success
+        # is established exclusively by process, bundle and plugin postconditions below.
+        install_call='returned'
+        try:
+            invoke('install_update')
+        except RuntimeError as exc:
+            if not restart_transport_interrupted(exc):
+                raise RuntimeError(f'healthy signed install failed: {exc}')
+            install_call='interrupted_during_restart: '+str(exc)[:200]
+        try: proc.wait(timeout=60)
+        except subprocess.TimeoutExpired: raise RuntimeError('updater install did not exit within 60s')
+        end=time.monotonic()+120; after=None
         while time.monotonic()<end:
             try:
                 candidate=native_state()
@@ -92,7 +103,7 @@ try:
         if not isinstance(after_pid,int) or after_pid<=0 or not after_exe or str(pathlib.Path(after_exe).resolve())!=expected: raise RuntimeError(f'post-install executable identity mismatch: {after}')
         post=invoke('update_status')
         if not isinstance(post,dict) or post.get('version')!=new: raise RuntimeError(f'relaunched application version is not bundled target version: {post}')
-        evidence={'signature_accepted':True,'replacement_installed':version(app)==new,'restart_requested':True,'restart_observed':True,'restart_process_exited':proc.poll() is not None,'restart_identity':{'before_pid':before_pid,'after_pid':after_pid,'expected_executable':expected,'actual_executable':str(pathlib.Path(after_exe).resolve())},'before_version':old,'after_version':post['version']}
+        evidence={'signature_accepted':True,'replacement_installed':version(app)==new,'restart_requested':True,'restart_call':install_call,'restart_observed':True,'restart_process_exited':proc.poll() is not None,'restart_identity':{'before_pid':before_pid,'after_pid':after_pid,'expected_executable':expected,'actual_executable':str(pathlib.Path(after_exe).resolve())},'before_version':old,'after_version':post['version']}
         (root/'healthy-result.json').write_text(json.dumps(evidence,sort_keys=True)+'\n')
         if not all((evidence['replacement_installed'],evidence['restart_process_exited'],after_pid!=before_pid)): raise RuntimeError('post-install assertions failed')
     else:
