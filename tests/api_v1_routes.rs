@@ -413,7 +413,7 @@ async fn status_separates_database_from_service_and_version_is_real_binary() {
     );
 }
 #[tokio::test]
-async fn production_router_fails_closed_and_preserves_legacy_responses() {
+async fn production_router_reads_empty_store_and_preserves_legacy_responses() {
     let app = server::router(
         chat_hub::store::Store::in_memory().unwrap(),
         "secret".into(),
@@ -430,15 +430,16 @@ async fn production_router_fails_closed_and_preserves_legacy_responses() {
         get(&app, "/api/conversations/missing").await,
         (StatusCode::NOT_FOUND, json!({"error":"not found"}))
     );
-    for uri in [
-        "/api/v1/conversations",
-        "/api/v1/search?q=foo",
-        "/api/v1/conversations/missing",
-    ] {
+    for uri in ["/api/v1/conversations", "/api/v1/search?q=foo"] {
         let (status, body) = get(&app, uri).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["code"], "service_unavailable");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(body["next_cursor"], Value::Null);
     }
+    assert_eq!(
+        get(&app, "/api/v1/conversations/missing").await.0,
+        StatusCode::NOT_FOUND
+    );
     let (status, diagnostics) = get(&app, "/api/v1/status").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(diagnostics["service"]["code"], "readiness_unknown");

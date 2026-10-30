@@ -1,7 +1,6 @@
 //! API v1 projection and routing. ReadAdapter owns transactional snapshot reads;
 //! this module owns HTTP, keyset paging, and view-only graph selection. The
-//! production adapter supports real status/version reads; library reads remain
-//! unavailable until bounded transactional Store methods are connected.
+//! production adapter uses bounded Store snapshots and actual DB/lifecycle facts.
 
 use super::authorized;
 use axum::{
@@ -156,24 +155,73 @@ pub(super) fn store_reader(
 impl ReadAdapter for StoreReader {
     fn list_page_snapshot(
         &mut self,
-        _: usize,
-        _: Option<&ListKey>,
-        _: Option<i64>,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
     ) -> Result<ListPageSnapshot, ReadError> {
-        // Deliberately unavailable until bounded F1 reads can be connected.
-        Err(ReadError::Unavailable)
+        let after = after.map(|key| crate::store::ListKey {
+            updated_at_ms: key.updated_at_ms,
+            id: key.id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .list_page_snapshot(limit, after.as_ref(), expected_revision)
+            .map_err(store_read_error)?;
+        Ok(ListPageSnapshot {
+            library_revision: snapshot.library_revision,
+            items: snapshot
+                .items
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
     }
     fn search_page_snapshot(
         &mut self,
-        _: &str,
-        _: usize,
-        _: Option<&SearchKey>,
-        _: Option<i64>,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
     ) -> Result<SearchPageSnapshot, ReadError> {
-        Err(ReadError::Unavailable)
+        let after = after.map(|key| crate::store::SearchKey {
+            score: key.score,
+            conversation_id: key.conversation_id.clone(),
+            node_id: key.node_id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .search_page_snapshot(query, limit, after.as_ref(), expected_revision)
+            .map_err(store_read_error)?;
+        Ok(SearchPageSnapshot {
+            library_revision: snapshot.library_revision,
+            hits: snapshot
+                .hits
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
     }
-    fn detail_snapshot(&mut self, _: &str) -> Result<DetailSnapshot, ReadError> {
-        Err(ReadError::Unavailable)
+    fn detail_snapshot(&mut self, canonical_id: &str) -> Result<DetailSnapshot, ReadError> {
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .detail_snapshot(canonical_id)
+            .map_err(store_read_error)?;
+        Ok(DetailSnapshot {
+            library_revision: snapshot.library_revision,
+            conversation: snapshot
+                .conversation
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
     }
     fn diagnostics(&mut self) -> Result<Diagnostics, ReadError> {
         let service = self
@@ -224,8 +272,14 @@ struct ApiState {
     import_ops: Arc<Semaphore>,
 }
 
-/// Explicit adapter injection for route tests and the eventual F1 integration.
-/// The production adapter currently supports only actual status/version reads.
+fn store_read_error(error: crate::error::Error) -> ReadError {
+    match error {
+        crate::error::Error::ReadBudgetExceeded { .. } => ReadError::BudgetExceeded,
+        _ => ReadError::Unavailable,
+    }
+}
+
+/// Explicit adapter injection for route tests.
 pub fn router(reader: Box<dyn ReadAdapter>, token: String) -> Router {
     routes(
         Arc::from(token),
@@ -901,6 +955,46 @@ mod tests {
         assert_eq!(permits.available_permits(), 0);
         release.send(()).unwrap();
         let _released = permits.acquire().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_store_null_time_cursor_does_not_restart_known_time_rows() {
+        let mut store = crate::store::Store::in_memory().unwrap();
+        let docs: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/chatgpt-export/array.json"
+        ))
+        .unwrap();
+        crate::importer::import_chatgpt(&mut store, &serde_json::to_vec(&docs).unwrap()).unwrap();
+        let revision = store.library_revision().unwrap();
+        let token = encode_cursor(
+            "list",
+            None,
+            revision,
+            Key::List {
+                updated_at_ms: None,
+                id: "already-passed-null-row".into(),
+            },
+        )
+        .unwrap();
+        let app = super::super::router(store, "secret".into());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/conversations?cursor={token}"))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(page["items"], json!([]));
+        assert_eq!(page["next_cursor"], Value::Null);
+        assert_eq!(page["library_revision"], revision);
     }
 
     #[test]

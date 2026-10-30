@@ -180,8 +180,7 @@ fn build_router(
         db_ops: Arc::new(Semaphore::new(MAX_DB_OPS)),
         identity,
     };
-    // Status/version use real DB/lifecycle facts; library reads still fail
-    // closed until F1's bounded transactional adapter is connected.
+    // Share bounded Store reads and actual DB/lifecycle diagnostics with API v1.
     let reader = api_v1::store_reader(state.store.clone(), readiness);
     let v1 = api_v1::routes(
         state.token.clone(),
