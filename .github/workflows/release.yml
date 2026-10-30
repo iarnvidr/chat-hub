@@ -53,8 +53,96 @@ jobs:
           PY
       - name: Install locked frontend dependencies
         run: npm ci
+      - name: Early production Tauri compile gate
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin
+      - name: Early native-smoke Tauri compile gate
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin --features native-smoke
       - name: Build ad-hoc Apple Silicon Tauri app (not notarized; no Apple account)
         run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
+      - name: Required startup and authenticated health smoke
+        env:
+          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
+        run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
+      - name: Prepare allowlisted release and native smoke evidence
+        if: always()
+        run: python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence"
+      - name: Upload required smoke diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chat-hub-release-smoke-evidence
+          path: |
+            ${{ runner.temp }}/chat-hub-safe-evidence/**
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Resolve native-smoke Cargo artifact path
+        id: native-smoke-artifact
+        run: |
+          set -euo pipefail
+          binary="$(python3 build/native_smoke_artifact.py src-tauri/Cargo.toml)"
+          test -n "$binary"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+      - name: Required native-smoke feature compilation
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
+      - name: Build native-smoke binary for required launch harness
+        run: cargo build --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
+      - name: Prepare isolated debug bundle for required launch harness
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app"
+          mkdir -p "$(dirname "$app")"
+          ditto "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$app"
+          exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          binary="${{ steps.native-smoke-artifact.outputs.binary }}"
+          test -x "$binary"
+          cp "$binary" "$app/Contents/MacOS/$exe"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "$exe"
+          cmp -s "$binary" "$app/Contents/MacOS/$exe"
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+      - name: Required native UI, health, update status, relaunch, and shutdown smoke
+        env:
+          HOME: ${{ runner.temp }}/chat-hub-launch-home
+          NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-launch-evidence
+        run: |
+          set -uo pipefail
+          final_rc=1
+          for attempt in 1 2; do
+            evidence="$RUNNER_TEMP/chat-hub-native-launch-evidence/attempt-$attempt"
+            set +e
+            bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$evidence" basic
+            rc=$?
+            set -e
+            echo "Required native launch smoke attempt $attempt exit code: $rc; evidence: $evidence" | tee -a "$GITHUB_STEP_SUMMARY"
+            final_rc=$rc
+            if [ "$rc" -eq 0 ]; then break; fi
+          done
+          exit "$final_rc"
+      - name: Advisory provider proxy capture and denial smoke (debug bundle)
+        continue-on-error: true
+        env:
+          HOME: ${{ runner.temp }}/chat-hub-provider-home
+          NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-provider-evidence
+        run: |
+          set +e
+          bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-provider-evidence" full
+          rc=$?
+          echo "::warning::Advisory provider proxy capture/denial smoke exited $rc; provider interception is not yet verified on macOS."
+          echo "Provider proxy capture/denial advisory exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+      - name: Prepare allowlisted native launch and updater evidence
+        if: always()
+        run: python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-native-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence"
+      - name: Upload allowlisted native launch and updater evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chat-hub-native-smoke-evidence
+          path: ${{ runner.temp }}/chat-hub-safe-native-evidence/**
+          if-no-files-found: warn
+          retention-days: 30
       - name: Create updater archive, sign and verify
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

@@ -11,6 +11,9 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::mpsc;
+mod crash_diagnostics;
+mod window_policy;
+use window_policy::MainWindowOwnership;
 #[cfg(target_os = "macos")]
 mod trust_mac;
 
@@ -34,6 +37,7 @@ struct UpdateStatus {
     status: String,
     message: String,
 }
+#[allow(dead_code)] // Used only when the native-smoke feature is enabled.
 fn smoke() -> bool {
     cfg!(all(feature = "native-smoke", debug_assertions))
         && std::env::args().any(|a| a == "--native-ui-smoke")
@@ -44,7 +48,7 @@ fn smoke() -> bool {
 mod e2e {
     use serde_json::{json, Value};
     use std::{path::PathBuf, time::Duration};
-    use tauri::{Manager, WebviewWindow};
+    use tauri::Manager;
     fn dir() -> Option<PathBuf> {
         if !cfg!(debug_assertions) || !super::smoke() {
             return None;
@@ -54,7 +58,20 @@ mod e2e {
     fn respond(d: &std::path::Path, id: &str, v: &Value) {
         let p = d.join(format!("{id}.res.json"));
         let t = d.join(format!("{id}.res.json.tmp"));
-        if std::fs::write(&t, v.to_string()).is_ok() {
+        if let Err(e) = std::fs::write(&t, v.to_string()) {
+            eprintln!("native E2E response write failed id={id}: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&t, &p) {
+            eprintln!("native E2E response publish failed id={id}: {e}");
+            let _ = std::fs::remove_file(t);
+        }
+    }
+    fn progress(d: &std::path::Path, id: &str, stage: &str, detail: Value) {
+        let value = json!({"id":id,"stage":stage,"detail":detail});
+        let p = d.join(format!("{id}.diag.json"));
+        let t = d.join(format!("{id}.diag.json.tmp"));
+        if std::fs::write(&t, value.to_string()).is_ok() {
             let _ = std::fs::rename(t, p);
         }
     }
@@ -86,13 +103,132 @@ mod e2e {
                 {
                     continue;
                 }
-                let result = run(&app, &c);
+                progress(&d, &id, "dispatch", json!({"op":c["op"]}));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(&app, &c, &d, &id)
+                }))
+                .unwrap_or_else(|_| json!({"ok":false,"error":"native E2E operation panicked"}));
+                progress(&d, &id, "response", json!({"ok":result["ok"]}));
                 respond(&d, &id, &result);
             }
         });
     }
-    fn run(app: &tauri::AppHandle, c: &Value) -> Value {
+    fn run(app: &tauri::AppHandle, c: &Value, d: &std::path::Path, id: &str) -> Value {
         match c["op"].as_str().unwrap_or("") {
+            "provider_denial" => {
+                let w = app.get_webview_window("provider");
+                let Some(w) = w else {
+                    return json!({"ok":false,"error":"provider webview missing"});
+                };
+                if !super::smoke() {
+                    return json!({"ok":false,"error":"native smoke automation disabled"});
+                }
+                // The provider webview is created during setup and may not yet
+                // have committed its initial navigation when the driver asks.
+                // Wait for the real expected origin and a live JS context, bounded
+                // so an actual navigation failure has useful diagnostics.
+                // Keep the entire two-phase operation inside the Python driver's 40s IPC
+                // deadline, leaving time to publish a response even on a stalled WebView.
+                let operation_deadline = std::time::Instant::now() + Duration::from_secs(28);
+                let ready_deadline =
+                    operation_deadline.min(std::time::Instant::now() + Duration::from_secs(10));
+                let mut readiness = json!({"href":null,"readyState":null,"windowLabel":w.label()});
+                let mut readiness_polls = 0u64;
+                loop {
+                    readiness_polls += 1;
+                    progress(
+                        d,
+                        id,
+                        "provider_readiness",
+                        json!({"polls":readiness_polls,"href":readiness["href"],"readyState":readiness["readyState"]}),
+                    );
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    if w.eval_with_callback("JSON.stringify({href:location.href,readyState:document.readyState,label:window.__TAURI_INTERNALS__?'tauri':'no-tauri'})", move |v| { let _ = tx.send(v); }).is_ok() {
+                        if let Ok(Ok(value)) = rx.recv_timeout(Duration::from_secs(1)).map(|v| serde_json::from_str::<Value>(&v)) {
+                            if let Some(parsed) = value.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                                readiness = parsed;
+                                if readiness["href"].as_str().is_some_and(|h| tauri::Url::parse(h).ok().is_some_and(|u| crate::window_policy::is_provider_origin(u.scheme(), u.host_str(), u.port(), u.username(), u.password()))) && readiness["readyState"].as_str().is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if std::time::Instant::now() >= ready_deadline {
+                        return json!({"ok":false,"error":"provider webview readiness timed out","readiness":readiness,"polls":readiness_polls,"deadline_ms":28000});
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                progress(
+                    d,
+                    id,
+                    "provider_probe_started",
+                    json!({"href":readiness["href"],"readyState":readiness["readyState"]}),
+                );
+                let nonce = format!(
+                    "{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                );
+                let key = format!("__chatHubDenialProbe_{}", nonce);
+                let escaped_key =
+                    serde_json::to_string(&key).unwrap_or_else(|_| "\"invalid\"".into());
+                let start = format!("(()=>{{const k={escaped_key};const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke!==\"function\"){{window[k]={{nonce:{escaped_key},attempted:false,error:\"invoke unavailable\"}};return}};window[k]={{nonce:{escaped_key},pending:true}};Promise.resolve().then(()=>invoke(\"service_info\")).then(()=>{{window[k]={{nonce:{escaped_key},attempted:true,denied:false}}}},e=>{{window[k]={{nonce:{escaped_key},attempted:true,denied:true,error:String(e).slice(0,120)}}}})}})()");
+                if let Err(e) = w.eval(start) {
+                    return json!({"ok":false,"error":format!("provider probe start failed: {e}")});
+                }
+                let deadline = operation_deadline;
+                let mut probe_polls = 0u64;
+                loop {
+                    probe_polls += 1;
+                    progress(
+                        d,
+                        id,
+                        "provider_probe_poll",
+                        json!({"polls":probe_polls,"remaining_ms":deadline.saturating_duration_since(std::time::Instant::now()).as_millis()}),
+                    );
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let poll = format!("window[{escaped_key}]||null");
+                    if let Err(e) = w.eval_with_callback(poll, move |value| {
+                        let _ = tx.send(value);
+                    }) {
+                        return json!({"ok":false,"error":format!("provider probe poll failed: {e}")});
+                    }
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
+                        Ok(value) => {
+                            let decoded = serde_json::from_str::<Value>(&value).ok();
+                            let result = decoded.as_ref().and_then(|v| {
+                                v.as_str()
+                                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                    .or_else(|| Some(v.clone()))
+                            });
+                            if let Some(result) = result {
+                                if result["nonce"].as_str() != Some(&key) {
+                                    continue;
+                                }
+                                if result["attempted"].as_bool() == Some(false) {
+                                    return json!({"ok":false,"error":result["error"].as_str().unwrap_or("invoke unavailable")});
+                                }
+                                if result["attempted"].as_bool() == Some(true) {
+                                    let denied = result["denied"].as_bool() == Some(true);
+                                    return json!({"ok":denied,"denied":denied,"category":result["error"].as_str().unwrap_or("")});
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(_) => {
+                            return json!({"ok":false,"error":"provider probe callback disconnected"})
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return json!({"ok":false,"error":"timed out waiting for provider service_info result","href":readiness["href"],"readyState":readiness["readyState"],"polls":probe_polls});
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             "state" => {
                 let window = app.get_webview_window("main");
                 json!({"ok":true,"process_id":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"executable_path":std::env::current_exe().ok().map(|p|p.to_string_lossy().into_owned()),"window_visible":window.and_then(|w|w.is_visible().ok()).unwrap_or(false)})
@@ -113,7 +249,6 @@ mod e2e {
             _ => json!({"ok":false,"error":"unknown operation"}),
         }
     }
-    #[tauri::command]
     pub fn e2e_result(id: String, value: String) -> Result<(), String> {
         let Some(d) = dir() else {
             return Err("automation disabled".into());
@@ -129,24 +264,51 @@ mod e2e {
         Ok(())
     }
 }
+fn authorize_local_main(window: &tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("privileged command is restricted to the main application window".into());
+    }
+    // The label alone is not authority: only the native packaged-main builder
+    // can register this process-local ownership token, and destruction revokes it.
+    // Do not call WebviewWindow::url(): WKURL can be nil during macOS startup.
+    let ownership = window.app_handle().state::<MainWindowOwnership>();
+    // Authorization performs an Ordering::Acquire load paired with build registration.
+    if !ownership.is_authorized(window.label()) {
+        return Err("privileged command requires the live native main window".into());
+    }
+    Ok(())
+}
 #[tauri::command]
-fn update_status(s: State<'_, AppState>) -> UpdateStatus {
-    s.updater.lock().unwrap().clone()
+fn update_status(
+    window: tauri::WebviewWindow,
+    s: State<'_, AppState>,
+) -> Result<UpdateStatus, String> {
+    authorize_local_main(&window)?;
+    Ok(s.updater.lock().map_err(|e| e.to_string())?.clone())
 }
 #[cfg(feature = "native-smoke")]
 #[tauri::command]
-fn e2e_result(id: String, value: String) -> Result<(), String> {
+fn e2e_result(window: tauri::WebviewWindow, id: String, value: String) -> Result<(), String> {
+    authorize_local_main(&window)?;
     e2e::e2e_result(id, value)
 }
 #[tauri::command]
-fn service_info(s: State<'_, AppState>) -> serde_json::Value {
-    serde_json::json!({"service":APP_NAME,"version":env!("CARGO_PKG_VERSION"),"api":s.api,"proxy":s.proxy,"process_id":std::process::id(),"executable":std::env::current_exe().ok()})
+fn service_info(
+    window: tauri::WebviewWindow,
+    s: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    Ok(
+        serde_json::json!({"service":APP_NAME,"version":env!("CARGO_PKG_VERSION"),"api":s.api,"proxy":s.proxy,"process_id":std::process::id(),"executable":std::env::current_exe().ok()}),
+    )
 }
 #[tauri::command]
 async fn check_for_updates(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UpdateStatus, String> {
+    authorize_local_main(&window)?;
     #[cfg(feature = "native-smoke")]
     if smoke() {
         let mut s = state.updater.lock().map_err(|e| e.to_string())?;
@@ -155,13 +317,26 @@ async fn check_for_updates(
     }
     use tauri_plugin_updater::UpdaterExt;
     #[cfg(feature = "native-smoke")]
-    let updater = if smoke() {
-        updater_builder(&app)?
+    let updater_result = if smoke() {
+        updater_builder(&app)
     } else {
-        app.updater().map_err(|e| e.to_string())?
+        app.updater().map_err(|e| e.to_string())
     };
     #[cfg(not(feature = "native-smoke"))]
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater_result = app.updater().map_err(|e| e.to_string());
+    let updater = match updater_result {
+        Ok(updater) => updater,
+        Err(message) => {
+            let status = UpdateStatus {
+                version: env!("CARGO_PKG_VERSION").into(),
+                channel: "stable".into(),
+                status: "error".into(),
+                message: message.clone(),
+            };
+            *state.updater.lock().map_err(|e| e.to_string())? = status;
+            return Err(message);
+        }
+    };
     let result = updater.check().await;
     match result {
         Ok(Some(update)) => {
@@ -205,24 +380,22 @@ fn updater_builder(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updat
         std::env::var("MUNINN_UPDATER_SMOKE_ENDPOINT").map_err(|_| "missing smoke endpoint")?;
     let pubkey =
         std::env::var("MUNINN_UPDATER_SMOKE_PUBKEY").map_err(|_| "missing smoke public key")?;
-    let current = std::env::var("MUNINN_UPDATER_SMOKE_CURRENT_VERSION")
-        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
-    let endpoint = url::Url::parse(&endpoint).map_err(|e| e.to_string())?;
+    let endpoint = tauri::Url::parse(&endpoint).map_err(|e| e.to_string())?;
     app.updater_builder()
         .endpoints(vec![endpoint])
         .map_err(|e| e.to_string())?
         .pubkey(pubkey)
-        .version_comparator(move |_, release| {
-            semver::Version::parse(&release.version)
-                .ok()
-                .zip(semver::Version::parse(&current).ok())
-                .is_some_and(|(r, c)| r > c)
-        })
+        .version_comparator(|current, release| release.version > current)
         .build()
         .map_err(|e| e.to_string())
 }
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn install_update(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    authorize_local_main(&window)?;
     let pending = state
         .pending_update
         .lock()
@@ -300,19 +473,45 @@ fn persistent_token(path: &std::path::Path) -> Result<String, String> {
     }
     Ok(token)
 }
-#[tokio::main]
-async fn main() {
+fn main() {
+    crash_diagnostics::install();
     let updater_builder = tauri_plugin_updater::Builder::new();
     let builder = tauri::Builder::default().plugin(updater_builder.build());
     let builder = builder.setup(|app| {
-        let dir = app.path().app_data_dir()?;
+        let dir = {
+            #[cfg(feature = "native-smoke")]
+            {
+                if smoke() {
+                    if let Some(path) = std::env::var_os("MUNINN_E2E_DATA_DIR") {
+                        PathBuf::from(path)
+                    } else {
+                        app.path().app_data_dir()?
+                    }
+                } else {
+                    app.path().app_data_dir()?
+                }
+            }
+            #[cfg(not(feature = "native-smoke"))]
+            {
+                app.path().app_data_dir()?
+            }
+        };
         std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         let token = persistent_token(&dir).map_err(std::io::Error::other)?;
         let db = dir.join("chat-hub.sqlite3");
         let ca = dir.join("ca");
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(128);
         let store = Arc::new(Mutex::new(
-            Store::open(db.to_str().unwrap()).map_err(std::io::Error::other)?,
+            Store::open(
+                db.to_str()
+                    .ok_or_else(|| std::io::Error::other("database path is not valid UTF-8"))?,
+            )
+            .map_err(std::io::Error::other)?,
         ));
         let ingest = store.clone();
         tauri::async_runtime::spawn(async move {
@@ -368,6 +567,48 @@ async fn main() {
         });
         #[cfg(feature = "native-smoke")]
         e2e::start(app.handle().clone());
+        // Disable Tauri's automatic window creation: the configured main window
+        // must be created only through this validated native builder.
+        let mut main_config = app
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|w| w.label == "main")
+            .ok_or_else(|| std::io::Error::other("missing configured main window"))?
+            .clone();
+        if !matches!(main_config.url, tauri::utils::config::WebviewUrl::App(_)) {
+            return Err(std::io::Error::other("main window must use packaged app URL").into());
+        }
+        main_config.create = false;
+        let main_ownership = MainWindowOwnership::new();
+        app.manage(main_ownership.clone());
+        let main = tauri::WebviewWindowBuilder::from_config(app, &main_config)?
+            .on_navigation(|url| {
+                window_policy::allows_origin(
+                    url.scheme(),
+                    url.host_str(),
+                    url.port(),
+                    url.username(),
+                    url.password(),
+                )
+            })
+            .build()
+            .map_err(|error| {
+                eprintln!("main webview setup failed: {error}");
+                error
+            })?;
+        main.on_window_event({
+            let ownership = main_ownership.clone();
+            move |event| {
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    ownership.revoke();
+                }
+            }
+        });
+        // Registration follows successful construction only; JS cannot create or
+        // impersonate this native process-local ownership token.
+        main_ownership.register_after_build();
         #[cfg(target_os = "macos")]
         {
             let proxy_url = format!("http://{}", proxy.addr);
@@ -375,10 +616,14 @@ async fn main() {
             let provider = tauri::WebviewWindowBuilder::new(
                 app,
                 "provider",
-                tauri::WebviewUrl::External("https://chatgpt.com".parse().unwrap()),
+                tauri::WebviewUrl::External(
+                    "https://chatgpt.com"
+                        .parse()
+                        .map_err(std::io::Error::other)?,
+                ),
             )
             .title("Provider")
-            .proxy_url(proxy_url.parse().unwrap())
+            .proxy_url(proxy_url.parse().map_err(std::io::Error::other)?)
             .build()?;
             crate::trust_mac::prepare(&ca_der, &provider);
         }

@@ -1,0 +1,5 @@
+# Native smoke evidence handling
+
+CI uploads only `chat-hub-safe-evidence`, produced by `prepare-native-evidence.py` from explicitly named diagnostic files. The sanitizer never follows symlinks, enumerates arbitrary files for copying, or reads certificate/private-key, token, cookie, environment-dump, or credential files. Structured JSON retains only recognized smoke assertions and identity/version fields; unknown and secret-like keys are dropped. Logs are restricted to named diagnostic logs and redacted for common credential patterns; screenshots are limited to named PNG captures with PNG signature and size checks. The original temporary evidence trees remain local to the runner and are not upload inputs.
+
+The native smoke creates an ephemeral test CA and service token for its isolated synthetic fixture. They are test-only credentials, not product secrets; their source files are excluded from artifact staging and are cleaned with the temporary harness directory. This filtering protects artifact distribution; it does not establish that any hypothesized native IPC sleep/wake cause is fixed.

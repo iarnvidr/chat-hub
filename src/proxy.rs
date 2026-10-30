@@ -5,6 +5,10 @@ use hyper::body::Bytes;
 use hyper::{body::Incoming, Request, Response};
 use hyper_util::rt::TokioIo;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+
+fn rustls_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -161,7 +165,9 @@ async fn client(
     let key = rustls_pemfile::private_key(&mut key.as_bytes())
         .map_err(std::io::Error::other)?
         .ok_or(std::io::ErrorKind::InvalidData)?;
-    let cfg = rustls::ServerConfig::builder()
+    let cfg = rustls::ServerConfig::builder_with_provider(rustls_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(std::io::Error::other)?;
@@ -178,7 +184,9 @@ async fn client(
     } else {
         r.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     }
-    let mut cc = rustls::ClientConfig::builder()
+    let mut cc = rustls::ClientConfig::builder_with_provider(rustls_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
         .with_root_certificates(r)
         .with_no_client_auth();
     cc.alpn_protocols = vec![b"http/1.1".to_vec()];

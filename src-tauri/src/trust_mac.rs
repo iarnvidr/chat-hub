@@ -10,7 +10,7 @@ use tauri::WebviewWindow;
 static CA_DER: OnceLock<Vec<u8>> = OnceLock::new();
 extern "C" {
     fn object_getClass(obj: *const c_void) -> *const c_void;
-    fn sel_registerName(name: *const c_char) -> *const c_void;
+    fn sel_registerName(name: *const c_char) -> *mut c_void;
     fn class_addMethod(
         cls: *const c_void,
         name: *const c_void,

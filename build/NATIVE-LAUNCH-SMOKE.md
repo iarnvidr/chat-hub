@@ -1,0 +1,3 @@
+# Required native launch smoke
+
+`native-launch-smoke.sh APP [evidence-dir]` runs only on Apple Silicon macOS and must be given the isolated, `native-smoke`-feature debug executable copied into the real packaged app bundle. It exercises the actual WKWebView DOM and gated IPC `service_info`, authenticated `/api/health` using the token in private app data (token is never emitted), 15-second survival, a real screenshot, full-bundle Launch Services reopen, graceful AppleScript quit, and listener closure. `native-launch-result.json` contains non-secret evidence. This gate does not claim synthetic TLS interception or provider-denial coverage; those require a separate provider-fixture task.

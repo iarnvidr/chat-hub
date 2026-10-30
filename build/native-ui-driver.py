@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise update controls in the actual app window using its gated Tauri IPC."""
-import json, os, pathlib, plistlib, subprocess, sys, time
+import json, os, pathlib, plistlib, subprocess, sys, time, traceback
 app, evidence = map(pathlib.Path, sys.argv[1:3])
 evidence.mkdir(parents=True, exist_ok=True)
 e2e = pathlib.Path(os.environ['MUNINN_E2E_DIR'])
@@ -25,9 +25,16 @@ def bridge(op, **fields):
                     continue
                 return value.get('value', value)
             time.sleep(.1)
-        raise RuntimeError(f'native E2E {op} IPC timed out')
+        diag=e2e/f'{ident}.diag.json'
+        try:
+            progress=json.loads(diag.read_text()) if diag.exists() else {'stage':'unavailable','reason':'native side-channel not published'}
+            if diag.exists(): (evidence/f'{ident}.diag.json').write_text(json.dumps(progress,sort_keys=True))
+        except (OSError,ValueError) as exc: progress={'stage':'unreadable','reason':str(exc)}
+        raise RuntimeError(f'native E2E {op} IPC timed out; request={ident}; progress={progress!r}')
     finally:
         cmd.unlink(missing_ok=True); result.unlink(missing_ok=True)
+        # Preserve progress metadata in evidence; the temporary directory is private and cleaned on exit.
+
 
 record={'app': str(app), 'binary': str(binary)}
 try:
@@ -52,16 +59,20 @@ try:
     if not shot.is_file() or shot.stat().st_size<1000: raise RuntimeError('native screenshot missing or empty')
     record['screenshot']=str(shot)
     js=pathlib.Path(__file__).with_name('native-ui-interactions.js').read_text()
-    expression='(async()=>{'+js+'})()'
-    result=bridge('eval', js='return await ('+expression+');')
+    # The automation wrapper runs an async function body; the interaction file
+    # itself is an IIFE expression, so explicitly return its value to IPC.
+    result=bridge('eval', js='return await ('+js.strip().rstrip(';')+');')
     if not isinstance(result,dict) or result.get('clicked') is not True or not result.get('version') or not result.get('message'):
         raise RuntimeError(f'update UI assertion failed: {result!r}')
     record['interaction']=result
+    # Native callback returns only after the actual provider invoke rejects.
+    denial=bridge('provider_denial')
+    if denial.get('denied') is not True: raise RuntimeError(f'provider service_info was not denied: {denial!r}')
+    record['provider_denial']=denial
     record['passed']=True
 except Exception as exc:
-    record.update(passed=False,error=f'{type(exc).__name__}: {exc}')
-    print(record['error'],file=sys.stderr)
-    sys.exit(1)
+    record.update(passed=False,error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc())
+    print(record['traceback'],file=sys.stderr,flush=True)
 finally:
     (evidence/'native-ui-result.json').write_text(json.dumps(record,sort_keys=True,indent=2)+'\n')
     if proc is not None and proc.poll() is None:

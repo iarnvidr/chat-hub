@@ -10,8 +10,16 @@
   while (Date.now() < deadline) {
     const text = message.textContent || '';
     if (text.startsWith('Update check failed:') || text === 'No update available' || text === 'Update available') {
+      // Failed checks return a rejected IPC promise, but update_status retains
+      // the authoritative native error status/message. Compare the rendered
+      // failure prefix to that state without requiring the DOM to expose raw
+      // platform error details verbatim.
       const state = await window.ChatHub.invoke('update_status');
-      if (!state || !state.version || !text.includes(state.message)) throw new Error('update DOM does not match native IPC state');
+      const matches = state && state.version && (
+        (state.status === 'error' && text === `Update check failed: ${state.message}`) ||
+        (state.status !== 'error' && text === state.message)
+      );
+      if (!matches) throw new Error(`update DOM does not match native IPC state: ${JSON.stringify({text, state})}`);
       return {clicked: true, message: text, version: version.textContent, state};
     }
     await new Promise(resolve => setTimeout(resolve, 100));

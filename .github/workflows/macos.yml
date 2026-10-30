@@ -27,10 +27,18 @@ jobs:
           key: chat-hub-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build/tools.lock.json', 'build/ffmpeg_lgpl.py') }}
       - name: Install helper build tools
         run: brew install meson ninja pkgconf
-      - name: Select the pinned Rust toolchain
-        run: rustup show active-toolchain
+      - name: Select the pinned Rust toolchain and preserve real homes for isolated smoke steps
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
       - name: Install locked frontend dependencies
         run: npm ci
+      - name: Early production Tauri compile gate
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin
+      - name: Early native-smoke Tauri compile gate
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin --features native-smoke
       - name: Build real Tauri app, ad-hoc signed (not notarized)
         run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
       - name: Build and mount-verify the DMG with corresponding sources
@@ -39,48 +47,95 @@ jobs:
           python3 build/release_sources.py prepare "$RUNNER_TEMP/chat-hub/corresponding-source"
           version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
           bash build/package-dmg.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$RUNNER_TEMP/chat-hub/corresponding-source" "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg"
-      - name: Release app launch and localhost health smoke
-        continue-on-error: true
+      - name: Required release app launch and localhost health smoke
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
+      - name: Resolve native-smoke Cargo artifact path
+        id: native-smoke-artifact
+        run: |
+          set -euo pipefail
+          binary="$(python3 build/native_smoke_artifact.py src-tauri/Cargo.toml)"
+          test -n "$binary"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+      - name: Compile native-smoke feature (required)
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
       - name: Build debug binary for native UI interactions
-        continue-on-error: true
         run: cargo build --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
       - id: prepare-debug-smoke
         name: Prepare isolated debug bundle for native smokes
-        continue-on-error: true
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app"
           mkdir -p "$(dirname "$app")"
           ditto "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$app"
           exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
-          debug_binary="${CARGO_TARGET_DIR:-target}/aarch64-apple-darwin/debug/chat-hub-desktop"
+          debug_binary="${{ steps.native-smoke-artifact.outputs.binary }}"
           test -x "$debug_binary"
           cp "$debug_binary" "$app/Contents/MacOS/$exe"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "$exe"
+          cmp -s "$debug_binary" "$app/Contents/MacOS/$exe"
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
       - id: updater-smoke
-        continue-on-error: true
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         name: Native signed updater integration smoke (debug bundle)
         env:
           MUNINN_UPDATER_SMOKE_APP: ${{ runner.temp }}/chat-hub-debug-smoke/Chat Hub.app
           MUNINN_UPDATER_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-updater-evidence
         run: bash build/updater-smoke/run-macos.sh
-      - name: Native UI interaction smoke (debug bundle only)
+      - name: Required native launch, UI, API, update status, reopen, shutdown smoke (debug bundle)
+        env:
+          HOME: ${{ runner.temp }}/chat-hub-launch-home
+          RUSTUP_HOME: ${{ env.RUSTUP_HOME }}
+          CARGO_HOME: ${{ env.CARGO_HOME }}
+          NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-launch-evidence
+        run: |
+          set -uo pipefail
+          final_rc=1
+          for attempt in 1 2; do
+            evidence="$RUNNER_TEMP/chat-hub-native-launch-evidence/attempt-$attempt"
+            set +e
+            bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$evidence" basic
+            rc=$?
+            set -e
+            echo "Required native launch smoke attempt $attempt exit code: $rc; evidence: $evidence" | tee -a "$GITHUB_STEP_SUMMARY"
+            final_rc=$rc
+            if [ "$rc" -eq 0 ]; then break; fi
+          done
+          exit "$final_rc"
+      - name: Advisory provider proxy capture and denial smoke (debug bundle)
+        continue-on-error: true
+        if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
+        env:
+          HOME: ${{ runner.temp }}/chat-hub-provider-home
+          RUSTUP_HOME: ${{ env.RUSTUP_HOME }}
+          CARGO_HOME: ${{ env.CARGO_HOME }}
+          NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-provider-evidence
+        run: |
+          set +e
+          bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-provider-evidence" full
+          rc=$?
+          echo "::warning::Advisory provider proxy capture/denial smoke exited $rc; provider interception is not yet verified on macOS."
+          echo "Provider proxy capture/denial advisory exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+      - name: Optional updater UI interaction smoke (debug bundle only)
         continue-on-error: true
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         env:
           NATIVE_UI_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-debug-ui-evidence
         run: bash build/native-ui-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-debug-ui-evidence"
+      - name: Prepare allowlisted release and native smoke evidence
+        if: always()
+        run: python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-debug-ui-evidence" "$RUNNER_TEMP/chat-hub-provider-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence"
       - name: Upload release startup evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: chat-hub-macos-release-evidence
-          path: ${{ runner.temp }}/chat-hub-release-evidence/**
+          path: |
+            ${{ runner.temp }}/chat-hub-safe-evidence/**
           if-no-files-found: error
           retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
       - id: upload
@@ -90,14 +145,12 @@ jobs:
           name: chat-hub-macos-arm64
           path: |
             ${{ runner.temp }}/chat-hub/Chat Hub.app/**
+            ${{ runner.temp }}/chat-hub-safe-evidence/**
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip.sha256
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.dmg
             ${{ runner.temp }}/chat-hub/verify-macos.txt
-            ${{ runner.temp }}/chat-hub-release-evidence/**
-            ${{ runner.temp }}/release-evidence/**
-            ${{ runner.temp }}/chat-hub-debug-ui-evidence/**
-            ${{ runner.temp }}/chat-hub-updater-evidence/**
+            ${{ runner.temp }}/chat-hub-safe-evidence/**
           if-no-files-found: error
           # Builds of main stay downloadable for a month; PR builds for a week.
           retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}

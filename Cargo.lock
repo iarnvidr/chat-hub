@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "chat-hub"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "http-body-util",
@@ -229,15 +229,19 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tokio-rustls",
  "tower",
+ "url",
  "webpki-roots 0.26.11",
+ "x509-parser",
 ]
 
 [[package]]

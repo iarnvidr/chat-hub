@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the real ChatHub updater IPC through the gated native eval bridge."""
-import json, os, pathlib, plistlib, subprocess, sys, time
+import json, os, pathlib, plistlib, subprocess, sys, time, traceback
 mode, root_arg, app_arg = sys.argv[1:]
 root, app = pathlib.Path(root_arg), pathlib.Path(app_arg)
 e2e = pathlib.Path(os.environ['MUNINN_E2E_DIR'])
@@ -25,6 +25,10 @@ def bridge(expression, timeout=40):
         raise RuntimeError('native E2E eval bridge timed out')
     finally: command.unlink(missing_ok=True); result.unlink(missing_ok=True)
 def invoke(name,args=None): return bridge('window.ChatHub.invoke('+json.dumps(name)+','+json.dumps(args or {})+')')
+def restart_transport_interrupted(exc):
+    """Only bridge/transport failures can be explained by app.restart() closing IPC."""
+    text=str(exc).lower()
+    return any(token in text for token in ('timed out','timeout','bridge','connection','transport','native e2e'))
 def native_state():
     ident='updater-state-'+str(time.time_ns()); command=e2e/(ident+'.cmd.json'); result=e2e/(ident+'.res.json')
     tmp=command.with_suffix('.tmp'); tmp.write_text(json.dumps({'id':ident,'op':'state','target':'chrome','args':{}})); os.replace(tmp,command)
@@ -38,16 +42,27 @@ def native_state():
             time.sleep(.1)
         raise RuntimeError('native state bridge timed out')
     finally: command.unlink(missing_ok=True); result.unlink(missing_ok=True)
-def launch(): return subprocess.Popen([str(executable(app)),'--native-ui-smoke','--updater-smoke'],env=os.environ.copy(),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-def wait_ready(proc):
-    end=time.monotonic()+90
+def launch():
+    out=open(root/(mode+'.stdout.log'),'w'); err=open(root/(mode+'.stderr.log'),'w')
+    return subprocess.Popen([str(executable(app)),'--native-ui-smoke','--updater-smoke'],env=os.environ.copy(),stdout=out,stderr=err)
+def wait_ready(proc, timeout=20):
+    # A visible native window precedes frontend module initialization. Wait for
+    # the actual application bridge, without replacing it with internal APIs.
+    end=time.monotonic()+timeout
+    last=None
     while time.monotonic()<end:
         if proc.poll() is not None: raise RuntimeError('native app exited prematurely')
         try:
-            s=native_state()
-            if s.get('window_visible'): return s
-        except (RuntimeError,OSError,ValueError): time.sleep(.2)
-    raise RuntimeError('native app state bridge did not become ready')
+            last=native_state()
+            if last.get('window_visible'):
+                try:
+                    evidence=bridge("({ready:typeof window.ChatHub?.invoke==='function',href:location.href,readyState:document.readyState,chatHub:typeof window.ChatHub})",timeout=2)
+                    if isinstance(evidence,dict) and evidence.get('ready'):
+                        return {'native_state':last,'frontend':evidence}
+                except (RuntimeError,OSError,ValueError): pass
+        except (RuntimeError,OSError,ValueError): pass
+        time.sleep(.2)
+    raise RuntimeError(f'actual ChatHub frontend bridge did not become ready within {timeout}s; last native state={last!r}')
 def version(bundle): return plistlib.loads((bundle/'Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString')
 old=json.loads((root/'old.json').read_text())['version']; new=json.loads((root/'new.json').read_text())['version']
 if mode not in ('healthy','tampered'): raise RuntimeError('mode must be healthy or tampered')
@@ -56,19 +71,34 @@ try:
     wait_ready(proc)
     before=native_state(); before_pid=before.get('process_id'); before_exe=before.get('executable_path') or before.get('executable')
     if not isinstance(before_pid,int) or before_pid<=0 or not before_exe: raise RuntimeError(f'pre-install identity missing: {before}')
-    status=invoke('update_status')
-    if not isinstance(status,dict) or not status.get('version'): raise RuntimeError(f'actual app version unavailable: {status}')
-    if mode=='healthy':
-        if status['version'] != old: raise RuntimeError(f'fixture executable version mismatch: expected {old}, got {status["version"]}')
+    # update_status.version is mutable updater state: after a successful check it
+    # intentionally contains the OFFERED target, not the running binary version.
+    # service_info.version comes from this executable's compile-time package metadata.
+    expected_exe=str(executable(app))
+    actual=invoke('service_info')
+    actual_pid=actual.get('process_id') if isinstance(actual,dict) else None
+    actual_exe=actual.get('executable') if isinstance(actual,dict) else None
+    if (not isinstance(actual,dict) or actual_pid != proc.pid or not actual_exe
+            or str(pathlib.Path(actual_exe).resolve()) != expected_exe):
+        raise RuntimeError(f'initial running-process identity mismatch: expected pid={proc.pid}, executable={expected_exe}; service_info={actual}')
+    if mode=='healthy' and actual.get('version') != old:
+        raise RuntimeError(f'fixture executable version mismatch: expected current {old}, got service_info={actual}')
     checked=invoke('check_for_updates',{'includePreviews':False})
     if not isinstance(checked,dict) or checked.get('status')!='available' or checked.get('version')!=new: raise RuntimeError(f'signed update was not offered: {checked}')
     if mode=='healthy':
-        # Native command performs download, signature verification, install and app.restart().
-        try: invoke('install_update')
-        except RuntimeError as exc: raise RuntimeError(f'healthy signed install failed: {exc}')
-        try: proc.wait(timeout=120)
-        except subprocess.TimeoutExpired: raise RuntimeError('updater install did not exit/relaunch')
-        end=time.monotonic()+180; after=None
+        # app.restart() may terminate the IPC bridge before its successful response arrives.
+        # Only classify explicit transport/eval/bridge loss as an interrupted call; success
+        # is established exclusively by process, bundle and plugin postconditions below.
+        install_call='returned'
+        try:
+            invoke('install_update')
+        except RuntimeError as exc:
+            if not restart_transport_interrupted(exc):
+                raise RuntimeError(f'healthy signed install failed: {exc}')
+            install_call='interrupted_during_restart: '+str(exc)[:200]
+        try: proc.wait(timeout=60)
+        except subprocess.TimeoutExpired: raise RuntimeError('updater install did not exit within 60s')
+        end=time.monotonic()+120; after=None
         while time.monotonic()<end:
             try:
                 candidate=native_state()
@@ -79,9 +109,9 @@ try:
         after_pid=after.get('process_id'); after_exe=after.get('executable_path') or after.get('executable')
         expected=str(executable(app))
         if not isinstance(after_pid,int) or after_pid<=0 or not after_exe or str(pathlib.Path(after_exe).resolve())!=expected: raise RuntimeError(f'post-install executable identity mismatch: {after}')
-        post=invoke('update_status')
-        if not isinstance(post,dict) or post.get('version')!=new: raise RuntimeError(f'relaunched application version is not bundled target version: {post}')
-        evidence={'signature_accepted':True,'replacement_installed':version(app)==new,'restart_requested':True,'restart_observed':True,'restart_process_exited':proc.poll() is not None,'restart_identity':{'before_pid':before_pid,'after_pid':after_pid,'expected_executable':expected,'actual_executable':str(pathlib.Path(after_exe).resolve())},'before_version':old,'after_version':post['version']}
+        post=invoke('service_info')
+        if not isinstance(post,dict) or post.get('version')!=new or post.get('process_id')!=after_pid or str(pathlib.Path(post.get('executable','')).resolve())!=expected: raise RuntimeError(f'relaunched application identity/version mismatch: {post}')
+        evidence={'signature_accepted':True,'replacement_installed':version(app)==new,'restart_requested':True,'restart_call':install_call,'restart_observed':True,'restart_process_exited':proc.poll() is not None,'restart_identity':{'before_pid':before_pid,'after_pid':after_pid,'expected_executable':expected,'actual_executable':str(pathlib.Path(after_exe).resolve())},'before_version':actual['version'],'after_version':post['version']}
         (root/'healthy-result.json').write_text(json.dumps(evidence,sort_keys=True)+'\n')
         if not all((evidence['replacement_installed'],evidence['restart_process_exited'],after_pid!=before_pid)): raise RuntimeError('post-install assertions failed')
     else:
@@ -89,15 +119,26 @@ try:
         try: invoke('install_update')
         except RuntimeError as exc: failure=str(exc)
         observed_status=invoke('update_status')
+        # Verify identity from the actual running service, not mutable update_status.
+        retained=invoke('service_info')
         # Trust the backend's classification from the concrete updater Error variant,
         # never substring-match arbitrary error text in this harness.
         rejected=(bool(failure) and isinstance(observed_status,dict)
                   and observed_status.get('status')=='signature_rejected')
         still=version(app)==old
         live=proc.poll() is None
-        evidence={'tamper_rejected':rejected,'tamper_status':{'state':'failed' if rejected else 'unknown','reason':'signature_verification_failed' if rejected else 'unclassified','detail':failure,'backend_status':observed_status.get('status') if isinstance(observed_status,dict) else None},'old_version_retained':still,'app_usable':live}
+        expected_exe=str(executable(app))
+        retained_identity=(isinstance(retained,dict) and retained.get('version')==old
+            and retained.get('process_id')==before_pid==proc.pid
+            and retained.get('executable') and str(pathlib.Path(retained['executable']).resolve())==expected_exe)
+        evidence={'tamper_rejected':rejected,'tamper_status':{'state':'failed' if rejected else 'unknown','reason':'signature_verification_failed' if rejected else 'unclassified','detail':failure,'backend_status':observed_status.get('status') if isinstance(observed_status,dict) else None},'old_version_retained':still,'app_usable':live,'old_running_identity_retained':retained_identity,'before_identity':{'process_id':before_pid,'version':actual.get('version'),'executable':str(pathlib.Path(actual_exe).resolve())},'running_service_info':retained}
         (root/'tampered-result.json').write_text(json.dumps(evidence,sort_keys=True)+'\n')
-        if not all((rejected,still,live)): raise RuntimeError(f'tamper rejection assertions failed: {evidence}')
+        if not all((rejected,still,live,retained_identity)): raise RuntimeError(f'tamper rejection assertions failed: {evidence}')
+except Exception:
+    detail=traceback.format_exc()
+    print(detail,file=sys.stderr,flush=True)
+    (root/(mode+'-failure-traceback.txt')).write_text(detail)
+    raise
 finally:
     if proc.poll() is None: proc.terminate()
     try: proc.wait(timeout=10)
