@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_cursor",
+    "message": "Cursor is invalid for this request."
+  }
+}

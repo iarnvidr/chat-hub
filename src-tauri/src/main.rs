@@ -10,8 +10,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tauri::{Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
 mod crash_diagnostics;
+mod desktop_api;
+mod service_health;
+use service_health::healthy_response;
 mod window_policy;
 use window_policy::MainWindowOwnership;
 #[cfg(target_os = "macos")]
@@ -278,6 +282,111 @@ fn authorize_local_main(window: &tauri::WebviewWindow) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[tauri::command]
+async fn list_conversations(
+    window: tauri::WebviewWindow,
+    s: State<'_, AppState>,
+    query: String,
+    cursor: Option<String>,
+) -> Result<desktop_api::Page, String> {
+    authorize_local_main(&window)?;
+    desktop_api::list(&s.api, &s.token, &query, cursor.as_deref()).await
+}
+#[tauri::command]
+async fn get_conversation(
+    window: tauri::WebviewWindow,
+    s: State<'_, AppState>,
+    id: String,
+    leaf_node_id: Option<String>,
+) -> Result<desktop_api::Detail, String> {
+    authorize_local_main(&window)?;
+    desktop_api::detail(&s.api, &s.token, &id, leaf_node_id.as_deref()).await
+}
+#[tauri::command]
+async fn import_chatgpt_export(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    s: State<'_, AppState>,
+) -> Result<desktop_api::ImportResult, String> {
+    authorize_local_main(&window)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("ChatGPT conversations JSON", &["json"])
+        .pick_file(move |file| {
+            let _ = tx.send(file);
+        });
+    let Some(file) = rx.await.map_err(|_| "file picker unavailable")? else {
+        return Ok(desktop_api::ImportResult {
+            cancelled: true,
+            result: None,
+        });
+    };
+    let path = file.into_path().map_err(|_| "invalid_file")?;
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| "invalid_file")?;
+    if !metadata.file_type().is_file() || metadata.len() > desktop_api::MAX_IMPORT_BYTES as u64 {
+        return Err("file_too_large_or_invalid".into());
+    }
+    let bytes = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let f = std::fs::File::open(path).map_err(|_| "invalid_file")?;
+        let mut b = Vec::with_capacity(metadata.len() as usize);
+        f.take((desktop_api::MAX_IMPORT_BYTES + 1) as u64)
+            .read_to_end(&mut b)
+            .map_err(|_| "invalid_file")?;
+        Ok::<_, &'static str>(b)
+    })
+    .await
+    .map_err(|_| "invalid_file")??;
+    desktop_api::validate_import(&bytes)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "invalid_json")?;
+    let count = if let Some(a) = value.as_array() {
+        a.len()
+    } else {
+        value["conversations"]
+            .as_array()
+            .ok_or("invalid_export")?
+            .len()
+    } as u64;
+    let result = desktop_api::import(&s.api, &s.token, bytes, count).await?;
+    Ok(desktop_api::ImportResult {
+        cancelled: false,
+        result: Some(result),
+    })
+}
+
+#[tauri::command]
+async fn service_health(
+    window: tauri::WebviewWindow,
+    s: State<'_, AppState>,
+) -> Result<ServiceHealth, String> {
+    authorize_local_main(&window)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+        .map_err(|_| "health check unavailable".to_string())?;
+    let response = client
+        .get(format!("{}/api/health", s.api))
+        .bearer_auth(&s.token)
+        .send()
+        .await
+        .map_err(|_| "health check unavailable".to_string())?;
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "health check unavailable".to_string())?;
+    if !healthy_response(status, &body) {
+        return Err("health check unavailable".into());
+    }
+    Ok(ServiceHealth { healthy: true })
+}
+#[derive(Serialize)]
+struct ServiceHealth {
+    healthy: bool,
+}
+
 #[tauri::command]
 fn update_status(
     window: tauri::WebviewWindow,
@@ -476,7 +585,9 @@ fn persistent_token(path: &std::path::Path) -> Result<String, String> {
 fn main() {
     crash_diagnostics::install();
     let updater_builder = tauri_plugin_updater::Builder::new();
-    let builder = tauri::Builder::default().plugin(updater_builder.build());
+    let builder = tauri::Builder::default()
+        .plugin(updater_builder.build())
+        .plugin(tauri_plugin_dialog::init());
     let builder = builder.setup(|app| {
         let dir = {
             #[cfg(feature = "native-smoke")]
@@ -633,6 +744,10 @@ fn main() {
     let result = builder
         .invoke_handler(tauri::generate_handler![
             update_status,
+            list_conversations,
+            get_conversation,
+            import_chatgpt_export,
+            service_health,
             service_info,
             check_for_updates,
             install_update,
@@ -643,6 +758,10 @@ fn main() {
     let result = builder
         .invoke_handler(tauri::generate_handler![
             update_status,
+            list_conversations,
+            get_conversation,
+            import_chatgpt_export,
+            service_health,
             service_info,
             check_for_updates,
             install_update
