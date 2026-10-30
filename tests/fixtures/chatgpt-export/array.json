@@ -1,0 +1,14 @@
+[
+  {
+    "id": "synthetic-export-one",
+    "title": "Synthetic branching export",
+    "create_time": 1700000000,
+    "update_time": 1700000100,
+    "current_node": "right",
+    "mapping": {
+      "root": {"id":"root","parent":null,"children":["left","right"],"message":null},
+      "left": {"id":"left","parent":"root","children":[],"message":{"id":"message-left","author":{"role":"assistant"},"create_time":1700000001,"content":{"content_type":"text","parts":["Alternate synthetic answer"]}}},
+      "right": {"id":"right","parent":"root","children":[],"message":{"id":"message-right","author":{"role":"assistant"},"create_time":1700000002,"content":{"content_type":"multimodal_text","parts":["Selected synthetic answer",{"content_type":"future_part","payload":{"nested":[1,true,null]}}]}}}
+    }
+  }
+]

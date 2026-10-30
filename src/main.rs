@@ -14,6 +14,31 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
+        Some("import") => {
+            let path = args.next().ok_or("usage: chat-hub import <path>")?;
+            if args.next().is_some() {
+                return Err("usage: chat-hub import <path>".into());
+            }
+            let file = std::fs::File::open(path).map_err(|_| "unable to open import input")?;
+            let bytes = chat_hub::importer::read_input(file)?;
+            // Validate before opening the database or creating its data directory.
+            chat_hub::importer::parse_export(&bytes)?;
+            let c = Config::from_env()?;
+            if c.database_path != ":memory:" {
+                if let Some(parent) = std::path::Path::new(&c.database_path)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|_| "unable to create import library directory")?;
+                }
+            }
+            let mut store = chat_hub::store::Store::open(&c.database_path)
+                .map_err(|_| "unable to open import library")?;
+            let receipt = chat_hub::importer::import_chatgpt(&mut store, &bytes)?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(())
+        }
         Some("status") => {
             let c = Config::from_env()?;
             let s = chat_hub::runtime::status(&c).await?;
@@ -59,6 +84,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
-        _ => Err("usage: chat-hub <status|search|read|serve>".into()),
+        _ => Err("usage: chat-hub <status|search|read|serve|import>".into()),
     }
 }
