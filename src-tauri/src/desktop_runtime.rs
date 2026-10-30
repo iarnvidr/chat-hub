@@ -14,7 +14,7 @@ pub struct DesktopRuntime {
     pub ca_dir: std::path::PathBuf,
     handle: ServiceHandle,
     #[allow(dead_code)]
-    database_path: std::path::PathBuf,
+    pub database_path: std::path::PathBuf,
     capture_status: chat_hub::live_capture::CaptureStatus,
     capture: mpsc::Sender<CaptureEvent>,
 }
