@@ -219,6 +219,8 @@ pub async fn start_with_proxy(
         Duration::from_millis(100),
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -228,7 +230,8 @@ async fn start_internal(
     capacity: usize,
     mut proxy_config: ProxyConfig,
     writer_busy_timeout: Duration,
-    #[cfg(test)] writer_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
+    #[cfg(test)] writer_gate: Option<WriterTestGate>,
+    #[cfg(test)] writer_exit: Option<std::sync::mpsc::Sender<()>>,
 ) -> Result<(ServiceHandle, mpsc::Sender<CaptureEvent>), String> {
     if capacity == 0 {
         return Err("capture capacity must be positive".into());
@@ -308,6 +311,8 @@ async fn start_internal(
     let writer = Builder::new()
         .name("capture-ingestion".into())
         .spawn(move || {
+            #[cfg(test)]
+            let _writer_exit = writer_exit.map(WriterExitSignal);
             supervise_writer(
                 || {
                     let mut store = match Store::open(&db) {
@@ -473,6 +478,17 @@ pub fn try_submit(
 }
 
 #[cfg(test)]
+type WriterTestGate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+#[cfg(test)]
+struct WriterExitSignal(std::sync::mpsc::Sender<()>);
+#[cfg(test)]
+impl Drop for WriterExitSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+#[cfg(test)]
 mod deadline_tests {
     use super::*;
 
@@ -496,12 +512,23 @@ mod deadline_tests {
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
         };
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (writer_exit_tx, writer_exit_rx) = std::sync::mpsc::channel();
+        struct ReleaseGate(WriterTestGate);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                let (lock, cv) = &*self.0;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                cv.notify_all();
+            }
+        }
+        let release_gate = ReleaseGate(gate.clone());
         let (handle, tx) = start_internal(
             config,
             2,
             ProxyConfig::loopback(""),
             Duration::from_secs(30),
             Some(gate.clone()),
+            Some(writer_exit_tx),
         )
         .await
         .unwrap();
@@ -539,11 +566,18 @@ mod deadline_tests {
             "{stats:?}"
         );
         // Deadline has returned while writer is explicitly held in-flight by the private gate.
-        let (lock, cv) = &*gate;
-        *lock.lock().unwrap() = true;
-        cv.notify_all();
-        // Give the released writer time to observe abandon_queue and exit before removing files.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Release before waiting for the actual writer-thread exit acknowledgment.
+        drop(release_gate);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if writer_exit_rx.try_recv().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("writer thread did not exit after gate release");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
