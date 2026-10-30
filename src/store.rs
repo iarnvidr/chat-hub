@@ -361,22 +361,35 @@ impl Store {
         }
         if expected_revision.is_none_or(|v| v == revision) {
             let lim = limit.min(101) as i64;
-            let mut st=tx.prepare("SELECT id FROM conversations WHERE (?1 IS NULL OR (updated_at_ms IS NOT NULL AND (updated_at_ms < ?1 OR (updated_at_ms=?1 AND id>?2))) OR (updated_at_ms IS NULL AND ?1 IS NOT NULL)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?3")?;
+            let mut pre=tx.prepare("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE (?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)")?;
+            let source_bytes: i64 = pre.query_row(
+                params![
+                    after.is_none() as i64,
+                    after.and_then(|k| k.updated_at_ms),
+                    after.map(|k| k.id.as_str()).unwrap_or(""),
+                    after.is_some() as i64,
+                    lim
+                ],
+                |r| r.get(0),
+            )?;
+            if (source_bytes.max(0) as usize)
+                .saturating_mul(6)
+                .saturating_add(lim as usize * 256)
+                > 8 * 1024 * 1024 - 64 * 1024
+            {
+                return Err(Error::ReadBudgetExceeded {
+                    kind: "list encoded bytes",
+                    limit: 8 * 1024 * 1024 - 64 * 1024,
+                });
+            }
+            let mut st=tx.prepare("SELECT id,provider,account_scope,source_id,title,updated_at_ms FROM conversations WHERE (?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5")?;
             let ids = st
                 .query_map(
-                    params![
-                        after.and_then(|k| k.updated_at_ms),
-                        after.map(|k| k.id.as_str()).unwrap_or(""),
-                        lim
-                    ],
-                    |r| r.get::<_, String>(0),
+                    params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim],
+                    |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"provider":r.get::<_,String>(1)?,"account_scope":r.get::<_,String>(2)?,"source_id":r.get::<_,String>(3)?,"title":r.get::<_,String>(4)?,"updated_at_ms":r.get::<_,Option<i64>>(5)?})),
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            for id in ids {
-                if let Some(v) = read_normalized_conn(&tx, &id)? {
-                    items.push(v);
-                }
-            }
+            items.extend(ids);
         }
         tx.commit()?;
         Ok(ListPageSnapshot {
@@ -405,7 +418,8 @@ impl Store {
         // Bound source material before constructing the normalized DTO. The 6x allowance
         // covers JSON escaping plus normalized wrappers; serialized output is checked too.
         const RESPONSE_LIMIT: usize = 8 * 1024 * 1024 - 64 * 1024;
-        let bytes: i64 = tx.query_row("SELECT coalesce(sum(length(parts_json)+length(content)+coalesce(length(author_json),0)+coalesce(length(create_time_json),0)),0) FROM graph_nodes WHERE conversation_id=?1", [canonical_id], |r| r.get(0))?;
+        let bytes: i64 = tx.query_row("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))+coalesce(length(CAST(url AS BLOB)),0)+coalesce(length(CAST(current_node AS BLOB)),0)),0) FROM conversations WHERE id=?1", [canonical_id], |r| r.get(0))?;
+        let bytes = bytes.saturating_add(tx.query_row("SELECT coalesce(sum(length(CAST(source_node_id AS BLOB))+coalesce(length(CAST(source_message_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+coalesce(length(CAST(parent_id AS BLOB)),0)+coalesce(length(CAST(role AS BLOB)),0)+coalesce(length(CAST(author_json AS BLOB)),0)+coalesce(length(CAST(create_time_json AS BLOB)),0)+length(CAST(parts_json AS BLOB))+length(CAST(content AS BLOB))),0) FROM graph_nodes WHERE conversation_id=?1", [canonical_id], |r| r.get::<_,i64>(0))?);
         if (bytes.max(0) as usize)
             .saturating_mul(6)
             .saturating_add((count.max(0) as usize).saturating_mul(512))
@@ -486,6 +500,7 @@ impl Store {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let mut cache = std::collections::HashMap::<String, Value>::new();
             let mut total = 0usize;
+            let mut total_bytes = 0usize;
             for (id, node, msg, snip, score) in rows {
                 if !score.is_finite() {
                     continue;
@@ -499,6 +514,17 @@ impl Store {
                         return Err(Error::ReadBudgetExceeded {
                             kind: "search graph nodes",
                             limit: 100_000,
+                        });
+                    }
+                    let bytes:i64=tx.query_row("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))+coalesce(length(CAST(url AS BLOB)),0)+coalesce(length(CAST(current_node AS BLOB)),0)),0) FROM conversations WHERE id=?1",[&id],|r|r.get(0))?;
+                    let bytes=bytes.saturating_add(tx.query_row("SELECT coalesce(sum(length(CAST(source_node_id AS BLOB))+coalesce(length(CAST(source_message_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+coalesce(length(CAST(parent_id AS BLOB)),0)+coalesce(length(CAST(role AS BLOB)),0)+coalesce(length(CAST(author_json AS BLOB)),0)+coalesce(length(CAST(create_time_json AS BLOB)),0)+length(CAST(parts_json AS BLOB))+length(CAST(content AS BLOB))),0) FROM graph_nodes WHERE conversation_id=?1",[&id],|r|r.get::<_,i64>(0))?);
+                    total_bytes = total_bytes
+                        .saturating_add((bytes.max(0) as usize).saturating_mul(6))
+                        .saturating_add((count.max(0) as usize).saturating_mul(512));
+                    if total_bytes > 8 * 1024 * 1024 - 64 * 1024 {
+                        return Err(Error::ReadBudgetExceeded {
+                            kind: "search encoded bytes",
+                            limit: 8 * 1024 * 1024 - 64 * 1024,
                         });
                     }
                     let g = read_normalized_conn(&tx, &id)?.unwrap_or(Value::Null);
@@ -562,7 +588,8 @@ impl Store {
                     node.as_ref()
                         .is_some_and(|n| xs.iter().any(|x| x.as_str() == Some(n)))
                 });
-                hits.push(serde_json::json!({"conversation":{"id":id},"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
+                let summary: Value=tx.query_row("SELECT json_object('id',id,'provider',provider,'account_scope',account_scope,'source_id',source_id,'title',title,'updated_at_ms',updated_at_ms) FROM conversations WHERE id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
+                hits.push(serde_json::json!({"conversation":summary,"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
                 if serde_json::to_vec(&hits).map_or(true, |v| v.len() > 8 * 1024 * 1024 - 64 * 1024)
                 {
                     return Err(Error::ReadBudgetExceeded {
@@ -772,22 +799,28 @@ fn read_normalized_conn(conn: &Connection, id: &str) -> Result<Option<Value>> {
                 .map(|n| n["id"].as_str().unwrap_or("").to_owned())
                 .min()
         });
+    let reason = if selected.is_none() { "empty" } else { reason };
     let mut ancestry = Vec::new();
     let mut cursor = selected.clone();
+    let mut reached_root = selected.is_none() && nodes.is_empty();
     while let Some(c) = cursor {
         if ancestry.contains(&c) {
             ancestry.clear();
             break;
         }
         ancestry.push(c.clone());
-        cursor = nodes
+        let parent = nodes
             .iter()
             .find(|n| n["id"] == c)
-            .and_then(|n| n["parent_id"].as_str().map(str::to_owned))
-            .filter(|parent| nodes.iter().any(|n| n["id"] == *parent));
+            .and_then(|n| n["parent_id"].as_str().map(str::to_owned));
+        if parent.is_none() {
+            reached_root = true;
+        }
+        cursor = parent.filter(|parent| nodes.iter().any(|n| n["id"] == *parent));
     }
+    ancestry.reverse();
     Ok(Some(
-        serde_json::json!({"id":id,"title":title,"provider":provider,"account_scope":scope,"scope":scope,"source_id":source,"url":url,"updated_at_ms":updated,"source_current_node_id":current,"selected_node_id":selected,"selection_reason":reason,"thread_node_ids":ancestry,"thread_complete":(ancestry.is_empty() && nodes.is_empty()) || ancestry.last().is_some_and(|n|nodes.iter().any(|x|x["id"]==*n&&x["parent_id"].is_null())),"nodes":nodes,"messages":messages}),
+        serde_json::json!({"id":id,"title":title,"provider":provider,"account_scope":scope,"scope":scope,"source_id":source,"url":url,"updated_at_ms":updated,"source_current_node_id":current,"selected_node_id":selected,"selection_reason":reason,"thread_node_ids":ancestry,"thread_complete":reached_root,"nodes":nodes,"messages":messages}),
     ))
 }
 

@@ -60,7 +60,7 @@ fn normalized_nodes_messages_parts_and_time_are_distinct() {
     assert_eq!(m["parts"][3]["text"], "tail");
     assert_eq!(m["created_at_ms"], 1234);
     assert_eq!(v["selected_node_id"], "b");
-    assert_eq!(v["thread_node_ids"], json!(["b", "a"]));
+    assert_eq!(v["thread_node_ids"], json!(["a", "b"]));
     assert_eq!(v["thread_complete"], true);
 }
 #[test]

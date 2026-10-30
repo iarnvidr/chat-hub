@@ -77,6 +77,8 @@ fn api_v1_fixtures_replay_through_persisted_store() {
         let (observation, fixture) = replay(scenario);
         let id = store.ingest_observation(&observation).unwrap();
         let actual = store.read_normalized(&id).unwrap().unwrap();
+        let bounded = store.detail_snapshot(&id).unwrap().conversation.unwrap();
+        assert_eq!(bounded, actual);
         let c = &fixture["conversation"];
         assert_eq!(actual["id"], id);
         assert_eq!(actual["provider"], c["provider"]);
@@ -137,13 +139,12 @@ fn api_v1_fixtures_replay_through_persisted_store() {
         };
         assert_eq!(actual["selected_node_id"], expected_selected);
         let expected_path: Vec<Value> = if scenario == "alternate" {
-            vec![json!("n-a"), json!("n-user"), json!("n-root")]
+            vec![json!("n-root"), json!("n-user"), json!("n-a")]
         } else {
             fixture["thread_node_ids"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .rev()
                 .map(|id| json!(id.as_str().unwrap()))
                 .collect()
         };
@@ -161,9 +162,45 @@ fn api_v1_fixtures_replay_through_persisted_store() {
             })
             .collect();
         assert_eq!(actual["thread_node_ids"], json!(expected_path));
-        assert_eq!(
-            actual["thread_complete"],
-            fixture["selection"]["thread_complete"]
-        );
+        // Completeness describes the selected thread, not whether the raw source
+        // pointer itself names a known node (fallback can select another leaf).
+        let expected_complete = if scenario == "alternate" {
+            fixture["selection"]["thread_complete"].as_bool().unwrap()
+        } else {
+            let expected_leaf = expected_path.last().unwrap().as_str().unwrap();
+            let mut current = Some(expected_leaf);
+            let mut visited = Vec::new();
+            let mut complete = false;
+            while let Some(node_id) = current {
+                if visited.contains(&node_id) {
+                    break;
+                }
+                visited.push(node_id);
+                let Some(node) = fixture["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|node| node["source_id"] == node_id)
+                else {
+                    break;
+                };
+                match node["parent_id"].as_str() {
+                    Some(parent) => current = Some(parent),
+                    None => {
+                        complete = true;
+                        break;
+                    }
+                }
+            }
+            complete
+        };
+        if scenario == "fallback" {
+            assert_eq!(fixture["selection"]["reason"], "fallback_leaf");
+            assert_ne!(
+                fixture["selection"]["source_current_node_id"],
+                fixture["selection"]["selected_node_id"]
+            );
+        }
+        assert_eq!(actual["thread_complete"], expected_complete);
     }
 }
