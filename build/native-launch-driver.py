@@ -105,8 +105,14 @@ def wait_service():
  raise RuntimeError('authenticated API did not become healthy')
 
 def ports_closed(info):
+ keys=sorted(info.keys()) if isinstance(info,dict) else []
  for field in ('api','proxy'):
-  hostport=info[field].removeprefix('http://').removeprefix('https://').split('/')[0]; host,port=hostport.rsplit(':',1)
+  endpoint=info.get(field) if isinstance(info,dict) else None
+  if not isinstance(endpoint,str) or not endpoint:
+   raise RuntimeError(f'native service_info {field} endpoint not reported; keys={keys}')
+ for field in ('api','proxy'):
+  endpoint=info[field]
+  hostport=endpoint.removeprefix('http://').removeprefix('https://').split('/')[0]; host,port=hostport.rsplit(':',1)
   s=socket.socket(); s.settimeout(.5); result=s.connect_ex((host.strip('[]'),int(port))); s.close()
   if result==0: raise RuntimeError(f'{field} listener remained open')
 
@@ -152,13 +158,15 @@ try:
   time.sleep(.2)
  else: raise RuntimeError('same-PID app/window did not reopen')
  info2,token2=wait_service()
+ service_after_reopen=bridge('eval',js="return await window.ChatHub.invoke('service_info');")
+ if not isinstance(service_after_reopen,dict): raise RuntimeError(f'native service_info after reopen invalid: {service_after_reopen!r}')
  # Native callback returns only after the actual provider invoke rejects.
  if os.environ.get('MUNINN_NATIVE_LAUNCH_MODE') != 'basic':
   denial_result=bridge('provider_denial')
   if denial_result.get('denied') is not True: raise RuntimeError(f'provider service_info was not denied: {denial_result!r}')
   record['provider_denial']=denial_result
  if state2.get('process_id')!=pid: raise RuntimeError('reopen changed process PID')
- if info2.get('api')!=info.get('api') or info2.get('proxy')!=info.get('proxy'): raise RuntimeError('reopen changed same-PID service endpoints')
+ if service_after_reopen.get('api')!=service.get('api') or service_after_reopen.get('proxy')!=service.get('proxy'): raise RuntimeError('reopen changed same-PID native service endpoints')
  health(info2,token2); record['reopen_pid']=pid; record['reopen_health']='ok'
  subprocess.run(['osascript','-e',f'tell application id "{bid}" to quit'],check=True,timeout=15)
  end=time.monotonic()+20
@@ -166,7 +174,7 @@ try:
   if not alive(pid): break
   time.sleep(.2)
  if alive(pid): raise RuntimeError('reopened app graceful quit did not terminate PID')
- ports_closed(info2); record['ports_closed_after_quit']=True
+ ports_closed(service_after_reopen); record['ports_closed_after_quit']=True
  record['passed']=True
 except Exception as exc:
  record.update(passed=False,error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc()); print(record['traceback'],file=sys.stderr,flush=True)

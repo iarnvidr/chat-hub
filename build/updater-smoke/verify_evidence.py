@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Independently validate native updater evidence, including structured identity/reason."""
-import json, pathlib, sys
+import json, os, pathlib, sys
 root=pathlib.Path(sys.argv[1])
 try: healthy=json.loads((root/'healthy-result.json').read_text()); tampered=json.loads((root/'tampered-result.json').read_text())
 except (OSError,json.JSONDecodeError) as error: raise SystemExit(f'FAIL: missing or invalid native evidence: {error}')
@@ -62,3 +62,26 @@ if failed:
    except OSError: pass
  raise SystemExit(1)
 (root/'evidence.json').write_text(json.dumps({'healthy':healthy,'tampered':tampered},sort_keys=True)+'\n')
+summary=os.environ.get('GITHUB_STEP_SUMMARY')
+if summary:
+ # Emit only verifier-approved identity/version facts; never dump evidence or paths.
+ identity=healthy_identity
+ tamper_pid=tamper_before['process_id']
+ run_url=''
+ if all(os.environ.get(k) for k in ('GITHUB_SERVER_URL','GITHUB_REPOSITORY','GITHUB_RUN_ID')):
+  run_url=f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}#artifacts"
+ lines=['## Native signed updater smoke: PASS','',
+  f"- Signed update installed and restarted: PID {identity['before_pid']} → {identity['after_pid']} ({healthy['before_version']} → {healthy['after_version']}); executable identity matched.",
+  f"- Tampered update rejected: PID {tamper_pid} remained on {tamper_before['version']}; signature rejection verified.",
+  '- Machine-readable evidence: `evidence.json` (uploaded by the native updater smoke workflow).']
+ if run_url: lines.append(f'- Workflow run artifacts: {run_url}')
+ lines.append('')
+ block='\n'.join(lines)+'\n'
+ try:
+  target=pathlib.Path(summary)
+  prior=target.read_bytes() if target.exists() else b''
+  encoded=block.encode()
+  if len(prior)+len(encoded)<=400*1024:
+   with target.open('ab') as stream: stream.write(encoded)
+ except OSError as error:
+  raise SystemExit(f'FAIL: could not write bounded updater PASS summary: {error}')

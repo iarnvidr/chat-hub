@@ -57,7 +57,19 @@ class EvidenceProtocol(unittest.TestCase):
    def write(h,t):
     (root/'healthy-result.json').write_text(json.dumps(h)); (root/'tampered-result.json').write_text(json.dumps(t))
    h=copy.deepcopy(BASE_H); t=copy.deepcopy(BASE_T); write(h,t)
-   subprocess.run([sys.executable,str(HERE/'verify_evidence.py'),d],check=True)
+   summary=root/'summary.md'
+   env=dict(os.environ,GITHUB_STEP_SUMMARY=str(summary))
+   subprocess.run([sys.executable,str(HERE/'verify_evidence.py'),d],check=True,env=env)
+   report=summary.read_text()
+   self.assertIn('Native signed updater smoke: PASS',report)
+   self.assertIn('PID 101 → 202',report)
+   self.assertIn('0.1.0 → 0.1.1',report)
+   self.assertIn('PID 303 remained on 0.1.0',report)
+   self.assertIn('signature rejection verified',report)
+   self.assertIn('evidence.json',report)
+   self.assertLessEqual(summary.stat().st_size,400*1024)
+   self.assertNotIn('/tmp/',report)
+   self.assertNotIn('TOKEN',report)
    for key,value in [('after_pid',101),('actual_executable','/wrong')]:
     bad=copy.deepcopy(h); bad['restart_identity'][key]=value; write(bad,t); self.assertNotEqual(run(root).returncode,0)
    for reason in ('not a signature error','unclassified'):
