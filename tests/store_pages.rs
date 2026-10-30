@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::store::{GraphNode, ListKey, Observation, Store};
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -65,8 +67,7 @@ fn list_keyset_nulls_and_ties_and_limits() {
 }
 #[test]
 fn null_updated_at_rows_are_included_in_keyset_pages() {
-    let path = std::env::temp_dir().join(format!("store-pages-null-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = common::temp_dir("store-pages-null").join("library.db");
     let mut s = Store::open(path.to_str().unwrap()).unwrap();
     for id in ["a", "b", "c"] {
         s.ingest_observation(&observation(id, id, 10, vec![]))

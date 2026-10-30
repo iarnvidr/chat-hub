@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::{
     config::Config,
     proxy::{CaptureEvent, ProxyConfig},
@@ -20,14 +22,7 @@ fn config(db: String, ca: PathBuf) -> Config {
     }
 }
 fn tmp(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "chat-hub-service-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+    common::temp_dir(&format!("chat-hub-service-{label}"))
 }
 fn event(path: &str, body: &[u8]) -> CaptureEvent {
     CaptureEvent {
@@ -41,8 +36,6 @@ fn event(path: &str, body: &[u8]) -> CaptureEvent {
 #[tokio::test]
 async fn bounded_service_ingests_synthetic_capture_and_drains() {
     let root = tmp("ingest");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
     let (handle, tx) = service::start(
         config(
             root.join("db.sqlite").display().to_string(),
@@ -67,8 +60,6 @@ async fn bounded_service_ingests_synthetic_capture_and_drains() {
 #[tokio::test]
 async fn malformed_capture_is_ignored_then_valid_capture_is_stored() {
     let root = tmp("malformed-then-valid");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
     let (handle, tx) = service::start(
         config(
             root.join("db.sqlite").display().to_string(),
@@ -103,8 +94,6 @@ async fn malformed_capture_is_ignored_then_valid_capture_is_stored() {
 #[tokio::test]
 async fn start_proxy_failure_releases_api_listener_and_drop_releases_api() {
     let root = tmp("rollback");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = occupied.local_addr().unwrap();
     let mut cfg = config(
@@ -132,8 +121,6 @@ async fn start_proxy_failure_releases_api_listener_and_drop_releases_api() {
 #[tokio::test]
 async fn write_trigger_failure_is_counted_and_shutdown_drains_sender() {
     let root = tmp("write-error");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
     let db = root.join("db.sqlite");
     let (handle, tx) = service::start(config(db.display().to_string(), root.join("ca")), 1)
         .await
@@ -160,8 +147,6 @@ async fn write_trigger_failure_is_counted_and_shutdown_drains_sender() {
 #[tokio::test]
 async fn shutdown_with_live_sender_counts_queued_events_as_unprocessed() {
     let root = tmp("live-sender");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
     let (handle, tx) = service::start(
         config(
             root.join("db.sqlite").display().to_string(),
@@ -184,8 +169,6 @@ async fn shutdown_with_live_sender_counts_queued_events_as_unprocessed() {
 #[tokio::test]
 async fn bounded_queue_accepts_only_capacity_and_drains_after_sqlite_lock_release() {
     let root = tmp("queue-lock");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
     let db = root.join("db.sqlite");
     let (handle, tx) = service::start(config(db.display().to_string(), root.join("ca")), 1)
         .await
@@ -236,8 +219,6 @@ async fn bounded_queue_accepts_only_capacity_and_drains_after_sqlite_lock_releas
 #[tokio::test]
 async fn dropping_sender_before_deadline_preserves_exact_work_conservation() {
     let root = tmp("deadline-lock");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
     let db = root.join("db.sqlite");
     let (handle, tx) = service::start(config(db.display().to_string(), root.join("ca")), 1)
         .await
@@ -281,8 +262,6 @@ async fn dropping_sender_before_deadline_preserves_exact_work_conservation() {
 #[tokio::test]
 async fn tls_capture_flows_through_service_into_conversation_store() {
     let root = tmp("tls");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = CertificateParams::new(vec!["chatgpt.com".into()])
         .unwrap()

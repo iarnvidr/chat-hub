@@ -1,17 +1,11 @@
+mod common;
+
 use chat_hub::store::Store;
 use std::{fs, process::Command};
 
 #[test]
 fn cli_import_uses_canonical_config_and_persists_across_processes() {
-    let dir = std::env::temp_dir().join(format!(
-        "chat-hub-import-cli-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).unwrap();
+    let dir = common::temp_dir("chat-hub-import-cli");
     let input = dir.join("conversations.json");
     fs::write(&input, include_bytes!("fixtures/chatgpt-export/array.json")).unwrap();
     let data_dir = dir.join("absent").join("data");
@@ -56,15 +50,7 @@ fn cli_import_uses_canonical_config_and_persists_across_processes() {
 
 #[test]
 fn first_import_creates_default_or_explicit_database_parents() {
-    let dir = std::env::temp_dir().join(format!(
-        "chat-hub-first-import-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).unwrap();
+    let dir = common::temp_dir("chat-hub-import-cli");
     let input = dir.join("conversations.json");
     fs::write(&input, include_bytes!("fixtures/chatgpt-export/array.json")).unwrap();
     let home = dir.join("absent-home");

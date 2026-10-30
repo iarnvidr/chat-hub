@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::{
     ca::Ca,
     proxy::{self, CaptureEvent, ProxyConfig},
@@ -36,9 +38,7 @@ async fn connect_mitm_forwards_tls_response_and_emits_capture() {
 }
 
 async fn exercise_connect_mitm() {
-    let dir = std::env::temp_dir().join(format!("chat-hub-e2e-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = common::temp_dir("chat-hub-e2e");
     let upstream_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let upstream_params = CertificateParams::new(vec!["chatgpt.com".into()]).unwrap();
     let upstream_cert = upstream_params.self_signed(&upstream_key).unwrap();

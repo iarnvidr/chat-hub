@@ -1,16 +1,14 @@
+mod common;
+
 use chat_hub::store::{GraphNode, Observation, Store};
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn db_path() -> String {
-    format!(
-        "/tmp/store-identity-{}.db",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
+    common::temp_dir("store-identity")
+        .join("library.db")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn observation(
