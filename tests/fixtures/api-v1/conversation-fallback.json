@@ -36,16 +36,12 @@
       "author": null,
       "create_time": null,
       "created_at_ms": null,
-      "content": {
-        "content_type": "text",
-        "parts": [
-          "Synthetic fallback response."
-        ]
-      },
+      "content": "Synthetic fallback response.",
       "parts": [
         {
-          "type": "text",
-          "text": "Synthetic fallback response."
+          "text": "Synthetic fallback response.",
+          "kind": "text",
+          "raw": "Synthetic fallback response."
         }
       ]
     }

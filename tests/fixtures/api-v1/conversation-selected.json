@@ -50,16 +50,12 @@
       },
       "create_time": 1700000000.125,
       "created_at_ms": 1700000000125,
-      "content": {
-        "content_type": "text",
-        "parts": [
-          "Please show a synthetic example."
-        ]
-      },
+      "content": "Please show a synthetic example.",
       "parts": [
         {
-          "type": "text",
-          "text": "Please show a synthetic example."
+          "text": "Please show a synthetic example.",
+          "kind": "text",
+          "raw": "Please show a synthetic example."
         }
       ]
     },
@@ -73,16 +69,12 @@
       },
       "create_time": 1700000001.125,
       "created_at_ms": 1700000001125,
-      "content": {
-        "content_type": "text",
-        "parts": [
-          "Example:\n```rust\nprintln!(\"amber telescope\");\n```"
-        ]
-      },
+      "content": "Example:\n```rust\nprintln!(\"amber telescope\");\n```",
       "parts": [
         {
-          "type": "text",
-          "text": "Example:\n```rust\nprintln!(\"amber telescope\");\n```"
+          "text": "Example:\n```rust\nprintln!(\"amber telescope\");\n```",
+          "kind": "text",
+          "raw": "Example:\n```rust\nprintln!(\"amber telescope\");\n```"
         }
       ]
     },
@@ -96,30 +88,14 @@
       },
       "create_time": 1700000002.125,
       "created_at_ms": 1700000002125,
-      "content": {
-        "content_type": "mixed",
-        "parts": [
-          "Alternate amber telescope response.",
-          {
-            "content_type": "synthetic_widget",
-            "payload": {
-              "label": "unsupported",
-              "values": [
-                1,
-                null,
-                true
-              ]
-            }
-          }
-        ]
-      },
+      "content": "Alternate amber telescope response.",
       "parts": [
         {
-          "type": "text",
-          "text": "Alternate amber telescope response."
+          "text": "Alternate amber telescope response.",
+          "kind": "text",
+          "raw": "Alternate amber telescope response."
         },
         {
-          "type": "unknown",
           "raw": {
             "content_type": "synthetic_widget",
             "payload": {
@@ -130,7 +106,8 @@
                 true
               ]
             }
-          }
+          },
+          "kind": "unknown"
         }
       ]
     }
