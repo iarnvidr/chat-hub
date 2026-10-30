@@ -1,0 +1,17 @@
+{
+  "cancelled": false,
+  "result": {
+    "imported": 1,
+    "updated": 1,
+    "unchanged": 1,
+    "failed": 1,
+    "errors": [
+      {
+        "item_index": 3,
+        "code": "invalid_conversation",
+        "message": "Conversation entry is invalid."
+      }
+    ],
+    "errors_truncated": false
+  }
+}

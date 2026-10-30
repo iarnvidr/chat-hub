@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "stale_cursor",
+    "message": "Library changed. Restart from the first page."
+  }
+}

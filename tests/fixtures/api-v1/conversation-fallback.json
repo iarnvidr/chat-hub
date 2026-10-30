@@ -1,0 +1,60 @@
+{
+  "conversation": {
+    "id": "cv-b",
+    "provider": "chatgpt",
+    "account_scope": "provisional:default",
+    "source_id": "export-cv-b",
+    "title": "Synthetic fallback",
+    "updated_at_ms": 1700000003000
+  },
+  "selection": {
+    "source_current_node_id": "missing-node",
+    "selected_node_id": "f-a",
+    "reason": "fallback_leaf",
+    "thread_complete": true
+  },
+  "nodes": [
+    {
+      "id": "f-root",
+      "source_id": "f-root",
+      "parent_id": null,
+      "message_id": null
+    },
+    {
+      "id": "f-a",
+      "source_id": "f-a",
+      "parent_id": "f-root",
+      "message_id": "msg-f"
+    }
+  ],
+  "messages": [
+    {
+      "id": "msg-f",
+      "source_id": null,
+      "node_id": "f-a",
+      "role": "assistant",
+      "author": null,
+      "create_time": null,
+      "created_at_ms": null,
+      "content": "Synthetic fallback response.",
+      "parts": [
+        {
+          "text": "Synthetic fallback response.",
+          "kind": "text",
+          "raw": "Synthetic fallback response."
+        }
+      ]
+    }
+  ],
+  "thread_node_ids": [
+    "f-root",
+    "f-a"
+  ],
+  "branches": [
+    {
+      "leaf_node_id": "f-a",
+      "selected": true
+    }
+  ],
+  "library_revision": 7
+}
