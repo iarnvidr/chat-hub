@@ -622,7 +622,7 @@ fn main() {
             })),
             token,
             api,
-            proxy,
+            proxy: proxy.clone(),
             runtime: Arc::new(Mutex::new(Some(runtime))),
             shutdown_started: Arc::new(AtomicBool::new(false)),
             shutdown_finished: Arc::new(AtomicBool::new(false)),
