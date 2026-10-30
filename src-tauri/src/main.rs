@@ -11,6 +11,7 @@ use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 mod crash_diagnostics;
 mod desktop_api;
+mod desktop_archive;
 mod desktop_runtime;
 #[cfg(feature = "native-smoke")]
 mod e2e_protocol;
@@ -436,6 +437,125 @@ async fn import_chatgpt_export(
     })
 }
 
+#[derive(Serialize)]
+struct ArchiveReceipt {
+    cancelled: bool,
+    published: bool,
+    durability_confirmed: bool,
+    kind: &'static str,
+    conversation_count: Option<u64>,
+    message_count: Option<u64>,
+}
+
+#[tauri::command]
+async fn backup_library(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    s: State<'_, AppState>,
+) -> Result<ArchiveReceipt, String> {
+    authorize_local_main(&window)?;
+    save_library_archive(app, s, "backup").await
+}
+
+#[tauri::command]
+async fn export_library_json(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    s: State<'_, AppState>,
+) -> Result<ArchiveReceipt, String> {
+    authorize_local_main(&window)?;
+    save_library_archive(app, s, "json").await
+}
+
+async fn save_library_archive(
+    app: tauri::AppHandle,
+    s: State<'_, AppState>,
+    kind: &'static str,
+) -> Result<ArchiveReceipt, String> {
+    let permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (label, ext) = if kind == "backup" {
+        ("Library backup", "sqlite3")
+    } else {
+        ("Library JSON export", "json")
+    };
+    app.dialog()
+        .file()
+        .set_file_name(if kind == "backup" {
+            "library.sqlite3"
+        } else {
+            "library.json"
+        })
+        .add_filter(label, &[ext])
+        .save_file(move |file| {
+            let _ = tx.send(file);
+        });
+    let Some(file) = rx.await.map_err(|_| "save_dialog_unavailable")? else {
+        return Ok(ArchiveReceipt {
+            cancelled: true,
+            published: false,
+            durability_confirmed: false,
+            kind,
+            conversation_count: None,
+            message_count: None,
+        });
+    };
+    let destination = file.into_path().map_err(|_| "invalid_destination")?;
+    let runtime = s.runtime.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<ArchiveReceipt, String> {
+        let _permit = permit;
+        let database_path = {
+            let guard = runtime
+                .lock()
+                .map_err(|_| "library_unavailable".to_string())?;
+            guard
+                .as_ref()
+                .ok_or_else(|| "library_unavailable".to_string())?
+                .database_path
+                .clone()
+        };
+        let store = chat_hub::store::Store::open_existing(
+            database_path
+                .to_str()
+                .ok_or_else(|| "library_unavailable".to_string())?,
+        )
+        .map_err(|_| "library_unavailable".to_string())?;
+        let result = if kind == "backup" {
+            store
+                .backup_to(&destination)
+                .map(|r| (Some(r.conversation_count), None))
+        } else {
+            store.export_json_to(&destination).map(|r| {
+                (
+                    Some(r.metadata.conversation_count),
+                    Some(r.metadata.message_count),
+                )
+            })
+        };
+        match result {
+            Ok((conversation_count, message_count)) => Ok(ArchiveReceipt {
+                cancelled: false,
+                published: true,
+                durability_confirmed: true,
+                kind,
+                conversation_count,
+                message_count,
+            }),
+            Err(chat_hub::error::Error::ArchivePublished { .. }) => Ok(ArchiveReceipt {
+                cancelled: false,
+                published: true,
+                durability_confirmed: false,
+                kind,
+                conversation_count: None,
+                message_count: None,
+            }),
+            Err(_) => Err("archive_save_failed".to_string()),
+        }
+    })
+    .await
+    .map_err(|_| "archive_save_failed")?
+}
+
 #[tauri::command]
 async fn service_health(
     window: tauri::WebviewWindow,
@@ -780,6 +900,8 @@ fn main() {
             list_conversations,
             get_conversation,
             import_chatgpt_export,
+            backup_library,
+            export_library_json,
             service_health,
             service_info,
             check_for_updates,
@@ -818,6 +940,8 @@ fn main() {
             list_conversations,
             get_conversation,
             import_chatgpt_export,
+            backup_library,
+            export_library_json,
             service_health,
             service_info,
             check_for_updates,
