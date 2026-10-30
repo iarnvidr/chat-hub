@@ -65,9 +65,71 @@ mod macos {
         }
     }
 }
+fn bounded_line(text: &str) -> String {
+    text.chars()
+        .take(200)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+#[cfg(test)]
+mod tests {
+    use super::bounded_line;
+
+    #[test]
+    fn bounds_and_sanitizes_diagnostic_lines() {
+        let input = format!("{}\nsecret", "x".repeat(300));
+        let result = bounded_line(&input);
+        assert_eq!(result.chars().count(), 200);
+        assert!(!result.chars().any(char::is_control));
+        assert!(bounded_line("safe").contains("safe"));
+    }
+}
+fn panic_hook(info: &std::panic::PanicHookInfo<'_>) {
+    let location = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "unknown".into());
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload");
+    let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+    let mut report = format!(
+        "Rust panic at {}: {}\n",
+        bounded_line(&location),
+        bounded_line(payload)
+    );
+    for line in backtrace.lines().take(200) {
+        report.push_str(&bounded_line(line));
+        report.push('\n');
+    }
+    // Bound the complete diagnostic, not just individual lines, including evidence output.
+    report = report
+        .lines()
+        .map(bounded_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    report.push('\n');
+    report.truncate(report.floor_char_boundary(40 * 1024));
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), report.as_bytes());
+    if let Some(path) = std::env::var_os("CHAT_HUB_CRASH_EVIDENCE") {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = std::io::Write::write_all(&mut file, report.as_bytes());
+        }
+    }
+}
 #[cfg(target_os = "macos")]
 pub fn install() {
+    std::panic::set_hook(Box::new(panic_hook));
     macos::install();
 }
 #[cfg(not(target_os = "macos"))]
-pub fn install() {}
+pub fn install() {
+    std::panic::set_hook(Box::new(panic_hook));
+}

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Real debug Tauri updater integration. Requires hosted Apple Silicon macOS.
 set -euo pipefail
+export RUST_BACKTRACE=1
 source "$(dirname "$0")/../native-smoke-wrapper.sh"
 SMOKE_LOGS=""
 # HOME is replaced below for updater isolation; resolve Rust's real homes first.
@@ -118,7 +119,7 @@ ready=0
 for attempt in {1..50}; do
   if ! kill -0 "$SERVER" 2>/dev/null; then
     echo 'FAIL: updater feed server exited before readiness' >&2
-    tail -n 20 "$TMP/http.log" >&2 || true
+    tail -n 80 "$TMP/http.log" >&2 || true
     exit 2
   fi
   if curl --silent --show-error --fail --max-time 1 \
@@ -130,7 +131,7 @@ for attempt in {1..50}; do
 done
 if [[ "$ready" != 1 ]]; then
   echo 'FAIL: updater feed did not become ready at loopback endpoint' >&2
-  tail -n 20 "$TMP/http.log" >&2 || true
+  tail -n 80 "$TMP/http.log" >&2 || true
   exit 2
 fi
 # Run actual installed bundle; launcher itself accesses bridge via E2E command files.

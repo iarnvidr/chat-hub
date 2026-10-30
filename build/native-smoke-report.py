@@ -22,10 +22,12 @@ def bounded(lines):
   line=str(line)
   out.append(line[:200] + ('…[line truncated]' if len(line)>200 else ''))
  return out
-lines=[f'## Native smoke step {step}: FAILED',f'- Exit code: `{status}`',f'- Command: `{command}`',f'- Failure: {first or reason}', '### Captured output (last 80 lines per stream)']
+lines=[f'## Native smoke step {step}: FAILED',f'- Exit code: `{status}`',f'- Command: `{command}`',f'- Failure: {first or reason}', '### Captured output (last 200 app.log lines; last 80 lines per other stream)']
 for name in logfiles.split(':'):
  p=pathlib.Path(name)
- if p.is_file(): lines += [f'#### `{p.name}`','```text',*bounded(p.read_text(errors='replace').splitlines()[-80:]),'```']
+ if p.is_file():
+  limit=200 if p.name == 'app.log' else 80
+  lines += [f'#### `{p.name}`','```text',*bounded(p.read_text(errors='replace').splitlines()[-limit:]),'```']
 lines += ['### Evidence directory (names and metadata only)']
 for p in sorted(pathlib.Path(evidence).glob('**/*'))[:80] if pathlib.Path(evidence).exists() else []:
   if p.is_dir(): continue

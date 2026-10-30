@@ -10,7 +10,7 @@ smoke_diag_command "native smoke setup for $app"
 [[ -d "$app/Contents/MacOS" ]] || { echo "app missing: $app" >&2; exit 2; }
 evidence="${SMOKE_EVIDENCE_DIR:-${RUNNER_TEMP:-/tmp}/macos-smoke-evidence}"
 mkdir -p "$evidence"
-export RUST_BACKTRACE=full OBJC_DEBUG_MISSING_POOLS=NO NSUnbufferedIO=YES CHAT_HUB_CRASH_EVIDENCE="$evidence/objc-exceptions.log"
+export RUST_BACKTRACE=1 OBJC_DEBUG_MISSING_POOLS=NO NSUnbufferedIO=YES CHAT_HUB_CRASH_EVIDENCE="$evidence/objc-exceptions.log"
 export HOME="$evidence/home"
 app_data="$HOME/Library/Application Support/io.github.iarnvidr.chat-hub"
 mkdir -p "$app_data"

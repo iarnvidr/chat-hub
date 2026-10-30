@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export RUST_BACKTRACE=1
 source "$(dirname "$0")/native-smoke-wrapper.sh"
 # Preserve the runner's Rust installation despite isolated application HOME.
 REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')}"

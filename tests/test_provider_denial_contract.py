@@ -29,7 +29,7 @@ class ProviderDenialContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("pub fn e2e_result", source)
         self.assertIn('get_webview_window("provider")', source)
-        self.assertIn('url.host_str() == Some("chatgpt.com")', source)
+        self.assertIn('window_policy::is_provider_origin(u.scheme()', source)
         self.assertIn('provider webview readiness timed out', source)
         self.assertIn('"readiness":readiness', source)
         self.assertIn("authorize_local_main(&window)?;", source[source.index("fn service_info("):])

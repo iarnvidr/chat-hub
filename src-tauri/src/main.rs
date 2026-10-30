@@ -12,6 +12,8 @@ use std::{
 use tauri::{Manager, State};
 use tokio::sync::mpsc;
 mod crash_diagnostics;
+mod window_policy;
+use window_policy::MainWindowOwnership;
 #[cfg(target_os = "macos")]
 mod trust_mac;
 
@@ -139,18 +141,13 @@ mod e2e {
                         "provider_readiness",
                         json!({"polls":readiness_polls,"href":readiness["href"],"readyState":readiness["readyState"]}),
                     );
-                    if let Ok(url) = w.url() {
-                        readiness["href"] = json!(url.as_str());
-                        if url.scheme() == "https" && url.host_str() == Some("chatgpt.com") {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            if w.eval_with_callback("JSON.stringify({href:location.href,readyState:document.readyState,label:window.__TAURI_INTERNALS__?'tauri':'no-tauri'})", move |v| { let _ = tx.send(v); }).is_ok() {
-                                if let Ok(Ok(value)) = rx.recv_timeout(Duration::from_secs(1)).map(|v| serde_json::from_str::<Value>(&v)) {
-                                    if let Some(parsed) = value.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
-                                        readiness = parsed;
-                                        if readiness["href"].as_str().is_some_and(|h| h.starts_with("https://chatgpt.com/")) && readiness["readyState"].as_str().is_some() {
-                                            break;
-                                        }
-                                    }
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    if w.eval_with_callback("JSON.stringify({href:location.href,readyState:document.readyState,label:window.__TAURI_INTERNALS__?'tauri':'no-tauri'})", move |v| { let _ = tx.send(v); }).is_ok() {
+                        if let Ok(Ok(value)) = rx.recv_timeout(Duration::from_secs(1)).map(|v| serde_json::from_str::<Value>(&v)) {
+                            if let Some(parsed) = value.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                                readiness = parsed;
+                                if readiness["href"].as_str().is_some_and(|h| tauri::Url::parse(h).ok().is_some_and(|u| window_policy::is_provider_origin(u.scheme(), u.host_str(), u.port(), u.username(), u.password()))) && readiness["readyState"].as_str().is_some() {
+                                    break;
                                 }
                             }
                         }
@@ -270,11 +267,13 @@ fn authorize_local_main(window: &tauri::WebviewWindow) -> Result<(), String> {
     if window.label() != "main" {
         return Err("privileged command is restricted to the main application window".into());
     }
-    let url = window.url().map_err(|e| e.to_string())?;
-    let local = (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
-        || (url.scheme() == "http" && url.host_str() == Some("tauri.localhost"));
-    if !local {
-        return Err("privileged command is restricted to the packaged local UI origin".into());
+    // The label alone is not authority: only the native packaged-main builder
+    // can register this process-local ownership token, and destruction revokes it.
+    // Do not call WebviewWindow::url(): WKURL can be nil during macOS startup.
+    let ownership = window.app_handle().state::<MainWindowOwnership>();
+    // Authorization performs an Ordering::Acquire load paired with build registration.
+    if !ownership.is_authorized(window.label()) {
+        return Err("privileged command requires the live native main window".into());
     }
     Ok(())
 }
@@ -567,6 +566,44 @@ fn main() {
         {
             let proxy_url = format!("http://{}", proxy.addr);
             let ca_der = proxy.ca.cert_der().map_err(std::io::Error::other)?;
+        // Disable Tauri's automatic window creation: the configured main window
+        // must be created only through this validated native builder.
+        let mut main_config = app
+            .config()
+            .app
+            .windows
+            .iter()
+            .find(|w| w.label == "main")
+            .ok_or_else(|| std::io::Error::other("missing configured main window"))?
+            .clone();
+        if !matches!(main_config.url, tauri::utils::config::WebviewUrl::App(_)) {
+            return Err(std::io::Error::other("main window must use packaged app URL").into());
+        }
+        main_config.create = false;
+        let main_ownership = MainWindowOwnership::new();
+        app.manage(main_ownership.clone());
+        tauri::WebviewWindowBuilder::from_config(app, &main_config)?
+            .on_window_event({
+                let ownership = main_ownership.clone();
+                move |event| {
+                    if matches!(event, tauri::WindowEvent::Destroyed) {
+                        ownership.revoke();
+                    }
+                }
+            })
+            .on_navigation(|url| {
+                window_policy::allows_origin(
+                    url.scheme(),
+                    url.host_str(),
+                    url.port(),
+                    url.username(),
+                    url.password(),
+                )
+            })
+            .build()?;
+        // Registration follows successful construction only; JS cannot create or
+        // impersonate this native process-local ownership token.
+        main_ownership.register_after_build();
             let provider = tauri::WebviewWindowBuilder::new(
                 app,
                 "provider",
