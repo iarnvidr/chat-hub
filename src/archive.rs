@@ -12,14 +12,43 @@ use std::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// Step SQLite's online backup until completion, but never wait indefinitely on a busy source.
+pub fn backup_to_completion(
+    backup: &Backup<'_, '_>,
+    pages: i32,
+    pause: Duration,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match backup.step(pages)? {
+            rusqlite::backup::StepResult::Done => return Ok(()),
+            rusqlite::backup::StepResult::More => {}
+            rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked | _ => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Configuration(
+                        "database backup busy timeout elapsed".into(),
+                    ));
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Configuration(
+                "database backup deadline elapsed".into(),
+            ));
+        }
+        std::thread::sleep(pause);
+    }
+}
+
 /// Adjacent staging output that publishes atomically without replacing a destination.
-pub(crate) struct AtomicOutput {
+pub struct AtomicOutput {
     destination: PathBuf,
     staging: PathBuf,
     file: Option<File>,
 }
 impl AtomicOutput {
-    pub(crate) fn new(destination: impl AsRef<Path>) -> Result<Self> {
+    pub fn new(destination: impl AsRef<Path>) -> Result<Self> {
         let destination = destination.as_ref().to_path_buf();
         let parent = destination
             .parent()
@@ -53,22 +82,98 @@ impl AtomicOutput {
         ))
     }
     #[allow(dead_code)]
-    pub(crate) fn file(&mut self) -> &mut File {
+    pub fn file(&mut self) -> &mut File {
         self.file.as_mut().expect("staging writer closed")
     }
-    pub(crate) fn staging_path(&self) -> &Path {
+    pub fn staging_path(&self) -> &Path {
         &self.staging
     }
-    pub(crate) fn finish(mut self) -> Result<()> {
+    pub fn finish(self) -> Result<()> {
+        self.finish_with_parent_sync(sync_parent_directory)
+    }
+
+    fn finish_with_parent_sync(
+        mut self,
+        sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> Result<()> {
         if let Some(f) = self.file.take() {
             f.sync_all()?;
             drop(f);
         }
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.staging)?
+            .sync_all()?;
+        let parent = self
+            .destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        // Open before publication, so failure to open cannot make publication status ambiguous.
+        let parent_file = File::open(parent)?;
         fs::hard_link(&self.staging, &self.destination)?;
-        fs::remove_file(&self.staging)?;
+        let unlink_result = fs::remove_file(&self.staging);
+        #[cfg(unix)]
+        let sync_result = sync_parent(parent);
+        #[cfg(not(unix))]
+        let sync_result = {
+            let _ = (&sync_parent, &parent_file);
+            Ok(())
+        };
+        if let Err(source) = unlink_result {
+            return Err(Error::ArchivePublished {
+                destination: self.destination.clone(),
+                operation: "removing staging file",
+                source,
+            });
+        }
+        if let Err(source) = sync_result {
+            return Err(Error::ArchivePublished {
+                destination: self.destination.clone(),
+                operation: "syncing parent directory",
+                source,
+            });
+        }
+        drop(parent_file);
         Ok(())
     }
 }
+fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sync_failure_reports_published_target_and_cleans_stage() {
+        let dir = std::env::temp_dir().join(format!(
+            "archive-publish-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("archive.db");
+        let mut output = AtomicOutput::new(&dest).unwrap();
+        use std::io::Write;
+        output.file().write_all(b"complete archive").unwrap();
+        let stage = output.staging_path().to_path_buf();
+        let error = output
+            .finish_with_parent_sync(|_| Err(std::io::Error::other("injected sync failure")))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ArchivePublished {
+                operation: "syncing parent directory",
+                ..
+            }
+        ));
+        assert_eq!(fs::read(&dest).unwrap(), b"complete archive");
+        assert!(!stage.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 impl Drop for AtomicOutput {
     fn drop(&mut self) {
         self.file.take();
@@ -107,7 +212,12 @@ impl Store {
             let mut target = Connection::open(output.staging_path())?;
             {
                 let backup = Backup::new(src, &mut target)?;
-                backup.run_to_completion(128, Duration::from_millis(10), None)?;
+                backup_to_completion(
+                    &backup,
+                    128,
+                    Duration::from_millis(10),
+                    Duration::from_secs(30),
+                )?;
             }
             let schema_version =
                 target.query_row("SELECT max(version) FROM schema_migrations", [], |r| {

@@ -10,7 +10,7 @@ use std::{
         Arc, Barrier,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn observation(
@@ -290,5 +290,56 @@ fn backup_rejects_existing_aliases_and_cleans_failed_staging() {
         "failed paths leave no staging artifacts"
     );
     drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn backup_busy_deadline_is_bounded_and_cleans_staging() {
+    use chat_hub::archive::backup_to_completion;
+    use rusqlite::backup::Backup;
+    let dir = temp_dir("busy-deadline");
+    let source = dir.join("source.db");
+    let store = Store::open(source.to_str().unwrap()).unwrap();
+    let blocker = Connection::open(&source).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+    let source_connection = Connection::open(&source).unwrap();
+    source_connection.busy_timeout(Duration::ZERO).unwrap();
+    let dest = dir.join("backup.db");
+    std::fs::write(&dest, b"preserved database").unwrap();
+    let start = Instant::now();
+    let result = {
+        let mut target = Connection::open_in_memory().unwrap();
+        let backup = Backup::new(&source_connection, &mut target).unwrap();
+        backup_to_completion(
+            &backup,
+            128,
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        )
+    };
+    assert!(result.is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"preserved database");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    drop(source_connection);
+    drop(blocker);
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn atomic_output_destination_race_preserves_target_and_cleans_stage() {
+    use chat_hub::archive::AtomicOutput;
+    let dir = temp_dir("publication-race");
+    let dest = dir.join("backup.db");
+    let mut output = AtomicOutput::new(&dest).unwrap();
+    std::io::Write::write_all(output.file(), b"complete staged bytes").unwrap();
+    let stage = output.staging_path().to_path_buf();
+    std::fs::write(&dest, b"existing target").unwrap();
+    assert!(output.finish().is_err());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"existing target");
+    assert!(!stage.exists());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     std::fs::remove_dir_all(dir).unwrap();
 }
