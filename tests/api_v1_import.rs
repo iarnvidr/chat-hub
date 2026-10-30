@@ -10,22 +10,41 @@ use serde_json::{json, Value};
 use std::{
     fs,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use tower::ServiceExt;
 
 const EXPORT: &[u8] = include_bytes!("fixtures/chatgpt-export/array.json");
 fn app() -> (PathBuf, Router) {
-    let dir = std::env::temp_dir().join(format!(
-        "chat-hub-api-import-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    let store = Store::open(dir.join("library.sqlite").to_str().unwrap()).unwrap();
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+    let mut skipped_existing = 0;
+    let dir = loop {
+        let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "chat-hub-api-import-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                skipped_existing += 1
+            }
+            Err(error) => panic!("exclusive test-directory creation failed: {}", error.kind()),
+        }
+    };
+    if skipped_existing > 0 {
+        eprintln!(
+            "skipped {skipped_existing} existing test directories; no existing database was reused"
+        );
+    }
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        0,
+        "exclusive test directory must be empty"
+    );
+    let store = Store::open(dir.join("library.sqlite").to_str().unwrap()).unwrap_or_else(|error| {
+        panic!("Store open failed in exclusively created empty test directory: {error}")
+    });
     (dir, server::router(store, "secret".into()))
 }
 async fn post(
@@ -138,7 +157,7 @@ async fn http_item_failures_keep_committed_items_and_bound_error_receipt() {
         .unwrap();
     let (status, mixed) = import(&app, mixed).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(mixed["imported"], 1);
+    assert_eq!(mixed["imported"], 1, "safe import receipt: {mixed}");
     assert_eq!(mixed["failed"], 2);
     assert_eq!(mixed["errors"][0]["item_index"], 1);
     assert_eq!(mixed["errors"][1]["item_index"], 2);
