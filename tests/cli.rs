@@ -1,20 +1,13 @@
+mod common;
+
 use std::{
     fs,
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 fn temp() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "chat-hub-cli-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&p).unwrap();
-    p
+    common::temp_dir("chat-hub-cli")
 }
 fn configured<'a>(cmd: &'a mut Command, d: &std::path::Path) -> &'a mut Command {
     cmd.env("CHAT_HUB_TOKEN", "cli-test-token")

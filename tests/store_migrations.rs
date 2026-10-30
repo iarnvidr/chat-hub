@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::store::{GraphNode, Observation, Store};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -27,15 +29,8 @@ fn obs(source: &str, text: &str) -> Observation {
     }
 }
 fn temp(name: &str) -> String {
-    std::env::temp_dir()
-        .join(format!(
-            "chat-hub-{name}-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+    common::temp_dir(name)
+        .join("library.db")
         .to_string_lossy()
         .into_owned()
 }

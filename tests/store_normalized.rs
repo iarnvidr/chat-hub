@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::store::{GraphNode, Observation, Store};
 use serde_json::{json, Value};
 
@@ -123,8 +125,7 @@ fn scoped_conversations_and_global_message_id_collisions_are_allocated() {
 }
 #[test]
 fn migrated_legacy_message_links_are_exposed() {
-    let path = std::env::temp_dir().join(format!("normalized-migration-{}.db", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = common::temp_dir("normalized-migration").join("library.db");
     let c = rusqlite::Connection::open(&path).unwrap();
     c.execute_batch(include_str!("fixtures/store/v2.sql"))
         .unwrap();

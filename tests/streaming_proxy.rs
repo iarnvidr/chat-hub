@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::{
     ca::Ca,
     capture_lane::{CaptureLimits, CaptureObservation, CaptureState},
@@ -30,12 +32,7 @@ async fn fixture(
     mpsc::Receiver<CaptureEvent>,
     TcpListener,
 ) {
-    let dir = std::env::temp_dir().join(format!(
-        "stream-proxy-{}-{}",
-        std::process::id(),
-        rand_suffix()
-    ));
-    fs::create_dir_all(&dir).unwrap();
+    let dir = common::temp_dir("stream-proxy");
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = CertificateParams::new(vec!["chatgpt.com".into()])
         .unwrap()
@@ -84,12 +81,7 @@ async fn fixture(
         listener,
     )
 }
-fn rand_suffix() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-}
+
 async fn client(f: &Fixture) -> tokio_rustls::client::TlsStream<TcpStream> {
     let mut s = TcpStream::connect(f.addr).await.unwrap();
     s.write_all(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")

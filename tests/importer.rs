@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::importer::{parse_export, read_input, MAX_BYTES, MAX_ENTRIES};
 use chat_hub::{importer::import_chatgpt, store::Store};
 use serde_json::{json, Value};
@@ -77,16 +79,7 @@ fn timestamp_ordering_and_metadata_only_update_receipts() {
 }
 
 fn temporary_dir() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "chat-hub-import-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    path
+    common::temp_dir("chat-hub-import")
 }
 
 #[test]
