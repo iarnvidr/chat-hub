@@ -71,6 +71,7 @@ class NativeLaunchSmoke(unittest.TestCase):
   self.assertIn('subjectAltName=DNS:chatgpt.com',harness)
   self.assertIn('MUNINN_PROVIDER_SMOKE_UPSTREAM',harness)
   self.assertIn('wrap_socket(raw,server_hostname=\'chatgpt.com\')',driver)
+  self.assertIn('not ChatGPT login',driver)
   self.assertIn('from native_capture_contract import validate as validate_capture_contract',driver)
   self.assertIn("authenticated_json(info,token,'/api/v1/conversations?limit=100')",driver)
   self.assertIn("authenticated_json(info,token,'/api/v1/status')",driver)
