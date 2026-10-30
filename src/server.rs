@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+pub mod api_v1;
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<Store>>,
@@ -149,11 +151,15 @@ fn build_router(store: Store, token: String, identity: Option<RuntimeIdentity>) 
         db_ops: Arc::new(Semaphore::new(MAX_DB_OPS)),
         identity,
     };
+    // Until F1's transactional read adapter is connected, v1 fails closed.
+    // The legacy routes continue to use their existing store and responses.
+    let v1 = api_v1::routes(state.token.clone(), None, state.db_ops.clone());
     Router::new()
         .route("/api/health", get(health))
         .route("/api/search", get(search))
         .route("/api/conversations/:id", get(read))
         .with_state(state)
+        .merge(v1)
 }
 pub async fn serve(addr: std::net::SocketAddr, store: Store, token: String) -> Result<(), Error> {
     if !addr.ip().is_loopback() {
