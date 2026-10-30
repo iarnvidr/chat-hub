@@ -57,12 +57,52 @@ pub struct ServiceHandle {
     interrupt: Arc<rusqlite::InterruptHandle>,
     deadline: Duration,
 }
-fn supervise_writer<F>(operation: F, cleanup: impl FnOnce())
+#[derive(Clone)]
+struct WriterFailureContext {
+    stop: watch::Sender<bool>,
+    status: Arc<Mutex<ServiceStatus>>,
+    writer_stop: Arc<AtomicBool>,
+    abandon_queue: Arc<AtomicBool>,
+    abandoned: Arc<AtomicU64>,
+    receiver: Arc<Mutex<mpsc::Receiver<CaptureEvent>>>,
+    abort_registry: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl WriterFailureContext {
+    fn actual_cleanup(&self) {
+        self.writer_stop.store(true, Ordering::Release);
+        self.abandon_queue.store(true, Ordering::Release);
+        {
+            let mut rx = self.receiver.lock().unwrap_or_else(|p| p.into_inner());
+            rx.close();
+            let queued = rx.len() as u64;
+            while rx.try_recv().is_ok() {}
+            self.abandoned.fetch_add(queued, Ordering::AcqRel);
+        }
+        let mut status = lock_status(&self.status);
+        status.database_healthy = Some(false);
+        if !matches!(status.state, ServiceState::Failed(_)) {
+            status.state = ServiceState::Failed("capture writer panicked".into());
+        }
+        drop(status);
+        let _ = self.stop.send(true);
+        for abort in self
+            .abort_registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
+            abort.abort();
+        }
+    }
+}
+
+fn supervise_writer<F>(operation: F, failure: WriterFailureContext)
 where
     F: FnOnce(),
 {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err() {
-        cleanup();
+        failure.actual_cleanup();
     }
 }
 
@@ -229,8 +269,6 @@ pub async fn start_with_proxy(
     let (stop, _) = watch::channel(false);
     let abort_registry: Arc<Mutex<Vec<tokio::task::AbortHandle>>> =
         Arc::new(Mutex::new(Vec::new()));
-    let writer_abort_registry = abort_registry.clone();
-    let writer_stop_service = stop.clone();
     let (writer_ready_tx, writer_ready_rx) = oneshot::channel();
     let writer_status = status.clone();
     let flag = Arc::new(AtomicBool::new(false));
@@ -239,6 +277,15 @@ pub async fn start_with_proxy(
     let wa = abandon_queue.clone();
     let abandoned = Arc::new(AtomicU64::new(0));
     let writer_abandoned = abandoned.clone();
+    let writer_failure = WriterFailureContext {
+        stop: stop.clone(),
+        status: status.clone(),
+        writer_stop: flag.clone(),
+        abandon_queue: abandon_queue.clone(),
+        abandoned: abandoned.clone(),
+        receiver: writer_receiver.clone(),
+        abort_registry: abort_registry.clone(),
+    };
     let db = config.database_path.clone();
     let writer = Builder::new()
         .name("capture-ingestion".into())
@@ -300,31 +347,7 @@ pub async fn start_with_proxy(
                         }
                     }
                 },
-                || {
-                    wf.store(true, Ordering::Release);
-                    wa.store(true, Ordering::Release);
-                    {
-                        let mut rx = writer_receiver.lock().unwrap_or_else(|p| p.into_inner());
-                        rx.close();
-                        let queued = rx.len() as u64;
-                        while rx.try_recv().is_ok() {}
-                        writer_abandoned.fetch_add(queued, Ordering::AcqRel);
-                    }
-                    let mut status = lock_status(&writer_status);
-                    status.database_healthy = Some(false);
-                    if !matches!(status.state, ServiceState::Failed(_)) {
-                        status.state = ServiceState::Failed("capture writer panicked".into());
-                    }
-                    drop(status);
-                    let _ = writer_stop_service.send(true);
-                    for abort in writer_abort_registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .iter()
-                    {
-                        abort.abort();
-                    }
-                },
+                writer_failure,
             )
         })
         .map_err(|e| e.to_string())?;
@@ -485,7 +508,6 @@ mod writer_panic_tests {
             body: vec![],
         })
         .unwrap();
-        drop(tx);
         let receiver = Arc::new(Mutex::new(rx));
         let writer_stop = Arc::new(AtomicBool::new(false));
         let abandon = Arc::new(AtomicBool::new(false));
@@ -496,45 +518,50 @@ mod writer_panic_tests {
             tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
         ];
         let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let mut listener_tasks = Vec::new();
         for listener in listeners {
             let task = tokio::spawn(async move {
                 let _ = listener.accept().await;
             });
             registry.lock().unwrap().push(task.abort_handle());
-            std::mem::forget(task);
+            listener_tasks.push(task);
         }
-        let cleanup_status = status.clone();
-        let cleanup_receiver = receiver.clone();
-        let cleanup_stop = writer_stop.clone();
-        let cleanup_abandon = abandon.clone();
-        let cleanup_count = abandoned.clone();
-        let cleanup_registry = registry.clone();
         supervise_writer(
             || panic!("intentional writer panic"),
-            || {
-                cleanup_stop.store(true, Ordering::Release);
-                cleanup_abandon.store(true, Ordering::Release);
-                let mut rx = cleanup_receiver.lock().unwrap();
-                rx.close();
-                let count = rx.len() as u64;
-                while rx.try_recv().is_ok() {}
-                cleanup_count.fetch_add(count, Ordering::AcqRel);
-                let mut s = lock_status(&cleanup_status);
-                s.database_healthy = Some(false);
-                if !matches!(s.state, ServiceState::Failed(_)) {
-                    s.state = ServiceState::Failed("capture writer panicked".into());
-                }
-                drop(s);
-                let _ = stop.send(true);
-                for abort in cleanup_registry.lock().unwrap().iter() {
-                    abort.abort();
-                }
+            WriterFailureContext {
+                stop: stop.clone(),
+                status: status.clone(),
+                writer_stop: writer_stop.clone(),
+                abandon_queue: abandon.clone(),
+                abandoned: abandoned.clone(),
+                receiver: receiver.clone(),
+                abort_registry: registry.clone(),
             },
         );
+        for listener_task in listener_tasks {
+            let result = tokio::time::timeout(Duration::from_secs(1), listener_task)
+                .await
+                .expect("listener cancellation did not complete within one second");
+            assert!(
+                result
+                    .expect_err("aborted listener task unexpectedly succeeded")
+                    .is_cancelled(),
+                "listener task did not report cancellation"
+            );
+        }
         assert!(writer_stop.load(Ordering::Acquire));
         assert!(abandon.load(Ordering::Acquire));
         assert!(*stop_rx.borrow());
         assert_eq!(abandoned.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            tx.try_send(CaptureEvent {
+                host: "example.test".into(),
+                path: "/closed".into(),
+                status: 200,
+                body: vec![],
+            }),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
         assert_eq!(status.lock().unwrap().database_healthy, Some(false));
         assert_eq!(
             status.lock().unwrap().state,

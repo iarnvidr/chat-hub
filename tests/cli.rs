@@ -88,6 +88,9 @@ fn fresh_default_startup_creates_canonical_data_dir_and_sigint_cleans_runtime() 
     let home = d.join("home");
     let xdg = d.join("xdg");
     fs::create_dir_all(&home).unwrap();
+    #[cfg(target_os = "macos")]
+    let expected = home.join("Library/Application Support/io.github.iarnvidr.chat-hub");
+    #[cfg(target_os = "linux")]
     let expected = xdg.join("io.github.iarnvidr.chat-hub");
     assert!(!expected.exists());
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_chat-hub"));
@@ -103,20 +106,41 @@ fn fresh_default_startup_creates_canonical_data_dir_and_sigint_cleans_runtime() 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = ChildGuard(cmd.spawn().unwrap());
-    let db = expected.join("chat-hub.sqlite3");
+    let record_path = expected.join("runtime/service.json");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !db.exists() {
+    let record: serde_json::Value = loop {
+        if let Ok(bytes) = fs::read(&record_path) {
+            if let Ok(record) = serde_json::from_slice(&bytes) {
+                break record;
+            }
+        }
         assert!(
             Instant::now() < deadline,
-            "startup did not create default database"
+            "startup did not publish runtime record"
         );
         assert!(
             child.0.try_wait().unwrap().is_none(),
-            "serve exited before DB startup"
+            "serve exited before readiness"
         );
         thread::sleep(Duration::from_millis(20));
-    }
-    assert!(expected.join("runtime/service.json").exists());
+    };
+    assert_eq!(record["pid"].as_u64(), Some(u64::from(child.0.id())));
+    let running_out = Command::new(env!("CARGO_BIN_EXE_chat-hub"))
+        .arg("status")
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &xdg)
+        .env_remove("CHAT_HUB_DATA_DIR")
+        .env_remove("CHAT_HUB_DATABASE")
+        .env_remove("CHAT_HUB_CA_DIR")
+        .env("CHAT_HUB_TOKEN", "cli-test-token")
+        .output()
+        .unwrap();
+    assert!(running_out.status.success(), "status command failed");
+    let running: serde_json::Value = serde_json::from_slice(&running_out.stdout).unwrap();
+    assert_eq!(running["service"], "running", "{running}");
+    assert_eq!(running["pid"], record["pid"], "{running}");
+    assert_eq!(running["instance_id"], record["instance_id"], "{running}");
+    assert_eq!(running["database_health"], true, "{running}");
     Command::new("kill")
         .args(["-INT", &child.0.id().to_string()])
         .status()

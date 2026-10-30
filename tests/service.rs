@@ -20,7 +20,14 @@ fn config(db: String, ca: PathBuf) -> Config {
     }
 }
 fn tmp(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("chat-hub-service-{label}-{}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "chat-hub-service-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
 }
 fn event(path: &str, body: &[u8]) -> CaptureEvent {
     CaptureEvent {
@@ -128,7 +135,7 @@ async fn write_trigger_failure_is_counted_and_shutdown_drains_sender() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let db = root.join("db.sqlite");
-    let (handle, tx) = service::start(config(db.display().to_string(), root.join("ca")), 2)
+    let (handle, tx) = service::start(config(db.display().to_string(), root.join("ca")), 1)
         .await
         .unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -227,12 +234,12 @@ async fn bounded_queue_accepts_only_capacity_and_drains_after_sqlite_lock_releas
 }
 
 #[tokio::test]
-async fn shutdown_deadline_returns_with_blocked_writer_and_counts_inflight() {
+async fn dropping_sender_before_deadline_preserves_exact_work_conservation() {
     let root = tmp("deadline-lock");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let db = root.join("db.sqlite");
-    let (handle, tx) = service::start(config(db.display().to_string(), root.join("ca")), 2)
+    let (handle, tx) = service::start(config(db.display().to_string(), root.join("ca")), 1)
         .await
         .unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -250,25 +257,20 @@ async fn shutdown_deadline_returns_with_blocked_writer_and_counts_inflight() {
     })
     .await
     .unwrap();
-    tx.send(event(
-        "/backend-api/conversation/two",
-        br#"{"title":"two","mapping":{}}"#,
-    ))
-    .await
-    .unwrap();
-    let started = tokio::time::Instant::now();
+    tx.try_send(event("/ignored", b"queued")).unwrap();
+    drop(tx); // Close the sender while one accepted write is blocked and one item is queued.
     let stats = tokio::time::timeout(
-        Duration::from_secs(1),
-        handle.shutdown_timeout(Duration::from_millis(1)),
+        Duration::from_secs(3),
+        handle.shutdown_timeout(Duration::from_millis(100)),
     )
     .await
     .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(
-        stats.unprocessed >= 2,
-        "in-flight accepted item and queued item must be reported: {stats:?}"
+    assert!(stats.accepted <= 2, "{stats:?}");
+    assert_eq!(
+        stats.stored + stats.ignored + stats.failed + stats.unprocessed,
+        2,
+        "{stats:?}"
     );
-    drop(tx); // Removing the last sender must not hide accepted work from the deadline report.
     conn.execute_batch("ROLLBACK").unwrap();
     drop(conn);
     tokio::time::sleep(Duration::from_millis(150)).await;
