@@ -8,32 +8,147 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-class NativeLibraryWorkflowTests(unittest.TestCase):
-    def test_macos_opt_in_gate_precedes_all_production_startup_and_debug_smokes(self):
-        text = (ROOT / '.github/workflows/macos.yml').read_text()
-        gate=text.index('id: native-library-smoke')
-        for marker in ('Required release app launch', 'Build debug binary for native UI interactions', 'id: updater-smoke', 'Required native launch, UI, API', 'Optional updater UI interaction'):
-            self.assertLess(gate,text.index(marker),marker)
-        self.assertIn('native_library_smoke:',text)
-        self.assertIn("if: ${{ inputs.native_library_smoke }}",text)
-        section=text[gate:text.index('Resolve native-smoke Cargo artifact path')]
-        self.assertEqual(section.count('build/native-library-smoke.sh'),1)
-        self.assertNotIn('continue-on-error',section); self.assertNotIn('for attempt',section)
-        self.assertIn('MUNINN_E2E_DIR="$(mktemp -d "$RUNNER_TEMP/chat-hub-native-library-e2e.XXXXXX")"',section)
-        self.assertIn('pwd.getpwuid(os.getuid()).pw_dir',section)
-        self.assertIn('native library smoke: ran (success)',section)
-        self.assertIn('native library smoke: ran (failure',section)
-        self.assertIn('native library smoke: skipped',section)
+def parse_workflow_steps(text):
+    """Parse this workflow's YAML step sequence using only the Python stdlib.
 
-    def test_release_gate_is_unconditional_before_startup_after_dmg(self):
-        text=(ROOT/'.github/workflows/release.yml').read_text()
-        gate=text.index('Required native library persisted-data smoke')
-        self.assertLess(gate,text.index('Upload only reviewed DMG'))
-        section=text[gate:text.index('      - uses: actions/upload-artifact',gate)]
-        self.assertEqual(section.count('build/native-library-smoke.sh'),1)
-        self.assertNotIn('continue-on-error',section); self.assertNotRegex(section,r'\n\s+if:')
-        self.assertIn('mktemp -d',section); self.assertIn('--allow-default-app-data --disposable-home',section)
-        self.assertIn('--native-library-source',text)
+    This deliberately supports the block-scalar/key subset used by GitHub
+    Actions steps, producing mappings rather than searching source offsets.
+    Reject unexpected indentation/step syntax so a YAML shape change cannot
+    silently weaken these dependency assertions.
+    """
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line == '    steps:'), None)
+    if start is None:
+        raise ValueError('workflow has no jobs.package.steps sequence')
+    steps = []
+    i = start + 1
+    while i < len(lines):
+        line = lines[i]
+        if line and not line.startswith('      ') and not line.startswith('        '):
+            break
+        if not line.strip():
+            i += 1
+            continue
+        if line.startswith('      - '):
+            step = {}
+            key, _, value = line[8:].partition(':')
+            if not _:
+                raise ValueError(f'invalid step entry: {line}')
+            step[key] = value.strip()
+            steps.append(step)
+            i += 1
+            continue
+        if line.startswith('        ') and steps:
+            body = line[8:]
+            key, sep, value = body.partition(':')
+            if not sep:
+                raise ValueError(f'invalid step mapping: {line}')
+            if value.strip() == '|':
+                i += 1
+                block = []
+                while i < len(lines) and (not lines[i].strip() or lines[i].startswith('          ')):
+                    block.append(lines[i][10:] if lines[i].startswith('          ') else '')
+                    i += 1
+                steps[-1][key] = '\\n'.join(block)
+                continue
+            steps[-1][key] = value.strip()
+            i += 1
+            continue
+        raise ValueError(f'unexpected workflow step indentation: {line}')
+    if not steps:
+        raise ValueError('workflow step sequence is empty')
+    return steps
+
+
+def _assert_workflow_contract(test, steps, kind):
+    def find(fragment):
+        return next(i for i, step in enumerate(steps)
+                    if fragment in step.get('name', '') or fragment in step.get('id', ''))
+
+    gate = find('native-library-smoke') if kind == 'macos' else find('Required native library persisted-data smoke')
+    build_commands = [i for i, step in enumerate(steps)
+                      if 'bash build/build-native-macos.sh' in step.get('run', '')]
+    test.assertEqual(len(build_commands), 1, 'expected exactly one production app build command')
+    producer = build_commands[0]
+    resolve = find('Resolve native-smoke Cargo artifact path')
+    compile_step = find('Compile native-smoke feature') if kind == 'macos' else find('Required native-smoke feature compilation')
+    debug_build = find('Build debug binary') if kind == 'macos' else find('Build native-smoke binary')
+    prepare = find('Prepare isolated debug bundle')
+    test.assertLess(producer, resolve)
+    test.assertLess(producer, prepare)
+    test.assertLess(resolve, compile_step)
+    test.assertLess(compile_step, debug_build)
+    test.assertLess(debug_build, prepare)
+    test.assertLess(prepare, gate)
+    prepare_run = steps[prepare].get('run', '')
+    test.assertIn('cmp -s', prepare_run)
+    test.assertIn('codesign --verify --deep --strict', prepare_run)
+    app_assignment = next((line.strip() for line in prepare_run.split('\\n')
+                           if line.strip().startswith('app=') and 'Chat Hub.app' in line), None)
+    test.assertIsNotNone(app_assignment, 'debug prepare must assign the app bundle path')
+    debug_path = '$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app'
+    test.assertIn(debug_path, app_assignment)
+    test.assertIn('ditto "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$app"', prepare_run)
+    test.assertLess(producer, prepare)
+    gate_run = steps[gate].get('run', '')
+    test.assertIn('build/native-library-smoke.sh', gate_run)
+    test.assertIn(debug_path, gate_run)
+    test.assertIn(debug_path, prepare_run)
+    test.assertLess(gate, find('Required release app launch') if kind == 'macos' else find('Required startup and authenticated health smoke'))
+    markers = ('native-launch-smoke', 'smoke-native-macos')
+    if kind == 'macos':
+        markers += ('updater-smoke', 'native-ui-smoke')
+    for marker in markers:
+        matching = [i for i, step in enumerate(steps) if marker in step.get('run', '')]
+        test.assertTrue(matching, f'missing {marker}')
+        test.assertGreater(min(matching), gate, marker)
+    if kind == 'macos':
+        test.assertEqual(steps[gate].get('if'), '${{ inputs.native_library_smoke }}')
+        test.assertIn('native library smoke: skipped', steps[find('Report skipped native library smoke')]['run'])
+        test.assertNotIn('continue-on-error', steps[gate])
+        test.assertNotIn('for attempt', gate_run)
+    else:
+        test.assertNotIn('if', steps[gate])
+        test.assertNotIn('continue-on-error', steps[gate])
+    evidence = [i for i, step in enumerate(steps) if '--native-library-source' in step.get('run', '')]
+    test.assertTrue(evidence, 'missing native-library evidence preparation')
+    test.assertGreater(min(evidence), gate)
+
+
+class NativeLibraryWorkflowTests(unittest.TestCase):
+    def test_macos_opt_in_gate_has_correct_dependencies(self):
+        _assert_workflow_contract(self, parse_workflow_steps((ROOT / '.github/workflows/macos.yml').read_text()), 'macos')
+
+    def test_release_gate_has_correct_dependencies(self):
+        _assert_workflow_contract(self, parse_workflow_steps((ROOT / '.github/workflows/release.yml').read_text()), 'release')
+
+    def test_contract_rejects_debug_prepare_after_gate_and_wrong_artifact(self):
+        import copy
+        for kind, filename in (('macos', 'macos.yml'), ('release', 'release.yml')):
+            with self.subTest(workflow=kind):
+                original = parse_workflow_steps((ROOT / '.github/workflows' / filename).read_text())
+                find = lambda fragment: next(i for i, step in enumerate(original) if fragment in step.get('name', '') or fragment in step.get('id', ''))
+                gate = find('native-library-smoke') if kind == 'macos' else find('Required native library persisted-data smoke')
+                prep = find('Prepare isolated debug bundle')
+                producer = next(i for i, step in enumerate(original)
+                                if 'bash build/build-native-macos.sh' in step.get('run', ''))
+                mutant = copy.deepcopy(original)
+                mutant[producer], mutant[gate] = mutant[gate], mutant[producer]
+                with self.assertRaises(AssertionError): _assert_workflow_contract(self, mutant, kind)
+                mutant = copy.deepcopy(original)
+                mutant[producer], mutant[prep] = mutant[prep], mutant[producer]
+                with self.assertRaises(AssertionError): _assert_workflow_contract(self, mutant, kind)
+                mutant = copy.deepcopy(original)
+                mutant[gate], mutant[prep] = mutant[prep], mutant[gate]
+                with self.assertRaises(AssertionError): _assert_workflow_contract(self, mutant, kind)
+                mutant = copy.deepcopy(original)
+                mutant[gate]['run'] = mutant[gate]['run'].replace('$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app', '$RUNNER_TEMP/chat-hub/Chat Hub.app')
+                with self.assertRaises(AssertionError): _assert_workflow_contract(self, mutant, kind)
+                mutant = copy.deepcopy(original)
+                gate = next(i for i, step in enumerate(mutant) if 'native-library-smoke' in step.get('name', '') or 'Required native library persisted-data smoke' in step.get('name', '') or step.get('id') == 'native-library-smoke')
+                sanitizer = next(i for i, step in enumerate(mutant) if '--native-library-source' in step.get('run', ''))
+                mutant[gate], mutant[sanitizer] = mutant[sanitizer], mutant[gate]
+                with self.assertRaises(AssertionError): _assert_workflow_contract(self, mutant, kind)
 
     def test_wrapper_has_strict_flags_preflight_and_safe_executable(self):
         text=(ROOT/'build/native-library-smoke.sh').read_text()
