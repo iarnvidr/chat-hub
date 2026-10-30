@@ -5,6 +5,8 @@ on:
       - "src-tauri/**"
       - "build/**"
       - "tests/native/**"
+      - "src/**"
+      - "frontend/**"
       - "package.json"
       - "package-lock.json"
       - "Cargo.toml"
@@ -17,7 +19,7 @@ on:
       native_library_smoke:
         description: Run the native-library smoke against the packaged app
         required: true
-        default: false
+        default: true
         type: boolean
 permissions:
   contents: read
@@ -88,9 +90,8 @@ jobs:
           cmp -s "$debug_binary" "$app/Contents/MacOS/$exe"
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
-      - name: Optional native library persisted-data smoke (debug bundle only)
+      - name: Required native library persisted-data smoke (debug bundle only)
         id: native-library-smoke
-        if: ${{ github.event_name == 'pull_request' || inputs.native_library_smoke }}
         env:
           NATIVE_LIBRARY_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-library-evidence
         run: |
@@ -106,9 +107,6 @@ jobs:
             echo "native library smoke: ran (failure, exit $rc)" | tee -a "$GITHUB_STEP_SUMMARY"
             exit "$rc"
           fi
-      - name: Report skipped native library smoke
-        if: ${{ github.event_name != 'pull_request' && !inputs.native_library_smoke }}
-        run: 'echo "native library smoke: skipped (input disabled; not an acceptance result)" >> "$GITHUB_STEP_SUMMARY"'
       - name: Required release app launch and localhost health smoke
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
@@ -165,7 +163,7 @@ jobs:
         if: always()
         run: |
           args=()
-          if [[ '${{ inputs.native_library_smoke }}' == 'true' ]]; then args+=(--native-library-source "$RUNNER_TEMP/chat-hub-native-library-evidence"); fi
+          args+=(--native-library-source "$RUNNER_TEMP/chat-hub-native-library-evidence")
           python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-debug-ui-evidence" "$RUNNER_TEMP/chat-hub-provider-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence" "${args[@]}"
       - name: Upload release startup evidence
         if: always()
@@ -193,6 +191,21 @@ jobs:
           if-no-files-found: error
           # Builds of main stay downloadable for a month; PR builds for a week.
           retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
+      - name: Retain accepted native release input
+        run: |
+          version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/chat-hub/Chat Hub.app" "artifacts/Chat_Hub_${version}_macos-arm64.zip"
+          (cd artifacts && shasum -a 256 "Chat_Hub_${version}_macos-arm64.zip" > "Chat_Hub_${version}_macos-arm64.zip.sha256")
+          cp "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg" artifacts/
+          python3 build/release_artifact.py receipt
+      - name: Upload accepted native release input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chat-hub-native-release
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
       - name: Show where to download this build
         env:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
