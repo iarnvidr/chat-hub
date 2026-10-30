@@ -37,6 +37,23 @@ pub struct IngestStats {
     pub failed: u64,
     pub unprocessed: u64,
 }
+
+/// Shared by the real CLI caller and deadline tests. Legacy zeros cannot imply
+/// capture drain; unresolved capture work remains pending, and contention unknown.
+pub fn shutdown_report(
+    legacy: &IngestStats,
+    capture: crate::live_capture::Snapshot,
+) -> serde_json::Value {
+    let state = match &capture {
+        crate::live_capture::Snapshot::Unavailable => "unknown",
+        crate::live_capture::Snapshot::Available { enabled: false, .. } => "disabled",
+        crate::live_capture::Snapshot::Available { counters, .. } if counters.active > 0 => {
+            "pending"
+        }
+        crate::live_capture::Snapshot::Available { .. } => "settled",
+    };
+    serde_json::json!({"event":"shutdown", "LEGACY": {"accepted":legacy.accepted,"stored":legacy.stored,"ignored":legacy.ignored,"failed":legacy.failed,"unprocessed":legacy.unprocessed}, "capture_state":state, "capture":capture})
+}
 #[derive(Clone)]
 pub struct ServiceStatus {
     pub state: ServiceState,
@@ -785,6 +802,9 @@ mod deadline_tests {
         }
         assert!(matches!(handle.status().state, ServiceState::Failed(_)));
         assert!(handle.live_receiver.lock().unwrap().is_closed());
+        let report = shutdown_report(&IngestStats::default(), handle.capture_status().snapshot());
+        assert_eq!(report["capture"]["counters"]["store_failed"], 1);
+        assert_eq!(report["LEGACY"]["stored"], 0);
         let _ = handle.shutdown().await;
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -858,10 +878,15 @@ mod deadline_tests {
         })
         .await
         .unwrap();
-        let _ = handle.shutdown_timeout(Duration::from_millis(1)).await;
-        let pending = serde_json::to_value(capture.snapshot()).unwrap();
+        let legacy = handle.shutdown_timeout(Duration::from_millis(1)).await;
+        let report = shutdown_report(&legacy, capture.snapshot());
+        let pending = report["capture"].clone();
         drop(release);
         exited.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(report["capture_state"], "pending");
+        assert_eq!(report["LEGACY"]["stored"], 0);
+        assert_eq!(report["LEGACY"]["unprocessed"], 0);
+        assert!(!report.to_string().contains("shutdown complete"));
         assert_eq!(pending["counters"]["active"], 1);
         assert_eq!(pending["counters"]["shutdown_unprocessed"], 0);
         let final_state = serde_json::to_value(capture.snapshot()).unwrap();
@@ -874,6 +899,17 @@ mod deadline_tests {
         assert_eq!(store.library_snapshot().unwrap().conversations.len(), 1);
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_report_unavailable_is_unknown_and_never_fabricates_zero_capture() {
+        let report = shutdown_report(
+            &IngestStats::default(),
+            crate::live_capture::Snapshot::Unavailable,
+        );
+        assert_eq!(report["capture_state"], "unknown");
+        assert_eq!(report["capture"]["status"], "unavailable");
+        assert!(report["capture"].get("counters").is_none());
     }
 
     #[tokio::test]

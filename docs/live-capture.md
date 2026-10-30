@@ -41,6 +41,11 @@ Pending writer
 transactions remain active until resolved, including after shutdown timeout.
 Existing `ingest`/shutdown `IngestStats` counters describe legacy CaptureEvent
 ingress only; typed live attempts are counted exclusively by `capture`.
+The CLI shutdown report labels these fields `LEGACY` and includes the retained
+authoritative capture snapshot. `capture_state` is `pending` while attempts are
+active, `unknown` when the snapshot is unavailable, `disabled` when opted out,
+or `settled` when all attempts have a terminal disposition. Settled does not
+mean every snapshot committed; inspect terminal outcomes and safe errors.
 Safe last-error codes never contain bodies, paths, credentials or SQL errors.
 
 All usable `conversation_id` and export-style `id` values must match the source

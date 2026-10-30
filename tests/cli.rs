@@ -150,6 +150,7 @@ fn fresh_default_startup_creates_canonical_data_dir_and_sigint_cleans_runtime() 
 #[cfg(unix)]
 #[test]
 fn running_status_checks_identity_and_sigint_cleans_runtime() {
+    use std::io::Read;
     let d = temp();
     let mut child = ChildGuard(
         configured(
@@ -210,5 +211,20 @@ fn running_status_checks_identity_and_sigint_cleans_runtime() {
     assert!(!record_path.exists());
     assert!(!d.join("runtime/service.token").exists());
     assert!(!d.join("runtime/service.lock").exists());
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(report["event"], "shutdown");
+    assert!(report.get("LEGACY").is_some());
+    assert_eq!(report["capture_state"], "disabled");
+    assert_eq!(report["capture"]["enabled"], false);
+    assert_eq!(report["capture"]["counters"]["active"], 0);
+    assert!(!stderr.contains("shutdown complete"));
     fs::remove_dir_all(d).unwrap();
 }

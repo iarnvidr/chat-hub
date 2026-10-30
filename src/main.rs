@@ -102,12 +102,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("runtime setup: {e}"))?;
             println!("{{\"service\":\"{APP_NAME}\",\"status\":\"running\",\"pid\":{},\"instance_id\":\"{}\",\"api_addr\":\"{}\",\"proxy_addr\":\"{}\"}}",st.identity.pid,st.identity.instance_id,st.api_addr.unwrap(),st.proxy_addr.unwrap());
             tokio::signal::ctrl_c().await?;
+            let capture = handle.capture_status();
             let stats = handle.shutdown_timeout(Duration::from_secs(5)).await;
             runtime.cleanup();
-            eprintln!(
-                "shutdown complete: stored={}, ignored={}, failed={}, unprocessed={}",
-                stats.stored, stats.ignored, stats.failed, stats.unprocessed
-            );
+            eprintln!("{}", service::shutdown_report(&stats, capture.snapshot()));
             Ok(())
         }
         _ => Err("usage: chat-hub <status|search|read|serve|import|backup|export-json>".into()),
