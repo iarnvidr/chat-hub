@@ -58,6 +58,42 @@ async fn bounded_service_ingests_synthetic_capture_and_drains() {
 }
 
 #[tokio::test]
+async fn malformed_capture_is_ignored_then_valid_capture_is_stored() {
+    let root = tmp("malformed-then-valid");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let (handle, tx) = service::start(
+        config(
+            root.join("db.sqlite").display().to_string(),
+            root.join("ca"),
+        ),
+        4,
+    )
+    .await
+    .unwrap();
+    tx.send(event("/backend-api/conversation/bad", b"null"))
+        .await
+        .unwrap();
+    tx.send(event(
+        "/backend-api/conversation/good",
+        br#"{"title":"Good","mapping":{}}"#,
+    ))
+    .await
+    .unwrap();
+    drop(tx);
+    let stats = handle.shutdown().await;
+    assert_eq!(stats.accepted, 2);
+    assert_eq!(stats.ignored, 1);
+    assert_eq!(stats.stored, 1);
+    assert_eq!(stats.failed, 0);
+    let store =
+        chat_hub::store::Store::open(&root.join("db.sqlite").display().to_string()).unwrap();
+    assert!(store.read("good").unwrap().is_some());
+    assert!(store.read("bad").unwrap().is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn start_proxy_failure_releases_api_listener_and_drop_releases_api() {
     let root = tmp("rollback");
     let _ = std::fs::remove_dir_all(&root);
@@ -232,7 +268,7 @@ async fn shutdown_deadline_returns_with_blocked_writer_and_counts_inflight() {
         stats.unprocessed >= 2,
         "in-flight accepted item and queued item must be reported: {stats:?}"
     );
-    drop(tx);
+    drop(tx); // Removing the last sender must not hide accepted work from the deadline report.
     conn.execute_batch("ROLLBACK").unwrap();
     drop(conn);
     tokio::time::sleep(Duration::from_millis(150)).await;

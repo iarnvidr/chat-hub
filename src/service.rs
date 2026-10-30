@@ -52,10 +52,20 @@ pub struct ServiceHandle {
     writer: Option<JoinHandle<()>>,
     writer_stop: Arc<AtomicBool>,
     abandon_queue: Arc<AtomicBool>,
-    sender: mpsc::WeakSender<CaptureEvent>,
+    abandoned: Arc<AtomicU64>,
+    receiver: Arc<Mutex<mpsc::Receiver<CaptureEvent>>>,
     interrupt: Arc<rusqlite::InterruptHandle>,
     deadline: Duration,
 }
+fn supervise_writer<F>(operation: F, cleanup: impl FnOnce())
+where
+    F: FnOnce(),
+{
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err() {
+        cleanup();
+    }
+}
+
 fn lock_status(status: &Mutex<ServiceStatus>) -> std::sync::MutexGuard<'_, ServiceStatus> {
     match status.lock() {
         Ok(guard) => guard,
@@ -75,7 +85,12 @@ impl ServiceHandle {
         self.shutdown_timeout(d).await
     }
     pub async fn shutdown_timeout(mut self, budget: Duration) -> IngestStats {
-        lock_status(&self.status).state = ServiceState::Stopping;
+        {
+            let mut state = lock_status(&self.status);
+            if !matches!(state.state, ServiceState::Failed(_)) {
+                state.state = ServiceState::Stopping;
+            }
+        }
         let _ = self.shutdown.send(true);
         let end = Instant::now() + budget;
         // The proxy monitor awaits the original accept task, which does not
@@ -100,29 +115,35 @@ impl ServiceHandle {
             } else {
                 self.abandon_queue.store(true, Ordering::Release);
                 self.interrupt.interrupt();
-                let queued = self
-                    .sender
-                    .upgrade()
-                    .map(|tx| tx.max_capacity().saturating_sub(tx.capacity()) as u64)
-                    .unwrap_or(0);
+                let queued = {
+                    let mut rx = self.receiver.lock().unwrap_or_else(|p| p.into_inner());
+                    rx.close();
+                    let n = rx.len() as u64;
+                    while rx.try_recv().is_ok() {}
+                    n
+                };
+                self.abandoned.fetch_add(queued, Ordering::AcqRel);
                 let mut s = lock_status(&self.status);
                 s.state = ServiceState::Failed(
                     "shutdown deadline exceeded; SQLite interrupted; writer still finishing".into(),
                 );
-                s.ingest.unprocessed = s
-                    .ingest
-                    .accepted
-                    .saturating_sub(s.ingest.stored + s.ingest.ignored + s.ingest.failed)
-                    .saturating_add(queued);
+                s.ingest.unprocessed = self.abandoned.load(Ordering::Acquire).saturating_add(
+                    s.ingest
+                        .accepted
+                        .saturating_sub(s.ingest.stored + s.ingest.ignored + s.ingest.failed),
+                );
                 return s.ingest.clone();
             }
         }
         let mut s = lock_status(&self.status);
-        s.state = ServiceState::Stopped;
-        s.ingest.unprocessed = s
-            .ingest
-            .accepted
-            .saturating_sub(s.ingest.stored + s.ingest.ignored + s.ingest.failed);
+        if !matches!(s.state, ServiceState::Failed(_)) {
+            s.state = ServiceState::Stopped;
+        }
+        s.ingest.unprocessed = self.abandoned.load(Ordering::Acquire).saturating_add(
+            s.ingest
+                .accepted
+                .saturating_sub(s.ingest.stored + s.ingest.ignored + s.ingest.failed),
+        );
         s.ingest.clone()
     }
 }
@@ -161,6 +182,16 @@ pub async fn start_with_proxy(
         return Err("bearer token must not be empty".into());
     }
     let path = config.database_path.clone();
+    if !path.is_empty() && path != ":memory:" {
+        let db_path = std::path::Path::new(&path);
+        if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || std::fs::create_dir_all(parent))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+        }
+    }
     let api_store = tokio::task::spawn_blocking(move || {
         Store::open(&path).and_then(|s| {
             s.health()?;
@@ -174,7 +205,9 @@ pub async fn start_with_proxy(
         .await
         .map_err(|e| e.to_string())?;
     let api_addr = listener.local_addr().map_err(|e| e.to_string())?;
-    let (tx, mut rx) = mpsc::channel(capacity);
+    let (tx, rx) = mpsc::channel(capacity);
+    let receiver = Arc::new(Mutex::new(rx));
+    let writer_receiver = receiver.clone();
     static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -194,63 +227,105 @@ pub async fn start_with_proxy(
         ingest: IngestStats::default(),
     }));
     let (stop, _) = watch::channel(false);
+    let abort_registry: Arc<Mutex<Vec<tokio::task::AbortHandle>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let writer_abort_registry = abort_registry.clone();
+    let writer_stop_service = stop.clone();
     let (writer_ready_tx, writer_ready_rx) = oneshot::channel();
     let writer_status = status.clone();
     let flag = Arc::new(AtomicBool::new(false));
     let wf = flag.clone();
     let abandon_queue = Arc::new(AtomicBool::new(false));
     let wa = abandon_queue.clone();
+    let abandoned = Arc::new(AtomicU64::new(0));
+    let writer_abandoned = abandoned.clone();
     let db = config.database_path.clone();
     let writer = Builder::new()
         .name("capture-ingestion".into())
         .spawn(move || {
-            let mut store = match Store::open(&db) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = writer_ready_tx.send(Err(e.to_string()));
-                    return;
-                }
-            };
-            let _ = store.connection.busy_timeout(Duration::from_millis(100));
-            let interrupt = Arc::new(store.connection.get_interrupt_handle());
-            let _ = writer_ready_tx.send(Ok(interrupt));
-            loop {
-                if wf.load(Ordering::Acquire) {
-                    rx.close()
-                }
-                if wa.load(Ordering::Acquire) {
-                    // Expired shutdown must not start more SQLite work. Count queued
-                    // events as unprocessed before dropping them from the receiver.
-                    let queued = rx.len() as u64;
-                    if queued != 0 {
-                        let mut s = lock_status(&writer_status);
-                        s.ingest.unprocessed = s.ingest.unprocessed.saturating_add(queued);
-                    }
-                    while rx.try_recv().is_ok() {}
-                    break;
-                }
-                match rx.try_recv() {
-                    Ok(ev) => {
-                        let mut s = lock_status(&writer_status);
-                        s.ingest.accepted += 1;
-                        drop(s);
-                        let out = store.ingest_capture(ev);
-                        let mut s = lock_status(&writer_status);
-                        match out {
-                            Ok(true) => s.ingest.stored += 1,
-                            Ok(false) => s.ingest.ignored += 1,
-                            Err(_) => {
-                                s.ingest.failed += 1;
-                                s.database_healthy = Some(false);
+            supervise_writer(
+                || {
+                    let mut store = match Store::open(&db) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = writer_ready_tx.send(Err(e.to_string()));
+                            return;
+                        }
+                    };
+                    let _ = store.connection.busy_timeout(Duration::from_millis(100));
+                    let interrupt = Arc::new(store.connection.get_interrupt_handle());
+                    let _ = writer_ready_tx.send(Ok(interrupt));
+                    loop {
+                        if wf.load(Ordering::Acquire) {
+                            writer_receiver
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .close()
+                        }
+                        if wa.load(Ordering::Acquire) {
+                            let mut rx = writer_receiver.lock().unwrap_or_else(|p| p.into_inner());
+                            rx.close();
+                            let queued = rx.len() as u64;
+                            while rx.try_recv().is_ok() {}
+                            writer_abandoned.fetch_add(queued, Ordering::AcqRel);
+                            break;
+                        }
+                        // Holding the receiver lock through accepted accounting makes dequeue
+                        // and deadline abandonment mutually exclusive, with no accounting gap.
+                        let received = {
+                            let mut rx = writer_receiver.lock().unwrap_or_else(|p| p.into_inner());
+                            let received = rx.try_recv();
+                            if received.is_ok() {
+                                lock_status(&writer_status).ingest.accepted += 1;
+                            }
+                            received
+                        };
+                        match received {
+                            Ok(ev) => {
+                                let out = store.ingest_capture(ev);
+                                let mut s = lock_status(&writer_status);
+                                match out {
+                                    Ok(true) => s.ingest.stored += 1,
+                                    Ok(false) => s.ingest.ignored += 1,
+                                    Err(_) => {
+                                        s.ingest.failed += 1;
+                                        s.database_healthy = Some(false);
+                                    }
+                                }
+                            }
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                std::thread::sleep(Duration::from_millis(2))
                             }
                         }
                     }
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        std::thread::sleep(Duration::from_millis(2))
+                },
+                || {
+                    wf.store(true, Ordering::Release);
+                    wa.store(true, Ordering::Release);
+                    {
+                        let mut rx = writer_receiver.lock().unwrap_or_else(|p| p.into_inner());
+                        rx.close();
+                        let queued = rx.len() as u64;
+                        while rx.try_recv().is_ok() {}
+                        writer_abandoned.fetch_add(queued, Ordering::AcqRel);
                     }
-                }
-            }
+                    let mut status = lock_status(&writer_status);
+                    status.database_healthy = Some(false);
+                    if !matches!(status.state, ServiceState::Failed(_)) {
+                        status.state = ServiceState::Failed("capture writer panicked".into());
+                    }
+                    drop(status);
+                    let _ = writer_stop_service.send(true);
+                    for abort in writer_abort_registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .iter()
+                    {
+                        abort.abort();
+                    }
+                },
+            )
         })
         .map_err(|e| e.to_string())?;
     let interrupt = match writer_ready_rx.await.map_err(|e| e.to_string())? {
@@ -303,6 +378,20 @@ pub async fn start_with_proxy(
             let _ = proxy_stop.send(true);
         }
     });
+    let api_abort = api.abort_handle();
+    abort_registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .extend([api_abort, proxy_abort.clone()]);
+    if matches!(lock_status(&status).state, ServiceState::Failed(_)) {
+        for abort in abort_registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+        {
+            abort.abort();
+        }
+    }
     {
         let mut s = lock_status(&status);
         s.proxy_addr = Some(proxy.addr);
@@ -319,7 +408,8 @@ pub async fn start_with_proxy(
             writer: Some(writer),
             writer_stop: flag,
             abandon_queue,
-            sender: tx.downgrade(),
+            abandoned,
+            receiver,
             interrupt,
             deadline: Duration::from_secs(5),
         },
@@ -362,5 +452,119 @@ mod status_poison_tests {
             snapshot.state,
             ServiceState::Failed("service status lock poisoned".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod writer_panic_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn writer_panic_fails_service_accounts_queue_and_closes_listeners() {
+        let identity = server::RuntimeIdentity {
+            pid: 1,
+            instance_id: "panic-test".into(),
+        };
+        let status = Arc::new(Mutex::new(ServiceStatus {
+            state: ServiceState::Ready,
+            identity,
+            api_addr: None,
+            proxy_addr: None,
+            database_healthy: Some(true),
+            ingest: IngestStats {
+                accepted: 1,
+                ..IngestStats::default()
+            },
+        }));
+        let (stop, stop_rx) = watch::channel(false);
+        let (tx, rx) = mpsc::channel(2);
+        tx.try_send(CaptureEvent {
+            host: "example.test".into(),
+            path: "/queued".into(),
+            status: 200,
+            body: vec![],
+        })
+        .unwrap();
+        drop(tx);
+        let receiver = Arc::new(Mutex::new(rx));
+        let writer_stop = Arc::new(AtomicBool::new(false));
+        let abandon = Arc::new(AtomicBool::new(false));
+        let abandoned = Arc::new(AtomicU64::new(0));
+        let registry: Arc<Mutex<Vec<tokio::task::AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let listeners = [
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        ];
+        let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        for listener in listeners {
+            let task = tokio::spawn(async move {
+                let _ = listener.accept().await;
+            });
+            registry.lock().unwrap().push(task.abort_handle());
+            std::mem::forget(task);
+        }
+        let cleanup_status = status.clone();
+        let cleanup_receiver = receiver.clone();
+        let cleanup_stop = writer_stop.clone();
+        let cleanup_abandon = abandon.clone();
+        let cleanup_count = abandoned.clone();
+        let cleanup_registry = registry.clone();
+        supervise_writer(
+            || panic!("intentional writer panic"),
+            || {
+                cleanup_stop.store(true, Ordering::Release);
+                cleanup_abandon.store(true, Ordering::Release);
+                let mut rx = cleanup_receiver.lock().unwrap();
+                rx.close();
+                let count = rx.len() as u64;
+                while rx.try_recv().is_ok() {}
+                cleanup_count.fetch_add(count, Ordering::AcqRel);
+                let mut s = lock_status(&cleanup_status);
+                s.database_healthy = Some(false);
+                if !matches!(s.state, ServiceState::Failed(_)) {
+                    s.state = ServiceState::Failed("capture writer panicked".into());
+                }
+                drop(s);
+                let _ = stop.send(true);
+                for abort in cleanup_registry.lock().unwrap().iter() {
+                    abort.abort();
+                }
+            },
+        );
+        assert!(writer_stop.load(Ordering::Acquire));
+        assert!(abandon.load(Ordering::Acquire));
+        assert!(*stop_rx.borrow());
+        assert_eq!(abandoned.load(Ordering::Acquire), 1);
+        assert_eq!(status.lock().unwrap().database_healthy, Some(false));
+        assert_eq!(
+            status.lock().unwrap().state,
+            ServiceState::Failed("capture writer panicked".into())
+        );
+        let store = Store::in_memory().unwrap();
+        let interrupt = Arc::new(store.connection.get_interrupt_handle());
+        let handle = ServiceHandle {
+            status: status.clone(),
+            shutdown: stop,
+            tasks: vec![],
+            listener_abort_handles: registry.lock().unwrap().clone(),
+            writer: None,
+            writer_stop,
+            abandon_queue: abandon,
+            abandoned,
+            receiver,
+            interrupt,
+            deadline: Duration::from_millis(1),
+        };
+        let stats = handle.shutdown_timeout(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(stats.unprocessed, 2);
+        assert!(matches!(
+            status.lock().unwrap().state,
+            ServiceState::Failed(_)
+        ));
+        for addr in addresses {
+            let rebound = tokio::net::TcpListener::bind(addr).await;
+            assert!(rebound.is_ok(), "listener remained bound at {addr}");
+        }
     }
 }

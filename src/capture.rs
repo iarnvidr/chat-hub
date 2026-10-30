@@ -13,12 +13,13 @@ pub fn parse_event(event: &CaptureEvent) -> Option<Value> {
         return None;
     }
     let mut value: Value = serde_json::from_slice(&event.body).ok()?;
-    if value
+    let object = value.as_object_mut()?;
+    if object
         .get("conversation_id")
         .and_then(Value::as_str)
         .is_none()
     {
-        value["conversation_id"] = Value::String(id.to_owned());
+        object.insert("conversation_id".to_owned(), Value::String(id.to_owned()));
     }
     value.get("mapping").and_then(Value::as_object)?;
     Some(value)
