@@ -1,6 +1,12 @@
 name: Apple Silicon build
 on:
   workflow_dispatch:
+    inputs:
+      native_library_smoke:
+        description: Run the native-library smoke against the packaged app
+        required: true
+        default: false
+        type: boolean
 permissions:
   contents: read
 concurrency:
@@ -44,10 +50,6 @@ jobs:
           python3 build/release_sources.py prepare "$RUNNER_TEMP/chat-hub/corresponding-source"
           version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
           bash build/package-dmg.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$RUNNER_TEMP/chat-hub/corresponding-source" "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg"
-      - name: Required release app launch and localhost health smoke
-        env:
-          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
-        run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
       - name: Resolve native-smoke Cargo artifact path
         id: native-smoke-artifact
         run: |
@@ -74,6 +76,31 @@ jobs:
           cmp -s "$debug_binary" "$app/Contents/MacOS/$exe"
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
+      - name: Optional native library persisted-data smoke (debug bundle only)
+        id: native-library-smoke
+        if: ${{ inputs.native_library_smoke }}
+        env:
+          NATIVE_LIBRARY_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-library-evidence
+        run: |
+          set -euo pipefail
+          MUNINN_E2E_DIR="$(mktemp -d "$RUNNER_TEMP/chat-hub-native-library-e2e.XXXXXX")"
+          export MUNINN_E2E_DIR
+          mkdir -p "$NATIVE_LIBRARY_EVIDENCE_DIR"
+          home="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
+          if bash build/native-library-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$NATIVE_LIBRARY_EVIDENCE_DIR" --allow-default-app-data --disposable-home "$home"; then
+            echo "native library smoke: ran (success)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            rc=$?
+            echo "native library smoke: ran (failure, exit $rc)" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
+      - name: Report skipped native library smoke
+        if: ${{ !inputs.native_library_smoke }}
+        run: 'echo "native library smoke: skipped (input disabled; not an acceptance result)" >> "$GITHUB_STEP_SUMMARY"'
+      - name: Required release app launch and localhost health smoke
+        env:
+          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
+        run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
       - id: updater-smoke
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
         name: Native signed updater integration smoke (debug bundle)
@@ -124,7 +151,10 @@ jobs:
         run: bash build/native-ui-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-debug-ui-evidence"
       - name: Prepare allowlisted release and native smoke evidence
         if: always()
-        run: python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-debug-ui-evidence" "$RUNNER_TEMP/chat-hub-provider-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence"
+        run: |
+          args=()
+          if [[ '${{ inputs.native_library_smoke }}' == 'true' ]]; then args+=(--native-library-source "$RUNNER_TEMP/chat-hub-native-library-evidence"); fi
+          python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-debug-ui-evidence" "$RUNNER_TEMP/chat-hub-provider-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence" "${args[@]}"
       - name: Upload release startup evidence
         if: always()
         continue-on-error: true

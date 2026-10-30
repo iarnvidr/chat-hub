@@ -36,6 +36,8 @@ struct AppState {
     runtime: Arc<Mutex<Option<desktop_runtime::DesktopRuntime>>>,
     shutdown_started: Arc<AtomicBool>,
     shutdown_finished: Arc<AtomicBool>,
+    #[cfg(all(feature = "native-smoke", debug_assertions))]
+    smoke_data_dir: PathBuf,
 }
 #[derive(Clone, Serialize)]
 struct UpdateStatus {
@@ -118,6 +120,50 @@ mod e2e {
     }
     fn run(app: &tauri::AppHandle, c: &Value, d: &std::path::Path, id: &str) -> Value {
         match c["op"].as_str().unwrap_or("") {
+            "import_library_fixture" => {
+                // This path is intentionally available only in the debug native-smoke
+                // harness, with both the command channel and a caller-selected isolated
+                // data directory. Never import this fixture into normal user data.
+                // This operation deliberately targets the normal platform app-data
+                // location. Require an explicit disposable-home opt-in, and reject
+                // both data-dir overrides so the smoke app cannot silently fork its DB.
+                let e2e_dir_is_valid = dir().is_some_and(|p| p.is_absolute() && p.is_dir());
+                let has_data_override = std::env::var_os("MUNINN_DATA_DIR").is_some()
+                    || std::env::var_os("MUNINN_E2E_DATA_DIR").is_some();
+                let allow_default_data_dir =
+                    std::env::var_os("MUNINN_E2E_ALLOW_DEFAULT_DATA_DIR").is_some_and(|v| v == "1");
+                if !cfg!(debug_assertions)
+                    || !super::smoke()
+                    || !e2e_dir_is_valid
+                    || has_data_override
+                    || !allow_default_data_dir
+                {
+                    return json!({"ok":false,"error":"native smoke fixture import disabled or required opt-in missing"});
+                }
+                // Compile-time fixed official synthetic fixture; no path or bytes supplied
+                // by the webview/driver. Use the real authenticated desktop API importer.
+                let bytes =
+                    include_bytes!("../../tests/fixtures/chatgpt-export/array.json").to_vec();
+                let count = match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(v) => v.as_array().map(|a| a.len() as u64),
+                    Err(_) => None,
+                };
+                let Some(count) = count else {
+                    return json!({"ok":false,"error":"fixture_invalid"});
+                };
+                let state = app.state::<super::AppState>();
+                match tauri::async_runtime::block_on(super::desktop_api::import(
+                    &state.api,
+                    &state.token,
+                    bytes,
+                    count,
+                )) {
+                    Ok(r) => {
+                        json!({"ok":true,"receipt":{"imported":r.imported,"updated":r.updated,"unchanged":r.unchanged,"failed":r.failed,"errors_truncated":r.errors_truncated}})
+                    }
+                    Err(e) => json!({"ok":false,"error":e}),
+                }
+            }
             "provider_denial" => {
                 let w = app.get_webview_window("provider");
                 let Some(w) = w else {
@@ -230,6 +276,41 @@ mod e2e {
                         return json!({"ok":false,"error":"timed out waiting for provider service_info result","href":readiness["href"],"readyState":readiness["readyState"],"polls":probe_polls});
                     }
                     std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            "default_data_info" => {
+                #[cfg(not(debug_assertions))]
+                return json!({"ok":false,"error":"native smoke default data evidence disabled"});
+                #[cfg(debug_assertions)]
+                {
+                    // Strictly opt-in evidence for the positive default-directory smoke run.
+                    // Paths are returned only over the local E2E command channel; callers must
+                    // not upload or log them.
+                    let e2e_dir_is_valid = dir().is_some_and(|p| p.is_absolute() && p.is_dir());
+                    let has_data_override = std::env::var_os("MUNINN_DATA_DIR").is_some()
+                        || std::env::var_os("MUNINN_E2E_DATA_DIR").is_some();
+                    let allow_default_data_dir =
+                        std::env::var_os("MUNINN_E2E_ALLOW_DEFAULT_DATA_DIR")
+                            .is_some_and(|v| v == "1");
+                    if !cfg!(debug_assertions)
+                        || !super::smoke()
+                        || !e2e_dir_is_valid
+                        || has_data_override
+                        || !allow_default_data_dir
+                    {
+                        return json!({"ok":false,"error":"native smoke default data evidence disabled or required opt-in missing"});
+                    }
+                    let state = app.state::<super::AppState>();
+                    let platform_default = match app.path().app_data_dir() {
+                        Ok(path) => path,
+                        Err(_) => {
+                            return json!({"ok":false,"error":"platform app-data resolver unavailable"})
+                        }
+                    };
+                    json!({"ok":true,"data_dir_source":"platform_default",
+                    "configured_data_dir":state.smoke_data_dir.to_string_lossy(),
+                    "platform_default_data_dir":platform_default.to_string_lossy(),
+                    "configured_matches_platform_default":state.smoke_data_dir == platform_default})
                 }
             }
             "state" => {
@@ -564,11 +645,9 @@ fn main() {
             #[cfg(feature = "native-smoke")]
             {
                 if smoke() {
-                    if let Some(path) = std::env::var_os("MUNINN_E2E_DATA_DIR") {
-                        PathBuf::from(path)
-                    } else {
-                        app.path().app_data_dir()?
-                    }
+                    std::env::var_os("MUNINN_E2E_DATA_DIR")
+                        .map(PathBuf::from)
+                        .unwrap_or(app.path().app_data_dir()?)
                 } else {
                     app.path().app_data_dir()?
                 }
@@ -624,6 +703,8 @@ fn main() {
             runtime: Arc::new(Mutex::new(Some(runtime))),
             shutdown_started: Arc::new(AtomicBool::new(false)),
             shutdown_finished: Arc::new(AtomicBool::new(false)),
+            #[cfg(all(feature = "native-smoke", debug_assertions))]
+            smoke_data_dir: dir.clone(),
         });
         #[cfg(feature = "native-smoke")]
         e2e::start(app.handle().clone());
