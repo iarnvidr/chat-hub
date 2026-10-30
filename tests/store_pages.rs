@@ -173,3 +173,66 @@ fn huge_parts_list_summary_search_preflight_and_null_cursor_walk() {
         Err(chat_hub::error::Error::ReadBudgetExceeded { .. })
     ));
 }
+
+#[test]
+fn search_scan_candidate_cap_returns_typed_error() {
+    let mut s = Store::in_memory().unwrap();
+    let graph = (0..1025)
+        .map(|i| {
+            let id = format!("n{i:04}");
+            GraphNode {
+                source_node_id: id.clone(),
+                source_message_id: Some(id.clone()),
+                parent_id: Some(id),
+                role: Some("assistant".into()),
+                author: None,
+                create_time: None,
+                parts: vec![json!("scanprobe")],
+            }
+        })
+        .collect();
+    let mut obs = observation("scan-cap", "no token in title", 1, graph);
+    obs.current_node = Some("n1024".into());
+    s.ingest_observation(&obs).unwrap();
+    let result = s.search_page_snapshot("scanprobe", 1, None, None);
+    assert!(
+        matches!(
+            result,
+            Err(chat_hub::error::Error::ReadBudgetExceeded {
+                kind: "search_scan_candidates",
+                limit: 1024,
+            })
+        ),
+        "unexpected scan-cap outcome: {result:?}"
+    );
+}
+
+#[test]
+fn search_refills_past_cyclic_graph_candidates() {
+    let mut s = Store::in_memory().unwrap();
+    let cyc = vec![
+        GraphNode {
+            parent_id: Some("b-cycle".into()),
+            ..node("a-cycle", None, "routeprobe")
+        },
+        GraphNode {
+            parent_id: Some("a-cycle".into()),
+            ..node("b-cycle", None, "routeprobe")
+        },
+    ];
+    s.ingest_observation(&observation("cycle", "cycle", 1, cyc))
+        .unwrap();
+    let valid = vec![GraphNode {
+        source_node_id: "z-valid".into(),
+        source_message_id: Some("z-valid".into()),
+        parent_id: None,
+        role: Some("assistant".into()),
+        author: None,
+        create_time: None,
+        parts: vec![json!("routeprobe")],
+    }];
+    s.ingest_observation(&observation("valid", "valid", 1, valid))
+        .unwrap();
+    let page = s.search_page_snapshot("routeprobe", 2, None, None).unwrap();
+    assert!(page.hits.iter().any(|h| h["node_id"] == "z-valid"));
+}
