@@ -44,6 +44,120 @@ pub struct ServiceStatus {
     pub database_healthy: Option<bool>,
     pub ingest: IngestStats,
 }
+
+fn readiness_provider(status: Arc<Mutex<ServiceStatus>>) -> server::ReadinessProvider {
+    Arc::new(move || {
+        let state = match status.try_lock() {
+            Ok(snapshot) => snapshot.state.clone(),
+            Err(_) => {
+                return server::ServiceReadiness {
+                    ready: false,
+                    code: Some("status_unavailable"),
+                }
+            }
+        };
+        server::ServiceReadiness {
+            ready: state == ServiceState::Ready,
+            code: match state {
+                ServiceState::Ready => None,
+                ServiceState::Starting => Some("service_starting"),
+                ServiceState::Stopping => Some("service_stopping"),
+                ServiceState::Stopped => Some("service_stopped"),
+                ServiceState::Failed(_) => Some("service_failed"),
+            },
+        }
+    })
+}
+#[cfg(test)]
+mod api_readiness_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    async fn status(app: &axum::Router) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let code = response.status();
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        (code, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn actual_lifecycle_and_real_store_probe_are_independent() {
+        let lifecycle = Arc::new(Mutex::new(ServiceStatus {
+            state: ServiceState::Ready,
+            identity: server::RuntimeIdentity {
+                pid: 1,
+                instance_id: "synthetic-service".into(),
+            },
+            api_addr: None,
+            proxy_addr: None,
+            database_healthy: Some(true),
+            ingest: IngestStats::default(),
+        }));
+        let store = Arc::new(Mutex::new(Store::in_memory().unwrap()));
+        let app = server::status_test_router(store.clone(), readiness_provider(lifecycle.clone()));
+        let (code, body) = status(&app).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["service"]["status"], "ready");
+        assert_eq!(body["database"]["status"], "healthy");
+
+        lifecycle.lock().unwrap().state = ServiceState::Failed("synthetic worker detail".into());
+        let (code, body) = status(&app).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["service"]["code"], "service_failed");
+        assert_eq!(body["database"]["status"], "healthy");
+        assert!(!body.to_string().contains("synthetic worker detail"));
+
+        lifecycle.lock().unwrap().state = ServiceState::Ready;
+        // Actual loss of access to the store, rather than a canned DB fixture.
+        let poisoned = store.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("synthetic store lock failure");
+        })
+        .join()
+        .is_err());
+        let (code, body) = status(&app).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["service"]["status"], "ready");
+        assert_eq!(body["database"]["status"], "failed");
+        assert_eq!(body["database"]["code"], "database_unavailable");
+    }
+
+    #[test]
+    fn readiness_provider_never_waits_for_contended_status_lock() {
+        let lifecycle = Arc::new(Mutex::new(ServiceStatus {
+            state: ServiceState::Ready,
+            identity: server::RuntimeIdentity {
+                pid: 1,
+                instance_id: "synthetic".into(),
+            },
+            api_addr: None,
+            proxy_addr: None,
+            database_healthy: None,
+            ingest: IngestStats::default(),
+        }));
+        let provider = readiness_provider(lifecycle.clone());
+        let _held = lifecycle.lock().unwrap();
+        let result = provider();
+        assert!(!result.ready);
+        assert_eq!(result.code, Some("status_unavailable"));
+    }
+}
+
 pub struct ServiceHandle {
     status: Arc<Mutex<ServiceStatus>>,
     shutdown: watch::Sender<bool>,
@@ -403,8 +517,9 @@ async fn start_internal(
     let api_status = status.clone();
     let api_stop = stop.clone();
     let api_flag = flag.clone();
+    let api_readiness = readiness_provider(status.clone());
     let api = tokio::spawn(async move {
-        tokio::select! {_=axum::serve(listener,server::router_with_identity(api_store,config.bearer_token,identity))=>{},_=stop_rx.changed()=>{}}
+        tokio::select! {_=axum::serve(listener,server::router_with_readiness(api_store,config.bearer_token,identity,api_readiness))=>{},_=stop_rx.changed()=>{}}
         if !*api_stop.borrow() {
             api_flag.store(true, Ordering::Release);
             let mut state = lock_status(&api_status);

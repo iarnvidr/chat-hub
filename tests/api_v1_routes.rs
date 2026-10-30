@@ -360,8 +360,6 @@ async fn production_router_fails_closed_and_preserves_legacy_responses() {
         (StatusCode::NOT_FOUND, json!({"error":"not found"}))
     );
     for uri in [
-        "/api/v1/status",
-        "/api/v1/version",
         "/api/v1/conversations",
         "/api/v1/search?q=foo",
         "/api/v1/conversations/missing",
@@ -370,6 +368,13 @@ async fn production_router_fails_closed_and_preserves_legacy_responses() {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "service_unavailable");
     }
+    let (status, diagnostics) = get(&app, "/api/v1/status").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(diagnostics["service"]["code"], "readiness_unknown");
+    assert_eq!(diagnostics["database"]["status"], "healthy");
+    let (status, version) = get(&app, "/api/v1/version").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(version["binary_version"], env!("CARGO_PKG_VERSION"));
 }
 #[tokio::test]
 async fn graph_selection_handles_internal_null_nodes_dangling_and_cycles() {

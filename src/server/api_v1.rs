@@ -1,6 +1,7 @@
 //! API v1 projection and routing. ReadAdapter owns transactional snapshot reads;
 //! this module owns HTTP, keyset paging, and view-only graph selection. The
-//! production adapter is intentionally not connected in the phase-A checkpoint.
+//! production adapter supports real status/version reads; library reads remain
+//! unavailable until bounded transactional Store methods are connected.
 
 use super::authorized;
 use axum::{
@@ -111,6 +112,64 @@ pub struct Diagnostics {
 }
 
 type Reader = Arc<Mutex<Box<dyn ReadAdapter>>>;
+struct StoreReader {
+    store: Arc<Mutex<crate::store::Store>>,
+    readiness: Option<super::ReadinessProvider>,
+}
+pub(super) fn store_reader(
+    store: Arc<Mutex<crate::store::Store>>,
+    readiness: Option<super::ReadinessProvider>,
+) -> Reader {
+    Arc::new(Mutex::new(Box::new(StoreReader { store, readiness })))
+}
+impl ReadAdapter for StoreReader {
+    fn library_snapshot(&mut self) -> Result<LibrarySnapshot, ReadError> {
+        // Deliberately unavailable until bounded F1 reads can be connected.
+        Err(ReadError::Unavailable)
+    }
+    fn search_snapshot(&mut self, _: &str) -> Result<SearchSnapshot, ReadError> {
+        Err(ReadError::Unavailable)
+    }
+    fn diagnostics(&mut self) -> Result<Diagnostics, ReadError> {
+        let service = self
+            .readiness
+            .as_ref()
+            .map(|readiness| readiness())
+            .unwrap_or(super::ServiceReadiness {
+                ready: false,
+                code: Some("readiness_unknown"),
+            });
+        let healthy = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| store.health().ok())
+            .unwrap_or(false);
+        Ok(Diagnostics {
+            status: if service.ready && healthy {
+                "healthy"
+            } else {
+                "failed"
+            }
+            .into(),
+            service: Component {
+                status: if service.ready { "ready" } else { "failed" }.into(),
+                code: service.code.map(str::to_owned),
+            },
+            database: Component {
+                status: if healthy { "healthy" } else { "failed" }.into(),
+                code: (!healthy).then(|| "database_unavailable".into()),
+            },
+        })
+    }
+    fn schema_version(&mut self) -> Result<i64, ReadError> {
+        self.store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .schema_version()
+            .map_err(|_| ReadError::Unavailable)
+    }
+}
 #[derive(Clone)]
 struct ApiState {
     token: Arc<str>,
@@ -119,7 +178,7 @@ struct ApiState {
 }
 
 /// Explicit adapter injection for route tests and the eventual F1 integration.
-/// Production `server::router` passes no adapter until that integration exists.
+/// The production adapter currently supports only actual status/version reads.
 pub fn router(reader: Box<dyn ReadAdapter>, token: String) -> Router {
     routes(
         Arc::from(token),
