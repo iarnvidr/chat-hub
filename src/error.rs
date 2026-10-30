@@ -6,6 +6,7 @@ pub enum Error {
     Database(rusqlite::Error),
     Configuration(String),
     Http(String),
+    ReadBudgetExceeded { kind: &'static str, limit: usize },
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -14,6 +15,9 @@ impl fmt::Display for Error {
             Self::Database(e) => write!(f, "database error: {e}"),
             Self::Configuration(e) => write!(f, "configuration error: {e}"),
             Self::Http(e) => write!(f, "HTTP error: {e}"),
+            Self::ReadBudgetExceeded { kind, limit } => {
+                write!(f, "read budget exceeded ({kind}, limit {limit})")
+            }
         }
     }
 }
