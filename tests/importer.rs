@@ -5,6 +5,77 @@ use serde_json::{json, Value};
 const ARRAY: &[u8] = include_bytes!("fixtures/chatgpt-export/array.json");
 const OBJECT: &[u8] = include_bytes!("fixtures/chatgpt-export/object.json");
 
+#[test]
+fn malformed_graph_items_are_isolated_by_shared_normalizer() {
+    let template = parse_export(ARRAY).unwrap().remove(0);
+    let mut entries = Vec::new();
+    for (index, node) in [
+        json!(null),
+        json!({"message":12}),
+        json!({"parent":[]}),
+        json!({"message":{"content":[]}}),
+        json!({"message":{"content":{"parts":"invalid"}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut doc = template.clone();
+        doc["id"] = json!(format!("malformed-{index}"));
+        doc["mapping"]["root"] = node;
+        entries.push(doc);
+    }
+    for id in [Value::Null, json!("")] {
+        let mut valid = template.clone();
+        valid["conversation_id"] = id;
+        entries.push(valid);
+    }
+    let mut store = Store::in_memory().unwrap();
+    let receipt = import_chatgpt(&mut store, &serde_json::to_vec(&entries).unwrap()).unwrap();
+    assert_eq!(
+        (
+            receipt.imported,
+            receipt.updated,
+            receipt.unchanged,
+            receipt.failed
+        ),
+        (1, 0, 1, 5)
+    );
+    assert_eq!(
+        receipt
+            .errors
+            .iter()
+            .map(|e| e.item_index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    assert!(receipt.errors.iter().all(|e| e.code == "invalid_item"));
+    assert_eq!(store.library_snapshot().unwrap().conversations.len(), 1);
+}
+
+#[test]
+fn timestamp_ordering_and_metadata_only_update_receipts() {
+    let mut store = Store::in_memory().unwrap();
+    let mut doc = parse_export(ARRAY).unwrap().remove(0);
+    let ingest = |store: &mut Store, doc: &Value| {
+        import_chatgpt(store, &serde_json::to_vec(&vec![doc]).unwrap()).unwrap()
+    };
+    assert_eq!(ingest(&mut store, &doc).imported, 1);
+    let revision = store.library_revision().unwrap();
+    let mut missing = doc.clone();
+    missing.as_object_mut().unwrap().remove("update_time");
+    missing["title"] = json!("Missing time must not replace known time");
+    assert_eq!(ingest(&mut store, &missing).unchanged, 1);
+    assert_eq!(store.library_revision().unwrap(), revision);
+    doc["update_time"] = json!(1700000200);
+    assert_eq!(ingest(&mut store, &doc).updated, 1);
+    let revision = store.library_revision().unwrap();
+    assert_eq!(ingest(&mut store, &doc).unchanged, 1);
+    assert_eq!(store.library_revision().unwrap(), revision);
+    doc["update_time"] = json!(1700000100);
+    assert_eq!(ingest(&mut store, &doc).unchanged, 1);
+    assert_eq!(store.library_revision().unwrap(), revision);
+}
+
 fn temporary_dir() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
         "chat-hub-import-{}-{}",
