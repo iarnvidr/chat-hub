@@ -12,8 +12,11 @@ chat-hub backup /path/to/library.sqlite3
 chat-hub export-json /path/to/library.json
 ```
 
-Each command requires exactly one destination. Existing destinations are never
-overwritten, and errors exit nonzero. Successful stdout is a small JSON receipt
+Each command requires exactly one destination. The configured source library must
+already exist as a regular file: archive commands open it read/write without
+SQLite's create flag, and never create its parent directory or initialize a
+missing library. `:memory:` and other non-file-backed sources are rejected.
+Existing destinations are never overwritten, and errors exit nonzero. Successful stdout is a small JSON receipt
 containing operation and record counts/versions; archive contents and secrets
 are not printed. `backup` is a SQLite online backup. It includes the ordinary
 Store schema and rows (including schema migrations, library state, conversations,

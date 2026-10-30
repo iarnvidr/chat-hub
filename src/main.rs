@@ -50,17 +50,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(usage.into());
             }
             let c = Config::from_env()?;
-            if c.database_path != ":memory:" {
-                if let Some(parent) = std::path::Path::new(&c.database_path)
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|_| "unable to create library directory")?;
-                }
+            if c.database_path == ":memory:" {
+                return Err("archive commands require an existing file-backed library".into());
             }
-            let store = chat_hub::store::Store::open(&c.database_path)
-                .map_err(|_| "unable to open library")?;
+            let store = chat_hub::store::Store::open_existing(&c.database_path)
+                .map_err(|_| "unable to open existing library")?;
             if command == "backup" {
                 let receipt = store.backup_to(&destination)?;
                 println!("{{\"operation\":\"backup\",\"schema_version\":{},\"library_revision\":{},\"conversation_count\":{}}}", receipt.schema_version, receipt.library_revision, receipt.conversation_count);

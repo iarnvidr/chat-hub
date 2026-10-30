@@ -74,5 +74,55 @@ fn cli_backup_and_export_json_use_store_and_emit_only_receipts() {
     assert!(!extra.status.success());
     let same = invoke("backup", &[db.to_str().unwrap()], &db);
     assert!(!same.status.success());
+    // Neither archive source opening nor destination/staging setup may create paths.
+    for cmd in ["backup", "export-json"] {
+        let absent_parent = d.join("absent-parent").join("library.sqlite");
+        let out = invoke(
+            cmd,
+            &[d.join("destination").to_str().unwrap()],
+            &absent_parent,
+        );
+        assert!(
+            !out.status.success(),
+            "{cmd} unexpectedly created absent source"
+        );
+        assert!(!absent_parent.parent().unwrap().exists());
+        let absent = d.join("missing.sqlite");
+        let nested_dest = d.join("not-created").join("archive");
+        let out = invoke(cmd, &[nested_dest.to_str().unwrap()], &absent);
+        assert!(
+            !out.status.success(),
+            "{cmd} unexpectedly opened missing source"
+        );
+        assert!(!absent.exists());
+        assert!(!nested_dest.parent().unwrap().exists());
+        let memory_dest = d.join("memory-destination");
+        let out = Command::new(env!("CARGO_BIN_EXE_chat-hub"))
+            .arg(cmd)
+            .arg(&memory_dest)
+            .env("CHAT_HUB_TOKEN", "synthetic-token")
+            .env("CHAT_HUB_DATABASE", ":memory:")
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "{cmd} accepted ephemeral memory source"
+        );
+        assert!(!memory_dest.exists());
+    }
+    let empty = d.join("empty.sqlite");
+    drop(Store::open(empty.to_str().unwrap()).unwrap());
+    for (cmd, suffix) in [
+        ("backup", "empty-backup.sqlite"),
+        ("export-json", "empty-export.json"),
+    ] {
+        let dest = d.join(suffix);
+        let out = invoke(cmd, &[dest.to_str().unwrap()], &empty);
+        assert!(
+            out.status.success(),
+            "empty {cmd}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     fs::remove_dir_all(d).unwrap();
 }
