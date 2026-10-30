@@ -94,9 +94,13 @@ class LibrarySmokeDriverTests(unittest.TestCase):
         alternate_node, alternate_leaf = 'left', 'left'
         detail = {
             'nodes': [
-                {'id': 'root', 'message': {'content': 'root'}},
-                {'id': 'right', 'parent_id': 'root', 'message': {'content': 'Selected synthetic answer'}},
-                {'id': 'left', 'parent_id': 'root', 'message': {'content': 'Alternate synthetic answer'}},
+                {'id': 'root', 'source_id': 'root-source', 'parent_id': None, 'message_id': None},
+                {'id': 'right', 'source_id': 'right-source', 'parent_id': 'root', 'message_id': 'message-right'},
+                {'id': 'left', 'source_id': 'left-source', 'parent_id': 'root', 'message_id': 'message-left'},
+            ],
+            'messages': [
+                {'id': 'message-right', 'node_id': 'right', 'content': 'Selected synthetic answer', 'parts': [{'text': 'Selected synthetic answer'}]},
+                {'id': 'message-left', 'node_id': 'left', 'content': 'Alternate synthetic answer', 'parts': [{'text': 'Alternate synthetic answer'}]},
             ],
             'selection': {'leaf_node_id': 'right'},
             'branches': [{'leaf_node_id': 'right', 'selected': True}, {'leaf_node_id': 'left'}],
@@ -111,6 +115,19 @@ class LibrarySmokeDriverTests(unittest.TestCase):
         self.assertIn("branch.value=aleaf", script)
         self.assertLess(script.index("anchor absent before branch switch"), script.index("branch.value=aleaf"))
         self.assertNotEqual(canonical, selected_node)
+
+    def test_official_api_v1_fixture_contract_maps_canonical_messages_and_branches(self):
+        import json
+        fixture = ROOT / 'tests/fixtures/api-v1/conversation-selected.json'
+        detail = json.loads(fixture.read_text())
+        self.assertEqual(DRIVER._detail_anchor_ids(detail, 'n-a', 'Alternate amber telescope response.'),
+                         ('n-a', 'n-a', 'n-b', 'n-b'))
+        for bad in (
+            {**detail, 'nodes': [*detail['nodes'], {**detail['nodes'][2]}]},
+            {**detail, 'nodes': [{**n, 'message_id': 'missing'} if n['id'] == 'n-a' else n for n in detail['nodes']]},
+            {**detail, 'messages': [{**m, 'node_id': 'n-b'} if m['id'] == 'msg-a' else m for m in detail['messages']]},
+        ):
+            with self.assertRaises(RuntimeError): DRIVER._detail_anchor_ids(bad, 'n-a', 'Alternate amber telescope response.')
 
     def test_revision_must_be_canonical_integer_not_render_fallback(self):
         self.assertIs(type(7), int)
@@ -155,7 +172,7 @@ class LibrarySmokeDriverTests(unittest.TestCase):
                 if "const [cid,snode,sleaf,anode,aleaf]" in js:
                     counts['reader']+=1
                     return {'ready':True,'row':True,'revision':1,'selected':True,'alternate':True,'anchor':True,'node_id':'right','leaf_id':'left','canonical_id':'opaque','selected_leaf_id':'right','alternate_node_id':'left'}
-                if "get_conversation" in js: return {'nodes':[{'id':'root','message':{'content':'root'}},{'id':'right','parent_id':'root','message':{'content':'Selected synthetic answer'}},{'id':'left','parent_id':'root','message':{'content':'Alternate synthetic answer'}}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
+                if "get_conversation" in js: return {'nodes':[{'id':'root','source_id':'root-source','parent_id':None,'message_id':None},{'id':'right','source_id':'right-source','parent_id':'root','message_id':'message-right'},{'id':'left','source_id':'left-source','parent_id':'root','message_id':'message-left'}],'messages':[{'id':'message-right','node_id':'right','content':'Selected synthetic answer','parts':[{'text':'Selected synthetic answer'}]},{'id':'message-left','node_id':'left','content':'Alternate synthetic answer','parts':[{'text':'Alternate synthetic answer'}]}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
                 if 'list_conversations' in js:
                     counts['list']+=1
                     if "query:'Selected synthetic answer'" in js: return {'items':[{'message_id':'message:[canonical...]','node_id':'right','leaf_node_id':'right','conversation':{'id':'opaque'}}]}
@@ -199,7 +216,7 @@ class LibrarySmokeDriverTests(unittest.TestCase):
                 if "const [cid,snode,sleaf,anode,aleaf]" in js:
                     counts['reader']+=1
                     return {'ready':True,'row':True,'revision':1,'selected':False,'alternate':True,'anchor':True,'node_id':'right','leaf_id':'left','canonical_id':'opaque','selected_leaf_id':'right','alternate_node_id':'left'}
-                if "get_conversation" in js: return {'nodes':[{'id':'root','message':{'content':'root'}},{'id':'right','parent_id':'root','message':{'content':'Selected synthetic answer'}},{'id':'left','parent_id':'root','message':{'content':'Alternate synthetic answer'}}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
+                if "get_conversation" in js: return {'nodes':[{'id':'root','source_id':'root-source','parent_id':None,'message_id':None},{'id':'right','source_id':'right-source','parent_id':'root','message_id':'message-right'},{'id':'left','source_id':'left-source','parent_id':'root','message_id':'message-left'}],'messages':[{'id':'message-right','node_id':'right','content':'Selected synthetic answer','parts':[{'text':'Selected synthetic answer'}]},{'id':'message-left','node_id':'left','content':'Alternate synthetic answer','parts':[{'text':'Alternate synthetic answer'}]}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
                 if 'list_conversations' in js:
                     counts['list']+=1
                     if "query:'Selected synthetic answer'" in js: return {'items':[{'message_id':'message:[canonical...]','node_id':'right','leaf_node_id':'right','conversation':{'id':'opaque'}}]}
@@ -255,7 +272,7 @@ class LibrarySmokeDriverTests(unittest.TestCase):
                 if "const [cid,snode,sleaf,anode,aleaf]" in js:
                     counts['reader']+=1
                     return {'ready':True,'row':True,'revision':1,'selected':True,'alternate':True,'anchor':True,'node_id':'right','leaf_id':'left','canonical_id':'opaque','selected_leaf_id':'right','alternate_node_id':'left'}
-                if "get_conversation" in js: return {'nodes':[{'id':'root','message':{'content':'root'}},{'id':'right','parent_id':'root','message':{'content':'Selected synthetic answer'}},{'id':'left','parent_id':'root','message':{'content':'Alternate synthetic answer'}}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
+                if "get_conversation" in js: return {'nodes':[{'id':'root','source_id':'root-source','parent_id':None,'message_id':None},{'id':'right','source_id':'right-source','parent_id':'root','message_id':'message-right'},{'id':'left','source_id':'left-source','parent_id':'root','message_id':'message-left'}],'messages':[{'id':'message-right','node_id':'right','content':'Selected synthetic answer','parts':[{'text':'Selected synthetic answer'}]},{'id':'message-left','node_id':'left','content':'Alternate synthetic answer','parts':[{'text':'Alternate synthetic answer'}]}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
                 if 'list_conversations' in js:
                     counts['list']+=1
                     if "query:'Selected synthetic answer'" in js: return {'items':[{'message_id':'message:[canonical...]','node_id':'right','leaf_node_id':'right','conversation':{'id':'opaque'}}]}

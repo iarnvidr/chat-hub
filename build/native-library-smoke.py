@@ -142,19 +142,42 @@ def _default_data_ok(value, expected_path):
 
 
 def _detail_anchor_ids(detail, selected_node_id, alternate_text='Alternate synthetic answer'):
-    """Resolve selected and alternate leaves from the actual desktop detail graph."""
-    if not isinstance(detail, dict) or not isinstance(detail.get('nodes'), list):
+    """Resolve leaves using the detail DTO's node/message reference graph."""
+    if not isinstance(detail, dict) or not isinstance(detail.get('nodes'), list) or not isinstance(detail.get('messages'), list):
         raise RuntimeError('conversation detail graph unavailable')
-    nodes = detail['nodes']
-    by_id = {n.get('id'): n for n in nodes if isinstance(n, dict) and isinstance(n.get('id'), str)}
+    nodes, messages = detail['nodes'], detail['messages']
+    by_id = {}
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get('id'), str) or node['id'] in by_id:
+            raise RuntimeError('invalid or duplicate detail node id')
+        by_id[node['id']] = node
+    messages_by_id = {}
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get('id'), str) or message['id'] in messages_by_id:
+            raise RuntimeError('invalid or duplicate detail message id')
+        messages_by_id[message['id']] = message
+    # Enforce both directions where message/node associations are represented.
+    for node in nodes:
+        mid = node.get('message_id')
+        if mid is None:
+            continue
+        message = messages_by_id.get(mid)
+        if message is None:
+            raise RuntimeError('node references unknown canonical message')
+        if message.get('node_id') is not None and message['node_id'] != node['id']:
+            raise RuntimeError('canonical message node_id is inconsistent')
+    for message in messages:
+        nid = message.get('node_id')
+        if nid is not None:
+            node = by_id.get(nid)
+            if node is None or node.get('message_id') != message['id']:
+                raise RuntimeError('canonical message node_id is inconsistent')
     selected = by_id.get(selected_node_id)
     if selected is None:
         raise RuntimeError('FTS-selected node absent from conversation detail graph')
     def parent(node):
         return node.get('parent_id', node.get('parent_node_id'))
-    selected_path = set()
-    selected_path.add(selected_node_id)
-    cur = by_id.get(parent(selected))
+    selected_path, cur = {selected_node_id}, by_id.get(parent(selected))
     while cur:
         ident = cur.get('id')
         if not ident or ident in selected_path: break
@@ -162,20 +185,26 @@ def _detail_anchor_ids(detail, selected_node_id, alternate_text='Alternate synth
         cur = by_id.get(parent(cur))
     candidates = []
     for node in nodes:
-        if not isinstance(node, dict) or node.get('id') in selected_path: continue
-        message = node.get('message', node)
-        content = json.dumps(message, ensure_ascii=False)
-        if alternate_text in content:
+        if node['id'] in selected_path: continue
+        message = messages_by_id.get(node.get('message_id'))
+        if message is None: continue
+        content = message.get('content', '')
+        parts = message.get('parts', [])
+        searchable = [content] if isinstance(content, str) else []
+        if isinstance(parts, list):
+            searchable.extend(part['text'] for part in parts if isinstance(part, dict) and isinstance(part.get('text'), str))
+        if any(alternate_text in text for text in searchable):
             candidates.append(node)
     if len(candidates) != 1:
         raise RuntimeError('official alternate fixture node not uniquely identified in detail graph')
     alternate = candidates[0]
-    leaf_id = detail.get('selection', {}).get('leaf_node_id') if isinstance(detail.get('selection'), dict) else None
-    selected_leaf = next((b.get('leaf_node_id') for b in detail.get('branches', []) if isinstance(b, dict) and b.get('selected')), leaf_id)
-    alternate_leaf = next((b.get('leaf_node_id') for b in detail.get('branches', []) if isinstance(b, dict) and b.get('leaf_node_id') and _is_descendant(by_id, b.get('leaf_node_id'), alternate.get('id'))), None)
-    if not isinstance(selected_leaf, str) or not isinstance(alternate_leaf, str):
+    branches = detail.get('branches', [])
+    selection = detail.get('selection', {})
+    selected_leaf = next((b.get('leaf_node_id') for b in branches if isinstance(b, dict) and b.get('selected')), selection.get('leaf_node_id') if isinstance(selection, dict) else None)
+    alternate_leaves = [b.get('leaf_node_id') for b in branches if isinstance(b, dict) and isinstance(b.get('leaf_node_id'), str) and _is_descendant(by_id, b['leaf_node_id'], alternate['id'])]
+    if len(alternate_leaves) != 1 or not isinstance(selected_leaf, str) or not _is_descendant(by_id, selected_leaf, selected_node_id):
         raise RuntimeError('selected or alternate leaf missing from detail branch graph')
-    return selected.get('id'), selected_leaf, alternate.get('id'), alternate_leaf
+    return selected['id'], selected_leaf, alternate['id'], alternate_leaves[0]
 
 
 def _is_descendant(by_id, leaf_id, node_id):
