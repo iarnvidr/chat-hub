@@ -1,0 +1,131 @@
+{
+  "conversation": {
+    "id": "cv-a",
+    "provider": "chatgpt",
+    "account_scope": "provisional:default",
+    "source_id": "export-cv-a",
+    "title": "Synthetic branches",
+    "updated_at_ms": 1700000003000
+  },
+  "selection": {
+    "source_current_node_id": "n-a",
+    "selected_node_id": "n-b",
+    "reason": "leaf_override",
+    "thread_complete": true
+  },
+  "nodes": [
+    {
+      "id": "n-root",
+      "source_id": "n-root",
+      "parent_id": null,
+      "message_id": null
+    },
+    {
+      "id": "n-user",
+      "source_id": "n-user",
+      "parent_id": "n-root",
+      "message_id": "msg-u"
+    },
+    {
+      "id": "n-a",
+      "source_id": "n-a",
+      "parent_id": "n-user",
+      "message_id": "msg-a"
+    },
+    {
+      "id": "n-b",
+      "source_id": "n-b",
+      "parent_id": "n-user",
+      "message_id": "msg-b"
+    }
+  ],
+  "messages": [
+    {
+      "id": "msg-u",
+      "source_id": "provider-u",
+      "node_id": "n-user",
+      "role": "user",
+      "author": {
+        "role": "user"
+      },
+      "create_time": 1700000000.125,
+      "created_at_ms": 1700000000125,
+      "content": "Please show a synthetic example.",
+      "parts": [
+        {
+          "text": "Please show a synthetic example.",
+          "kind": "text",
+          "raw": "Please show a synthetic example."
+        }
+      ]
+    },
+    {
+      "id": "msg-a",
+      "source_id": "provider-a",
+      "node_id": "n-a",
+      "role": "assistant",
+      "author": {
+        "role": "assistant"
+      },
+      "create_time": 1700000001.125,
+      "created_at_ms": 1700000001125,
+      "content": "Example:\n```rust\nprintln!(\"amber telescope\");\n```",
+      "parts": [
+        {
+          "text": "Example:\n```rust\nprintln!(\"amber telescope\");\n```",
+          "kind": "text",
+          "raw": "Example:\n```rust\nprintln!(\"amber telescope\");\n```"
+        }
+      ]
+    },
+    {
+      "id": "msg-b",
+      "source_id": "provider-b",
+      "node_id": "n-b",
+      "role": "assistant",
+      "author": {
+        "role": "assistant"
+      },
+      "create_time": 1700000002.125,
+      "created_at_ms": 1700000002125,
+      "content": "Alternate amber telescope response.",
+      "parts": [
+        {
+          "text": "Alternate amber telescope response.",
+          "kind": "text",
+          "raw": "Alternate amber telescope response."
+        },
+        {
+          "raw": {
+            "content_type": "synthetic_widget",
+            "payload": {
+              "label": "unsupported",
+              "values": [
+                1,
+                null,
+                true
+              ]
+            }
+          },
+          "kind": "unknown"
+        }
+      ]
+    }
+  ],
+  "thread_node_ids": [
+    "n-root",
+    "n-user",
+    "n-b"
+  ],
+  "branches": [
+    {
+      "leaf_node_id": "n-a",
+      "selected": false
+    },
+    {
+      "leaf_node_id": "n-b",
+      "selected": true
+    }
+  ],
+  "library_revision": 7
+}
