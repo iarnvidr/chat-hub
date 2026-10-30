@@ -2,7 +2,7 @@
 import ast,copy,json,pathlib,subprocess,sys,tempfile,unittest,os
 HERE=pathlib.Path(__file__).resolve().parent
 BASE_H={'signature_accepted':True,'replacement_installed':True,'restart_requested':True,'restart_observed':True,'restart_process_exited':True,'before_version':'0.1.0','after_version':'0.1.1','restart_identity':{'before_pid':101,'after_pid':202,'expected_executable':'/tmp/Muninn.app/Contents/MacOS/app','actual_executable':'/tmp/Muninn.app/Contents/MacOS/app'}}
-BASE_T={'tamper_rejected':True,'tamper_status':{'state':'failed','reason':'signature_verification_failed'},'old_version_retained':True,'app_usable':True}
+BASE_T={'tamper_rejected':True,'tamper_status':{'state':'failed','reason':'signature_verification_failed'},'old_version_retained':True,'app_usable':True,'old_running_identity_retained':True,'running_service_info':{'version':'0.1.0','process_id':101,'executable':'/tmp/Muninn.app/Contents/MacOS/app'}}
 def run(root): return subprocess.run([sys.executable,str(HERE/'verify_evidence.py'),str(root)],capture_output=True)
 class EvidenceProtocol(unittest.TestCase):
  def test_restart_transport_classifier_is_narrow_and_postconditions_remain_required(self):
@@ -62,4 +62,8 @@ class EvidenceProtocol(unittest.TestCase):
     bad=copy.deepcopy(h); bad['restart_identity'][key]=value; write(bad,t); self.assertNotEqual(run(root).returncode,0)
    for reason in ('not a signature error','unclassified'):
     bad=copy.deepcopy(t); bad['tamper_status']['reason']=reason; write(h,bad); self.assertNotEqual(run(root).returncode,0)
+   for key,value in [('old_running_identity_retained',False)]:
+    bad=copy.deepcopy(t); bad[key]=value; write(h,bad); self.assertNotEqual(run(root).returncode,0)
+   bad=copy.deepcopy(t); bad['running_service_info']['version']='0.1.1'; write(h,bad); self.assertNotEqual(run(root).returncode,0)
+   bad=copy.deepcopy(t); bad['running_service_info']['process_id']=999; write(h,bad); self.assertNotEqual(run(root).returncode,0)
 if __name__=='__main__': unittest.main()

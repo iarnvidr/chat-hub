@@ -49,12 +49,23 @@ build_fixture() {
   mkdir -p "$source/build"
   cp -R "$ROOT/build/updater-smoke" "$source/build/updater-smoke"
   python3 "$ROOT/build/updater-smoke/prepare_fixture.py" "$source" "$version"
+  # Compile-time package version drives update_status; assert every version
+  # source in the actual temporary build tree before compiling.
+  python3 - "$source" "$version" <<'PY'
+import json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); expected=sys.argv[2]
+assert (root/'Cargo.toml').read_text().split('version = "',1)[1].split('"',1)[0] == expected
+assert (root/'src-tauri/Cargo.toml').read_text().split('version = "',1)[1].split('"',1)[0] == expected
+assert json.loads((root/'src-tauri/tauri.conf.json').read_text())['version'] == expected
+assert json.loads((root/'package.json').read_text())['version'] == expected
+PY
   CARGO_TARGET_DIR="$target" cargo build --locked --offline --manifest-path "$source/src-tauri/Cargo.toml" --target aarch64-apple-darwin --features native-smoke
   local app="$TMP/build-$version/Chat Hub-$version.app" exe
   mkdir -p "$(dirname "$app")"
   ditto "$MUNINN_UPDATER_SMOKE_APP" "$app"
   exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
   cp "$target/aarch64-apple-darwin/debug/chat-hub-desktop" "$app/Contents/MacOS/$exe"
+  shasum -a 256 "$target/aarch64-apple-darwin/debug/chat-hub-desktop" > "$TMP/build-$version.sha256"
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
   python3 - "$app" "$version" <<'PY'
 import pathlib,plistlib,sys
@@ -71,10 +82,16 @@ build_fixture "$OLD"
 build_fixture "$NEW"
 # Use the genuinely compiled old-version app as both isolated starting copies.
 APP="$TMP/build-$OLD/Chat Hub-$OLD.app"
+# Prove old and new fixtures are independently compiled binaries.
+OLD_HASH="$(cut -d ' ' -f1 "$TMP/build-$OLD.sha256")"
+NEW_HASH="$(cut -d ' ' -f1 "$TMP/build-$NEW.sha256")"
+[[ "$OLD_HASH" != "$NEW_HASH" ]] || { echo 'FAIL: old/new compiled executables are byte-identical' >&2; exit 2; }
 for bundle in "$TMP/healthy/Chat Hub.app" "$TMP/tampered/Chat Hub.app"; do
   rm -rf "$bundle"
   ditto "$APP" "$bundle"
   codesign --force --deep --sign - "$bundle"
+  # Do not compare executable bytes after codesign: signing mutates Mach-O.
+  # The running app's compile-time service_info version is the content identity proof.
 done
 
 # Isolated ephemeral minisign key; no key material is printed.

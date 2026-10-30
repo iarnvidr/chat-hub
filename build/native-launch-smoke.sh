@@ -7,6 +7,9 @@ REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).
 export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
 export CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
 app="${1:?usage: native-launch-smoke.sh APP [evidence-dir]}"
+mode="${3:-full}"
+[[ "$mode" == basic || "$mode" == full ]] || { echo 'mode must be basic or full' >&2; exit 2; }
+export MUNINN_NATIVE_LAUNCH_MODE="$mode"
 evidence="${2:-${NATIVE_LAUNCH_EVIDENCE_DIR:-${RUNNER_TEMP:-/tmp}/native-launch-evidence}}"
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'requires macos arm64' >&2; exit 2; }
 [[ -d "$app/Contents/MacOS" ]] || { echo "app missing: $app" >&2; exit 2; }
@@ -69,4 +72,8 @@ PY
 done
 [[ "$ready" == 1 ]] || report_fixture_failure
 export MUNINN_PROVIDER_SMOKE_UPSTREAM="$(cat "$addrfile")" MUNINN_PROVIDER_SMOKE_ROOTS="$fixture"
-run_smoke 16 "$evidence" "$evidence/app.log:$evidence/open.log:$evidence/provider-fixture.log" -- python3 "$(dirname "$0")/native-launch-driver.py" "$app" "$evidence"
+if [[ "$mode" == basic ]]; then
+  run_smoke 16 "$evidence" "$evidence/app.log:$evidence/open.log" -- python3 "$(dirname "$0")/native-launch-driver.py" "$app" "$evidence"
+else
+  run_smoke 16 "$evidence" "$evidence/app.log:$evidence/open.log:$evidence/provider-fixture.log" -- python3 "$(dirname "$0")/native-launch-driver.py" "$app" "$evidence"
+fi

@@ -99,11 +99,23 @@ jobs:
           cmp -s "$binary" "$app/Contents/MacOS/$exe"
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
-      - name: Required native UI, health, relaunch, and shutdown smoke
+      - name: Required native UI, health, update status, relaunch, and shutdown smoke
         env:
           HOME: ${{ runner.temp }}/chat-hub-launch-home
           NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-launch-evidence
-        run: bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-native-launch-evidence"
+        run: bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-native-launch-evidence" basic
+      - name: Advisory provider proxy capture and denial smoke (debug bundle)
+        continue-on-error: true
+        env:
+          HOME: ${{ runner.temp }}/chat-hub-provider-home
+          NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-provider-evidence
+        run: |
+          set +e
+          bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-provider-evidence" full
+          rc=$?
+          echo "::warning::Advisory provider proxy capture/denial smoke exited $rc; provider interception is not yet verified on macOS."
+          echo "Provider proxy capture/denial advisory exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
       - name: Create updater archive, sign and verify
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

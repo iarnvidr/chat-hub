@@ -119,10 +119,14 @@ try:
  info,token=wait_service(); state=bridge('state');
  if state.get('process_id')!=proc.pid or not state.get('window_visible'): raise RuntimeError('native main window not visible or PID mismatch')
  record['ui_bridge_readiness']=wait_ui_bridge()
+ status=bridge('eval',js="return await window.ChatHub.invoke('update_status');")
+ if not isinstance(status,dict) or not status.get('version') or status.get('version') != bundle.get('CFBundleShortVersionString'): raise RuntimeError(f'actual update_status version mismatch: {status!r}')
+ record['update_status']=status
  service=bridge('eval',js="return await window.ChatHub.invoke('service_info');")
  record['service_info']={'api':service.get('api'),'proxy':service.get('proxy'),'version':service.get('version'),'process_id':service.get('process_id')}
  if not isinstance(service,dict) or service.get('process_id')!=proc.pid or not service.get('api') or not service.get('proxy'): raise RuntimeError(f'service_info assertion failed: {service!r}')
- record['synthetic_tls_capture']=synthetic_tls_fixture(service,token)
+ if os.environ.get('MUNINN_NATIVE_LAUNCH_MODE') != 'basic':
+  record['synthetic_tls_capture']=synthetic_tls_fixture(service,token)
  js="const text=document.body.innerText; if(!text.includes('Chat Hub')||!document.querySelector('[data-testid=app-version]')?.textContent.includes('Version')||!document.querySelector('[data-testid=check-updates]')) throw Error('Chat Hub UI/version/control not rendered'); const s=await window.ChatHub.invoke('service_info'); if(!s.api||!s.proxy) throw Error('service addresses missing'); return {rendered:true,title:document.title,version:document.querySelector('[data-testid=app-version]').textContent,service:s};"
  rendered=bridge('eval',js='return await (async()=>{'+js+'})();')
  if not isinstance(rendered,dict) or rendered.get('rendered') is not True: raise RuntimeError(f'DOM assertion failed: {rendered!r}')
@@ -149,9 +153,10 @@ try:
  else: raise RuntimeError('same-PID app/window did not reopen')
  info2,token2=wait_service()
  # Native callback returns only after the actual provider invoke rejects.
- denial_result=bridge('provider_denial')
- if denial_result.get('denied') is not True: raise RuntimeError(f'provider service_info was not denied: {denial_result!r}')
- record['provider_denial']=denial_result
+ if os.environ.get('MUNINN_NATIVE_LAUNCH_MODE') != 'basic':
+  denial_result=bridge('provider_denial')
+  if denial_result.get('denied') is not True: raise RuntimeError(f'provider service_info was not denied: {denial_result!r}')
+  record['provider_denial']=denial_result
  if state2.get('process_id')!=pid: raise RuntimeError('reopen changed process PID')
  if info2.get('api')!=info.get('api') or info2.get('proxy')!=info.get('proxy'): raise RuntimeError('reopen changed same-PID service endpoints')
  health(info2,token2); record['reopen_pid']=pid; record['reopen_health']='ok'

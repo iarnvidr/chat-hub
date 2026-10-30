@@ -71,10 +71,18 @@ try:
     wait_ready(proc)
     before=native_state(); before_pid=before.get('process_id'); before_exe=before.get('executable_path') or before.get('executable')
     if not isinstance(before_pid,int) or before_pid<=0 or not before_exe: raise RuntimeError(f'pre-install identity missing: {before}')
-    status=invoke('update_status')
-    if not isinstance(status,dict) or not status.get('version'): raise RuntimeError(f'actual app version unavailable: {status}')
-    if mode=='healthy':
-        if status['version'] != old: raise RuntimeError(f'fixture executable version mismatch: expected {old}, got {status["version"]}')
+    # update_status.version is mutable updater state: after a successful check it
+    # intentionally contains the OFFERED target, not the running binary version.
+    # service_info.version comes from this executable's compile-time package metadata.
+    expected_exe=str(executable(app))
+    actual=invoke('service_info')
+    actual_pid=actual.get('process_id') if isinstance(actual,dict) else None
+    actual_exe=actual.get('executable') if isinstance(actual,dict) else None
+    if (not isinstance(actual,dict) or actual_pid != proc.pid or not actual_exe
+            or str(pathlib.Path(actual_exe).resolve()) != expected_exe):
+        raise RuntimeError(f'initial running-process identity mismatch: expected pid={proc.pid}, executable={expected_exe}; service_info={actual}')
+    if mode=='healthy' and actual.get('version') != old:
+        raise RuntimeError(f'fixture executable version mismatch: expected current {old}, got service_info={actual}')
     checked=invoke('check_for_updates',{'includePreviews':False})
     if not isinstance(checked,dict) or checked.get('status')!='available' or checked.get('version')!=new: raise RuntimeError(f'signed update was not offered: {checked}')
     if mode=='healthy':
@@ -101,9 +109,9 @@ try:
         after_pid=after.get('process_id'); after_exe=after.get('executable_path') or after.get('executable')
         expected=str(executable(app))
         if not isinstance(after_pid,int) or after_pid<=0 or not after_exe or str(pathlib.Path(after_exe).resolve())!=expected: raise RuntimeError(f'post-install executable identity mismatch: {after}')
-        post=invoke('update_status')
-        if not isinstance(post,dict) or post.get('version')!=new: raise RuntimeError(f'relaunched application version is not bundled target version: {post}')
-        evidence={'signature_accepted':True,'replacement_installed':version(app)==new,'restart_requested':True,'restart_call':install_call,'restart_observed':True,'restart_process_exited':proc.poll() is not None,'restart_identity':{'before_pid':before_pid,'after_pid':after_pid,'expected_executable':expected,'actual_executable':str(pathlib.Path(after_exe).resolve())},'before_version':old,'after_version':post['version']}
+        post=invoke('service_info')
+        if not isinstance(post,dict) or post.get('version')!=new or post.get('process_id')!=after_pid or str(pathlib.Path(post.get('executable','')).resolve())!=expected: raise RuntimeError(f'relaunched application identity/version mismatch: {post}')
+        evidence={'signature_accepted':True,'replacement_installed':version(app)==new,'restart_requested':True,'restart_call':install_call,'restart_observed':True,'restart_process_exited':proc.poll() is not None,'restart_identity':{'before_pid':before_pid,'after_pid':after_pid,'expected_executable':expected,'actual_executable':str(pathlib.Path(after_exe).resolve())},'before_version':actual['version'],'after_version':post['version']}
         (root/'healthy-result.json').write_text(json.dumps(evidence,sort_keys=True)+'\n')
         if not all((evidence['replacement_installed'],evidence['restart_process_exited'],after_pid!=before_pid)): raise RuntimeError('post-install assertions failed')
     else:
@@ -111,15 +119,21 @@ try:
         try: invoke('install_update')
         except RuntimeError as exc: failure=str(exc)
         observed_status=invoke('update_status')
+        # Verify identity from the actual running service, not mutable update_status.
+        retained=invoke('service_info')
         # Trust the backend's classification from the concrete updater Error variant,
         # never substring-match arbitrary error text in this harness.
         rejected=(bool(failure) and isinstance(observed_status,dict)
                   and observed_status.get('status')=='signature_rejected')
         still=version(app)==old
         live=proc.poll() is None
-        evidence={'tamper_rejected':rejected,'tamper_status':{'state':'failed' if rejected else 'unknown','reason':'signature_verification_failed' if rejected else 'unclassified','detail':failure,'backend_status':observed_status.get('status') if isinstance(observed_status,dict) else None},'old_version_retained':still,'app_usable':live}
+        expected_exe=str(executable(app))
+        retained_identity=(isinstance(retained,dict) and retained.get('version')==old
+            and retained.get('process_id')==before_pid==proc.pid
+            and retained.get('executable') and str(pathlib.Path(retained['executable']).resolve())==expected_exe)
+        evidence={'tamper_rejected':rejected,'tamper_status':{'state':'failed' if rejected else 'unknown','reason':'signature_verification_failed' if rejected else 'unclassified','detail':failure,'backend_status':observed_status.get('status') if isinstance(observed_status,dict) else None},'old_version_retained':still,'app_usable':live,'old_running_identity_retained':retained_identity,'running_service_info':retained}
         (root/'tampered-result.json').write_text(json.dumps(evidence,sort_keys=True)+'\n')
-        if not all((rejected,still,live)): raise RuntimeError(f'tamper rejection assertions failed: {evidence}')
+        if not all((rejected,still,live,retained_identity)): raise RuntimeError(f'tamper rejection assertions failed: {evidence}')
 except Exception:
     detail=traceback.format_exc()
     print(detail,file=sys.stderr,flush=True)

@@ -5,7 +5,7 @@ SMOKE=ROOT/'build/updater-smoke'
 class UpdaterSmokeWiring(unittest.TestCase):
  def test_driver_uses_real_ipc_and_checks_relaunch_version(self):
   driver=(SMOKE/'driver.py').read_text()
-  for expected in ('window.ChatHub.invoke(',"invoke('update_status')","invoke('check_for_updates'","invoke('install_update')","post.get('version')!=new","after_pid!=before_pid"):
+  for expected in ('window.ChatHub.invoke(',"invoke('update_status')","invoke('check_for_updates'","invoke('install_update')","post.get('version')!=new","after_pid!=before_pid","old_running_identity_retained","retained.get('version')==old","retained.get('process_id')==before_pid==proc.pid"):
    self.assertIn(expected,driver)
   for obsolete in ('Muninn.invoke','Muninn.api','updater_download','updater_install','tabs_state'):
    self.assertNotIn(obsolete,driver)

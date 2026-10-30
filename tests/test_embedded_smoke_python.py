@@ -22,6 +22,11 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
             root = pathlib.Path(td)
             manifest = root / "Cargo.toml"
             manifest.write_text('version = "0.0.1"\n')
+            (root / "source/src-tauri").mkdir(parents=True)
+            (root / "source/Cargo.toml").write_text('[package]\nversion = "0.1.0"\n')
+            (root / "source/src-tauri/Cargo.toml").write_text('[package]\nversion = "0.1.0"\n')
+            (root / "source/src-tauri/tauri.conf.json").write_text('{"version":"0.1.0"}')
+            (root / "source/package.json").write_text('{"version":"0.1.0"}')
             (root / "app/Contents").mkdir(parents=True)
             (root / "app/Contents/Info.plist").write_bytes(__import__('plistlib').dumps({'CFBundleShortVersionString': '0.2.0'}))
             (root / "feed").mkdir()
@@ -49,6 +54,7 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
                     "build/native-launch-smoke.sh": [[str(tls_addr), str(tls_cert), "chatgpt.com"]],
                     "build/native-ui-smoke.sh": [[f"{tls_addr.read_text().strip()}", str(tls_cert)]],
                     "build/updater-smoke/run-macos.sh": [
+                        [str(root / "source"), "0.1.0"],
                         [str(root / "app"), "0.2.0"],
                         [str(root), "0.1.0", "old-signature", "0.1.1", "new-signature", "8765"],
                         [str(root), "0.1.1"],
@@ -70,7 +76,7 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
                         proc = subprocess.run([sys.executable, "-c", block, *args], text=True, capture_output=True)
                         self.assertEqual(proc.returncode, 0, f"{script}: {proc.stderr}")
                         exercised.append((script, block))
-                self.assertEqual(len(exercised), 5)
+                self.assertEqual(len(exercised), 6)
                 self.assertEqual((root / "Cargo.toml").read_text(), 'version = "0.0.1"\n')
                 self.assertTrue((root / "old.json").is_file())
                 self.assertTrue((root / "new.json").is_file())

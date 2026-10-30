@@ -8,6 +8,14 @@ class NativeLaunchSmoke(unittest.TestCase):
    self.assertIn('Required native',text)
    self.assertIn('build/native-launch-smoke.sh',text)
   self.assertIn('cargo build --locked', (ROOT/'.github/workflows/release.yml').read_text())
+  for name in ('macos.yml','release.yml'):
+   text=(ROOT/'.github/workflows'/name).read_text()
+   self.assertIn('basic',text)
+   self.assertIn('Advisory provider proxy capture',text)
+   advisory=text.split('Advisory provider proxy capture',1)[1].split('      - name:',1)[0]
+   self.assertIn('continue-on-error: true',advisory)
+   self.assertIn('::warning::',advisory)
+   self.assertIn('GITHUB_STEP_SUMMARY',advisory)
  def test_checks_real_dom_api_reopen_and_shutdown(self):
   driver=(ROOT/'build/native-launch-driver.py').read_text()
   for required in ('window.ChatHub.invoke','document.body.innerText','/api/health','Authorization','survival_seconds','osascript','ports_closed','screencapture','native-launch.png','service.token','native-launch-result.json'):
@@ -21,6 +29,8 @@ class NativeLaunchSmoke(unittest.TestCase):
   self.assertEqual(driver.count("to quit']"),1)
   self.assertIn("info2.get('api')!=info.get('api')",driver)
   self.assertIn("denial_result=bridge('provider_denial')",driver)
+  self.assertIn("MUNINN_NATIVE_LAUNCH_MODE",driver)
+  self.assertIn("status=bridge('eval',js=\"return await window.ChatHub.invoke('update_status');\")",driver)
   self.assertIn("denial_result.get('denied') is not True",driver)
   self.assertIn("return proc.poll() is None",driver)
  def test_synthetic_tls_fixture_is_local_and_narrowly_claimed(self):
