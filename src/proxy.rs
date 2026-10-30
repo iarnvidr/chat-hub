@@ -375,7 +375,11 @@ async fn client(
                     .to_owned();
                 let context = CaptureContext::at_entry(
                     profile_scope.clone(),
-                    req.method().as_str(),
+                    if matches!(&lane, CaptureSource::Live(_)) && path.len() > 4096 {
+                        ""
+                    } else {
+                        req.method().as_str()
+                    },
                     path.clone(),
                 );
                 let sender = sender.clone();
@@ -394,12 +398,12 @@ async fn client(
                                     .headers
                                     .get(hyper::header::CONTENT_TYPE)
                                     .and_then(|v| v.to_str().ok())
-                                    .map(str::to_owned),
+                                    .map(|s| crate::capture_lane::bounded(s, 256)),
                                 content_encoding: parts
                                     .headers
                                     .get(hyper::header::CONTENT_ENCODING)
                                     .and_then(|v| v.to_str().ok())
-                                    .map(str::to_owned),
+                                    .map(|s| crate::capture_lane::bounded(s, 64)),
                             };
                             let forwarded = match lane.begin(context, metadata) {
                                 Some(capture) => TeeBody::new(body, capture).boxed_unsync(),

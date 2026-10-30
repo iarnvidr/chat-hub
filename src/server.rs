@@ -176,6 +176,10 @@ pub fn router_with_capture_status(
     readiness: ReadinessProvider,
     capture: CaptureStatusProvider,
 ) -> Router {
+    assert!(
+        identity.instance_id.len() <= 128,
+        "instance_id must be at most 128 bytes"
+    );
     build_router_capture(store, token, Some(identity), Some(readiness), Some(capture))
 }
 

@@ -12,6 +12,22 @@ pub const ITEM_BYTES: usize = 2 * 1024 * 1024;
 pub const RETAINED_BYTES: usize = 16 * 1024 * 1024;
 pub const QUEUE_ITEMS: usize = 32;
 
+#[derive(Clone, Copy)]
+struct Limits {
+    item: usize,
+    retained: usize,
+    queue: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            item: ITEM_BYTES,
+            retained: RETAINED_BYTES,
+            queue: QUEUE_ITEMS,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Counters {
     pub started: u64,
@@ -55,12 +71,14 @@ struct State {
 #[derive(Clone)]
 pub struct CaptureStatus {
     enabled: bool,
+    limits: Limits,
     state: Arc<Mutex<State>>,
 }
 impl CaptureStatus {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            limits: Limits::default(),
             state: Arc::new(Mutex::new(State::default())),
         }
     }
@@ -69,9 +87,9 @@ impl CaptureStatus {
             Ok(s) => Snapshot::Available {
                 enabled: self.enabled,
                 mode: "chatgpt_snapshot",
-                per_capture_bytes: ITEM_BYTES,
-                retained_byte_limit: RETAINED_BYTES,
-                queue_limit: QUEUE_ITEMS,
+                per_capture_bytes: self.limits.item,
+                retained_byte_limit: self.limits.retained,
+                queue_limit: self.limits.queue,
                 counters: Box::new(s.counters.clone()),
             },
             Err(_) => Snapshot::Unavailable,
@@ -181,14 +199,13 @@ pub struct Accumulator {
     work: Option<Work>,
 }
 pub(crate) fn channel(enabled: bool) -> (LiveSink, mpsc::Receiver<Work>) {
-    let (tx, rx) = mpsc::channel(QUEUE_ITEMS);
-    (
-        LiveSink {
-            tx,
-            status: CaptureStatus::new(enabled),
-        },
-        rx,
-    )
+    channel_with_limits(enabled, Limits::default())
+}
+fn channel_with_limits(enabled: bool, limits: Limits) -> (LiveSink, mpsc::Receiver<Work>) {
+    let (tx, rx) = mpsc::channel(limits.queue);
+    let mut status = CaptureStatus::new(enabled);
+    status.limits = limits;
+    (LiveSink { tx, status }, rx)
 }
 pub fn eligible(context: &CaptureContext, metadata: &CaptureMetadata) -> bool {
     context.method == "GET"
@@ -224,9 +241,11 @@ impl LiveSink {
             .content_encoding
             .as_deref()
             .is_some_and(|e| !e.eq_ignore_ascii_case("identity"));
-        let reserved = if !encoding && state.counters.retained_bytes + ITEM_BYTES <= RETAINED_BYTES
+        let reserved = if !encoding
+            && state.counters.retained_bytes + self.status.limits.item
+                <= self.status.limits.retained
         {
-            ITEM_BYTES
+            self.status.limits.item
         } else {
             0
         };
@@ -250,7 +269,7 @@ impl LiveSink {
             sink: self.clone(),
             work: Some(Work {
                 context,
-                body: Vec::with_capacity(ITEM_BYTES),
+                body: Vec::with_capacity(reserved),
                 attempt,
             }),
         })
@@ -261,7 +280,7 @@ impl Accumulator {
         let Some(work) = &mut self.work else {
             return;
         };
-        if work.body.len().saturating_add(bytes.len()) > ITEM_BYTES {
+        if work.body.len().saturating_add(bytes.len()) > self.sink.status.limits.item {
             let mut work = self.work.take().unwrap();
             work.body.clear();
             work.body.shrink_to_fit();
@@ -281,6 +300,8 @@ impl Accumulator {
         s.counters.completed_responses += 1;
         if s.stopping {
             drop(s);
+            work.body.clear();
+            work.body.shrink_to_fit();
             work.attempt.finish(Outcome::Shutdown);
             return;
         }
@@ -302,7 +323,10 @@ impl Accumulator {
     }
 }
 impl Work {
-    pub(crate) fn ingest(mut self, store: &mut Store) -> bool {
+    pub(crate) fn ingest(self, store: &mut Store) -> bool {
+        self.ingest_after(store, || {})
+    }
+    pub(crate) fn ingest_after(mut self, store: &mut Store, before_commit: impl FnOnce()) -> bool {
         {
             let mut s = self
                 .attempt
@@ -314,30 +338,37 @@ impl Work {
             s.counters.writer_in_flight += 1;
             self.attempt.stage = Stage::Writing;
         }
+        before_commit();
         let result = (|| {
             if self.context.profile_scope != "provisional:default" {
                 return Err(());
             }
-            let mut doc: serde_json::Value = serde_json::from_slice(&self.body).map_err(|_| ())?;
+            let raw: serde_json::Value = serde_json::from_slice(&self.body).map_err(|_| ())?;
+            let mut doc = raw.clone();
             let id = source_id(&self.context.path).ok_or(())?;
             let object = doc.as_object_mut().ok_or(())?;
-            if let Some(source) = object
-                .get("conversation_id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                if source != id {
-                    return Err(());
+            let mut has_identity = false;
+            for key in ["conversation_id", "id"] {
+                match object.get(key) {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::String(source)) if source.is_empty() => {}
+                    Some(serde_json::Value::String(source)) if source == id => {
+                        has_identity = true;
+                    }
+                    _ => return Err(()),
                 }
-            } else {
+            }
+            if !has_identity {
                 object.insert("conversation_id".into(), id.into());
             }
-            normalize_chatgpt_document(
+            let mut observation = normalize_chatgpt_document(
                 &doc,
                 "chatgpt-live-v1",
                 self.context.observed_unix_millis.min(i64::MAX as u128) as i64,
             )
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+            observation.raw_payload = raw;
+            Ok(observation)
         })();
         let outcome = match result {
             Err(()) => Outcome::Invalid,
@@ -356,5 +387,232 @@ impl Work {
             outcome,
             Outcome::Imported | Outcome::Updated | Outcome::Unchanged
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn context() -> CaptureContext {
+        CaptureContext::at_entry(
+            "provisional:default",
+            "GET",
+            "/backend-api/conversation/synthetic",
+        )
+    }
+    fn metadata() -> CaptureMetadata {
+        CaptureMetadata {
+            host: "chatgpt.com".into(),
+            status: 200,
+            ..Default::default()
+        }
+    }
+    fn counters(status: &CaptureStatus) -> Counters {
+        match status.snapshot() {
+            Snapshot::Available { counters, .. } => {
+                assert_eq!(
+                    counters.started,
+                    counters.active
+                        + counters.committed_imported
+                        + counters.committed_updated
+                        + counters.committed_unchanged
+                        + counters.invalid_snapshot
+                        + counters.unsupported_encoding
+                        + counters.oversized
+                        + counters.dropped
+                        + counters.interrupted
+                        + counters.store_failed
+                        + counters.shutdown_unprocessed
+                );
+                *counters
+            }
+            _ => panic!("unexpected unavailable snapshot"),
+        }
+    }
+    #[test]
+    fn default_off_ineligible_and_contended_status_do_not_invent_attempts() {
+        let (off, _) = channel(false);
+        assert!(off.begin(context(), metadata()).is_none());
+        assert_eq!(counters(&off.status).started, 0);
+        let (on, _) = channel(true);
+        let mut ctx = context();
+        ctx.method = "POST".into();
+        assert!(on.begin(ctx, metadata()).is_none());
+        assert_eq!(counters(&on.status).started, 0);
+        let guard = on.status.state.lock().unwrap();
+        assert!(matches!(on.status.snapshot(), Snapshot::Unavailable));
+        drop(guard);
+        assert_eq!(counters(&on.status).started, 0);
+    }
+    #[test]
+    fn byte_budget_oversize_encoding_cancel_and_shutdown_are_single_terminal() {
+        let (sink, _rx) = channel(true);
+        let mut held = Vec::new();
+        for _ in 0..RETAINED_BYTES / ITEM_BYTES {
+            held.push(sink.begin(context(), metadata()).unwrap());
+        }
+        assert!(sink.begin(context(), metadata()).is_none());
+        assert_eq!(counters(&sink.status).retained_bytes, RETAINED_BYTES);
+        assert_eq!(counters(&sink.status).dropped, 1);
+        drop(held);
+        assert_eq!(counters(&sink.status).retained_bytes, 0);
+        let mut oversized = sink.begin(context(), metadata()).unwrap();
+        oversized.observe(&vec![b'x'; ITEM_BYTES]);
+        oversized.observe(b"x");
+        oversized.finish();
+        assert_eq!(counters(&sink.status).oversized, 1);
+        let mut encoded = metadata();
+        encoded.content_encoding = Some("gzip".into());
+        assert!(sink.begin(context(), encoded).is_none());
+        assert_eq!(counters(&sink.status).unsupported_encoding, 1);
+        let pending = sink.begin(context(), metadata()).unwrap();
+        sink.status.stop();
+        drop(pending);
+        let c = counters(&sink.status);
+        assert_eq!(c.shutdown_unprocessed, 1);
+        assert_eq!(c.active, 0);
+        assert_eq!(c.retained_bytes, 0);
+    }
+    #[test]
+    fn closed_queue_and_queued_drop_release_budget_once() {
+        let (sink, rx) = channel(true);
+        drop(rx);
+        sink.begin(context(), metadata()).unwrap().finish();
+        let c = counters(&sink.status);
+        assert_eq!(
+            (c.dropped, c.admitted, c.queued, c.active, c.retained_bytes),
+            (1, 0, 0, 0, 0)
+        );
+        let (sink, rx) = channel(true);
+        sink.begin(context(), metadata()).unwrap().finish();
+        assert_eq!(counters(&sink.status).queued, 1);
+        sink.status.stop();
+        drop(rx);
+        let c = counters(&sink.status);
+        assert_eq!(
+            (c.shutdown_unprocessed, c.queued, c.active, c.retained_bytes),
+            (1, 0, 0, 0)
+        );
+    }
+    #[test]
+    fn actual_store_failure_invalid_and_duplicate_outcomes_conserve_attempts() {
+        let (sink, mut rx) = channel(true);
+        let mut store = Store::in_memory().unwrap();
+        let ingest = |bytes: &[u8], rx: &mut mpsc::Receiver<Work>, store: &mut Store| {
+            let mut a = sink.begin(context(), metadata()).unwrap();
+            a.observe(bytes);
+            a.finish();
+            rx.try_recv().unwrap().ingest(store)
+        };
+        assert!(!ingest(b"not-json", &mut rx, &mut store));
+        let payload = br#"{"title":"synthetic","update_time":1,"mapping":{}}"#;
+        assert!(ingest(payload, &mut rx, &mut store));
+        let revision = store.library_revision().unwrap();
+        assert!(ingest(payload, &mut rx, &mut store));
+        assert_eq!(store.library_revision().unwrap(), revision);
+        store.connection().execute_batch("CREATE TRIGGER synthetic_abort BEFORE INSERT ON observations BEGIN SELECT RAISE(ABORT,'PRIVATE_SQL_SENTINEL'); END;").unwrap();
+        assert!(!ingest(
+            br#"{"title":"change","update_time":2,"mapping":{}}"#,
+            &mut rx,
+            &mut store
+        ));
+        assert_eq!(store.library_revision().unwrap(), revision);
+        let c = counters(&sink.status);
+        assert_eq!(
+            (
+                c.invalid_snapshot,
+                c.committed_imported,
+                c.committed_unchanged,
+                c.store_failed,
+                c.active,
+                c.retained_bytes
+            ),
+            (1, 1, 1, 1, 0, 0)
+        );
+        assert!(!serde_json::to_string(&sink.status.snapshot())
+            .unwrap()
+            .contains("PRIVATE_SQL_SENTINEL"));
+    }
+
+    #[test]
+    fn queue_limit_and_panic_have_exactly_one_terminal_disposition() {
+        let (sink, mut rx) = channel_with_limits(
+            true,
+            Limits {
+                item: 4,
+                retained: 16,
+                queue: 1,
+            },
+        );
+        sink.begin(context(), metadata()).unwrap().finish();
+        sink.begin(context(), metadata()).unwrap().finish();
+        let c = counters(&sink.status);
+        assert_eq!(
+            (c.admitted, c.queued, c.dropped, c.active, c.retained_bytes),
+            (1, 1, 1, 1, 4)
+        );
+        let work = rx.try_recv().unwrap();
+        let mut store = Store::in_memory().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            work.ingest_after(&mut store, || panic!("synthetic writer panic"))
+        }));
+        assert!(result.is_err());
+        let c = counters(&sink.status);
+        assert_eq!(
+            (
+                c.store_failed,
+                c.active,
+                c.writer_in_flight,
+                c.retained_bytes
+            ),
+            (1, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn unresolved_writer_remains_active_across_stop_then_commits_once() {
+        let (sink, mut rx) = channel(true);
+        let mut a = sink.begin(context(), metadata()).unwrap();
+        a.observe(br#"{"title":"synthetic","update_time":1,"mapping":{}}"#);
+        a.finish();
+        let work = rx.try_recv().unwrap();
+        let (entered, blocked) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut store = Store::in_memory().unwrap();
+            work.ingest_after(&mut store, || {
+                entered.send(()).unwrap();
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            })
+        });
+        blocked
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        sink.status.stop();
+        let c = counters(&sink.status);
+        assert_eq!(
+            (
+                c.active,
+                c.writer_in_flight,
+                c.shutdown_unprocessed,
+                c.committed_imported
+            ),
+            (1, 1, 0, 0)
+        );
+        release.send(()).unwrap();
+        assert!(writer.join().unwrap());
+        let c = counters(&sink.status);
+        assert_eq!(
+            (
+                c.active,
+                c.writer_in_flight,
+                c.shutdown_unprocessed,
+                c.committed_imported,
+                c.retained_bytes
+            ),
+            (0, 0, 0, 1, 0)
+        );
     }
 }

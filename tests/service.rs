@@ -262,15 +262,42 @@ async fn dropping_sender_before_deadline_preserves_exact_work_conservation() {
 // Exercise the real CONNECT/TLS proxy feeding the service's bounded writer and SQLite store.
 #[tokio::test]
 async fn tls_capture_flows_through_service_into_conversation_store() {
-    exercise_live_tls(true).await;
+    exercise_live_tls(true, None).await;
 }
 
 #[tokio::test]
 async fn disabled_capture_forwards_tls_without_retention_or_archival() {
-    exercise_live_tls(false).await;
+    exercise_live_tls(false, None).await;
 }
 
-async fn exercise_live_tls(enabled: bool) {
+#[tokio::test]
+async fn live_tls_identity_validation_and_raw_path_fallback_are_lossless() {
+    for case in [
+        "fallback",
+        "mismatch",
+        "malformed_id",
+        "malformed_conversation_id",
+        "conflicting_ids",
+        "null_empty",
+        "empty_identity",
+    ] {
+        exercise_live_tls(true, Some(case)).await;
+    }
+}
+
+#[tokio::test]
+async fn live_tls_malformed_oversize_encoding_and_store_failure_preserve_traffic() {
+    for case in [
+        "invalid_snapshot",
+        "oversized",
+        "unsupported_encoding",
+        "store_failed",
+    ] {
+        exercise_live_tls(true, Some(case)).await;
+    }
+}
+
+async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
     let root = tmp("tls");
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = CertificateParams::new(vec!["chatgpt.com".into()])
@@ -296,13 +323,52 @@ async fn exercise_live_tls(enabled: bool) {
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
-    let body = serde_json::to_vec(
-        &serde_json::from_slice::<serde_json::Value>(include_bytes!(
-            "fixtures/chatgpt-export/array.json"
-        ))
-        .unwrap()[0],
-    )
-    .unwrap();
+    let mut doc = serde_json::from_slice::<serde_json::Value>(include_bytes!(
+        "fixtures/chatgpt-export/array.json"
+    ))
+    .unwrap()[0]
+        .clone();
+    match case {
+        Some("fallback") => {
+            doc.as_object_mut().unwrap().remove("id");
+        }
+        Some("mismatch") => doc["id"] = serde_json::json!("other"),
+        Some("malformed_id") => doc["id"] = serde_json::json!([]),
+        Some("malformed_conversation_id") => doc["conversation_id"] = serde_json::json!(23),
+        Some("conflicting_ids") => {
+            doc["conversation_id"] = serde_json::json!("other");
+        }
+        Some("empty_identity") => {
+            doc["id"] = serde_json::json!("");
+            doc["conversation_id"] = serde_json::json!("");
+        }
+        Some("null_empty") => doc["conversation_id"] = serde_json::Value::Null,
+        _ => {}
+    }
+    let body = match case {
+        Some("invalid_snapshot") => b"not-json PRIVATE_BODY_SENTINEL".to_vec(),
+        Some("oversized") => vec![b'x'; chat_hub::live_capture::ITEM_BYTES + 1],
+        _ => serde_json::to_vec(&doc).unwrap(),
+    };
+    let terminal = match case {
+        Some(
+            "mismatch"
+            | "malformed_id"
+            | "malformed_conversation_id"
+            | "conflicting_ids"
+            | "invalid_snapshot",
+        ) => "invalid_snapshot",
+        Some("oversized") => "oversized",
+        Some("unsupported_encoding") => "unsupported_encoding",
+        Some("store_failed") => "store_failed",
+        _ => "committed_imported",
+    };
+    let successful = enabled && terminal == "committed_imported";
+    let encoding_header = if case == Some("unsupported_encoding") {
+        "Content-Encoding: gzip\r\n"
+    } else {
+        ""
+    };
     let response_body = body.clone();
     let upstream_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -332,7 +398,7 @@ async fn exercise_live_tls(enabled: bool) {
         tls.read_exact(&mut payload).await.unwrap();
         assert!(end > 0);
         let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{encoding_header}\r\n",
             response_body.len()
         );
         tls.write_all(head.as_bytes()).await.unwrap();
@@ -349,6 +415,10 @@ async fn exercise_live_tls(enabled: bool) {
     let (handle, tx) = service::start_with_proxy(service_config, 1, proxy)
         .await
         .unwrap();
+    if case == Some("store_failed") {
+        let injector = rusqlite::Connection::open(root.join("db.sqlite")).unwrap();
+        injector.execute_batch("CREATE TRIGGER synthetic_live_abort BEFORE INSERT ON observations BEGIN SELECT RAISE(ABORT,'PRIVATE_SQL_SENTINEL'); END;").unwrap();
+    }
     let status = handle.status();
     let proxy_addr = status.proxy_addr.unwrap();
     let ca = chat_hub::ca::Ca::load_or_create(root.join("ca")).unwrap();
@@ -359,7 +429,7 @@ async fn exercise_live_tls(enabled: bool) {
         .build()
         .unwrap();
     let response = client
-        .get("https://chatgpt.com/backend-api/conversation/tls-c1")
+        .get("https://chatgpt.com/backend-api/conversation/synthetic-export-one")
         .body("request")
         .send()
         .await
@@ -391,7 +461,11 @@ async fn exercise_live_tls(enabled: bool) {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["capture"]["enabled"], enabled);
-        if enabled && v["capture"]["counters"]["committed_imported"] == 1 {
+        assert_eq!(v["service"]["status"], "ready");
+        assert_eq!(v["database"]["status"], "healthy");
+        assert!(!v.to_string().contains("PRIVATE_SQL_SENTINEL"));
+        assert!(!v.to_string().contains("PRIVATE_BODY_SENTINEL"));
+        if enabled && v["capture"]["counters"][terminal] == 1 {
             break v;
         }
         if !enabled && handle.status().ingest.ignored == 1 {
@@ -403,7 +477,7 @@ async fn exercise_live_tls(enabled: bool) {
     if !enabled {
         assert_eq!(detail["capture"]["counters"]["started"], 0);
         assert_eq!(detail["capture"]["counters"]["retained_bytes"], 0);
-    } else {
+    } else if successful {
         let bytes = api
             .get(format!("{api_url}/api/v1/conversations"))
             .bearer_auth("test")
@@ -435,16 +509,19 @@ async fn exercise_live_tls(enabled: bool) {
     let stats = tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
         .await
         .unwrap();
-    assert_eq!(stats.stored, u64::from(enabled));
-    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.stored, u64::from(successful));
+    assert_eq!(
+        stats.failed,
+        u64::from(enabled && matches!(terminal, "invalid_snapshot" | "store_failed"))
+    );
     assert_eq!(stats.unprocessed, 0);
     let store =
         chat_hub::store::Store::open(&root.join("db.sqlite").display().to_string()).unwrap();
     assert_eq!(
         store.library_snapshot().unwrap().conversations.len(),
-        usize::from(enabled)
+        usize::from(successful)
     );
-    if enabled {
+    if successful {
         let snapshot = store.library_snapshot().unwrap();
         let saved = store
             .read_normalized(snapshot.conversations[0]["id"].as_str().unwrap())
@@ -452,6 +529,14 @@ async fn exercise_live_tls(enabled: bool) {
             .unwrap();
         assert_eq!(saved["messages"].as_array().unwrap().len(), 2);
         assert!(saved.to_string().contains("Selected synthetic answer"));
+        let inspector = rusqlite::Connection::open(root.join("db.sqlite")).unwrap();
+        let raw: String = inspector
+            .query_row("SELECT raw_payload FROM observations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+            doc
+        );
     }
     let counters = serde_json::to_value(capture.snapshot()).unwrap();
     assert_eq!(counters["counters"]["active"], 0);

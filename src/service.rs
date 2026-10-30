@@ -159,6 +159,8 @@ mod api_readiness_tests {
 }
 
 pub struct ServiceHandle {
+    #[cfg(test)]
+    live_sink: crate::live_capture::LiveSink,
     capture: crate::live_capture::CaptureStatus,
     live_receiver: Arc<Mutex<mpsc::Receiver<crate::live_capture::Work>>>,
     status: Arc<Mutex<ServiceStatus>>,
@@ -175,6 +177,8 @@ pub struct ServiceHandle {
 }
 #[derive(Clone)]
 struct WriterFailureContext {
+    capture: crate::live_capture::CaptureStatus,
+    live_receiver: Arc<Mutex<mpsc::Receiver<crate::live_capture::Work>>>,
     stop: watch::Sender<bool>,
     status: Arc<Mutex<ServiceStatus>>,
     writer_stop: Arc<AtomicBool>,
@@ -186,6 +190,12 @@ struct WriterFailureContext {
 
 impl WriterFailureContext {
     fn actual_cleanup(&self) {
+        self.capture.stop();
+        {
+            let mut rx = self.live_receiver.lock().unwrap_or_else(|p| p.into_inner());
+            rx.close();
+            while rx.try_recv().is_ok() {}
+        }
         self.writer_stop.store(true, Ordering::Release);
         self.abandon_queue.store(true, Ordering::Release);
         {
@@ -352,6 +362,8 @@ pub async fn start_with_proxy(
         None,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        false,
     )
     .await
 }
@@ -363,6 +375,7 @@ async fn start_internal(
     writer_busy_timeout: Duration,
     #[cfg(test)] writer_gate: Option<WriterTestGate>,
     #[cfg(test)] writer_exit: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)] writer_panics: bool,
 ) -> Result<(ServiceHandle, mpsc::Sender<CaptureEvent>), String> {
     if capacity == 0 {
         return Err("capture capacity must be positive".into());
@@ -435,6 +448,8 @@ async fn start_internal(
     let abandoned = Arc::new(AtomicU64::new(0));
     let writer_abandoned = abandoned.clone();
     let writer_failure = WriterFailureContext {
+        capture: capture.clone(),
+        live_receiver: live_receiver.clone(),
         stop: stop.clone(),
         status: status.clone(),
         writer_stop: flag.clone(),
@@ -491,7 +506,19 @@ async fn start_internal(
                             .try_recv();
                         if let Ok(work) = live {
                             lock_status(&writer_status).ingest.accepted += 1;
+                            #[cfg(not(test))]
                             let committed = work.ingest(&mut store);
+                            #[cfg(test)]
+                            let committed = work.ingest_after(&mut store, || {
+                                if let Some(gate) = &writer_gate {
+                                    let (lock, cv) = &**gate;
+                                    let mut released = lock.lock().unwrap();
+                                    while !*released {
+                                        released = cv.wait(released).unwrap();
+                                    }
+                                }
+                                assert!(!writer_panics, "synthetic live writer panic");
+                            });
                             let mut status = lock_status(&writer_status);
                             if committed {
                                 status.ingest.stored += 1;
@@ -568,6 +595,8 @@ async fn start_internal(
     };
     proxy_config.ca_dir = config.ca_dir.clone();
     proxy_config.bind = config.proxy_addr;
+    #[cfg(test)]
+    let test_live_sink = live_sink.clone();
     let (proxy, pt) = match proxy::run_live(proxy_config, live_sink).await {
         Ok(x) => x,
         Err(e) => {
@@ -634,6 +663,8 @@ async fn start_internal(
     }
     Ok((
         ServiceHandle {
+            #[cfg(test)]
+            live_sink: test_live_sink,
             capture,
             live_receiver,
             status,
@@ -674,6 +705,183 @@ mod deadline_tests {
     use super::*;
 
     #[tokio::test]
+    async fn actual_live_writer_panic_drains_queue_without_handle_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "live-panic-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = Config {
+            capture_enabled: true,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            bearer_token: "synthetic".into(),
+            database_path: root.join("db.sqlite").to_string_lossy().into_owned(),
+            ca_dir: root.join("ca"),
+        };
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        struct Release(WriterTestGate);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let (lock, cv) = &*self.0;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                cv.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        let (exit, exited) = std::sync::mpsc::channel();
+        let (handle, _legacy) = start_internal(
+            config.clone(),
+            1,
+            ProxyConfig::loopback(""),
+            Duration::from_millis(100),
+            Some(gate),
+            Some(exit),
+            true,
+        )
+        .await
+        .unwrap();
+        let submit = || {
+            let mut a = handle
+                .live_sink
+                .begin(
+                    crate::capture_lane::CaptureContext::at_entry(
+                        "provisional:default",
+                        "GET",
+                        "/backend-api/conversation/panic",
+                    ),
+                    crate::capture_lane::CaptureMetadata {
+                        host: "chatgpt.com".into(),
+                        status: 200,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            a.observe(br#"{"update_time":1,"mapping":{}}"#);
+            a.finish();
+        };
+        submit();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = serde_json::to_value(handle.capture_status().snapshot()).unwrap();
+                if snapshot["counters"]["writer_in_flight"] == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        submit();
+        let queued = serde_json::to_value(handle.capture_status().snapshot()).unwrap();
+        drop(release);
+        exited.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(queued["counters"]["queued"], 1);
+        // Keep the actual handle alive: production supervisor cleanup must act.
+        let final_state = serde_json::to_value(handle.capture_status().snapshot()).unwrap();
+        assert_eq!(final_state["counters"]["started"], 2);
+        assert_eq!(final_state["counters"]["store_failed"], 1);
+        assert_eq!(final_state["counters"]["shutdown_unprocessed"], 1);
+        for key in ["active", "queued", "writer_in_flight", "retained_bytes"] {
+            assert_eq!(final_state["counters"][key], 0);
+        }
+        assert!(matches!(handle.status().state, ServiceState::Failed(_)));
+        assert!(handle.live_receiver.lock().unwrap().is_closed());
+        let _ = handle.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_writer_pending_across_deadline_is_not_double_counted() {
+        let root = std::env::temp_dir().join(format!(
+            "live-deadline-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = Config {
+            capture_enabled: true,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+            bearer_token: "synthetic".into(),
+            database_path: root.join("db.sqlite").to_string_lossy().into_owned(),
+            ca_dir: root.join("ca"),
+        };
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        struct Release(WriterTestGate);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let (lock, cv) = &*self.0;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                cv.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        let (exit, exited) = std::sync::mpsc::channel();
+        let (handle, _legacy) = start_internal(
+            config.clone(),
+            1,
+            ProxyConfig::loopback(""),
+            Duration::from_millis(100),
+            Some(gate),
+            Some(exit),
+            false,
+        )
+        .await
+        .unwrap();
+        let capture = handle.capture_status();
+        let mut accumulator = handle
+            .live_sink
+            .begin(
+                crate::capture_lane::CaptureContext::at_entry(
+                    "provisional:default",
+                    "GET",
+                    "/backend-api/conversation/pending",
+                ),
+                crate::capture_lane::CaptureMetadata {
+                    host: "chatgpt.com".into(),
+                    status: 200,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        accumulator.observe(br#"{"update_time":1,"mapping":{}}"#);
+        accumulator.finish();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = serde_json::to_value(capture.snapshot()).unwrap();
+                if snapshot["counters"]["writer_in_flight"] == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = handle.shutdown_timeout(Duration::from_millis(1)).await;
+        let pending = serde_json::to_value(capture.snapshot()).unwrap();
+        drop(release);
+        exited.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(pending["counters"]["active"], 1);
+        assert_eq!(pending["counters"]["shutdown_unprocessed"], 0);
+        let final_state = serde_json::to_value(capture.snapshot()).unwrap();
+        assert_eq!(final_state["counters"]["started"], 1);
+        assert_eq!(final_state["counters"]["committed_imported"], 1);
+        assert_eq!(final_state["counters"]["shutdown_unprocessed"], 0);
+        assert_eq!(final_state["counters"]["active"], 0);
+        assert_eq!(final_state["counters"]["retained_bytes"], 0);
+        let store = Store::open(&config.database_path).unwrap();
+        assert_eq!(store.library_snapshot().unwrap().conversations.len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn blocked_writer_hits_deadline_after_sender_drop_and_accounts_queue() {
         let root = std::env::temp_dir().join(format!(
             "chat-hub-deadline-{}-{}",
@@ -711,6 +919,7 @@ mod deadline_tests {
             Duration::from_secs(30),
             Some(gate.clone()),
             Some(writer_exit_tx),
+            false,
         )
         .await
         .unwrap();
@@ -847,6 +1056,8 @@ mod writer_panic_tests {
         supervise_writer(
             || panic!("intentional writer panic"),
             WriterFailureContext {
+                capture: crate::live_capture::CaptureStatus::new(false),
+                live_receiver: Arc::new(Mutex::new(crate::live_capture::channel(false).1)),
                 stop: stop.clone(),
                 status: status.clone(),
                 writer_stop: writer_stop.clone(),
@@ -888,6 +1099,7 @@ mod writer_panic_tests {
         let store = Store::in_memory().unwrap();
         let interrupt = Arc::new(store.connection().get_interrupt_handle());
         let handle = ServiceHandle {
+            live_sink: crate::live_capture::channel(false).0,
             capture: crate::live_capture::CaptureStatus::new(false),
             live_receiver: Arc::new(Mutex::new(crate::live_capture::channel(false).1)),
             status: status.clone(),

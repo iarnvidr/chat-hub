@@ -17,7 +17,10 @@ time and correlation through the sole service writer. Each snapshot has a
 2 MiB limit, the typed path has a 16 MiB retained-body reservation limit and a
 32-item writer queue. Permits cover accumulation, queue and writer processing.
 These bounds concern retained source bodies, not all parser/graph allocations
-or total process memory. The compatibility `Sender<CaptureEvent>` has its
+or total process memory.
+Derived JSON/normalized graph allocations are bounded by the 2 MiB input and
+single writer, but have additional parsing overhead outside the raw-copy budget.
+The compatibility `Sender<CaptureEvent>` has its
 separate caller-selected item-count capacity; its externally supplied body
 allocations are outside the live byte budget. Oversized legacy events are
 ignored at writer entry. Disabled mode never archives legacy submissions.
@@ -35,8 +38,17 @@ are independent diagnostics, not an additional dropped attempt. Pending writer
 transactions remain active until resolved, including after shutdown timeout.
 Safe last-error codes never contain bodies, paths, credentials or SQL errors.
 
-Implementation checkpoint: default-off and opt-in synthetic TLS forwarding,
-normalized v1 read and reopen persistence are tested. Detailed deterministic
-failure, budget, panic and shutdown conservation proofs remain required before
-this work is considered complete or merge-ready. No native/macOS validation is
-claimed.
+All usable `conversation_id` and export-style `id` values must match the source
+request path. Present non-string identity shapes are rejected; null and empty
+strings are missing, consistent with F1. When both identities are missing, the
+path is supplied only to the shared normalizer; stored raw provenance remains
+the original provider JSON without invented fields.
+
+Tests cover default-off and opt-in synthetic TLS forwarding, normalized v1 read,
+raw payload fidelity and reopen persistence; malformed/oversized/unsupported and
+SQLite-abort responses preserve traffic. Deterministic budget/queue/drop/panic
+tests assert conservation. The actual service supervisor drains live work after
+writer panic while the handle remains held. A deadline test holds the actual
+writer before commit and verifies it remains active until resolution. Fresh full
+regressions, Linux CI and lead review remain required before merge. No native or
+macOS validation is claimed.
