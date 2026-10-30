@@ -24,6 +24,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Validate before opening the database or creating its data directory.
             chat_hub::importer::parse_export(&bytes)?;
             let c = Config::from_env()?;
+            if c.database_path != ":memory:" {
+                if let Some(parent) = std::path::Path::new(&c.database_path)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|_| "unable to create import library directory")?;
+                }
+            }
             let mut store = chat_hub::store::Store::open(&c.database_path)
                 .map_err(|_| "unable to open import library")?;
             let receipt = chat_hub::importer::import_chatgpt(&mut store, &bytes)?;
