@@ -509,11 +509,10 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
     let stats = tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
         .await
         .unwrap();
-    assert_eq!(stats.stored, u64::from(successful));
-    assert_eq!(
-        stats.failed,
-        u64::from(enabled && matches!(terminal, "invalid_snapshot" | "store_failed"))
-    );
+    // Compatibility ingress accounting does not count typed live attempts or
+    // turn their pending commits into legacy unprocessed outcomes at deadlines.
+    assert_eq!(stats.stored, 0);
+    assert_eq!(stats.failed, 0);
     assert_eq!(stats.unprocessed, 0);
     let store =
         chat_hub::store::Store::open(&root.join("db.sqlite").display().to_string()).unwrap();

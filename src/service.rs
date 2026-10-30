@@ -28,6 +28,8 @@ pub enum ServiceState {
 }
 #[derive(Clone, Debug, Default)]
 pub struct IngestStats {
+    // Legacy CaptureEvent ingress only. Typed live attempts have their own
+    // conservation snapshot, including pending commits after shutdown timeout.
     /// Events dequeued by the ingestion writer (not merely accepted by the channel).
     pub accepted: u64,
     pub stored: u64,
@@ -505,11 +507,10 @@ async fn start_internal(
                             .unwrap_or_else(|p| p.into_inner())
                             .try_recv();
                         if let Ok(work) = live {
-                            lock_status(&writer_status).ingest.accepted += 1;
                             #[cfg(not(test))]
-                            let committed = work.ingest(&mut store);
+                            work.ingest(&mut store);
                             #[cfg(test)]
-                            let committed = work.ingest_after(&mut store, || {
+                            work.ingest_after(&mut store, || {
                                 if let Some(gate) = &writer_gate {
                                     let (lock, cv) = &**gate;
                                     let mut released = lock.lock().unwrap();
@@ -519,12 +520,6 @@ async fn start_internal(
                                 }
                                 assert!(!writer_panics, "synthetic live writer panic");
                             });
-                            let mut status = lock_status(&writer_status);
-                            if committed {
-                                status.ingest.stored += 1;
-                            } else {
-                                status.ingest.failed += 1;
-                            }
                             continue;
                         }
                         let received = {

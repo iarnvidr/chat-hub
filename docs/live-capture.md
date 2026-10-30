@@ -34,8 +34,13 @@ Contended capture state returns `status: unavailable`, never invented zeros.
 `started = active + mutually exclusive terminal outcomes`. Imported, updated
 and unchanged outcomes count only after commit. Admitted/completed responses
 are stage counters; queued/writer-in-flight are gauges. Lost observer messages
-are independent diagnostics, not an additional dropped attempt. Pending writer
+are independent diagnostics, not an additional dropped attempt.
+The typed path has no lossy observer channel, so its `lost_observations` stays
+zero; legacy explicit proxy capture APIs retain their separate observer counters.
+Pending writer
 transactions remain active until resolved, including after shutdown timeout.
+Existing `ingest`/shutdown `IngestStats` counters describe legacy CaptureEvent
+ingress only; typed live attempts are counted exclusively by `capture`.
 Safe last-error codes never contain bodies, paths, credentials or SQL errors.
 
 All usable `conversation_id` and export-style `id` values must match the source

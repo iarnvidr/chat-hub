@@ -535,6 +535,42 @@ mod tests {
     }
 
     #[test]
+    fn entry_context_is_owned_until_normalization_and_durable_provenance() {
+        let (sink, mut rx) = channel(true);
+        let mut entry = context();
+        entry.observed_unix_millis = 12345;
+        entry.correlation = 7823;
+        let mut accumulator = sink.begin(entry.clone(), metadata()).unwrap();
+        entry.profile_scope = "changed-after-entry".into();
+        entry.observed_unix_millis = 99999;
+        let body = br#"{"title":"synthetic","update_time":1,"mapping":{}}"#;
+        accumulator.observe(body);
+        accumulator.finish();
+        let work = rx.try_recv().unwrap();
+        assert_eq!(work.context.correlation, 7823);
+        let mut store = Store::in_memory().unwrap();
+        assert!(work.ingest(&mut store));
+        let (observed, parser, raw): (i64, String, String) = store
+            .connection()
+            .query_row(
+                "SELECT observed_ms,parser,raw_payload FROM observations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(observed, 12345);
+        assert_eq!(parser, "chatgpt-live-v1");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(body).unwrap()
+        );
+        assert_eq!(
+            store.library_snapshot().unwrap().conversations[0]["account_scope"],
+            "provisional:default"
+        );
+    }
+
+    #[test]
     fn queue_limit_and_panic_have_exactly_one_terminal_disposition() {
         let (sink, mut rx) = channel_with_limits(
             true,
