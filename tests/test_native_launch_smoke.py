@@ -71,6 +71,24 @@ class NativeLaunchSmoke(unittest.TestCase):
   self.assertIn('subjectAltName=DNS:chatgpt.com',harness)
   self.assertIn('MUNINN_PROVIDER_SMOKE_UPSTREAM',harness)
   self.assertIn('wrap_socket(raw,server_hostname=\'chatgpt.com\')',driver)
-  self.assertIn("info['api']+'/api/conversations/native-smoke-synthetic'",driver)
-  self.assertIn('not ChatGPT login',driver)
+  self.assertIn('from native_capture_contract import validate as validate_capture_contract',driver)
+  self.assertIn("authenticated_json(info,token,'/api/v1/conversations?limit=100')",driver)
+  self.assertIn("authenticated_json(info,token,'/api/v1/status')",driver)
+  self.assertIn('canonical_archive(service,token); capture_before=capture_snapshot(service,token)',driver)
+  self.assertIn('canonical_archive(service,token); capture_after=capture_snapshot(service,token)',driver)
+  self.assertIn('validate_capture_contract(capture_before,capture_after,forwarding_ok=tls.get(\'forwarded\') is True,archive_before=archive_before,archive_after=archive_after)',driver)
+  self.assertNotIn("info['api']+'/api/conversations/native-smoke-synthetic'",driver)
+  self.assertIn("record['default_off_capture']",driver)
+  self.assertIn("if os.environ.get('MUNINN_NATIVE_LAUNCH_MODE') != 'basic':",driver)
+  import ast
+  tree=ast.parse(driver)
+  guards=[node for node in ast.walk(tree) if isinstance(node,ast.If) and isinstance(node.test,ast.Compare) and isinstance(node.test.left,ast.Call) and isinstance(node.test.left.func,ast.Attribute) and node.test.left.func.attr=='get' and node.test.left.args and isinstance(node.test.left.args[0],ast.Constant) and node.test.left.args[0].value=='MUNINN_NATIVE_LAUNCH_MODE' and any(isinstance(op,ast.NotEq) for op in node.test.ops) and any(isinstance(c,ast.Constant) and c.value=='basic' for c in node.test.comparators)]
+  self.assertTrue(guards, 'nonbasic smoke branch must exist')
+  start=driver.rindex("if os.environ.get('MUNINN_NATIVE_LAUNCH_MODE') != 'basic':",0,driver.index('archive_before='))
+  branch=driver[start:driver.index('validate_capture_contract(',start)+len('validate_capture_contract(')]
+  expected=['canonical_archive(service,token); capture_before=capture_snapshot(service,token)','tls=synthetic_tls_fixture(service)','canonical_archive(service,token); capture_after=capture_snapshot(service,token)','validate_capture_contract(']
+  positions=[branch.index(step) for step in expected]
+  self.assertEqual(positions,sorted(positions), 'nonbasic archive/capture snapshots must bracket the actual TLS fixture before validation')
+  for step in expected:
+   self.assertTrue(any(ast.get_source_segment(driver,node) and step.split('(')[0] in ast.get_source_segment(driver,node) for guard in guards for node in ast.walk(guard)), f'{step} must be contained in a nonbasic branch')
 if __name__=='__main__': unittest.main()
