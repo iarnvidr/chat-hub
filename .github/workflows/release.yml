@@ -65,7 +65,7 @@ jobs:
         run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
       - name: Prepare allowlisted release and native smoke evidence
         if: always()
-        run: python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence"
+        run: python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence" --native-library-source "$RUNNER_TEMP/chat-hub-native-library-evidence"
       - name: Upload required smoke diagnostics
         if: always()
         continue-on-error: true
@@ -187,6 +187,16 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: bash build/package-dmg.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$RUNNER_TEMP/chat-hub/corresponding-source" "$RUNNER_TEMP/chat-hub/Chat_Hub_${INPUT_VERSION}_macos-arm64.dmg"
+      - name: Required native library persisted-data smoke (debug bundle only)
+        env:
+          NATIVE_LIBRARY_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-library-evidence
+        run: |
+          set -euo pipefail
+          MUNINN_E2E_DIR="$(mktemp -d "$RUNNER_TEMP/chat-hub-native-library-e2e.XXXXXX")"
+          export MUNINN_E2E_DIR
+          mkdir -p "$NATIVE_LIBRARY_EVIDENCE_DIR"
+          home="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
+          bash build/native-library-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$NATIVE_LIBRARY_EVIDENCE_DIR" --allow-default-app-data --disposable-home "$home"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-review-${{ inputs.tag }}
