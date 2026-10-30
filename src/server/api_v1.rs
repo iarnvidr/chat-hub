@@ -24,29 +24,58 @@ use tokio::sync::Semaphore;
 /// Every record and the revision in a snapshot must come from ONE store read
 /// transaction. Never implement this by reading the revision and rows separately.
 pub trait ReadAdapter: Send {
-    fn library_snapshot(&mut self) -> Result<LibrarySnapshot, ReadError>;
+    fn list_page_snapshot(
+        &mut self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError>;
     /// RAW text, not FTS grammar. The store literalizes whitespace-separated
     /// Unicode terms and ANDs them. Do not prequote or resolve summaries later.
-    fn search_snapshot(&mut self, query: &str) -> Result<SearchSnapshot, ReadError>;
+    fn search_page_snapshot(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<SearchPageSnapshot, ReadError>;
+    fn detail_snapshot(&mut self, canonical_id: &str) -> Result<DetailSnapshot, ReadError>;
     /// Service readiness must be known independently of the database probe.
     fn diagnostics(&mut self) -> Result<Diagnostics, ReadError>;
     fn schema_version(&mut self) -> Result<i64, ReadError>;
 }
 
 #[derive(Clone, Debug)]
-pub struct LibrarySnapshot {
+pub struct ListPageSnapshot {
     pub library_revision: i64,
-    pub conversations: Vec<Conversation>,
+    pub items: Vec<Summary>,
 }
 #[derive(Clone, Debug)]
-pub struct SearchSnapshot {
+pub struct SearchPageSnapshot {
     pub library_revision: i64,
     pub hits: Vec<SearchHit>,
+}
+#[derive(Clone, Debug)]
+pub struct DetailSnapshot {
+    pub library_revision: i64,
+    pub conversation: Option<Conversation>,
+}
+#[derive(Clone, Debug)]
+pub struct ListKey {
+    pub updated_at_ms: Option<i64>,
+    pub id: String,
+}
+#[derive(Clone, Debug)]
+pub struct SearchKey {
+    pub score: f64,
+    pub conversation_id: String,
+    pub node_id: Option<String>,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum ReadError {
     Unavailable,
     InvalidData,
+    BudgetExceeded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -123,11 +152,25 @@ pub(super) fn store_reader(
     Arc::new(Mutex::new(Box::new(StoreReader { store, readiness })))
 }
 impl ReadAdapter for StoreReader {
-    fn library_snapshot(&mut self) -> Result<LibrarySnapshot, ReadError> {
+    fn list_page_snapshot(
+        &mut self,
+        _: usize,
+        _: Option<&ListKey>,
+        _: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
         // Deliberately unavailable until bounded F1 reads can be connected.
         Err(ReadError::Unavailable)
     }
-    fn search_snapshot(&mut self, _: &str) -> Result<SearchSnapshot, ReadError> {
+    fn search_page_snapshot(
+        &mut self,
+        _: &str,
+        _: usize,
+        _: Option<&SearchKey>,
+        _: Option<i64>,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        Err(ReadError::Unavailable)
+    }
+    fn detail_snapshot(&mut self, _: &str) -> Result<DetailSnapshot, ReadError> {
         Err(ReadError::Unavailable)
     }
     fn diagnostics(&mut self) -> Result<Diagnostics, ReadError> {
@@ -264,12 +307,17 @@ impl From<ReadError> for ApiError {
         match value {
             ReadError::Unavailable => unavailable(),
             ReadError::InvalidData => invalid_data(),
+            ReadError::BudgetExceeded => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "response_too_large",
+                "Response exceeds the read budget.",
+            ),
         }
     }
 }
-async fn run_read<T: Send + 'static>(
+async fn run_read<T: Send + 'static, E: Into<ApiError> + Send + 'static>(
     s: &ApiState,
-    f: impl FnOnce(&mut dyn ReadAdapter) -> Result<T, ReadError> + Send + 'static,
+    f: impl FnOnce(&mut dyn ReadAdapter) -> Result<T, E> + Send + 'static,
 ) -> Result<T, ApiError> {
     let permit = s
         .db_ops
@@ -279,12 +327,34 @@ async fn run_read<T: Send + 'static>(
     let reader = s.reader.clone().ok_or_else(unavailable)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let mut reader = reader.lock().map_err(|_| ReadError::Unavailable)?;
-        f(reader.as_mut())
+        let mut reader = reader.lock().map_err(|_| unavailable())?;
+        f(reader.as_mut()).map_err(Into::into)
     })
     .await
     .map_err(|_| unavailable())?
-    .map_err(Into::into)
+}
+
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+struct JsonBudget(usize);
+impl std::io::Write for JsonBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.0 {
+            return Err(std::io::Error::other("response budget exceeded"));
+        }
+        self.0 -= bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn check_json_budget(value: &Value, max_bytes: usize) -> Result<(), ApiError> {
+    serde_json::to_writer(JsonBudget(max_bytes), value)
+        .map_err(|_| ReadError::BudgetExceeded.into())
+}
+fn checked_json(value: Value) -> ApiResult {
+    check_json_budget(&value, MAX_RESPONSE_BYTES)?;
+    Ok(Json(value))
 }
 
 async fn status(State(s): State<ApiState>) -> Response {
@@ -478,15 +548,30 @@ async fn list(State(s): State<ApiState>, q: Result<Query<PageQuery>, QueryReject
     let q = query(q)?;
     let limit = limit(q.limit)?;
     let cursor = decode_cursor(q.cursor.as_deref(), "list", None)?;
-    let snapshot = run_read(&s, |r| r.library_snapshot()).await?;
+    let after = cursor.as_ref().and_then(|c| match &c.after {
+        Key::List { updated_at_ms, id } => Some(ListKey {
+            updated_at_ms: *updated_at_ms,
+            id: id.clone(),
+        }),
+        _ => None,
+    });
+    let expected = cursor.as_ref().map(|c| c.revision);
+    let snapshot = run_read(&s, move |r| {
+        r.list_page_snapshot(limit + 1, after.as_ref(), expected)
+    })
+    .await?;
     revision(&cursor, snapshot.library_revision)?;
-    let mut items: Vec<Summary> = snapshot
-        .conversations
-        .into_iter()
-        .map(|c| c.summary)
-        .filter(|c| cursor.as_ref().is_none_or(|p| after_list(c, &p.after)))
-        .collect();
-    items.sort_by(compare_list);
+    let mut items = snapshot.items;
+    if items.len() > limit + 1
+        || items
+            .windows(2)
+            .any(|pair| compare_list(&pair[0], &pair[1]) != Ordering::Less)
+        || items
+            .iter()
+            .any(|item| cursor.as_ref().is_some_and(|c| !after_list(item, &c.after)))
+    {
+        return Err(invalid_data());
+    }
     let more = items.len() > limit;
     items.truncate(limit);
     let next_cursor = if more {
@@ -503,9 +588,9 @@ async fn list(State(s): State<ApiState>, q: Result<Query<PageQuery>, QueryReject
     } else {
         None
     };
-    Ok(Json(
+    checked_json(
         json!({"items":items,"next_cursor":next_cursor,"library_revision":snapshot.library_revision}),
-    ))
+    )
 }
 fn compare_search(a: &SearchHit, b: &SearchHit) -> Ordering {
     a.score
@@ -542,7 +627,23 @@ async fn search(
     }
     let cursor = decode_cursor(q.cursor.as_deref(), "search", Some(&normalized))?;
     let raw_query = normalized.clone();
-    let snapshot = run_read(&s, move |r| r.search_snapshot(&raw_query)).await?;
+    let after = cursor.as_ref().and_then(|c| match &c.after {
+        Key::Search {
+            score,
+            conversation_id,
+            node_id,
+        } => Some(SearchKey {
+            score: *score,
+            conversation_id: conversation_id.clone(),
+            node_id: node_id.clone(),
+        }),
+        _ => None,
+    });
+    let expected = cursor.as_ref().map(|c| c.revision);
+    let snapshot = run_read(&s, move |r| {
+        r.search_page_snapshot(&raw_query, limit + 1, after.as_ref(), expected)
+    })
+    .await?;
     revision(&cursor, snapshot.library_revision)?;
     for h in &snapshot.hits {
         let title = h.node_id.is_none()
@@ -554,12 +655,19 @@ async fn search(
             return Err(invalid_data());
         }
     }
-    let mut items: Vec<_> = snapshot
-        .hits
-        .into_iter()
-        .filter(|h| cursor.as_ref().is_none_or(|p| after_search(h, &p.after)))
-        .collect();
-    items.sort_by(compare_search);
+    let mut items = snapshot.hits;
+    if items.len() > limit + 1
+        || items
+            .windows(2)
+            .any(|pair| compare_search(&pair[0], &pair[1]) != Ordering::Less)
+        || items.iter().any(|item| {
+            cursor
+                .as_ref()
+                .is_some_and(|c| !after_search(item, &c.after))
+        })
+    {
+        return Err(invalid_data());
+    }
     let more = items.len() > limit;
     items.truncate(limit);
     let next_cursor = if more {
@@ -577,9 +685,9 @@ async fn search(
     } else {
         None
     };
-    Ok(Json(
+    checked_json(
         json!({"items":items,"next_cursor":next_cursor,"library_revision":snapshot.library_revision}),
-    ))
+    )
 }
 
 fn detail_value(mut c: Conversation, leaf: Option<&str>, revision: i64) -> Result<Value, ApiError> {
@@ -665,24 +773,28 @@ async fn detail(
     q: Result<Query<DetailQuery>, QueryRejection>,
 ) -> ApiResult {
     let q = query(q)?;
-    let snapshot = run_read(&s, |r| r.library_snapshot()).await?;
-    revision(&None, snapshot.library_revision)?;
-    let conversation = snapshot
-        .conversations
-        .into_iter()
-        .find(|c| c.summary.id == id)
-        .ok_or_else(|| {
+    // Keep graph traversal and bounded encoding off the async executor, under
+    // the same admission permit even if the HTTP future is cancelled.
+    run_read(&s, move |r| -> ApiResult {
+        let snapshot = r.detail_snapshot(&id)?;
+        revision(&None, snapshot.library_revision)?;
+        let conversation = snapshot.conversation.ok_or_else(|| {
             error(
                 StatusCode::NOT_FOUND,
                 "not_found",
                 "Conversation not found.",
             )
         })?;
-    Ok(Json(detail_value(
-        conversation,
-        q.leaf_node_id.as_deref(),
-        snapshot.library_revision,
-    )?))
+        if conversation.summary.id != id {
+            return Err(invalid_data());
+        }
+        checked_json(detail_value(
+            conversation,
+            q.leaf_node_id.as_deref(),
+            snapshot.library_revision,
+        )?)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -691,20 +803,48 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
+    #[test]
+    fn encoded_json_budget_counts_escaping_and_never_returns_partial_data() {
+        let text = json!("\"\\\n");
+        let size = serde_json::to_vec(&text).unwrap().len();
+        assert!(check_json_budget(&text, size).is_ok());
+        let error = check_json_budget(&text, size - 1).err().unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.1, "response_too_large");
+        assert_eq!(
+            ApiError::from(ReadError::BudgetExceeded).1,
+            "response_too_large"
+        );
+    }
+
     struct BlockingReader {
         started: Option<tokio::sync::oneshot::Sender<()>>,
         release: std::sync::mpsc::Receiver<()>,
     }
     impl ReadAdapter for BlockingReader {
-        fn library_snapshot(&mut self) -> Result<LibrarySnapshot, ReadError> {
+        fn list_page_snapshot(
+            &mut self,
+            _: usize,
+            _: Option<&ListKey>,
+            _: Option<i64>,
+        ) -> Result<ListPageSnapshot, ReadError> {
             self.started.take().unwrap().send(()).unwrap();
             self.release.recv().unwrap();
-            Ok(LibrarySnapshot {
+            Ok(ListPageSnapshot {
                 library_revision: 0,
-                conversations: vec![],
+                items: vec![],
             })
         }
-        fn search_snapshot(&mut self, _: &str) -> Result<SearchSnapshot, ReadError> {
+        fn search_page_snapshot(
+            &mut self,
+            _: &str,
+            _: usize,
+            _: Option<&SearchKey>,
+            _: Option<i64>,
+        ) -> Result<SearchPageSnapshot, ReadError> {
+            Err(ReadError::Unavailable)
+        }
+        fn detail_snapshot(&mut self, _: &str) -> Result<DetailSnapshot, ReadError> {
             Err(ReadError::Unavailable)
         }
         fn diagnostics(&mut self) -> Result<Diagnostics, ReadError> {

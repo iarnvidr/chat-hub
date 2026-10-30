@@ -8,8 +8,8 @@ use axum::{
 use chat_hub::server::{
     self,
     api_v1::{
-        self, Conversation, Diagnostics, LibrarySnapshot, ReadAdapter, ReadError, SearchHit,
-        SearchSnapshot,
+        self, Conversation, DetailSnapshot, Diagnostics, ListKey, ListPageSnapshot, ReadAdapter,
+        ReadError, SearchHit, SearchKey, SearchPageSnapshot,
     },
 };
 use serde_json::{json, Value};
@@ -66,15 +66,58 @@ impl FixtureReader {
     }
 }
 impl ReadAdapter for FixtureReader {
-    fn library_snapshot(&mut self) -> Result<LibrarySnapshot, ReadError> {
-        Ok(LibrarySnapshot {
-            library_revision: self.revision.load(Ordering::SeqCst),
-            conversations: self.conversations.clone(),
+    fn list_page_snapshot(
+        &mut self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        assert!((1..=101).contains(&limit));
+        let revision = self.revision.load(Ordering::SeqCst);
+        let mut items: Vec<_> = if expected.is_some_and(|r| r != revision) {
+            vec![]
+        } else {
+            self.conversations
+                .iter()
+                .map(|c| c.summary.clone())
+                .filter(|s| {
+                    after.is_none_or(|a| {
+                        a.updated_at_ms
+                            .cmp(&s.updated_at_ms)
+                            .then_with(|| s.id.cmp(&a.id))
+                            .is_gt()
+                    })
+                })
+                .collect()
+        };
+        items.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        items.truncate(limit);
+        Ok(ListPageSnapshot {
+            library_revision: revision,
+            items,
         })
     }
-    fn search_snapshot(&mut self, query: &str) -> Result<SearchSnapshot, ReadError> {
+    fn search_page_snapshot(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected: Option<i64>,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        assert!((1..=101).contains(&limit));
         self.queries.lock().unwrap().push(query.to_owned());
-        let hits: Vec<SearchHit> = match query {
+        let revision = self.revision.load(Ordering::SeqCst);
+        if expected.is_some_and(|r| r != revision) {
+            return Ok(SearchPageSnapshot {
+                library_revision: revision,
+                hits: vec![],
+            });
+        }
+        let mut hits: Vec<SearchHit> = match query {
             "amber telescope" => vec![
                 value(SEARCH2)["items"][0].clone(),
                 value(SEARCH1)["items"][0].clone(),
@@ -85,9 +128,37 @@ impl ReadAdapter for FixtureReader {
         .into_iter()
         .map(|v| serde_json::from_value(v).unwrap())
         .collect();
-        Ok(SearchSnapshot {
-            library_revision: self.revision.load(Ordering::SeqCst),
+        hits.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap()
+                .then_with(|| a.conversation.id.cmp(&b.conversation.id))
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        hits.retain(|h| {
+            after.is_none_or(|a| {
+                h.score
+                    .partial_cmp(&a.score)
+                    .unwrap()
+                    .then_with(|| h.conversation.id.cmp(&a.conversation_id))
+                    .then_with(|| h.node_id.cmp(&a.node_id))
+                    .is_gt()
+            })
+        });
+        hits.truncate(limit);
+        Ok(SearchPageSnapshot {
+            library_revision: revision,
             hits,
+        })
+    }
+    fn detail_snapshot(&mut self, canonical_id: &str) -> Result<DetailSnapshot, ReadError> {
+        Ok(DetailSnapshot {
+            library_revision: self.revision.load(Ordering::SeqCst),
+            conversation: self
+                .conversations
+                .iter()
+                .find(|c| c.summary.id == canonical_id)
+                .cloned(),
         })
     }
     fn diagnostics(&mut self) -> Result<Diagnostics, ReadError> {
