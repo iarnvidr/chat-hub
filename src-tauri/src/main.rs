@@ -367,7 +367,7 @@ async fn service_health(
         .build()
         .map_err(|_| "health check unavailable".to_string())?;
     let response = client
-        .get(format!("{}/api/health", s.api))
+        .get(format!("{}/api/v1/status", s.api))
         .bearer_auth(&s.token)
         .send()
         .await
@@ -722,7 +722,8 @@ fn main() {
         main_ownership.register_after_build();
         #[cfg(target_os = "macos")]
         {
-            let proxy_url = format!("http://{}", proxy.addr);
+            let proxy_addr = proxy.addr.to_string();
+            let proxy_url = format!("http://{proxy_addr}");
             let ca_der = proxy.ca.cert_der().map_err(std::io::Error::other)?;
             let provider = tauri::WebviewWindowBuilder::new(
                 app,
