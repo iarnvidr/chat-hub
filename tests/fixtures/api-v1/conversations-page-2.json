@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "id": "cv-b",
+      "provider": "chatgpt",
+      "account_scope": "provisional:default",
+      "source_id": "export-cv-b",
+      "title": "Synthetic fallback",
+      "updated_at_ms": 1700000003000
+    }
+  ],
+  "next_cursor": null,
+  "library_revision": 7
+}

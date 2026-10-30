@@ -1,0 +1,11 @@
+{
+  "status": "healthy",
+  "service": {
+    "status": "ready",
+    "code": null
+  },
+  "database": {
+    "status": "healthy",
+    "code": null
+  }
+}
