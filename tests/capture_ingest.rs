@@ -1,4 +1,27 @@
-use chat_hub::{proxy::CaptureEvent, store::Store};
+use chat_hub::{capture::parse_event, proxy::CaptureEvent, store::Store};
+
+#[test]
+fn eligible_non_object_and_missing_mapping_documents_are_ignored_without_panicking() {
+    for body in [
+        br#"null"#.as_slice(),
+        br#"[]"#,
+        br#"\"text\""#,
+        br#"42"#,
+        br#"{}"#,
+    ] {
+        let event = CaptureEvent {
+            host: "chatgpt.com".into(),
+            path: "/backend-api/conversation/scalar".into(),
+            status: 200,
+            body: body.to_vec(),
+        };
+        assert!(
+            parse_event(&event).is_none(),
+            "body: {}",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
 
 #[test]
 fn captured_synthetic_conversation_ingests_and_rereads_idempotently() {

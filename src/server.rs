@@ -6,13 +6,45 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<Store>>,
     token: Arc<str>,
+    db_ops: Arc<Semaphore>,
+    identity: Option<RuntimeIdentity>,
+}
+
+/// Runtime identity exposed only by the opt-in authenticated health router.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeIdentity {
+    pub pid: u32,
+    pub instance_id: String,
+}
+const MAX_DB_OPS: usize = 16;
+fn overload() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error":"unavailable"})),
+    )
+}
+async fn run_db<T, F>(s: &AppState, f: F) -> Result<T, ()>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Store) -> T + Send + 'static,
+{
+    let permit: OwnedSemaphorePermit = s.db_ops.clone().try_acquire_owned().map_err(|_| ())?;
+    let store = s.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut store = store.lock().map_err(|_| ())?;
+        Ok::<T, ()>(f(&mut store))
+    })
+    .await
+    .map_err(|_| ())?
 }
 fn authorized(headers: &HeaderMap, token: &str) -> bool {
     headers
@@ -28,8 +60,15 @@ async fn health(State(s): State<AppState>, headers: HeaderMap) -> impl IntoRespo
             Json(serde_json::json!({"error":"unauthorized"})),
         );
     }
-    match s.store.lock().unwrap().health() {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"status":"ok"}))),
+    match run_db(&s, |store| store.health()).await {
+        Ok(Ok(true)) => {
+            let mut response = serde_json::json!({"status":"ok"});
+            if let Some(identity) = &s.identity {
+                response["pid"] = serde_json::json!(identity.pid);
+                response["instance_id"] = serde_json::json!(identity.instance_id);
+            }
+            (StatusCode::OK, Json(response))
+        }
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"status":"unavailable"})),
@@ -52,14 +91,14 @@ async fn search(
             Json(serde_json::json!({"error":"unauthorized"})),
         );
     }
-    match s
-        .store
-        .lock()
-        .unwrap()
-        .search(&q.q, q.limit.unwrap_or(50).min(200))
+    match run_db(&s, move |store| {
+        store.search(&q.q, q.limit.unwrap_or(50).min(200))
+    })
+    .await
     {
-        Ok(ids) => (StatusCode::OK, Json(serde_json::json!({"results":ids}))),
-        Err(_) => (
+        Err(()) => overload(),
+        Ok(Ok(ids)) => (StatusCode::OK, Json(serde_json::json!({"results":ids}))),
+        Ok(Err(_)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error":"internal error"})),
         ),
@@ -76,22 +115,39 @@ async fn read(
             Json(serde_json::json!({"error":"unauthorized"})),
         );
     }
-    match s.store.lock().unwrap().read(&id) {
-        Ok(Some(item)) => (StatusCode::OK, Json(item)),
-        Ok(None) => (
+    match run_db(&s, move |store| store.read(&id)).await {
+        Err(()) => overload(),
+        Ok(Ok(Some(item))) => (StatusCode::OK, Json(item)),
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error":"not found"})),
         ),
-        Err(_) => (
+        Ok(Err(_)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error":"internal error"})),
         ),
     }
 }
 pub fn router(store: Store, token: String) -> Router {
+    build_router(store, token, None)
+}
+
+/// Builds a router whose successful authenticated health response includes the runtime identity.
+/// `instance_id` must contain at most 128 bytes.
+pub fn router_with_identity(store: Store, token: String, identity: RuntimeIdentity) -> Router {
+    assert!(
+        identity.instance_id.len() <= 128,
+        "instance_id must be at most 128 bytes"
+    );
+    build_router(store, token, Some(identity))
+}
+
+fn build_router(store: Store, token: String, identity: Option<RuntimeIdentity>) -> Router {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         token: Arc::from(token),
+        db_ops: Arc::new(Semaphore::new(MAX_DB_OPS)),
+        identity,
     };
     Router::new()
         .route("/api/health", get(health))
@@ -100,6 +156,9 @@ pub fn router(store: Store, token: String) -> Router {
         .with_state(state)
 }
 pub async fn serve(addr: std::net::SocketAddr, store: Store, token: String) -> Result<(), Error> {
+    if !addr.ip().is_loopback() {
+        return Err(Error::Http("server address must be loopback".into()));
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router(store, token))
         .await
@@ -135,6 +194,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(auth.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn identity_health_is_authenticated_and_includes_identity_only_on_success() {
+        let app = router_with_identity(
+            Store::in_memory().unwrap(),
+            "secret".into(),
+            RuntimeIdentity {
+                pid: 42,
+                instance_id: "instance-a".into(),
+            },
+        );
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(unauth.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("pid").is_none());
+        assert!(json.get("instance_id").is_none());
+
+        let auth = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(auth.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"status":"ok", "pid":42, "instance_id":"instance-a"})
+        );
     }
     #[test]
     fn only_loopback_config_binding() {
