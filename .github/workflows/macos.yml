@@ -15,12 +15,6 @@ on:
       - "tauri.conf.json"
       - ".github/workflows/macos.yml"
   workflow_dispatch:
-    inputs:
-      native_library_smoke:
-        description: Run the native-library smoke against the packaged app
-        required: true
-        default: true
-        type: boolean
 permissions:
   contents: read
 concurrency:

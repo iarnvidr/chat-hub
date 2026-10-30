@@ -47,6 +47,12 @@ def receipt(root):
               'platform': 'darwin-aarch64',
               'version': json.loads((root / 'src-tauri/tauri.conf.json').read_text())['version'],
               'files': {p.name: sha(p.read_bytes()) for p in (archive, checksum, archive.with_suffix('.dmg'))}}
+    event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+    pr = event.get('pull_request')
+    if pr:
+        record.update({'pr_number': pr['number'], 'pr_head_sha': pr['head']['sha'],
+                       'tested_base': pr['base']['sha'],
+                       'head_repository': pr['head']['repo']['full_name']})
     (root / 'artifacts/native-receipt.json').write_text(json.dumps(record, sort_keys=True) + '\n')
 
 
@@ -117,7 +123,9 @@ def retrieve(root, tag, api=request):
         page += 1
     if not candidates:
         raise ValueError('no exact trusted native artifact; run a deliberate native build before release')
-    run = max(candidates, key=lambda r: (r['id'], r['run_attempt']))
+    if len(candidates) != 1:
+        raise ValueError('multiple native producers for the requested commit; explicit accepted mapping is required')
+    run = candidates[0]
     artifacts = api(f'repos/{REPOSITORY}/actions/runs/{run["id"]}/artifacts?per_page=100')['artifacts']
     matches = [a for a in artifacts if a['name'] == ARTIFACT and not a.get('expired')]
     if len(matches) != 1:
