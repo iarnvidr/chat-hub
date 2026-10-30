@@ -34,6 +34,16 @@ impl RuntimeFiles {
         proxy: SocketAddr,
         identity: &crate::server::RuntimeIdentity,
     ) -> Result<Self, String> {
+        Self::create_with_publish_hook(c, api, proxy, identity, |_| Ok(()))
+    }
+
+    fn create_with_publish_hook(
+        c: &Config,
+        api: SocketAddr,
+        proxy: SocketAddr,
+        identity: &crate::server::RuntimeIdentity,
+        before_publish: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<Self, String> {
         let dir = Path::new(&c.database_path)
             .parent()
             .unwrap_or(Path::new("."))
@@ -73,39 +83,65 @@ impl RuntimeFiles {
         if let Err(e) = writeln!(f, "{}", r.record.pid).and_then(|_| f.sync_all()) {
             return Err(format!("write service runtime lock: {e}"));
         }
-        r.write(c)?;
+        r.write(c, before_publish)?;
         Ok(r)
     }
-    fn write(&self, c: &Config) -> Result<(), String> {
-        for (name, data) in [
-            (
-                "service.json",
-                serde_json::to_vec(&self.record).map_err(|e| e.to_string())?,
-            ),
-            ("service.token", c.bearer_token.as_bytes().to_vec()),
-        ] {
-            let tmp = self.dir.join(format!("{name}.tmp.{}", self.record.pid));
-            let path = self.dir.join(name);
-            let mut o = OpenOptions::new();
-            o.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                o.mode(0o600);
+    fn write(
+        &self,
+        c: &Config,
+        mut before_publish: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut token_published = false;
+        let result = (|| {
+            // The discovery record is the final publication marker: a reader must
+            // never discover this instance before its credential is available.
+            for (name, data) in [
+                ("service.token", c.bearer_token.as_bytes().to_vec()),
+                (
+                    "service.json",
+                    serde_json::to_vec(&self.record).map_err(|e| e.to_string())?,
+                ),
+            ] {
+                let tmp = self.dir.join(format!("{name}.tmp.{}", self.record.pid));
+                let path = self.dir.join(name);
+                let mut o = OpenOptions::new();
+                o.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    o.mode(0o600);
+                }
+                let mut f = o
+                    .open(&tmp)
+                    .map_err(|e| format!("create runtime file: {e}"))?;
+                f.write_all(&data).and_then(|_| f.sync_all()).map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    format!("write runtime file: {e}")
+                })?;
+                if let Err(error) = before_publish(name) {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(error);
+                }
+                fs::rename(&tmp, path).map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    format!("publish runtime file: {e}")
+                })?;
+                if name == "service.token" {
+                    token_published = true;
+                }
             }
-            let mut f = o
-                .open(&tmp)
-                .map_err(|e| format!("create runtime file: {e}"))?;
-            f.write_all(&data).and_then(|_| f.sync_all()).map_err(|e| {
-                let _ = fs::remove_file(&tmp);
-                format!("write runtime file: {e}")
-            })?;
-            fs::rename(&tmp, path).map_err(|e| {
-                let _ = fs::remove_file(&tmp);
-                format!("publish runtime file: {e}")
-            })?;
+            Ok(())
+        })();
+        // With no discovery marker, remove only the credential we just wrote.
+        // Preserve an externally replaced credential; lock cleanup stays owned
+        // by RuntimeFiles::drop and the existing record-identity check.
+        if result.is_err() && token_published {
+            let path = self.dir.join("service.token");
+            if fs::read(&path).is_ok_and(|bytes| bytes == c.bearer_token.as_bytes()) {
+                let _ = fs::remove_file(path);
+            }
         }
-        Ok(())
+        result
     }
     fn matches(&self) -> bool {
         read_record(&self.dir.join("service.json")).is_some_and(|r| {
@@ -133,6 +169,7 @@ impl Drop for RuntimeFiles {
         self.remove_owned();
     }
 }
+
 fn read_record(path: &Path) -> Option<ServiceRecord> {
     let m = fs::metadata(path).ok()?;
     if m.len() > MAX_RECORD {
@@ -230,4 +267,128 @@ pub async fn status(c: &Config) -> Result<serde_json::Value, String> {
     Ok(
         serde_json::json!({"schema":1,"database_health":dbhealth,"service":if running{"running"}else if identity_mismatch{"identity_mismatch"}else{"stopped"},"pid":record.as_ref().map(|r|r.pid),"instance_id":record.as_ref().map(|r|&r.instance_id),"api_addr":record.as_ref().map(|r|&r.api_addr),"proxy_addr":record.as_ref().map(|r|&r.proxy_addr)}),
     )
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::server::RuntimeIdentity;
+
+    fn config() -> Config {
+        let dir = std::env::temp_dir().join(format!(
+            "chat-hub-runtime-publication-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        Config {
+            bind_addr: "127.0.0.1:41001".parse().unwrap(),
+            proxy_addr: "127.0.0.1:41002".parse().unwrap(),
+            bearer_token: "synthetic-publication-token".into(),
+            database_path: dir.join("db.sqlite").to_string_lossy().into_owned(),
+            ca_dir: dir.join("ca"),
+        }
+    }
+    fn identity() -> RuntimeIdentity {
+        RuntimeIdentity {
+            pid: std::process::id(),
+            instance_id: "synthetic-publication-instance".into(),
+        }
+    }
+
+    #[test]
+    fn actual_publisher_hides_record_until_credential_is_published() {
+        let config = config();
+        let dir = Path::new(&config.database_path)
+            .parent()
+            .unwrap()
+            .join("runtime");
+        let (blocked, entered) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let publisher_config = config.clone();
+        let publisher = std::thread::spawn(move || {
+            RuntimeFiles::create_with_publish_hook(
+                &publisher_config,
+                publisher_config.bind_addr,
+                publisher_config.proxy_addr,
+                &identity(),
+                |name| {
+                    if name == "service.token" {
+                        blocked.send(()).unwrap();
+                        resume.recv().unwrap();
+                    }
+                    Ok(())
+                },
+            )
+        });
+        entered.recv().unwrap();
+        // This barrier is inside the actual file publisher, immediately before
+        // credential rename. No timing assumption, retry, or sleep is involved.
+        let hidden = !dir.join("service.json").exists();
+        let token_hidden = !dir.join("service.token").exists();
+        let lock_present = dir.join("service.lock").exists();
+        release.send(()).unwrap();
+        let runtime = publisher.join().unwrap().unwrap();
+        assert!(hidden, "discovery record preceded its credential");
+        assert!(token_hidden);
+        assert!(lock_present);
+        let record = read_record(&dir.join("service.json")).unwrap();
+        assert_eq!(record.instance_id, identity().instance_id);
+        assert_eq!(record.pid, identity().pid);
+        assert_eq!(
+            fs::read(dir.join("service.token")).unwrap(),
+            config.bearer_token.as_bytes()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["service.json", "service.token", "service.lock"] {
+                assert_eq!(
+                    fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        runtime.cleanup();
+        for name in ["service.json", "service.token", "service.lock"] {
+            assert!(!dir.join(name).exists());
+        }
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failure_before_discovery_marker_leaves_no_published_readiness_or_owned_credential() {
+        for fail_at in ["service.token", "service.json"] {
+            let config = config();
+            let dir = Path::new(&config.database_path)
+                .parent()
+                .unwrap()
+                .join("runtime");
+            let result = RuntimeFiles::create_with_publish_hook(
+                &config,
+                config.bind_addr,
+                config.proxy_addr,
+                &identity(),
+                |name| {
+                    if name == fail_at {
+                        return Err("synthetic publication failure".into());
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(read_record(&dir.join("service.json")).is_none());
+            assert!(!dir.join("service.token").exists());
+            assert!(!dir.join("service.lock").exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        }
+    }
 }

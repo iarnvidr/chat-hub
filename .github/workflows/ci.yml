@@ -17,5 +17,18 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets
+      - name: Test desktop UI on Linux
+        run: node --test tests/desktop_ui_*.test.cjs
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: python3 -m unittest discover -s build -p 'test_*.py'
+  browser:
+    name: Desktop UI browser (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Browser-test desktop UI on Linux
+        run: |
+          npm install --prefix "$RUNNER_TEMP/f4-playwright" --no-audit --no-fund playwright@1.58.2
+          "$RUNNER_TEMP/f4-playwright/node_modules/.bin/playwright" install --with-deps chromium
+          PLAYWRIGHT_MODULE="$RUNNER_TEMP/f4-playwright/node_modules/playwright" node tests/desktop_ui_browser.cjs

@@ -1,0 +1,12 @@
+{
+  "items": [
+    {
+      "conversation": {"id":"cv-a","provider":"chatgpt","account_scope":"provisional:default","source_id":"export-cv-a","title":"Synthetic branches","updated_at_ms":1700000003000},
+      "node_id":"n-b","message_id":"msg-b","leaf_node_id":"n-b","snippet":"Alternate amber telescope response.","score":0.91,"selected_branch":false
+    },
+    {
+      "conversation": {"id":"cv-a","provider":"chatgpt","account_scope":"provisional:default","source_id":"export-cv-a","title":"","updated_at_ms":null},
+      "node_id":null,"message_id":null,"leaf_node_id":null,"snippet":"Title match","score":0.5,"selected_branch":false
+    }
+  ],"next_cursor":null,"library_revision":7
+}

@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "id": "cv-a",
+      "provider": "chatgpt",
+      "account_scope": "provisional:default",
+      "source_id": "export-cv-a",
+      "title": "Synthetic branches",
+      "updated_at_ms": 1700000003000
+    }
+  ],
+  "next_cursor": "fixture-list-r7-after-cv-a",
+  "library_revision": 7
+}
