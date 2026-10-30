@@ -8,7 +8,7 @@ import (
 	"dagger/check/internal/dagger"
 )
 
-type ChatHub struct{}
+type ChatHubCi struct{}
 
 const (
 	pythonImage = "python:3.14.0-slim-bookworm@sha256:d13fa0424035d290decef3d575cea23d1b7d5952cdf429df8f5542c71e961576"
@@ -16,7 +16,7 @@ const (
 	nodeImage   = "node:22.23.3-bookworm-slim@sha256:3ed98443660ff48413b5af19ecefce3b9d50845a901a43420d47cc63a9fddbe9"
 )
 
-func (m *ChatHub) Contracts(ctx context.Context, source *dagger.Directory) (string, error) {
+func (m *ChatHubCi) Contracts(ctx context.Context, source *dagger.Directory) (string, error) {
 	python := dag.Container().From(pythonImage)
 	rust := dag.Container().From(rustImage)
 	node := dag.Container().From(nodeImage)
@@ -33,7 +33,7 @@ func (m *ChatHub) Contracts(ctx context.Context, source *dagger.Directory) (stri
 		WithExec([]string{"python3", "-m", "unittest", "discover", "-s", "build", "-p", "test_*.py"}).Stdout(ctx)
 }
 
-func (m *ChatHub) LinuxChecks(ctx context.Context, source *dagger.Directory) (string, error) {
+func (m *ChatHubCi) LinuxChecks(ctx context.Context, source *dagger.Directory) (string, error) {
 	var out strings.Builder
 	rust := dag.Container().From(rustImage).
 		WithExec([]string{"sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libxdo-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf ffmpeg && rm -rf /var/lib/apt/lists/*"}).
