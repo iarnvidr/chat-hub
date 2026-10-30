@@ -88,6 +88,21 @@ fn invalid_global_input_never_commits_and_item_failures_continue() {
     assert!(import_chatgpt(&mut store, &malformed).is_err());
     assert_eq!(store.library_revision().unwrap(), before);
     assert!(store.library_snapshot().unwrap().conversations.is_empty());
+    for bytes in [
+        b"\xff".as_slice(),
+        b"{}",
+        b"null",
+        b"{\"conversations\":null}",
+    ] {
+        assert!(import_chatgpt(&mut store, bytes).is_err());
+        assert_eq!(store.library_revision().unwrap(), before);
+    }
+    let hundred = serde_json::to_vec(&vec![Value::Null; 100]).unwrap();
+    let receipt = import_chatgpt(&mut store, &hundred).unwrap();
+    assert_eq!(receipt.failed, 100);
+    assert_eq!(receipt.errors.len(), 100);
+    assert!(!receipt.errors_truncated);
+    assert_eq!(store.library_revision().unwrap(), before);
     let valid = parse_export(ARRAY).unwrap().remove(0);
     let mut entries = vec![Value::Null; 102];
     entries.insert(1, valid);
@@ -108,6 +123,26 @@ fn invalid_global_input_never_commits_and_item_failures_continue() {
         assert_eq!(error.code, "invalid_item");
         assert_eq!(error.message, "Conversation entry is invalid.");
     }
+}
+
+#[test]
+fn duplicate_items_are_classified_after_each_commit() {
+    let mut store = Store::in_memory().unwrap();
+    let doc = parse_export(ARRAY).unwrap().remove(0);
+    let input = serde_json::to_vec(&vec![doc.clone(), doc]).unwrap();
+    let receipt = import_chatgpt(&mut store, &input).unwrap();
+    assert_eq!(
+        (
+            receipt.imported,
+            receipt.updated,
+            receipt.unchanged,
+            receipt.failed
+        ),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(store.library_snapshot().unwrap().conversations.len(), 1);
+    let empty = import_chatgpt(&mut store, b"[]").unwrap();
+    assert_eq!(empty, Default::default());
 }
 
 #[test]
