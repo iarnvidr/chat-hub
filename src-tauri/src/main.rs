@@ -1,19 +1,17 @@
-use chat_hub::{
-    config::APP_NAME,
-    proxy::{self, CaptureEvent, ProxyConfig},
-    server,
-    store::Store,
-};
+use chat_hub::{config::APP_NAME, proxy::ProxyConfig};
 use serde::Serialize;
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
-use tokio::sync::mpsc;
 mod crash_diagnostics;
 mod desktop_api;
+mod desktop_runtime;
 mod service_health;
 use service_health::healthy_response;
 mod window_policy;
@@ -33,6 +31,9 @@ struct AppState {
     token: String,
     api: String,
     proxy: String,
+    runtime: Arc<Mutex<Option<desktop_runtime::DesktopRuntime>>>,
+    shutdown_started: Arc<AtomicBool>,
+    shutdown_finished: Arc<AtomicBool>,
 }
 #[derive(Clone, Serialize)]
 struct UpdateStatus {
@@ -554,34 +555,6 @@ async fn install_update(
     update.install(&bytes).map_err(|e| e.to_string())?;
     app.restart();
 }
-fn persistent_token(path: &std::path::Path) -> Result<String, String> {
-    use std::io::{Read, Write};
-    let f = path.join("service.token");
-    if let Ok(mut x) = std::fs::File::open(&f) {
-        let mut t = String::new();
-        x.read_to_string(&mut t).map_err(|e| e.to_string())?;
-        if t.len() >= 64 {
-            return Ok(t);
-        }
-    }
-    let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|e| e.to_string())?;
-    let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let mut o = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&f)
-        .or_else(|_| std::fs::File::create(&f))
-        .map_err(|e| e.to_string())?;
-    o.write_all(token.as_bytes()).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?
-    }
-    Ok(token)
-}
 fn main() {
     crash_diagnostics::install();
     let updater_builder = tauri_plugin_updater::Builder::new();
@@ -613,25 +586,7 @@ fn main() {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        let token = persistent_token(&dir).map_err(std::io::Error::other)?;
-        let db = dir.join("chat-hub.sqlite3");
         let ca = dir.join("ca");
-        let (tx, mut rx) = mpsc::channel::<CaptureEvent>(128);
-        let store = Arc::new(Mutex::new(
-            Store::open(
-                db.to_str()
-                    .ok_or_else(|| std::io::Error::other("database path is not valid UTF-8"))?,
-            )
-            .map_err(std::io::Error::other)?,
-        ));
-        let ingest = store.clone();
-        tauri::async_runtime::spawn(async move {
-            while let Some(e) = rx.recv().await {
-                if let Ok(mut s) = ingest.lock() {
-                    let _ = s.ingest_capture(e);
-                }
-            }
-        });
         let mut cfg = ProxyConfig::loopback(&ca);
         #[cfg(feature = "native-smoke")]
         if smoke() {
@@ -642,23 +597,16 @@ fn main() {
                 cfg.test_roots = Some(PathBuf::from(roots));
             }
         }
-        let (proxy, _) =
-            tauri::async_runtime::block_on(proxy::run(cfg, tx)).map_err(std::io::Error::other)?;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let api = listener.local_addr()?;
-        drop(listener);
-        let api_listener = tauri::async_runtime::block_on(tokio::net::TcpListener::bind(api))?;
-        let router = server::router(
-            Store::open(db.to_str().unwrap()).map_err(std::io::Error::other)?,
-            token.clone(),
-        );
-        tauri::async_runtime::spawn(async move {
-            let _ = axum::serve(api_listener, router).await;
-        });
+        let runtime = tauri::async_runtime::block_on(desktop_runtime::start(&dir, cfg))
+            .map_err(std::io::Error::other)?;
+        let api = runtime.api.clone();
+        let token = runtime.token.clone();
+        let proxy = runtime.proxy.clone();
+        let ca_dir = runtime.ca_dir.clone();
         let service_info = serde_json::json!({
             "service": APP_NAME,
             "version": env!("CARGO_PKG_VERSION"),
-            "api": format!("http://{api}"),
+            "api": api,
             "process_id": std::process::id(),
         });
         let info_tmp = dir.join("service.json.tmp");
@@ -673,8 +621,11 @@ fn main() {
                 message: "Ready".into(),
             })),
             token,
-            api: format!("http://{api}"),
-            proxy: proxy.addr.to_string(),
+            api,
+            proxy,
+            runtime: Arc::new(Mutex::new(Some(runtime))),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
+            shutdown_finished: Arc::new(AtomicBool::new(false)),
         });
         #[cfg(feature = "native-smoke")]
         e2e::start(app.handle().clone());
@@ -722,9 +673,11 @@ fn main() {
         main_ownership.register_after_build();
         #[cfg(target_os = "macos")]
         {
-            let proxy_addr = proxy.addr.to_string();
+            let proxy_addr = proxy.clone();
             let proxy_url = format!("http://{proxy_addr}");
-            let ca_der = proxy.ca.cert_der().map_err(std::io::Error::other)?;
+            let ca_der = chat_hub::ca::Ca::load_or_create(&ca_dir)
+                .and_then(|ca| ca.cert_der())
+                .map_err(std::io::Error::other)?;
             let provider = tauri::WebviewWindowBuilder::new(
                 app,
                 "provider",
@@ -742,7 +695,7 @@ fn main() {
         Ok(())
     });
     #[cfg(feature = "native-smoke")]
-    let result = builder
+    let run = builder
         .invoke_handler(tauri::generate_handler![
             update_status,
             list_conversations,
@@ -754,9 +707,33 @@ fn main() {
             install_update,
             e2e_result
         ])
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!())
+        .map(|app| {
+            app.run(|app, event| {
+                if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                    let state = app.state::<AppState>();
+                    if state.shutdown_finished.load(Ordering::Acquire) {
+                        return;
+                    }
+                    api.prevent_exit();
+                    if state.shutdown_started.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                    let runtime = state.runtime.lock().ok().and_then(|mut slot| slot.take());
+                    let finished = state.shutdown_finished.clone();
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(runtime) = runtime {
+                            let _ = runtime.shutdown().await;
+                        }
+                        finished.store(true, Ordering::Release);
+                        handle.exit(code.unwrap_or(0));
+                    });
+                }
+            })
+        });
     #[cfg(not(feature = "native-smoke"))]
-    let result = builder
+    let run = builder
         .invoke_handler(tauri::generate_handler![
             update_status,
             list_conversations,
@@ -767,8 +744,33 @@ fn main() {
             check_for_updates,
             install_update
         ])
-        .run(tauri::generate_context!());
-    if let Err(e) = result {
-        eprintln!("desktop failed: {e}")
+        .build(tauri::generate_context!())
+        .map(|app| {
+            app.run(|app, event| {
+                if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                    let state = app.state::<AppState>();
+                    if state.shutdown_finished.load(Ordering::Acquire) {
+                        return;
+                    }
+                    api.prevent_exit();
+                    if state.shutdown_started.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                    let runtime = state.runtime.lock().ok().and_then(|mut slot| slot.take());
+                    let finished = state.shutdown_finished.clone();
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(runtime) = runtime {
+                            let _ = runtime.shutdown().await;
+                        }
+                        finished.store(true, Ordering::Release);
+                        handle.exit(code.unwrap_or(0));
+                    });
+                }
+            })
+        });
+    match run {
+        Ok(()) => {}
+        Err(error) => eprintln!("desktop failed: {error}"),
     }
 }
