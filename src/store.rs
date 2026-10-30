@@ -83,6 +83,22 @@ impl Store {
         s.migrate()?;
         Ok(s)
     }
+    /// Open and migrate an existing regular-file database without creating it.
+    pub fn open_existing(path: &str) -> Result<Self> {
+        let file_path = std::path::Path::new(path);
+        if path == ":memory:" || !file_path.is_file() {
+            return Err(Error::Configuration(
+                "database must be an existing regular file".into(),
+            ));
+        }
+        let c = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut s = Self { connection: c };
+        s.migrate()?;
+        Ok(s)
+    }
     pub fn in_memory() -> Result<Self> {
         let c = Connection::open_in_memory()?;
         let mut s = Self { connection: c };

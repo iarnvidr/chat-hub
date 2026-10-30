@@ -39,6 +39,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(())
         }
+        Some(command @ ("backup" | "export-json")) => {
+            let usage = if command == "backup" {
+                "usage: chat-hub backup <destination>"
+            } else {
+                "usage: chat-hub export-json <destination>"
+            };
+            let destination = args.next().ok_or(usage)?;
+            if args.next().is_some() {
+                return Err(usage.into());
+            }
+            let c = Config::from_env()?;
+            if c.database_path == ":memory:" {
+                return Err("archive commands require an existing file-backed library".into());
+            }
+            let store = chat_hub::store::Store::open_existing(&c.database_path)
+                .map_err(|_| "unable to open existing library")?;
+            if command == "backup" {
+                let receipt = store.backup_to(&destination)?;
+                println!("{{\"operation\":\"backup\",\"schema_version\":{},\"library_revision\":{},\"conversation_count\":{}}}", receipt.schema_version, receipt.library_revision, receipt.conversation_count);
+            } else {
+                let receipt = store.export_json_to(&destination)?;
+                let m = receipt.metadata;
+                println!("{{\"operation\":\"export-json\",\"schema_version\":{},\"library_revision\":{},\"conversation_count\":{},\"node_count\":{},\"message_count\":{},\"observation_count\":{}}}", m.schema_version, m.library_revision, m.conversation_count, m.node_count, m.message_count, m.observation_count);
+            }
+            Ok(())
+        }
         Some("status") => {
             let c = Config::from_env()?;
             let s = chat_hub::runtime::status(&c).await?;
@@ -84,6 +110,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
-        _ => Err("usage: chat-hub <status|search|read|serve|import>".into()),
+        _ => Err("usage: chat-hub <status|search|read|serve|import|backup|export-json>".into()),
     }
 }

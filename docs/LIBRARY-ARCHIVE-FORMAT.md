@@ -1,0 +1,67 @@
+# Library archives
+
+## SQLite backup
+
+The CLI provides local backup and JSON export commands. Both use the configured
+library database (`CHAT_HUB_DATABASE`, or the normal `CHAT_HUB_DATA_DIR` / platform
+default) and open the existing shared Store directly; they do not start the
+service, proxy, or capture runtime. The configured source must be a preexisting
+regular file and is opened without SQLite's create flag.
+
+```sh
+chat-hub backup /path/to/library.sqlite3
+chat-hub export-json /path/to/library.json
+```
+
+Each command requires exactly one destination. The configured source library must
+already exist as a regular file: archive commands open it read/write without
+SQLite's create flag, and never create its parent directory or initialize a
+missing library. `:memory:` and other non-file-backed sources are rejected.
+Existing destinations are never overwritten, and errors exit nonzero. Successful stdout is a small JSON receipt
+containing operation and record counts/versions; archive contents and secrets
+are not printed. `backup` is a SQLite online backup. It includes the ordinary
+Store schema and rows (including schema migrations, library state, conversations,
+observations, graph nodes, messages, and their associated relational data), not
+an alternate portable interchange format. SQLite backup includes the current
+FTS and search tables as they exist in the source database. SQLite internal
+bookkeeping is likewise not a portable API. Opening a current schema-8 Store
+does not automatically repair missing FTS/search indexes; index creation or
+repair occurs only through explicit maintenance or migrations where
+provided. Credentials/secrets are not specially stripped: archives contain
+personal conversation/library content and must be protected accordingly.
+
+On Unix, the adjacent staging file is created with mode `0600`, so the
+published backup/export remains private regardless of the process umask. On
+other platforms, creation follows platform defaults/umask; no equivalent mode
+is asserted here. Publication uses an adjacent staging file and a no-replace
+hard link. The completed file becomes atomically visible at the destination, so observers do
+not see a partially-written destination. The staging file is then unlinked and,
+on Unix, the parent directory is synced. Atomic visibility is distinct from
+crash durability: a failed post-publication unlink or directory sync returns an
+`ArchivePublished` error identifying the destination and failed operation. The
+target is already complete and published; durability is unconfirmed, so callers
+must not treat the result as an ordinary unpublished failure or blindly retry
+to the same existing destination. The backup busy-deadline test checks a
+specific timeout error, bounded elapsed time, preservation of an existing
+destination, and staging cleanup. Its concurrent WAL snapshot test verifies a
+transaction-consistent copy while a writer runs, including at least one commit
+before and after backup; its commit counter is sampled before and after the
+backup call, not instrumented during the snapshot itself. The separate JSON
+export concurrency test uses a barrier during the export. These tests do not
+establish a universal concurrency guarantee. Staging cleanup is best-effort on errors and
+drop; there is no absolute cleanup or crash-durability guarantee.
+
+## JSON export
+
+`export-json` writes the versioned JSON library representation described by the
+library JSON format (`format: "chat-hub-library"`, `format_version: 1`). The
+archive is a set of explicit relational row arrays: each table uses its exact
+SQLite column names and columns, and each row preserves that table's column
+order. SQL `NULL` is JSON `null`; text (including values whose content looks
+like JSON) is emitted as a JSON string; raw JSON payload/content columns are
+therefore string-encoded rather than embedded JSON values. This is an export
+representation, not a restore adapter: no JSON import/restore operation is
+provided. Derived FTS/search indexes are excluded from the logical JSON
+representation; JSON restore is not implemented. As with SQLite
+backups, exports may contain sensitive personal conversation content; no
+credential or content redaction is implied.

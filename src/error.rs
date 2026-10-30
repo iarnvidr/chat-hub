@@ -6,7 +6,15 @@ pub enum Error {
     Database(rusqlite::Error),
     Configuration(String),
     Http(String),
-    ReadBudgetExceeded { kind: &'static str, limit: usize },
+    ReadBudgetExceeded {
+        kind: &'static str,
+        limit: usize,
+    },
+    ArchivePublished {
+        destination: std::path::PathBuf,
+        operation: &'static str,
+        source: io::Error,
+    },
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -18,6 +26,11 @@ impl fmt::Display for Error {
             Self::ReadBudgetExceeded { kind, limit } => {
                 write!(f, "read budget exceeded ({kind}, limit {limit})")
             }
+            Self::ArchivePublished { destination, operation, source } => write!(
+                f,
+                "archive was published at {} but {operation} failed; durability is unconfirmed: {source}",
+                destination.display()
+            ),
         }
     }
 }
