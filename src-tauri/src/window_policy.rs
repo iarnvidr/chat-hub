@@ -39,6 +39,21 @@ impl Default for MainWindowOwnership {
     }
 }
 
+/// Provider smoke readiness accepts only the exact HTTPS provider origin.
+pub fn is_provider_origin(
+    scheme: &str,
+    host: Option<&str>,
+    port: Option<u16>,
+    username: &str,
+    password: Option<&str>,
+) -> bool {
+    scheme == "https"
+        && host == Some("chatgpt.com")
+        && port.is_none()
+        && username.is_empty()
+        && password.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,19 +108,4 @@ mod tests {
         let failed_build = MainWindowOwnership::new();
         assert!(!failed_build.is_authorized("main"));
     }
-}
-
-/// Provider smoke readiness accepts only the exact HTTPS provider origin.
-pub fn is_provider_origin(
-    scheme: &str,
-    host: Option<&str>,
-    port: Option<u16>,
-    username: &str,
-    password: Option<&str>,
-) -> bool {
-    scheme == "https"
-        && host == Some("chatgpt.com")
-        && port.is_none()
-        && username.is_empty()
-        && password.is_none()
 }

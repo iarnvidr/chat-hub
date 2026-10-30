@@ -37,6 +37,7 @@ struct UpdateStatus {
     status: String,
     message: String,
 }
+#[allow(dead_code)] // Used only when the native-smoke feature is enabled.
 fn smoke() -> bool {
     cfg!(all(feature = "native-smoke", debug_assertions))
         && std::env::args().any(|a| a == "--native-ui-smoke")
@@ -47,7 +48,7 @@ fn smoke() -> bool {
 mod e2e {
     use serde_json::{json, Value};
     use std::{path::PathBuf, time::Duration};
-    use tauri::{Manager, WebviewWindow};
+    use tauri::Manager;
     fn dir() -> Option<PathBuf> {
         if !cfg!(debug_assertions) || !super::smoke() {
             return None;
@@ -146,7 +147,7 @@ mod e2e {
                         if let Ok(Ok(value)) = rx.recv_timeout(Duration::from_secs(1)).map(|v| serde_json::from_str::<Value>(&v)) {
                             if let Some(parsed) = value.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
                                 readiness = parsed;
-                                if readiness["href"].as_str().is_some_and(|h| tauri::Url::parse(h).ok().is_some_and(|u| window_policy::is_provider_origin(u.scheme(), u.host_str(), u.port(), u.username(), u.password()))) && readiness["readyState"].as_str().is_some() {
+                                if readiness["href"].as_str().is_some_and(|h| tauri::Url::parse(h).ok().is_some_and(|u| crate::window_policy::is_provider_origin(u.scheme(), u.host_str(), u.port(), u.username(), u.password()))) && readiness["readyState"].as_str().is_some() {
                                     break;
                                 }
                             }
