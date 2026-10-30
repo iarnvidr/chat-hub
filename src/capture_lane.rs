@@ -32,7 +32,7 @@ pub struct CaptureContext {
     pub method: String,
     pub path: String,
 }
-fn bounded(s: &str, max: usize) -> String {
+pub(crate) fn bounded(s: &str, max: usize) -> String {
     let mut end = max.min(s.len());
     while !s.is_char_boundary(end) {
         end -= 1;

@@ -47,6 +47,7 @@ pub fn default_data_dir() -> Result<PathBuf, String> {
 
 #[derive(Clone)]
 pub struct Config {
+    pub capture_enabled: bool,
     pub bind_addr: SocketAddr,
     pub bearer_token: String,
     pub database_path: String,
@@ -57,6 +58,7 @@ pub struct Config {
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
+            .field("capture_enabled", &self.capture_enabled)
             .field("bind_addr", &self.bind_addr)
             .field("bearer_token", &"[REDACTED]")
             .field("database_path", &self.database_path)
@@ -92,6 +94,15 @@ impl Config {
             .map(Ok)
             .unwrap_or_else(default_data_dir)?;
         Ok(Self {
+            capture_enabled: match env::var("CHAT_HUB_CAPTURE_ENABLED").as_deref() {
+                Err(env::VarError::NotPresent) | Ok("false" | "0") => false,
+                Ok("true" | "1") => true,
+                _ => {
+                    return Err(
+                        "invalid CHAT_HUB_CAPTURE_ENABLED; expected true, false, 1 or 0".into(),
+                    )
+                }
+            },
             bind_addr,
             bearer_token,
             database_path: env::var("CHAT_HUB_DATABASE").unwrap_or_else(|_| {
@@ -122,14 +133,37 @@ mod tests {
             "CHAT_HUB_DATABASE",
             "CHAT_HUB_CA_DIR",
             "CHAT_HUB_DATA_DIR",
+            "CHAT_HUB_CAPTURE_ENABLED",
         ] {
             env::remove_var(key);
         }
     }
 
     #[test]
+    fn capture_is_strict_startup_opt_in() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear();
+        env::set_var("CHAT_HUB_TOKEN", "synthetic-test");
+        assert!(!Config::from_env().unwrap().capture_enabled);
+        for (value, enabled) in [("true", true), ("1", true), ("false", false), ("0", false)] {
+            env::set_var("CHAT_HUB_CAPTURE_ENABLED", value);
+            assert_eq!(Config::from_env().unwrap().capture_enabled, enabled);
+        }
+        for value in ["", "TRUE", "yes", " false", "secret-sentinel"] {
+            env::set_var("CHAT_HUB_CAPTURE_ENABLED", value);
+            let error = Config::from_env().unwrap_err();
+            assert_eq!(
+                error,
+                "invalid CHAT_HUB_CAPTURE_ENABLED; expected true, false, 1 or 0"
+            );
+        }
+        clear();
+    }
+
+    #[test]
     fn debug_redacts_bearer_token_and_preserves_other_fields() {
         let c = Config {
+            capture_enabled: false,
             bind_addr: "127.0.0.1:1".parse().unwrap(),
             bearer_token: "sensitive-marker".into(),
             database_path: "/tmp/db".into(),

@@ -35,6 +35,7 @@ pub struct ServiceReadiness {
     pub code: Option<&'static str>,
 }
 pub type ReadinessProvider = Arc<dyn Fn() -> ServiceReadiness + Send + Sync>;
+pub type CaptureStatusProvider = Arc<dyn Fn() -> crate::live_capture::Snapshot + Send + Sync>;
 const MAX_DB_OPS: usize = 16;
 fn overload() -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -168,11 +169,34 @@ pub fn router_with_readiness(
     build_router(store, token, Some(identity), Some(readiness))
 }
 
+pub fn router_with_capture_status(
+    store: Store,
+    token: String,
+    identity: RuntimeIdentity,
+    readiness: ReadinessProvider,
+    capture: CaptureStatusProvider,
+) -> Router {
+    assert!(
+        identity.instance_id.len() <= 128,
+        "instance_id must be at most 128 bytes"
+    );
+    build_router_capture(store, token, Some(identity), Some(readiness), Some(capture))
+}
+
 fn build_router(
     store: Store,
     token: String,
     identity: Option<RuntimeIdentity>,
     readiness: Option<ReadinessProvider>,
+) -> Router {
+    build_router_capture(store, token, identity, readiness, None)
+}
+fn build_router_capture(
+    store: Store,
+    token: String,
+    identity: Option<RuntimeIdentity>,
+    readiness: Option<ReadinessProvider>,
+    capture: Option<CaptureStatusProvider>,
 ) -> Router {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
@@ -187,6 +211,7 @@ fn build_router(
         Some(reader),
         state.db_ops.clone(),
         Some(state.store.clone()),
+        capture,
     );
     Router::new()
         .route("/api/health", get(health))
@@ -203,6 +228,7 @@ pub(crate) fn status_test_router(store: Arc<Mutex<Store>>, readiness: ReadinessP
         Some(api_v1::store_reader(store.clone(), Some(readiness))),
         Arc::new(Semaphore::new(MAX_DB_OPS)),
         Some(store),
+        None,
     )
 }
 pub async fn serve(addr: std::net::SocketAddr, store: Store, token: String) -> Result<(), Error> {
