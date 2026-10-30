@@ -141,6 +141,61 @@ def _default_data_ok(value, expected_path):
             and value.get('platform_default_data_dir') == expected_path)
 
 
+def _detail_anchor_ids(detail, selected_node_id, alternate_text='Alternate synthetic answer'):
+    """Resolve selected and alternate leaves from the actual desktop detail graph."""
+    if not isinstance(detail, dict) or not isinstance(detail.get('nodes'), list):
+        raise RuntimeError('conversation detail graph unavailable')
+    nodes = detail['nodes']
+    by_id = {n.get('id'): n for n in nodes if isinstance(n, dict) and isinstance(n.get('id'), str)}
+    selected = by_id.get(selected_node_id)
+    if selected is None:
+        raise RuntimeError('FTS-selected node absent from conversation detail graph')
+    def parent(node):
+        return node.get('parent_id', node.get('parent_node_id'))
+    selected_path = set()
+    selected_path.add(selected_node_id)
+    cur = by_id.get(parent(selected))
+    while cur:
+        ident = cur.get('id')
+        if not ident or ident in selected_path: break
+        selected_path.add(ident)
+        cur = by_id.get(parent(cur))
+    candidates = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get('id') in selected_path: continue
+        message = node.get('message', node)
+        content = json.dumps(message, ensure_ascii=False)
+        if alternate_text in content:
+            candidates.append(node)
+    if len(candidates) != 1:
+        raise RuntimeError('official alternate fixture node not uniquely identified in detail graph')
+    alternate = candidates[0]
+    leaf_id = detail.get('selection', {}).get('leaf_node_id') if isinstance(detail.get('selection'), dict) else None
+    selected_leaf = next((b.get('leaf_node_id') for b in detail.get('branches', []) if isinstance(b, dict) and b.get('selected')), leaf_id)
+    alternate_leaf = next((b.get('leaf_node_id') for b in detail.get('branches', []) if isinstance(b, dict) and b.get('leaf_node_id') and _is_descendant(by_id, b.get('leaf_node_id'), alternate.get('id'))), None)
+    if not isinstance(selected_leaf, str) or not isinstance(alternate_leaf, str):
+        raise RuntimeError('selected or alternate leaf missing from detail branch graph')
+    return selected.get('id'), selected_leaf, alternate.get('id'), alternate_leaf
+
+
+def _is_descendant(by_id, leaf_id, node_id):
+    cur = by_id.get(leaf_id)
+    seen = set()
+    while cur:
+        ident = cur.get('id')
+        if ident == node_id: return True
+        if not ident or ident in seen: return False
+        seen.add(ident)
+        cur = by_id.get(cur.get('parent_id', cur.get('parent_node_id')))
+    return False
+
+
+def reader_script(canonical_id, selected_node_id, selected_leaf_id, alternate_node_id, alternate_leaf_id):
+    """Build the browser-side reader verification script from opaque actual IDs."""
+    vals = ','.join(json.dumps(v) for v in (canonical_id, selected_node_id, selected_leaf_id, alternate_node_id, alternate_leaf_id))
+    return f"const [cid,snode,sleaf,anode,aleaf]=[{vals}]; const until=async f=>{{const end=Date.now()+5000;while(Date.now()<end){{if(f())return true;await new Promise(r=>setTimeout(r,20));}}return false}}; const f=document.querySelector('#search');if(!f)throw Error('search control absent');f.value='Selected synthetic answer';f.dispatchEvent(new Event('input',{{bubbles:true}}));if(!await until(()=>[...document.querySelectorAll('.conversation-item')].some(x=>x.querySelector('.search-snippet')?.textContent.includes('Selected synthetic answer'))))throw Error('body FTS row absent');const row=[...document.querySelectorAll('.conversation-item')].find(x=>x.querySelector('.search-snippet')?.textContent.includes('Selected synthetic answer'));row.click();if(!await until(()=>[...document.querySelectorAll('#messages article[data-node-id]')].some(a=>a.dataset.nodeId===snode)&&document.querySelector('#messages')?.innerText.includes('Selected synthetic answer')))throw Error('selected detail not rendered');const anchor=[...document.querySelectorAll('#messages article[data-node-id]')].find(a=>a.dataset.nodeId===snode);if(!anchor?.id)throw Error('selected anchor absent before branch switch');const branch=document.querySelector('#branch');if(!branch||!await until(()=>[...branch.options].some(o=>o.value===aleaf)))throw Error('alternate leaf absent');branch.value=aleaf;branch.dispatchEvent(new Event('change'));if(!await until(()=>[...document.querySelectorAll('#messages article[data-node-id]')].some(a=>a.dataset.nodeId===anode)&&document.querySelector('#messages')?.innerText.includes('Alternate synthetic answer')))throw Error('alternate detail not rendered');const rev=(await window.ChatHub.invoke('list_conversations',{{query:'',cursor:null}})).library_revision;return {{ready:document.querySelector('#health')?.textContent.includes('READY'),row:true,revision:rev,selected:true,alternate:true,anchor:true,node_id:snode,leaf_id:aleaf,canonical_id:cid,selected_leaf_id:sleaf,alternate_node_id:anode}};"
+
+
 def _pid_running(pid):
     try:
         os.kill(pid, 0)
@@ -221,6 +276,8 @@ def run(app, evidence, allow_default_app_data=False, disposable_home=None):
         if not isinstance(service, dict): raise RuntimeError('native service info unavailable')
         if not _coherent_native_pid(state, service): raise RuntimeError('native state/service_info process_id mismatch or invalid PID')
         if not _native_identity_ok(state, service, expected_version, expected_executable): raise RuntimeError('native version/executable identity does not match bundle')
+        owned_pid = state['process_id']
+        owned_addresses = _listener_pair(service)
         token_path = data / 'service.token'
         token = token_path.read_text().strip()
         req = urllib.request.Request(service['api'].rstrip('/') + '/api/v1/status', headers={'Authorization': 'Bearer ' + token})
@@ -237,23 +294,23 @@ def run(app, evidence, allow_default_app_data=False, disposable_home=None):
         if type(post_revision) is not int or post_revision <= before_revision:
             raise RuntimeError('post-import revision did not advance or is not canonical')
         record['receipt_counts'] = {key: receipt.get(key) for key in ('imported','updated','unchanged','failed')}
-        def verify_reader(expected_revision, canonical_id, expected_node, expected_leaf):
-            # All waits are deadline-bounded condition polls (never blind sleeps).
-            # JSON quoting keeps opaque backend identifiers data, not executable JS.
-            node_js, leaf_js = json.dumps(expected_node), json.dumps(expected_leaf)
-            script = f"const expectedNode={node_js},expectedLeaf={leaf_js}; const until=async f=>{{const end=Date.now()+5000;while(Date.now()<end){{if(f())return true;await new Promise(r=>setTimeout(r,20));}}return false}}; const f=document.querySelector('#search'); if(!f)throw Error('search control absent'); f.value='Selected synthetic answer'; f.dispatchEvent(new Event('input',{{bubbles:true}})); if(!await until(()=>[...document.querySelectorAll('.conversation-item')].some(x=>x.querySelector('.search-snippet')?.textContent.includes('Selected synthetic answer')))throw Error('body FTS row absent'); const row=[...document.querySelectorAll('.conversation-item')].find(x=>x.querySelector('.search-snippet')?.textContent.includes('Selected synthetic answer')); row.click(); if(!await until(()=>!![...document.querySelectorAll('#messages article[data-node-id]')].find(a=>a.dataset.nodeId===expectedNode)&&document.querySelector('#messages')?.innerText.includes('Selected synthetic answer')))throw Error('selected detail not rendered'); const branch=document.querySelector('#branch'); if(!branch||!await until(()=>branch.options.length>1))throw Error('alternate leaf absent'); const alt=[...branch.options].find(o=>o.value===expectedLeaf); if(!alt)throw Error('expected alternate leaf absent'); branch.value=alt.value; branch.dispatchEvent(new Event('change')); if(!await until(()=>document.querySelector('#messages')?.innerText.includes('Alternate synthetic answer')))throw Error('alternate detail not rendered'); const article=[...document.querySelectorAll('#messages article[data-node-id]')].find(a=>a.dataset.nodeId===expectedNode); const rev=(await window.ChatHub.invoke('list_conversations',{{query:'',cursor:null}})).library_revision; return {{ready:document.querySelector('#health')?.textContent.includes('READY'),row:true,revision:rev,selected:true,alternate:true,anchor:!!article?.id,node_id:article?.dataset.nodeId,leaf_id:branch.value}};"
-            result = request(e2e, 'eval', js=script)
-            if not _ui_ok(result, expected_revision, expected_node, expected_leaf): raise RuntimeError('actual search/detail/health criteria failed')
+        def verify_reader(expected_revision, canonical_id, selected_node, selected_leaf, alternate_node, alternate_leaf):
+            result = request(e2e, 'eval', js=reader_script(canonical_id, selected_node, selected_leaf, alternate_node, alternate_leaf))
+            if not _ui_ok(result, expected_revision, selected_node, alternate_leaf): raise RuntimeError('actual search/detail/health criteria failed')
             return result
         listed = request(e2e, 'eval', js="return await window.ChatHub.invoke('list_conversations',{query:'',cursor:null});")
         fixture_rows = [x for x in listed.get('items', []) if x.get('title') == 'Synthetic branching export']
         if len(fixture_rows) != 1 or fixture_rows[0].get('provider') != 'chatgpt' or fixture_rows[0].get('account_scope') != 'provisional:default' or fixture_rows[0].get('source_id') != 'synthetic-export-one': raise RuntimeError('canonical API list lacks exact imported fixture identity')
         hit = request(e2e, 'eval', js="return await window.ChatHub.invoke('list_conversations',{query:'Selected synthetic answer',cursor:null});")
         canonical_id = fixture_rows[0]['id']
-        match_rows = [x for x in hit.get('items', []) if x.get('conversation',{}).get('id') == canonical_id and isinstance(x.get('message_id'), str) and isinstance(x.get('leaf_node_id'), str)]
-        if len(match_rows) != 1: raise RuntimeError('canonical FTS search lacks unique selected message and alternate leaf anchors')
-        expected_node, expected_leaf = match_rows[0]['message_id'], match_rows[0]['leaf_node_id']
-        result = verify_reader(post_revision, canonical_id, expected_node, expected_leaf)
+        match_rows = [x for x in hit.get('items', []) if x.get('conversation',{}).get('id') == canonical_id and isinstance(x.get('node_id'), str) and isinstance(x.get('leaf_node_id'), str)]
+        if len(match_rows) != 1: raise RuntimeError('canonical FTS search lacks unique selected node and leaf anchors')
+        expected_node = match_rows[0]['node_id']
+        message_id = match_rows[0].get('message_id')
+        selected_detail = request(e2e, 'eval', js=f"return await window.ChatHub.invoke('get_conversation',{{id:{json.dumps(canonical_id)}}});")
+        expected_node, _, alternate_node, alternate_leaf = _detail_anchor_ids(selected_detail, expected_node)
+        selected_leaf = match_rows[0]['leaf_node_id']
+        result = verify_reader(post_revision, canonical_id, expected_node, selected_leaf, alternate_node, alternate_leaf)
         record['ui'] = result
         record['canonical_id'] = canonical_id
         record['fts_anchor'] = True
@@ -307,7 +364,7 @@ def run(app, evidence, allow_default_app_data=False, disposable_home=None):
         same_pid_list = request(e2e, 'eval', js="return await window.ChatHub.invoke('list_conversations',{query:'',cursor:null});")
         if same_pid_list.get('library_revision') != post_revision:
             raise RuntimeError('same-PID reopen canonical library revision changed')
-        same_pid_ui = verify_reader(post_revision, canonical_id, expected_node, expected_leaf)
+        same_pid_ui = verify_reader(post_revision, canonical_id, expected_node, selected_leaf, alternate_node, alternate_leaf)
         same_pid_state_after = request(e2e, 'state', timeout=3)
         same_pid_service_after = request(e2e, 'eval', js="const s=await window.__TAURI_INTERNALS__.invoke('service_info'); return {api:s.api,proxy:s.proxy,pid:s.process_id,version:s.version,executable:s.executable};")
         if (not same_pid_state_after.get('window_visible')
@@ -361,10 +418,12 @@ def run(app, evidence, allow_default_app_data=False, disposable_home=None):
         if not _health_ok(restarted_health) or not _v1_health_ok(restarted_raw): raise RuntimeError('restart native IPC/API health proof failed')
         after = request(e2e, 'eval', js="return await window.ChatHub.invoke('list_conversations',{query:'',cursor:null});")
         if after.get('library_revision') != post_revision: raise RuntimeError('canonical library revision changed across restart')
-        result = verify_reader(post_revision, canonical_id, expected_node, expected_leaf)
+        result = verify_reader(post_revision, canonical_id, expected_node, selected_leaf, alternate_node, alternate_leaf)
         record['restart'] = {'old_pid': old_pid, 'new_pid': state['process_id'], 'service_pid': restarted_service['pid'], 'version_matches_bundle': True, 'executable_matches_bundle': True, 'default_data_matches_platform': True, 'persisted_reader': True, 'ui': result}
         record['passed'] = True
-        return record
+    except Exception as exc:
+        record['passed'] = False
+        record['primary_error'] = f'{type(exc).__name__}: {exc}'
     finally:
         # The app is owned by `open`; never substitute terminating its launcher
         # wrapper for a graceful quit of the native app. Quit only our verified app.
@@ -390,7 +449,21 @@ def run(app, evidence, allow_default_app_data=False, disposable_home=None):
             except Exception as exc:
                 record['cleanup_error'] = f'graceful quit unavailable: {type(exc).__name__}'
         log.close()
+        if record.get('cleanup_error'):
+            record['passed'] = False
+        if owned_pid is not None and not record.get('final_native_pid_closed'):
+            record['passed'] = False
+            record['cleanup_error'] = record.get('cleanup_error', 'cleanup was not verified complete')
+        if record.get('passed') is True and not record.get('final_native_pid_closed'):
+            record['passed'] = False
+            record['cleanup_error'] = 'cleanup was not verified complete'
         (evidence / 'native-library-result.json').write_text(json.dumps(record, sort_keys=True, indent=2) + '\n')
+    if record.get('passed') is not True:
+        details = record.get('primary_error', 'native smoke did not complete')
+        if record.get('cleanup_error'):
+            details += f"; cleanup failed ({record['cleanup_error']})"
+        raise RuntimeError(details)
+    return record
 
 
 def main():

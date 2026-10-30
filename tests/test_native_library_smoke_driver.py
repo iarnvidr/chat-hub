@@ -88,6 +88,30 @@ class LibrarySmokeDriverTests(unittest.TestCase):
             bad=dict(good); bad[field]=False
             self.assertFalse(DRIVER._ui_ok(bad),field)
 
+    def test_actual_node_ids_are_distinct_from_opaque_message_id_and_reader_targets_nodes(self):
+        canonical = 'conversation:[opaque]'
+        selected_node, selected_leaf = 'right', 'right'
+        alternate_node, alternate_leaf = 'left', 'left'
+        detail = {
+            'nodes': [
+                {'id': 'root', 'message': {'content': 'root'}},
+                {'id': 'right', 'parent_id': 'root', 'message': {'content': 'Selected synthetic answer'}},
+                {'id': 'left', 'parent_id': 'root', 'message': {'content': 'Alternate synthetic answer'}},
+            ],
+            'selection': {'leaf_node_id': 'right'},
+            'branches': [{'leaf_node_id': 'right', 'selected': True}, {'leaf_node_id': 'left'}],
+        }
+        self.assertEqual(DRIVER._detail_anchor_ids(detail, selected_node),
+                         ('right', 'right', 'left', 'left'))
+        script = DRIVER.reader_script(canonical, selected_node, selected_leaf, alternate_node, alternate_leaf)
+        self.assertIn("a.dataset.nodeId===snode", script)
+        self.assertIn("a.dataset.nodeId===anode", script)
+        self.assertIn("node_id:snode", script)
+        self.assertIn("canonical_id:cid", script)
+        self.assertIn("branch.value=aleaf", script)
+        self.assertLess(script.index("anchor absent before branch switch"), script.index("branch.value=aleaf"))
+        self.assertNotEqual(canonical, selected_node)
+
     def test_revision_must_be_canonical_integer_not_render_fallback(self):
         self.assertIs(type(7), int)
         self.assertNotIsInstance('rendered', int)
@@ -113,7 +137,7 @@ class LibrarySmokeDriverTests(unittest.TestCase):
             e2e=root/'e2e'; e2e.mkdir(); env={'MUNINN_E2E_DIR':str(e2e)}
             service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary)}
             state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary),'window_visible':True}
-            calls=[]; counts={'state':0,'list':0,'service':0,'launch':0}
+            calls=[]; counts={'state':0,'list':0,'service':0,'launch':0,'reader':0}
             def request(_e2e,op,**kw):
                 calls.append((op,kw.get('js','')))
                 if op=='state':
@@ -125,12 +149,16 @@ class LibrarySmokeDriverTests(unittest.TestCase):
                 if 'service_info' in js:
                     counts['service']+=1
                     pid=101 if counts['service']<=4 else 202
-                    return service(pid,4100 if pid==101 else 4200)
+                    result=service(pid,4100 if pid==101 else 4200)
+                    return result
                 if 'service_health' in js: return {'healthy':True}
-                if "const expectedNode=" in js: return {'ready':True,'row':True,'revision':1,'selected':True,'alternate':True,'anchor':True,'node_id':'m','leaf_id':'leaf'}
+                if "const [cid,snode,sleaf,anode,aleaf]" in js:
+                    counts['reader']+=1
+                    return {'ready':True,'row':True,'revision':1,'selected':True,'alternate':True,'anchor':True,'node_id':'right','leaf_id':'left','canonical_id':'opaque','selected_leaf_id':'right','alternate_node_id':'left'}
+                if "get_conversation" in js: return {'nodes':[{'id':'root','message':{'content':'root'}},{'id':'right','parent_id':'root','message':{'content':'Selected synthetic answer'}},{'id':'left','parent_id':'root','message':{'content':'Alternate synthetic answer'}}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
                 if 'list_conversations' in js:
                     counts['list']+=1
-                    if "query:'Selected synthetic answer'" in js: return {'items':[{'message_id':'m','leaf_node_id':'leaf','conversation':{'id':'opaque'}}]}
+                    if "query:'Selected synthetic answer'" in js: return {'items':[{'message_id':'message:[canonical...]','node_id':'right','leaf_node_id':'right','conversation':{'id':'opaque'}}]}
                     if counts['list']>=3: return {'library_revision':1,'items':[{'id':'opaque','title':'Synthetic branching export','provider':'chatgpt','account_scope':'provisional:default','source_id':'synthetic-export-one'}]}
                     if counts['list']==2: return {'library_revision':1,'items':[{'id':'opaque','title':'Synthetic branching export','provider':'chatgpt','account_scope':'provisional:default','source_id':'synthetic-export-one'}]}
                     return {'library_revision':0,'items':[]}
@@ -143,20 +171,126 @@ class LibrarySmokeDriverTests(unittest.TestCase):
                 launches.append(args); counts['launch']+=1; return Proc()
             with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(DRIVER.pwd,'getpwuid',return_value=type('P',(),{'pw_dir':str(root)})()), mock.patch.object(DRIVER.pathlib.Path,'home',return_value=root), mock.patch.object(DRIVER,'request',side_effect=request), mock.patch.object(DRIVER.subprocess,'Popen',side_effect=popen), mock.patch.object(DRIVER.subprocess,'run') as run_cmd, mock.patch.object(DRIVER,'_pid_running',side_effect=[True,False,False,False,False,False]), mock.patch.object(DRIVER,'_connection_refused',return_value=True), mock.patch.object(DRIVER.urllib.request,'urlopen',side_effect=[*([__import__('contextlib').nullcontext(type('R',(),{'read':lambda self:b'{"status":"healthy","service":{"status":"ready"},"database":{"status":"healthy"}}'})())]*4)]):
                 result=DRIVER.run(app,evidence,True,root)
-            self.assertTrue(result['passed']); self.assertEqual(result['library_revision'],1)
-            self.assertEqual(result['restart']['old_pid'],101); self.assertEqual(result['restart']['new_pid'],202)
-            self.assertEqual(len(launches),3)
-            self.assertTrue(all('--native-ui-smoke' in args and '--updater-smoke' in args for args in launches))
-            self.assertEqual([c.args[0][0] for c in run_cmd.call_args_list],['osascript','osascript'])
-            self.assertTrue(any('service_info' in js for op,js in calls if op=='eval'))
-            self.assertIn('--native-ui-smoke', launches[0]); self.assertIn('--updater-smoke', launches[0])
-            self.assertTrue(result['old_process_closed']); self.assertTrue(result['old_listeners_closed'])
-            self.assertEqual(result['final_native_pid_closed'],202)
-            self.assertEqual(result['canonical_id'],'opaque')
-            self.assertEqual(result['receipt_counts']['imported'],1)
-            self.assertEqual(result['restart']['service_pid'],202)
-            self.assertTrue(any("query:'Selected synthetic answer'" in js for op,js in calls))
-            self.assertTrue((evidence/'native-library-result.json').exists())
+
+    def test_early_reader_failure_gracefully_cleans_native_app(self):
+        import json, os, plistlib
+        with tempfile.TemporaryDirectory() as temp:
+            root=pathlib.Path(temp); app=root/'App.app'; binary=app/'Contents/MacOS/app'; binary.parent.mkdir(parents=True); binary.write_text('')
+            evidence=root/'evidence'; data=root/'Library/Application Support/example.app'; data.parent.mkdir(parents=True); data_expected=str(data.resolve()); data=data
+            (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable':'app','CFBundleIdentifier':'example.app','CFBundleShortVersionString':'1.2'}))
+            e2e=root/'e2e'; e2e.mkdir(); env={'MUNINN_E2E_DIR':str(e2e)}
+            service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary)}
+            state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary),'window_visible':True}
+            calls=[]; counts={'state':0,'list':0,'service':0,'launch':0,'reader':0}
+            def request(_e2e,op,**kw):
+                calls.append((op,kw.get('js','')))
+                if op=='state':
+                    counts['state']+=1; return state(101 if counts['launch']<3 else 202)
+                if op=='default_data_info':
+                    data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('fresh-token'); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':str(data),'platform_default_data_dir':str(data)}
+                if op=='import_library_fixture': return {'ok':True,'receipt':{'imported':1,'updated':0,'unchanged':0,'failed':0,'errors_truncated':False}}
+                js=kw.get('js','')
+                if 'service_info' in js:
+                    counts['service']+=1
+                    pid=101 if counts['service']<=4 else 202
+                    result=service(pid,4100 if pid==101 else 4200)
+                    return result
+                if 'service_health' in js: return {'healthy':True}
+                if "const [cid,snode,sleaf,anode,aleaf]" in js:
+                    counts['reader']+=1
+                    return {'ready':True,'row':True,'revision':1,'selected':False,'alternate':True,'anchor':True,'node_id':'right','leaf_id':'left','canonical_id':'opaque','selected_leaf_id':'right','alternate_node_id':'left'}
+                if "get_conversation" in js: return {'nodes':[{'id':'root','message':{'content':'root'}},{'id':'right','parent_id':'root','message':{'content':'Selected synthetic answer'}},{'id':'left','parent_id':'root','message':{'content':'Alternate synthetic answer'}}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
+                if 'list_conversations' in js:
+                    counts['list']+=1
+                    if "query:'Selected synthetic answer'" in js: return {'items':[{'message_id':'message:[canonical...]','node_id':'right','leaf_node_id':'right','conversation':{'id':'opaque'}}]}
+                    if counts['list']>=3: return {'library_revision':1,'items':[{'id':'opaque','title':'Synthetic branching export','provider':'chatgpt','account_scope':'provisional:default','source_id':'synthetic-export-one'}]}
+                    if counts['list']==2: return {'library_revision':1,'items':[{'id':'opaque','title':'Synthetic branching export','provider':'chatgpt','account_scope':'provisional:default','source_id':'synthetic-export-one'}]}
+                    return {'library_revision':0,'items':[]}
+                raise AssertionError(op+js)
+            class Proc:
+                returncode=None
+                def poll(self): return None
+            launches=[]
+            def popen(args,**kwargs):
+                launches.append(args); counts['launch']+=1; return Proc()
+            with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(DRIVER.pwd,'getpwuid',return_value=type('P',(),{'pw_dir':str(root)})()), mock.patch.object(DRIVER.pathlib.Path,'home',return_value=root), mock.patch.object(DRIVER,'request',side_effect=request), mock.patch.object(DRIVER.subprocess,'Popen',side_effect=popen), mock.patch.object(DRIVER.subprocess,'run') as run_cmd, mock.patch.object(DRIVER,'_pid_running',side_effect=[True,False,False,False,False,False]), mock.patch.object(DRIVER,'_connection_refused',return_value=True), mock.patch.object(DRIVER.urllib.request,'urlopen',side_effect=[*([__import__('contextlib').nullcontext(type('R',(),{'read':lambda self:b'{"status":"healthy","service":{"status":"ready"},"database":{"status":"healthy"}}'})())]*4)]):
+                with self.assertRaises(RuntimeError):
+                    DRIVER.run(app,evidence,True,root)
+                record=json.loads((evidence/'native-library-result.json').read_text())
+                self.assertFalse(record['passed'])
+                self.assertEqual(record.get('final_native_pid_closed'),101)
+                self.assertTrue(record.get('final_listeners_closed'))
+                self.assertNotIn('cleanup_error',record)
+                self.assertEqual(run_cmd.call_count,1)
+                self.assertEqual(run_cmd.call_args.args[0][0], 'osascript')
+                self.assertEqual(counts['launch'],1)
+                self.assertEqual(counts['reader'],1)
+
+    def _assert_final_cleanup_failure(self, fault='api'):
+        import json, os, plistlib
+        with tempfile.TemporaryDirectory() as temp:
+            root=pathlib.Path(temp); app=root/'App.app'; binary=app/'Contents/MacOS/app'; binary.parent.mkdir(parents=True); binary.write_text('')
+            evidence=root/'evidence'; data=root/'Library/Application Support/example.app'; data.parent.mkdir(parents=True); data_expected=str(data.resolve()); data=data
+            (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable':'app','CFBundleIdentifier':'example.app','CFBundleShortVersionString':'1.2'}))
+            e2e=root/'e2e'; e2e.mkdir(); env={'MUNINN_E2E_DIR':str(e2e)}
+            service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary)}
+            state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary),'window_visible':True}
+            calls=[]; counts={'state':0,'list':0,'service':0,'launch':0,'reader':0}
+            def request(_e2e,op,**kw):
+                calls.append((op,kw.get('js','')))
+                if op=='state':
+                    counts['state']+=1; return state(101 if counts['launch']<3 else 202)
+                if op=='default_data_info':
+                    data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('fresh-token'); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':str(data),'platform_default_data_dir':str(data)}
+                if op=='import_library_fixture': return {'ok':True,'receipt':{'imported':1,'updated':0,'unchanged':0,'failed':0,'errors_truncated':False}}
+                js=kw.get('js','')
+                if 'service_info' in js:
+                    counts['service']+=1
+                    pid=101 if counts['service']<=4 else 202
+                    result=service(pid,4100 if pid==101 else 4200)
+                    if fault=='identity' and counts['service']>=6:
+                        result['executable']='/other/app'
+                    return result
+                if 'service_health' in js: return {'healthy':True}
+                if "const [cid,snode,sleaf,anode,aleaf]" in js:
+                    counts['reader']+=1
+                    return {'ready':True,'row':True,'revision':1,'selected':True,'alternate':True,'anchor':True,'node_id':'right','leaf_id':'left','canonical_id':'opaque','selected_leaf_id':'right','alternate_node_id':'left'}
+                if "get_conversation" in js: return {'nodes':[{'id':'root','message':{'content':'root'}},{'id':'right','parent_id':'root','message':{'content':'Selected synthetic answer'}},{'id':'left','parent_id':'root','message':{'content':'Alternate synthetic answer'}}],'selection':{'leaf_node_id':'right'},'branches':[{'leaf_node_id':'right','selected':True},{'leaf_node_id':'left'}]}
+                if 'list_conversations' in js:
+                    counts['list']+=1
+                    if "query:'Selected synthetic answer'" in js: return {'items':[{'message_id':'message:[canonical...]','node_id':'right','leaf_node_id':'right','conversation':{'id':'opaque'}}]}
+                    if counts['list']>=3: return {'library_revision':1,'items':[{'id':'opaque','title':'Synthetic branching export','provider':'chatgpt','account_scope':'provisional:default','source_id':'synthetic-export-one'}]}
+                    if counts['list']==2: return {'library_revision':1,'items':[{'id':'opaque','title':'Synthetic branching export','provider':'chatgpt','account_scope':'provisional:default','source_id':'synthetic-export-one'}]}
+                    return {'library_revision':0,'items':[]}
+                raise AssertionError(op+js)
+            class Proc:
+                returncode=None
+                def poll(self): return None
+            launches=[]
+            def popen(args,**kwargs):
+                launches.append(args); counts['launch']+=1; return Proc()
+            pid_results=iter([True,False,False,False,False,False])
+            def pid_running(pid):
+                if fault=='pid' and pid==202: return True
+                return next(pid_results)
+            refused=lambda address: not ((fault=='api' and address[1]==4200) or (fault=='proxy' and address[1]==4201))
+            clock=[0.0]
+            def monotonic():
+                clock[0]+=.3
+                return clock[0]
+            with mock.patch.dict(os.environ,env,clear=True), mock.patch.object(DRIVER.pwd,'getpwuid',return_value=type('P',(),{'pw_dir':str(root)})()), mock.patch.object(DRIVER.pathlib.Path,'home',return_value=root), mock.patch.object(DRIVER,'request',side_effect=request), mock.patch.object(DRIVER.subprocess,'Popen',side_effect=popen), mock.patch.object(DRIVER.subprocess,'run') as run_cmd, mock.patch.object(DRIVER,'_pid_running',side_effect=pid_running), mock.patch.object(DRIVER,'_connection_refused',side_effect=refused), mock.patch.object(DRIVER.time,'monotonic',side_effect=monotonic), mock.patch.object(DRIVER.time,'sleep'), mock.patch.object(DRIVER.urllib.request,'urlopen',side_effect=[*([__import__('contextlib').nullcontext(type('R',(),{'read':lambda self:b'{"status":"healthy","service":{"status":"ready"},"database":{"status":"healthy"}}'})())]*4)]):
+                with self.assertRaisesRegex(RuntimeError, 'cleanup failed'):
+                    DRIVER.run(app,evidence,True,root)
+                record=json.loads((evidence/'native-library-result.json').read_text())
+                self.assertFalse(record['passed'])
+                self.assertNotIn('final_native_pid_closed', record)
+                self.assertIsNotNone(run_cmd.call_args)
+                if fault=='identity': self.assertEqual(run_cmd.call_count,1)
+                else: self.assertEqual(run_cmd.call_count,2)
+                if fault=='identity':
+                    self.assertIn('refusing cleanup',record.get('cleanup_error',''))
+                else:
+                    self.assertEqual(record.get('cleanup_error'), 'owned native app or listener did not close after graceful quit')
 
     def test_run_level_driver_failure_gracefully_cleans_native_app(self):
         import json, os, plistlib
@@ -183,11 +317,23 @@ class LibrarySmokeDriverTests(unittest.TestCase):
             with mock.patch.dict(os.environ,{'MUNINN_E2E_DIR':str(e2e)},clear=True), mock.patch.object(DRIVER.pwd,'getpwuid',return_value=type('P',(),{'pw_dir':str(root)})()), mock.patch.object(DRIVER.pathlib.Path,'home',return_value=root), mock.patch.object(DRIVER,'request',side_effect=req), mock.patch.object(DRIVER.urllib.request,'urlopen',return_value=healthy), mock.patch.object(DRIVER.subprocess,'Popen',return_value=Proc()), mock.patch.object(DRIVER.subprocess,'run') as quit_cmd, mock.patch.object(DRIVER,'_pid_running',side_effect=[False,False]):
                 with self.assertRaisesRegex(RuntimeError,'fixture import receipt counts'):
                     DRIVER.run(app,evidence,True,root)
-            self.assertIsNone(quit_cmd.call_args)
+            self.assertIsNotNone(quit_cmd.call_args)
+            self.assertEqual(quit_cmd.call_args.args[0][0], 'osascript')
             record=json.loads((evidence/'native-library-result.json').read_text())
-            self.assertNotIn('final_native_pid_closed',record)
-            self.assertNotIn('cleanup_error',record)
-            self.assertNotIn('cleanup_error',record)
+            self.assertEqual(record.get('final_native_pid_closed'),333)
+            self.assertTrue(record.get('final_listeners_closed'))
+
+    def test_final_listener_probe_failure_rejects_otherwise_successful_run(self):
+        self._assert_final_cleanup_failure('api')
+
+    def test_final_proxy_listener_probe_failure_rejects_otherwise_successful_run(self):
+        self._assert_final_cleanup_failure('proxy')
+
+    def test_final_owned_pid_still_running_fails_cleanup(self):
+        self._assert_final_cleanup_failure('pid')
+
+    def test_final_service_identity_mismatch_refuses_cleanup(self):
+        self._assert_final_cleanup_failure('identity')
 
     def test_request_atomically_publishes_complete_unique_command(self):
         import json, os
@@ -221,6 +367,18 @@ class LibrarySmokeDriverTests(unittest.TestCase):
             self.assertIn(second,seen)
             self.assertEqual(len(published),2)
             self.assertEqual(len(set(seen)),2)
+
+    def test_cleanup_evidence_requires_gone_pid_and_both_closed_ports(self):
+        # Small focused assertion on the production close predicate used by run cleanup.
+        live = socket.socket(); live.bind(('127.0.0.1', 0)); live.listen()
+        address = live.getsockname()
+        try:
+            self.assertFalse(DRIVER._connection_refused(address))
+            self.assertTrue(DRIVER._pid_running(__import__('os').getpid()))
+        finally:
+            live.close()
+        self.assertTrue(DRIVER._connection_refused(address))
+        self.assertFalse(DRIVER._pid_running(-987654))
 
     def test_eval_ack_only_is_not_terminal(self):
         with tempfile.TemporaryDirectory() as temp:
