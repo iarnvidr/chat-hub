@@ -56,16 +56,26 @@ pub struct ServiceHandle {
     interrupt: Arc<rusqlite::InterruptHandle>,
     deadline: Duration,
 }
+fn lock_status(status: &Mutex<ServiceStatus>) -> std::sync::MutexGuard<'_, ServiceStatus> {
+    match status.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.state = ServiceState::Failed("service status lock poisoned".into());
+            guard
+        }
+    }
+}
 impl ServiceHandle {
     pub fn status(&self) -> ServiceStatus {
-        self.status.lock().unwrap().clone()
+        lock_status(&self.status).clone()
     }
     pub async fn shutdown(self) -> IngestStats {
         let d = self.deadline;
         self.shutdown_timeout(d).await
     }
     pub async fn shutdown_timeout(mut self, budget: Duration) -> IngestStats {
-        self.status.lock().unwrap().state = ServiceState::Stopping;
+        lock_status(&self.status).state = ServiceState::Stopping;
         let _ = self.shutdown.send(true);
         let end = Instant::now() + budget;
         // The proxy monitor awaits the original accept task, which does not
@@ -95,7 +105,7 @@ impl ServiceHandle {
                     .upgrade()
                     .map(|tx| tx.max_capacity().saturating_sub(tx.capacity()) as u64)
                     .unwrap_or(0);
-                let mut s = self.status.lock().unwrap();
+                let mut s = lock_status(&self.status);
                 s.state = ServiceState::Failed(
                     "shutdown deadline exceeded; SQLite interrupted; writer still finishing".into(),
                 );
@@ -107,7 +117,7 @@ impl ServiceHandle {
                 return s.ingest.clone();
             }
         }
-        let mut s = self.status.lock().unwrap();
+        let mut s = lock_status(&self.status);
         s.state = ServiceState::Stopped;
         s.ingest.unprocessed = s
             .ingest
@@ -213,7 +223,7 @@ pub async fn start_with_proxy(
                     // events as unprocessed before dropping them from the receiver.
                     let queued = rx.len() as u64;
                     if queued != 0 {
-                        let mut s = writer_status.lock().unwrap();
+                        let mut s = lock_status(&writer_status);
                         s.ingest.unprocessed = s.ingest.unprocessed.saturating_add(queued);
                     }
                     while rx.try_recv().is_ok() {}
@@ -221,11 +231,11 @@ pub async fn start_with_proxy(
                 }
                 match rx.try_recv() {
                     Ok(ev) => {
-                        let mut s = writer_status.lock().unwrap();
+                        let mut s = lock_status(&writer_status);
                         s.ingest.accepted += 1;
                         drop(s);
                         let out = store.ingest_capture(ev);
-                        let mut s = writer_status.lock().unwrap();
+                        let mut s = lock_status(&writer_status);
                         match out {
                             Ok(true) => s.ingest.stored += 1,
                             Ok(false) => s.ingest.ignored += 1,
@@ -268,7 +278,7 @@ pub async fn start_with_proxy(
         tokio::select! {_=axum::serve(listener,server::router_with_identity(api_store,config.bearer_token,identity))=>{},_=stop_rx.changed()=>{}}
         if !*api_stop.borrow() {
             api_flag.store(true, Ordering::Release);
-            let mut state = api_status.lock().unwrap();
+            let mut state = lock_status(&api_status);
             if !matches!(state.state, ServiceState::Stopping | ServiceState::Stopped) {
                 state.state = ServiceState::Failed("API listener exited unexpectedly".into());
             }
@@ -284,7 +294,7 @@ pub async fn start_with_proxy(
         let mut pt = pt;
         let _ = (&mut pt).await;
         if !*proxy_stop.borrow() {
-            let mut state = proxy_status.lock().unwrap();
+            let mut state = lock_status(&proxy_status);
             if !matches!(state.state, ServiceState::Stopping | ServiceState::Stopped) {
                 state.state = ServiceState::Failed("proxy listener exited unexpectedly".into());
             }
@@ -294,7 +304,7 @@ pub async fn start_with_proxy(
         }
     });
     {
-        let mut s = status.lock().unwrap();
+        let mut s = lock_status(&status);
         s.proxy_addr = Some(proxy.addr);
         if s.state == ServiceState::Starting {
             s.state = ServiceState::Ready;
@@ -321,4 +331,36 @@ pub fn try_submit(
     event: CaptureEvent,
 ) -> Result<(), mpsc::error::TrySendError<CaptureEvent>> {
     sender.try_send(event)
+}
+
+#[cfg(test)]
+mod status_poison_tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_status_is_reported_as_failed_without_panicking() {
+        let identity = server::RuntimeIdentity {
+            pid: 1,
+            instance_id: "test".into(),
+        };
+        let status = Arc::new(Mutex::new(ServiceStatus {
+            state: ServiceState::Ready,
+            identity,
+            api_addr: None,
+            proxy_addr: None,
+            database_healthy: Some(true),
+            ingest: IngestStats::default(),
+        }));
+        let poisoned = status.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("intentional status lock poison");
+        })
+        .join();
+        let snapshot = lock_status(&status).clone();
+        assert_eq!(
+            snapshot.state,
+            ServiceState::Failed("service status lock poisoned".into())
+        );
+    }
 }
