@@ -14,6 +14,8 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
 mod crash_diagnostics;
 mod desktop_api;
+#[cfg(feature = "native-smoke")]
+mod e2e_protocol;
 mod service_health;
 use service_health::healthy_response;
 mod window_policy;
@@ -59,18 +61,6 @@ mod e2e {
         }
         std::env::var_os("MUNINN_E2E_DIR").map(PathBuf::from)
     }
-    fn respond(d: &std::path::Path, id: &str, v: &Value) {
-        let p = d.join(format!("{id}.res.json"));
-        let t = d.join(format!("{id}.res.json.tmp"));
-        if let Err(e) = std::fs::write(&t, v.to_string()) {
-            eprintln!("native E2E response write failed id={id}: {e}");
-            return;
-        }
-        if let Err(e) = std::fs::rename(&t, &p) {
-            eprintln!("native E2E response publish failed id={id}: {e}");
-            let _ = std::fs::remove_file(t);
-        }
-    }
     fn progress(d: &std::path::Path, id: &str, stage: &str, detail: Value) {
         let value = json!({"id":id,"stage":stage,"detail":detail});
         let p = d.join(format!("{id}.diag.json"));
@@ -108,12 +98,20 @@ mod e2e {
                     continue;
                 }
                 progress(&d, &id, "dispatch", json!({"op":c["op"]}));
+                let op = c["op"].as_str().unwrap_or("");
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run(&app, &c, &d, &id)
                 }))
                 .unwrap_or_else(|_| json!({"ok":false,"error":"native E2E operation panicked"}));
                 progress(&d, &id, "response", json!({"ok":result["ok"]}));
-                respond(&d, &id, &result);
+                let reply = if op == "eval" && result["ok"].as_bool() == Some(true) {
+                    super::e2e_protocol::DispatchReply::Deferred
+                } else {
+                    super::e2e_protocol::DispatchReply::Terminal(result)
+                };
+                if let Err(e) = super::e2e_protocol::publish_dispatch(&d, &id, reply) {
+                    eprintln!("native E2E response publish failed id={id}: {e}");
+                }
             }
         });
     }
@@ -264,8 +262,8 @@ mod e2e {
             return Err("bad id".into());
         }
         let v: Value = serde_json::from_str(&value).map_err(|e| e.to_string())?;
-        respond(&d, &id, &json!({"ok":true,"value":v}));
-        Ok(())
+        super::e2e_protocol::publish_terminal(&d, &id, &json!({"ok":true,"value":v}))
+            .map_err(|e| e.to_string())
     }
 }
 fn authorize_local_main(window: &tauri::WebviewWindow) -> Result<(), String> {
