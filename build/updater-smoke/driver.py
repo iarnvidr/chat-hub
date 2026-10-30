@@ -131,7 +131,7 @@ try:
         retained_identity=(isinstance(retained,dict) and retained.get('version')==old
             and retained.get('process_id')==before_pid==proc.pid
             and retained.get('executable') and str(pathlib.Path(retained['executable']).resolve())==expected_exe)
-        evidence={'tamper_rejected':rejected,'tamper_status':{'state':'failed' if rejected else 'unknown','reason':'signature_verification_failed' if rejected else 'unclassified','detail':failure,'backend_status':observed_status.get('status') if isinstance(observed_status,dict) else None},'old_version_retained':still,'app_usable':live,'old_running_identity_retained':retained_identity,'running_service_info':retained}
+        evidence={'tamper_rejected':rejected,'tamper_status':{'state':'failed' if rejected else 'unknown','reason':'signature_verification_failed' if rejected else 'unclassified','detail':failure,'backend_status':observed_status.get('status') if isinstance(observed_status,dict) else None},'old_version_retained':still,'app_usable':live,'old_running_identity_retained':retained_identity,'before_identity':{'process_id':before_pid,'version':actual.get('version'),'executable':str(pathlib.Path(actual_exe).resolve())},'running_service_info':retained}
         (root/'tampered-result.json').write_text(json.dumps(evidence,sort_keys=True)+'\n')
         if not all((rejected,still,live,retained_identity)): raise RuntimeError(f'tamper rejection assertions failed: {evidence}')
 except Exception:

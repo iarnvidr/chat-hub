@@ -4,6 +4,7 @@ set -euo pipefail
 export RUST_BACKTRACE=1
 source "$(dirname "$0")/../native-smoke-wrapper.sh"
 SMOKE_LOGS=""
+SERVER=""
 # HOME is replaced below for updater isolation; resolve Rust's real homes first.
 REAL_HOME="${HOME:-$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}"
@@ -18,6 +19,7 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/muninn-updater-smoke.XXXXXX")"; chmod 700 "$TM
 EVIDENCE_DIR="${MUNINN_UPDATER_SMOKE_EVIDENCE_DIR:-}"
 cleanup() {
   local rc=$?
+  if [[ -n "${SERVER:-}" ]]; then kill "$SERVER" 2>/dev/null || true; SERVER=""; fi
   if [[ -n "$EVIDENCE_DIR" ]]; then
     mkdir -p "$EVIDENCE_DIR"; chmod 700 "$EVIDENCE_DIR"
     # Results contain assertion/status evidence only; never copy logs, keys, or runtime state.
@@ -129,7 +131,7 @@ export MUNINN_UPDATER_SMOKE_CURRENT_VERSION="$OLD"
 python3 "$ROOT/build/updater-smoke/verify_artifacts.py" "$TMP"
 # loopback-only server, shared by actual plugin fetches
 python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$TMP/feed" >"$TMP/http.log" 2>&1 & SERVER=$!
-trap 'kill "$SERVER" 2>/dev/null || true; cleanup' EXIT
+trap cleanup EXIT
 # Wait for the actual feed endpoint, not an assumed startup delay. Keep the server
 # alive throughout polling and fail with a bounded, credential-free diagnostic.
 ready=0
@@ -162,5 +164,5 @@ source=p/'new/Chat-Hub.app.tar.gz'; b=bytearray(source.read_bytes()); b[len(b)//
 # Keep the original signed metadata and same in-feed URL: only payload bytes are tampered.
 PY
 run_smoke 17 "$TMP" "$TMP/tampered.stdout.log:$TMP/tampered.stderr.log:$TMP/http.log" -- python3 "$ROOT/build/updater-smoke/driver.py" tampered "$TMP" "$TMP/tampered/Chat Hub.app"
-python3 "$ROOT/build/updater-smoke/verify_evidence.py" "$TMP"
+run_smoke 17 "$TMP" "$TMP/healthy.stdout.log:$TMP/healthy.stderr.log:$TMP/tampered.stdout.log:$TMP/tampered.stderr.log:$TMP/http.log" -- python3 "$ROOT/build/updater-smoke/verify_evidence.py" "$TMP"
 echo 'PASS: native updater smoke; boolean-only evidence generated'

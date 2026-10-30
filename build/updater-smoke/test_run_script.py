@@ -22,7 +22,9 @@ class ScriptRegression(unittest.TestCase):
    self.assertIn(field,driver)
   self.assertIn("retained.get('version')==old",driver)
   self.assertIn("tampered.get('old_running_identity_retained') is True",verifier)
-  self.assertIn("get('process_id')==identity.get('before_pid')",verifier)
+  self.assertIn("'tampered.running_service_info.process_id.matches_before'",verifier)
+  self.assertIn("tamper_retained.get('process_id') == tamper_before.get('process_id')",verifier)
+  self.assertNotIn("tamper_retained.get('process_id')==healthy_identity.get('before_pid')",verifier)
  def test_tar_archive_uses_chat_hub_bundle_name(self):
   s=SCRIPT.read_text()
   self.assertIn('tar -czf "$out/Chat-Hub.app.tar.gz" -C "$TMP" "Chat Hub.app"',s)

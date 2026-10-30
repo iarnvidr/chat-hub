@@ -2,7 +2,7 @@
 import ast,copy,json,pathlib,subprocess,sys,tempfile,unittest,os
 HERE=pathlib.Path(__file__).resolve().parent
 BASE_H={'signature_accepted':True,'replacement_installed':True,'restart_requested':True,'restart_observed':True,'restart_process_exited':True,'before_version':'0.1.0','after_version':'0.1.1','restart_identity':{'before_pid':101,'after_pid':202,'expected_executable':'/tmp/Muninn.app/Contents/MacOS/app','actual_executable':'/tmp/Muninn.app/Contents/MacOS/app'}}
-BASE_T={'tamper_rejected':True,'tamper_status':{'state':'failed','reason':'signature_verification_failed'},'old_version_retained':True,'app_usable':True,'old_running_identity_retained':True,'running_service_info':{'version':'0.1.0','process_id':101,'executable':'/tmp/Muninn.app/Contents/MacOS/app'}}
+BASE_T={'tamper_rejected':True,'tamper_status':{'state':'failed','reason':'signature_verification_failed'},'old_version_retained':True,'app_usable':True,'old_running_identity_retained':True,'before_identity':{'version':'0.1.0','process_id':303,'executable':'/tmp/Tamper.app/Contents/MacOS/app'},'running_service_info':{'version':'0.1.0','process_id':303,'executable':'/tmp/Tamper.app/Contents/MacOS/app'}}
 def run(root): return subprocess.run([sys.executable,str(HERE/'verify_evidence.py'),str(root)],capture_output=True)
 class EvidenceProtocol(unittest.TestCase):
  def test_restart_transport_classifier_is_narrow_and_postconditions_remain_required(self):
@@ -65,5 +65,30 @@ class EvidenceProtocol(unittest.TestCase):
    for key,value in [('old_running_identity_retained',False)]:
     bad=copy.deepcopy(t); bad[key]=value; write(h,bad); self.assertNotEqual(run(root).returncode,0)
    bad=copy.deepcopy(t); bad['running_service_info']['version']='0.1.1'; write(h,bad); self.assertNotEqual(run(root).returncode,0)
-   bad=copy.deepcopy(t); bad['running_service_info']['process_id']=999; write(h,bad); self.assertNotEqual(run(root).returncode,0)
+   bad=copy.deepcopy(t); bad['running_service_info']['process_id']=404; write(h,bad); self.assertNotEqual(run(root).returncode,0)
+   for key,value in [('process_id',0),('version','0.1.1'),('executable','/wrong')]:
+    bad=copy.deepcopy(t); bad['before_identity'][key]=value; write(h,bad); self.assertNotEqual(run(root).returncode,0)
+   bad=copy.deepcopy(t); bad.pop('before_identity'); write(h,bad); self.assertNotEqual(run(root).returncode,0)
+   bad=copy.deepcopy(t); bad['running_service_info']['executable']='/wrong'; write(h,bad); self.assertNotEqual(run(root).returncode,0)
+   # bool subclasses int in Python; reject it in each PID field, including
+   # both tamper identity snapshots independently and together.
+   for field,value in [('process_id',True),('process_id',False),('process_id',0),('process_id',-1),('process_id',1.5),('process_id','303')]:
+    bad=copy.deepcopy(t); bad['before_identity'][field]=value; bad['running_service_info'][field]=value
+    write(h,bad); self.assertNotEqual(run(root).returncode,0, (field,value))
+   for field,value in [('before_pid',True),('before_pid',False),('before_pid',0),('before_pid',-1),('before_pid',1.5),('before_pid','101'),('after_pid',True),('after_pid',False),('after_pid',0),('after_pid',-1),('after_pid',1.5),('after_pid','202')]:
+    bad=copy.deepcopy(h); bad['restart_identity'][field]=value; write(bad,t)
+    self.assertNotEqual(run(root).returncode,0, (field,value))
+   for which in ('before_identity','running_service_info'):
+    bad=copy.deepcopy(t); bad[which]['process_id']=True; write(h,bad)
+    self.assertNotEqual(run(root).returncode,0, which)
+   bad=copy.deepcopy(t); bad['before_identity']['process_id']=True; bad['running_service_info']['process_id']=True; write(h,bad)
+   self.assertNotEqual(run(root).returncode,0)
+   # Equality alone is insufficient: bool is an int subclass, so both
+   # retained snapshots at True would otherwise compare equal and pass.
+   for before,retained in ((1,True),(True,1),(True,True)):
+    bad=copy.deepcopy(t); bad['before_identity']['process_id']=before; bad['running_service_info']['process_id']=retained
+    write(h,bad); self.assertNotEqual(run(root).returncode,0, (before,retained))
+   for before,retained in ((1,1),(303,303)):
+    good=copy.deepcopy(t); good['before_identity']['process_id']=before; good['running_service_info']['process_id']=retained
+    write(h,good); self.assertEqual(run(root).returncode,0, (before,retained))
 if __name__=='__main__': unittest.main()
