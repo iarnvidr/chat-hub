@@ -279,33 +279,39 @@ mod e2e {
                 }
             }
             "default_data_info" => {
-                // Strictly opt-in evidence for the positive default-directory smoke run.
-                // Paths are returned only over the local E2E command channel; callers must
-                // not upload or log them.
-                let e2e_dir_is_valid = dir().is_some_and(|p| p.is_absolute() && p.is_dir());
-                let has_data_override = std::env::var_os("MUNINN_DATA_DIR").is_some()
-                    || std::env::var_os("MUNINN_E2E_DATA_DIR").is_some();
-                let allow_default_data_dir =
-                    std::env::var_os("MUNINN_E2E_ALLOW_DEFAULT_DATA_DIR").is_some_and(|v| v == "1");
-                if !cfg!(debug_assertions)
-                    || !super::smoke()
-                    || !e2e_dir_is_valid
-                    || has_data_override
-                    || !allow_default_data_dir
+                #[cfg(not(debug_assertions))]
+                return json!({"ok":false,"error":"native smoke default data evidence disabled"});
+                #[cfg(debug_assertions)]
                 {
-                    return json!({"ok":false,"error":"native smoke default data evidence disabled or required opt-in missing"});
-                }
-                let state = app.state::<super::AppState>();
-                let platform_default = match app.path().app_data_dir() {
-                    Ok(path) => path,
-                    Err(_) => {
-                        return json!({"ok":false,"error":"platform app-data resolver unavailable"})
+                    // Strictly opt-in evidence for the positive default-directory smoke run.
+                    // Paths are returned only over the local E2E command channel; callers must
+                    // not upload or log them.
+                    let e2e_dir_is_valid = dir().is_some_and(|p| p.is_absolute() && p.is_dir());
+                    let has_data_override = std::env::var_os("MUNINN_DATA_DIR").is_some()
+                        || std::env::var_os("MUNINN_E2E_DATA_DIR").is_some();
+                    let allow_default_data_dir =
+                        std::env::var_os("MUNINN_E2E_ALLOW_DEFAULT_DATA_DIR")
+                            .is_some_and(|v| v == "1");
+                    if !cfg!(debug_assertions)
+                        || !super::smoke()
+                        || !e2e_dir_is_valid
+                        || has_data_override
+                        || !allow_default_data_dir
+                    {
+                        return json!({"ok":false,"error":"native smoke default data evidence disabled or required opt-in missing"});
                     }
-                };
-                json!({"ok":true,"data_dir_source":"platform_default",
+                    let state = app.state::<super::AppState>();
+                    let platform_default = match app.path().app_data_dir() {
+                        Ok(path) => path,
+                        Err(_) => {
+                            return json!({"ok":false,"error":"platform app-data resolver unavailable"})
+                        }
+                    };
+                    json!({"ok":true,"data_dir_source":"platform_default",
                     "configured_data_dir":state.smoke_data_dir.to_string_lossy(),
                     "platform_default_data_dir":platform_default.to_string_lossy(),
                     "configured_matches_platform_default":state.smoke_data_dir == platform_default})
+                }
             }
             "state" => {
                 let window = app.get_webview_window("main");
@@ -639,7 +645,9 @@ fn main() {
             #[cfg(feature = "native-smoke")]
             {
                 if smoke() {
-                    app.path().app_data_dir()?
+                    std::env::var_os("MUNINN_E2E_DATA_DIR")
+                        .map(PathBuf::from)
+                        .unwrap_or(app.path().app_data_dir()?)
                 } else {
                     app.path().app_data_dir()?
                 }
