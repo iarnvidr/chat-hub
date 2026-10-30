@@ -86,8 +86,10 @@ class NativeSmokeWiring(unittest.TestCase):
         self.assertIn("service_json_path", script)
         self.assertIn("app_alive", script)
         self.assertIn("app_exitcode", script)
-        self.assertIn("chat-hub-release-evidence/**", workflow)
-        self.assertIn("release-evidence/**", workflow)
+        self.assertIn("chat-hub-safe-evidence/**", workflow)
+        self.assertIn("chat-hub-release-evidence\"", workflow)
+        self.assertIn("prepare-native-evidence.py", workflow)
+        self.assertIn('"$RUNNER_TEMP/chat-hub-release-evidence"', workflow)
         self.assertIn("if-no-files-found: error", workflow)
         self.assertNotIn("service.token", workflow)
 

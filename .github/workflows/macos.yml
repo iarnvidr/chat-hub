@@ -90,7 +90,20 @@ jobs:
           RUSTUP_HOME: ${{ env.RUSTUP_HOME }}
           CARGO_HOME: ${{ env.CARGO_HOME }}
           NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-launch-evidence
-        run: bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-native-launch-evidence" basic
+        run: |
+          set -uo pipefail
+          final_rc=1
+          for attempt in 1 2; do
+            evidence="$RUNNER_TEMP/chat-hub-native-launch-evidence/attempt-$attempt"
+            set +e
+            bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$evidence" basic
+            rc=$?
+            set -e
+            echo "Required native launch smoke attempt $attempt exit code: $rc; evidence: $evidence" | tee -a "$GITHUB_STEP_SUMMARY"
+            final_rc=$rc
+            if [ "$rc" -eq 0 ]; then break; fi
+          done
+          exit "$final_rc"
       - name: Advisory provider proxy capture and denial smoke (debug bundle)
         continue-on-error: true
         if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
@@ -112,6 +125,9 @@ jobs:
         env:
           NATIVE_UI_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-debug-ui-evidence
         run: bash build/native-ui-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-debug-ui-evidence"
+      - name: Prepare allowlisted release and native smoke evidence
+        if: always()
+        run: python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-debug-ui-evidence" "$RUNNER_TEMP/chat-hub-provider-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence"
       - name: Upload release startup evidence
         if: always()
         continue-on-error: true
@@ -119,9 +135,7 @@ jobs:
         with:
           name: chat-hub-macos-release-evidence
           path: |
-            ${{ runner.temp }}/chat-hub-release-evidence/**
-            ${{ runner.temp }}/chat-hub-native-launch-evidence/**
-            ${{ runner.temp }}/chat-hub-native-ui-evidence/**
+            ${{ runner.temp }}/chat-hub-safe-evidence/**
           if-no-files-found: error
           retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
       - id: upload
@@ -131,15 +145,12 @@ jobs:
           name: chat-hub-macos-arm64
           path: |
             ${{ runner.temp }}/chat-hub/Chat Hub.app/**
-            ${{ runner.temp }}/chat-hub-native-launch-evidence/**
+            ${{ runner.temp }}/chat-hub-safe-evidence/**
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.zip.sha256
             ${{ runner.temp }}/chat-hub/Chat_Hub_*.dmg
             ${{ runner.temp }}/chat-hub/verify-macos.txt
-            ${{ runner.temp }}/chat-hub-release-evidence/**
-            ${{ runner.temp }}/release-evidence/**
-            ${{ runner.temp }}/chat-hub-debug-ui-evidence/**
-            ${{ runner.temp }}/chat-hub-updater-evidence/**
+            ${{ runner.temp }}/chat-hub-safe-evidence/**
           if-no-files-found: error
           # Builds of main stay downloadable for a month; PR builds for a week.
           retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}

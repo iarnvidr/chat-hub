@@ -6,11 +6,76 @@ data = pathlib.Path(os.environ['MUNINN_E2E_DATA_DIR']).resolve()
 e2e=pathlib.Path(os.environ['MUNINN_E2E_DIR']); bundle=plistlib.loads((app/'Contents/Info.plist').read_bytes()); bid=bundle['CFBundleIdentifier']
 record={'app':str(app),'bundle_id':bid}; proc=None
 
+EVAL_MAX_ATTEMPTS=4
+EVAL_DEADLINE_SECONDS=90
+EVAL_ATTEMPT_SECONDS=20
+record['eval_attempts']=[]
+
+def _persist_attempts():
+ try:
+  (evidence/'native-launch-result.json').write_text(json.dumps(record,sort_keys=True,indent=2)+'\n')
+ except OSError: pass
+ try:
+  summary=os.environ.get('GITHUB_STEP_SUMMARY')
+  if summary:
+   rows=['| Eval op | Attempt | Elapsed ms | Outcome | Wake diagnostics |','|---|---:|---:|---|---|']
+   for a in record['eval_attempts']:
+    rows.append(f"| {a['op']} | {a['attempt']} | {a['elapsed_ms']} | {a['outcome']} | {a.get('wake','')[:200]} |")
+   with open(summary,'a') as f: f.write('\n### Native eval IPC attempts\n'+'\n'.join(rows)+'\n')
+ except OSError: pass
+
+def _wake_app(deadline):
+ started=time.monotonic(); info=[]
+ def budget(): return max(0,min(2,deadline-time.monotonic()))
+ try:
+  if deadline-time.monotonic() <= 0: return '; '.join(info), int((time.monotonic()-started)*1000)
+  r=subprocess.run(['open','-a',str(app)],capture_output=True,text=True,timeout=budget())
+  info.append(f'open rc={r.returncode} stderr={r.stderr[:200]}')
+ except Exception as e: info.append(f'open {type(e).__name__}: {str(e)[:200]}')
+ try:
+  if deadline-time.monotonic() <= 0: return '; '.join(info), int((time.monotonic()-started)*1000)
+  r=subprocess.run(['osascript','-e','tell application "System Events" to get unix id of first process whose frontmost is true'],capture_output=True,text=True,timeout=budget())
+  pid_text=r.stdout.strip()
+  pid=int(pid_text) if pid_text.isdigit() else None
+  valid=bool(proc and pid==proc.pid and proc.poll() is None)
+  info.append(f'frontmost_pid={pid_text[:40]} validated_child={valid} rc={r.returncode} stderr={r.stderr[:200]}')
+ except Exception as e: info.append(f'frontmost {type(e).__name__}: {str(e)[:200]}')
+ try:
+  if deadline-time.monotonic() <= 0: return '; '.join(info), int((time.monotonic()-started)*1000)
+  r=subprocess.run(['caffeinate','-u','-t','2'],capture_output=True,text=True,timeout=budget())
+  info.append(f'caffeinate rc={r.returncode} stderr={r.stderr[:200]}')
+ except Exception as e: info.append(f'caffeinate {type(e).__name__}: {str(e)[:200]}')
+ return '; '.join(info)[:600], int((time.monotonic()-started)*1000)
+
+def _run_eval(op, fields, *, clock=time.monotonic, wake=_wake_app, call=None):
+ deadline=clock()+EVAL_DEADLINE_SECONDS
+ errors=[]
+ for attempt in range(1,EVAL_MAX_ATTEMPTS+1):
+  begin=clock(); ident=f'launch-{time.time_ns()}-{attempt}'; wake_info,wake_ms=wake(deadline)
+  entry={'op':op,'attempt':attempt,'request_id':ident,'elapsed_ms':0,'outcome':'pending','wake':wake_info}
+  record['eval_attempts'].append(entry)
+  remaining=deadline-clock()
+  if remaining<=0: entry['outcome']='deadline'; entry['elapsed_ms']=int((clock()-begin)*1000); _persist_attempts(); break
+  try:
+   value=(call or _bridge_once)(op, _timeout=min(EVAL_ATTEMPT_SECONDS,remaining), _ident=ident, **fields)
+   entry['outcome']='ok'; entry['elapsed_ms']=int((clock()-begin)*1000); _persist_attempts(); return value
+  except RuntimeError as exc:
+   entry['outcome']='timeout' if 'IPC timed out' in str(exc) else 'error'
+   entry['error']=str(exc)[:300]; entry['elapsed_ms']=int((clock()-begin)*1000); _persist_attempts()
+   if entry['outcome']!='timeout': raise
+   errors.append(str(exc))
+  if clock()>=deadline: break
+ raise RuntimeError(f'eval IPC failed after bounded retries: {errors}; attempts={record["eval_attempts"]!r}')
+
 def bridge(op, **fields):
- ident=f'launch-{time.time_ns()}'; cmd=e2e/f'{ident}.cmd.json'; result=e2e/f'{ident}.res.json'
+ if op!='eval': return _bridge_once(op, **fields)
+ return _run_eval(op,fields)
+
+def _bridge_once(op, _timeout=40, _ident=None, **fields):
+ ident=_ident or f'launch-{time.time_ns()}'; cmd=e2e/f'{ident}.cmd.json'; result=e2e/f'{ident}.res.json'
  tmp=cmd.with_suffix('.tmp'); tmp.write_text(json.dumps({'id':ident,'op':op,'target':'chrome',**fields})); os.replace(tmp,cmd)
  try:
-  end=time.monotonic()+40
+  end=time.monotonic()+_timeout
   while time.monotonic()<end:
    if result.exists():
     v=json.loads(result.read_text())
@@ -19,9 +84,9 @@ def bridge(op, **fields):
      value=v['value']
      if isinstance(value,dict) and value.get('error'): raise RuntimeError(f'JavaScript evaluation failed: {value["error"]}')
      return value
-    if op=='eval': time.sleep(.1); continue
+    if op=='eval': time.sleep(min(.1,max(0,end-time.monotonic()))); continue
     return v
-   time.sleep(.1)
+   time.sleep(min(.1,max(0,end-time.monotonic())))
   raise RuntimeError(f'{op} IPC timed out')
  finally: cmd.unlink(missing_ok=True); result.unlink(missing_ok=True)
 
@@ -177,7 +242,7 @@ try:
  ports_closed(service_after_reopen); record['ports_closed_after_quit']=True
  record['passed']=True
 except Exception as exc:
- record.update(passed=False,error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc()); print(record['traceback'],file=sys.stderr,flush=True)
+ record.update(passed=False,error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc()); _persist_attempts(); print(record['traceback'],file=sys.stderr,flush=True)
 finally:
  (evidence/'native-launch-result.json').write_text(json.dumps(record,sort_keys=True,indent=2)+'\n')
  if proc is not None and proc.poll() is None:
