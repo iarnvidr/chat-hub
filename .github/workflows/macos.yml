@@ -35,6 +35,10 @@ jobs:
           echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
       - name: Install locked frontend dependencies
         run: npm ci
+      - name: Early production Tauri compile gate
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin
+      - name: Early native-smoke Tauri compile gate
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin --features native-smoke
       - name: Build real Tauri app, ad-hoc signed (not notarized)
         run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
       - name: Build and mount-verify the DMG with corresponding sources

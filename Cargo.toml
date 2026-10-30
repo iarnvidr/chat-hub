@@ -34,6 +34,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 rcgen = { version = "0.13", features = ["pem"] }
 x509-parser = "0.16"
+url = "=2.5.8"
 
 [profile.release]
 lto = true

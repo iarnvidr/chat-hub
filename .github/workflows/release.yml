@@ -53,6 +53,10 @@ jobs:
           PY
       - name: Install locked frontend dependencies
         run: npm ci
+      - name: Early production Tauri compile gate
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin
+      - name: Early native-smoke Tauri compile gate
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin --features native-smoke
       - name: Build ad-hoc Apple Silicon Tauri app (not notarized; no Apple account)
         run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
       - name: Required startup and authenticated health smoke

@@ -239,6 +239,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "url",
  "webpki-roots 0.26.11",
  "x509-parser",
 ]

@@ -19,22 +19,22 @@ class WindowPolicyTests(unittest.TestCase):
             self.assertIn("2 passed", result.stdout)
 
     def test_parsed_urls_execute_production_policy(self):
-        with tempfile.TemporaryDirectory(dir=ROOT) as temp:
-            project = pathlib.Path(temp)
-            (project / "src").mkdir()
-            (project / "tests").mkdir()
-            (project / "Cargo.toml").write_text('[package]\nname="url-policy-check"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nurl="=2.5.8"\n')
-            (project / "src/lib.rs").write_text(f'#[path = "{POLICY}"] pub mod window_policy;')
-            (project / "tests/parsed.rs").write_text('''use url::Url; use url_policy_check::window_policy::{allows_origin,is_provider_origin};\n#[test] fn parsed_origins_are_strict() {\n for (raw, expected) in [("tauri://localhost",true),("http://tauri.localhost",true),("https://tauri.localhost",false),("http://tauri.localhost:8080",false),("http://tauri.localhost:443",false),("http://user@tauri.localhost",false),("http://user:pw@tauri.localhost",false),("http://tauri.localhost.evil",false)] { let u=Url::parse(raw).unwrap(); assert_eq!(allows_origin(u.scheme(),u.host_str(),u.port(),u.username(),u.password()),expected,"{raw}"); }\n for (raw, expected) in [("https://chatgpt.com",true),("https://chatgpt.com/path?q=x",true),("https://chatgpt.com.evil/",false),("https://chatgpt.com.evil@evil/",false),("https://chatgpt.com:444/",false),("https://chatgpt.com:443/",true),("https://chatgpt.com./",false),("http://chatgpt.com/",false)] { let u=Url::parse(raw).unwrap(); assert_eq!(is_provider_origin(u.scheme(),u.host_str(),u.port(),u.username(),u.password()),expected,"{raw}"); }\n for (raw, expected) in [("https://chatgpt.com",true),("https://chatgpt.com/path?q=x",true),("https://chatgpt.com.evil/",false),("https://chatgpt.com.evil@evil/",false),("https://chatgpt.com:444/",false),("https://chatgpt.com:443/",true),("https://chatgpt.com./",false),("http://chatgpt.com/",false)] { let u=Url::parse(raw).unwrap(); assert_eq!(is_provider_origin(u.scheme(),u.host_str(),u.port(),u.username(),u.password()),expected,"{raw}"); }\n}''')
-            result = subprocess.run(["cargo", "test", "--offline", "--manifest-path", str(project / "Cargo.toml")], capture_output=True, text=True, timeout=120)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = subprocess.run(
+            ["cargo", "test", "--locked", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "window_policy"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_native_main_ownership_wiring_is_single_and_post_build(self):
         source = (ROOT / "src-tauri/src/main.rs").read_text()
         setup = source[source.index(".setup(|app|"):]
         self.assertEqual(setup.count("WebviewWindowBuilder::from_config(app, &main_config)"), 1)
         self.assertEqual(setup.count("register_after_build()"), 1)
-        self.assertLess(setup.index(".build()?;"), setup.index("register_after_build()"))
+        self.assertLess(setup.index(".build()?;"), setup.index("main.on_window_event("))
+        self.assertLess(setup.index("main.on_window_event("), setup.index("register_after_build()"))
+        self.assertNotIn(".on_window_event(", setup[:setup.index(".build()?;")])
         self.assertIn("window_policy::allows_origin(", setup)
         self.assertIn("ownership.revoke()", setup)
         self.assertIn("move |event|", setup)

@@ -506,7 +506,11 @@ fn main() {
         let ca = dir.join("ca");
         let (tx, mut rx) = mpsc::channel::<CaptureEvent>(128);
         let store = Arc::new(Mutex::new(
-            Store::open(db.to_str().unwrap()).map_err(std::io::Error::other)?,
+            Store::open(
+                db.to_str()
+                    .ok_or_else(|| std::io::Error::other("database path is not valid UTF-8"))?,
+            )
+            .map_err(std::io::Error::other)?,
         ));
         let ingest = store.clone();
         tauri::async_runtime::spawn(async move {
@@ -562,10 +566,6 @@ fn main() {
         });
         #[cfg(feature = "native-smoke")]
         e2e::start(app.handle().clone());
-        #[cfg(target_os = "macos")]
-        {
-            let proxy_url = format!("http://{}", proxy.addr);
-            let ca_der = proxy.ca.cert_der().map_err(std::io::Error::other)?;
         // Disable Tauri's automatic window creation: the configured main window
         // must be created only through this validated native builder.
         let mut main_config = app
@@ -582,15 +582,7 @@ fn main() {
         main_config.create = false;
         let main_ownership = MainWindowOwnership::new();
         app.manage(main_ownership.clone());
-        tauri::WebviewWindowBuilder::from_config(app, &main_config)?
-            .on_window_event({
-                let ownership = main_ownership.clone();
-                move |event| {
-                    if matches!(event, tauri::WindowEvent::Destroyed) {
-                        ownership.revoke();
-                    }
-                }
-            })
+        let main = tauri::WebviewWindowBuilder::from_config(app, &main_config)?
             .on_navigation(|url| {
                 window_policy::allows_origin(
                     url.scheme(),
@@ -601,16 +593,32 @@ fn main() {
                 )
             })
             .build()?;
+        main.on_window_event({
+            let ownership = main_ownership.clone();
+            move |event| {
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    ownership.revoke();
+                }
+            }
+        });
         // Registration follows successful construction only; JS cannot create or
         // impersonate this native process-local ownership token.
         main_ownership.register_after_build();
+        #[cfg(target_os = "macos")]
+        {
+            let proxy_url = format!("http://{}", proxy.addr);
+            let ca_der = proxy.ca.cert_der().map_err(std::io::Error::other)?;
             let provider = tauri::WebviewWindowBuilder::new(
                 app,
                 "provider",
-                tauri::WebviewUrl::External("https://chatgpt.com".parse().unwrap()),
+                tauri::WebviewUrl::External(
+                    "https://chatgpt.com"
+                        .parse()
+                        .map_err(std::io::Error::other)?,
+                ),
             )
             .title("Provider")
-            .proxy_url(proxy_url.parse().unwrap())
+            .proxy_url(proxy_url.parse().map_err(std::io::Error::other)?)
             .build()?;
             crate::trust_mac::prepare(&ca_der, &provider);
         }
