@@ -99,26 +99,86 @@ pub async fn run_with_capture_context(
     observations: mpsc::Sender<crate::capture_lane::CaptureObservation>,
     profile_scope: impl Into<String>,
 ) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
+    let lane = CaptureLane::new(events, observations, limits);
+    run_source(config, CaptureSource::Legacy(lane), profile_scope.into()).await
+}
+
+/// Shared service capture is optional and bypasses the tee entirely when off.
+pub(crate) async fn run_live(
+    config: ProxyConfig,
+    sink: crate::live_capture::LiveSink,
+) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
+    run_source(
+        config,
+        CaptureSource::Live(sink),
+        "provisional:default".into(),
+    )
+    .await
+}
+
+#[derive(Clone)]
+enum CaptureSource {
+    Legacy(CaptureLane),
+    Live(crate::live_capture::LiveSink),
+}
+enum BodyCapture {
+    Legacy(Accumulator),
+    Live(crate::live_capture::Accumulator),
+}
+impl CaptureSource {
+    fn begin(&self, context: CaptureContext, metadata: CaptureMetadata) -> Option<BodyCapture> {
+        match self {
+            Self::Legacy(lane) => Some(BodyCapture::Legacy(lane.begin(context, metadata))),
+            Self::Live(sink) => sink.begin(context, metadata).map(BodyCapture::Live),
+        }
+    }
+}
+impl BodyCapture {
+    fn observe(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Legacy(c) => c.observe(bytes),
+            Self::Live(c) => c.observe(bytes),
+        }
+    }
+    fn finish(self) {
+        match self {
+            Self::Legacy(c) => c.finish(),
+            Self::Live(c) => c.finish(),
+        }
+    }
+    fn interrupt(self) {
+        match self {
+            Self::Legacy(c) => c.interrupt(),
+            Self::Live(c) => c.interrupt(),
+        }
+    }
+}
+async fn run_source(
+    config: ProxyConfig,
+    lane: CaptureSource,
+    profile_scope: String,
+) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
     if !config.bind.ip().is_loopback() {
         return Err(ProxyError::NonLoopback);
     }
     let ca = Arc::new(Ca::load_or_create(&config.ca_dir)?);
     let listener = TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
-    let lane = CaptureLane::new(events.clone(), observations, limits);
     let c = ca.clone();
     let test = config.test_upstream;
     let roots = config.test_roots;
-    let profile_scope = CaptureContext::at_entry(profile_scope.into(), "", "").profile_scope;
+    let profile_scope = CaptureContext::at_entry(profile_scope, "", "").profile_scope;
     let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         while let Ok((s, _)) = listener.accept().await {
             let ca = c.clone();
             let lane = lane.clone();
             let roots = roots.clone();
             let profile_scope = profile_scope.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let _ = client(s, ca, lane, test, roots, profile_scope).await;
             });
+            while connections.try_join_next().is_some() {}
         }
     });
     Ok((RunningProxy { addr, ca }, task))
@@ -135,11 +195,11 @@ pub async fn run_with_capture(
 /// Forwards every upstream response frame as-is while retaining bounded data-only bytes.
 struct TeeBody {
     inner: Incoming,
-    capture: Option<Accumulator>,
+    capture: Option<BodyCapture>,
     finished: bool,
 }
 impl TeeBody {
-    fn new(inner: Incoming, capture: Accumulator) -> Self {
+    fn new(inner: Incoming, capture: BodyCapture) -> Self {
         let mut body = Self {
             inner,
             capture: Some(capture),
@@ -211,7 +271,7 @@ fn empty_body() -> UnsyncBoxBody<Bytes, hyper::Error> {
 async fn client(
     mut s: TcpStream,
     ca: Arc<Ca>,
-    lane: CaptureLane,
+    lane: CaptureSource,
     test: Option<SocketAddr>,
     roots: Option<PathBuf>,
     profile_scope: String,
@@ -341,11 +401,12 @@ async fn client(
                                     .and_then(|v| v.to_str().ok())
                                     .map(str::to_owned),
                             };
-                            let capture = lane.begin(context, metadata);
-                            let tee = TeeBody::new(body, capture);
+                            let forwarded = match lane.begin(context, metadata) {
+                                Some(capture) => TeeBody::new(body, capture).boxed_unsync(),
+                                None => body.boxed_unsync(),
+                            };
                             Ok::<_, std::convert::Infallible>(Response::from_parts(
-                                parts,
-                                tee.boxed_unsync(),
+                                parts, forwarded,
                             ))
                         }
                         Err(_) => Ok(Response::builder().status(502).body(empty_body()).unwrap()),

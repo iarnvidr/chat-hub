@@ -154,6 +154,7 @@ mod tests {
     }
     fn state(store: Arc<Mutex<crate::store::Store>>) -> ApiState {
         ApiState {
+            capture: None,
             token: Arc::from("secret"),
             reader: None,
             db_ops: Arc::new(Semaphore::new(16)),

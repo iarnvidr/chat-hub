@@ -159,6 +159,8 @@ mod api_readiness_tests {
 }
 
 pub struct ServiceHandle {
+    capture: crate::live_capture::CaptureStatus,
+    live_receiver: Arc<Mutex<mpsc::Receiver<crate::live_capture::Work>>>,
     status: Arc<Mutex<ServiceStatus>>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<TokioJoinHandle<()>>,
@@ -231,6 +233,9 @@ fn lock_status(status: &Mutex<ServiceStatus>) -> std::sync::MutexGuard<'_, Servi
     }
 }
 impl ServiceHandle {
+    pub fn capture_status(&self) -> crate::live_capture::CaptureStatus {
+        self.capture.clone()
+    }
     pub fn status(&self) -> ServiceStatus {
         lock_status(&self.status).clone()
     }
@@ -239,6 +244,7 @@ impl ServiceHandle {
         self.shutdown_timeout(d).await
     }
     pub async fn shutdown_timeout(mut self, budget: Duration) -> IngestStats {
+        self.capture.stop();
         {
             let mut state = lock_status(&self.status);
             if !matches!(state.state, ServiceState::Failed(_)) {
@@ -269,6 +275,11 @@ impl ServiceHandle {
             } else {
                 self.abandon_queue.store(true, Ordering::Release);
                 self.interrupt.interrupt();
+                {
+                    let mut rx = self.live_receiver.lock().unwrap_or_else(|p| p.into_inner());
+                    rx.close();
+                    while rx.try_recv().is_ok() {}
+                }
                 let queued = {
                     let mut rx = self.receiver.lock().unwrap_or_else(|p| p.into_inner());
                     rx.close();
@@ -303,6 +314,12 @@ impl ServiceHandle {
 }
 impl Drop for ServiceHandle {
     fn drop(&mut self) {
+        self.capture.stop();
+        {
+            let mut rx = self.live_receiver.lock().unwrap_or_else(|p| p.into_inner());
+            rx.close();
+            while rx.try_recv().is_ok() {}
+        }
         let _ = self.shutdown.send(true);
         self.writer_stop.store(true, Ordering::Release);
         self.abandon_queue.store(true, Ordering::Release);
@@ -381,6 +398,11 @@ async fn start_internal(
         .map_err(|e| e.to_string())?;
     let api_addr = listener.local_addr().map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel(capacity);
+    let (live_sink, live_rx) = crate::live_capture::channel(config.capture_enabled);
+    let capture = live_sink.status.clone();
+    let live_receiver = Arc::new(Mutex::new(live_rx));
+    let writer_live = live_receiver.clone();
+    let capture_enabled = config.capture_enabled;
     let receiver = Arc::new(Mutex::new(rx));
     let writer_receiver = receiver.clone();
     static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -441,12 +463,19 @@ async fn start_internal(
                     let _ = writer_ready_tx.send(Ok(interrupt));
                     loop {
                         if wf.load(Ordering::Acquire) {
+                            writer_live
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .close();
                             writer_receiver
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .close()
                         }
                         if wa.load(Ordering::Acquire) {
+                            let mut live = writer_live.lock().unwrap_or_else(|p| p.into_inner());
+                            live.close();
+                            while live.try_recv().is_ok() {}
                             let mut rx = writer_receiver.lock().unwrap_or_else(|p| p.into_inner());
                             rx.close();
                             let queued = rx.len() as u64;
@@ -456,6 +485,21 @@ async fn start_internal(
                         }
                         // Holding the receiver lock through accepted accounting makes dequeue
                         // and deadline abandonment mutually exclusive, with no accounting gap.
+                        let live = writer_live
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .try_recv();
+                        if let Ok(work) = live {
+                            lock_status(&writer_status).ingest.accepted += 1;
+                            let committed = work.ingest(&mut store);
+                            let mut status = lock_status(&writer_status);
+                            if committed {
+                                status.ingest.stored += 1;
+                            } else {
+                                status.ingest.failed += 1;
+                            }
+                            continue;
+                        }
                         let received = {
                             let mut rx = writer_receiver.lock().unwrap_or_else(|p| p.into_inner());
                             let received = rx.try_recv();
@@ -474,7 +518,16 @@ async fn start_internal(
                                         released = cv.wait(released).unwrap();
                                     }
                                 }
-                                let out = store.ingest_capture(ev);
+                                // Legacy ingress remains item-count bounded by capacity; its
+                                // bodies are outside the typed live 16 MiB retained budget.
+                                // Disabled capture never archives direct legacy submissions.
+                                let out = if !capture_enabled
+                                    || ev.body.len() > crate::live_capture::ITEM_BYTES
+                                {
+                                    Ok(false)
+                                } else {
+                                    store.ingest_capture(ev)
+                                };
                                 let mut s = lock_status(&writer_status);
                                 match out {
                                     Ok(true) => s.ingest.stored += 1,
@@ -485,7 +538,17 @@ async fn start_internal(
                                     }
                                 }
                             }
-                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                if wf.load(Ordering::Acquire)
+                                    || writer_live
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .is_closed()
+                                {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
                             Err(mpsc::error::TryRecvError::Empty) => {
                                 std::thread::sleep(Duration::from_millis(2))
                             }
@@ -505,7 +568,7 @@ async fn start_internal(
     };
     proxy_config.ca_dir = config.ca_dir.clone();
     proxy_config.bind = config.proxy_addr;
-    let (proxy, pt) = match proxy::run(proxy_config, tx.clone()).await {
+    let (proxy, pt) = match proxy::run_live(proxy_config, live_sink).await {
         Ok(x) => x,
         Err(e) => {
             flag.store(true, Ordering::Release);
@@ -518,8 +581,9 @@ async fn start_internal(
     let api_stop = stop.clone();
     let api_flag = flag.clone();
     let api_readiness = readiness_provider(status.clone());
+    let api_capture = capture.clone();
     let api = tokio::spawn(async move {
-        tokio::select! {_=axum::serve(listener,server::router_with_readiness(api_store,config.bearer_token,identity,api_readiness))=>{},_=stop_rx.changed()=>{}}
+        tokio::select! {_=axum::serve(listener,server::router_with_capture_status(api_store,config.bearer_token,identity,api_readiness,Arc::new(move || api_capture.snapshot())))=>{},_=stop_rx.changed()=>{}}
         if !*api_stop.borrow() {
             api_flag.store(true, Ordering::Release);
             let mut state = lock_status(&api_status);
@@ -570,6 +634,8 @@ async fn start_internal(
     }
     Ok((
         ServiceHandle {
+            capture,
+            live_receiver,
             status,
             shutdown: stop,
             tasks: vec![api, monitor],
@@ -620,6 +686,7 @@ mod deadline_tests {
         std::fs::create_dir_all(&root).unwrap();
         let db = root.join("db.sqlite");
         let config = Config {
+            capture_enabled: false,
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             bearer_token: "test".into(),
             database_path: db.display().to_string(),
@@ -821,6 +888,8 @@ mod writer_panic_tests {
         let store = Store::in_memory().unwrap();
         let interrupt = Arc::new(store.connection().get_interrupt_handle());
         let handle = ServiceHandle {
+            capture: crate::live_capture::CaptureStatus::new(false),
+            live_receiver: Arc::new(Mutex::new(crate::live_capture::channel(false).1)),
             status: status.clone(),
             shutdown: stop,
             tasks: vec![],

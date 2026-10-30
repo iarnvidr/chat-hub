@@ -14,6 +14,7 @@ use tokio::{
 
 fn config(db: String, ca: PathBuf) -> Config {
     Config {
+        capture_enabled: true,
         bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         bearer_token: "test".into(),
         database_path: db,
@@ -261,6 +262,15 @@ async fn dropping_sender_before_deadline_preserves_exact_work_conservation() {
 // Exercise the real CONNECT/TLS proxy feeding the service's bounded writer and SQLite store.
 #[tokio::test]
 async fn tls_capture_flows_through_service_into_conversation_store() {
+    exercise_live_tls(true).await;
+}
+
+#[tokio::test]
+async fn disabled_capture_forwards_tls_without_retention_or_archival() {
+    exercise_live_tls(false).await;
+}
+
+async fn exercise_live_tls(enabled: bool) {
     let root = tmp("tls");
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = CertificateParams::new(vec!["chatgpt.com".into()])
@@ -286,7 +296,13 @@ async fn tls_capture_flows_through_service_into_conversation_store() {
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
-    let body = br#"{"title":"TLS conversation","mapping":{"u":{"parent":null,"message":{"author":{"role":"user"},"content":{"parts":["tls-user"]}}},"a":{"parent":"u","message":{"author":{"role":"assistant"},"content":{"parts":["tls-assistant"]}}}}}"#.to_vec();
+    let body = serde_json::to_vec(
+        &serde_json::from_slice::<serde_json::Value>(include_bytes!(
+            "fixtures/chatgpt-export/array.json"
+        ))
+        .unwrap()[0],
+    )
+    .unwrap();
     let response_body = body.clone();
     let upstream_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -325,16 +341,14 @@ async fn tls_capture_flows_through_service_into_conversation_store() {
     let mut proxy = ProxyConfig::loopback(root.join("unused"));
     proxy.test_upstream = Some(upstream_addr);
     proxy.test_roots = Some(roots);
-    let (handle, _tx) = service::start_with_proxy(
-        config(
-            root.join("db.sqlite").display().to_string(),
-            root.join("ca"),
-        ),
-        1,
-        proxy,
-    )
-    .await
-    .unwrap();
+    let mut service_config = config(
+        root.join("db.sqlite").display().to_string(),
+        root.join("ca"),
+    );
+    service_config.capture_enabled = enabled;
+    let (handle, tx) = service::start_with_proxy(service_config, 1, proxy)
+        .await
+        .unwrap();
     let status = handle.status();
     let proxy_addr = status.proxy_addr.unwrap();
     let ca = chat_hub::ca::Ca::load_or_create(root.join("ca")).unwrap();
@@ -345,7 +359,7 @@ async fn tls_capture_flows_through_service_into_conversation_store() {
         .build()
         .unwrap();
     let response = client
-        .post("https://chatgpt.com/backend-api/conversation/tls-c1")
+        .get("https://chatgpt.com/backend-api/conversation/tls-c1")
         .body("request")
         .send()
         .await
@@ -353,16 +367,94 @@ async fn tls_capture_flows_through_service_into_conversation_store() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.bytes().await.unwrap().as_ref(), body.as_slice());
     upstream_task.await.unwrap();
+    if !enabled {
+        tx.send(event(
+            "/backend-api/conversation/direct-must-not-archive",
+            &body,
+        ))
+        .await
+        .unwrap();
+    }
+    let capture = handle.capture_status();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let api = reqwest::Client::builder().no_proxy().build().unwrap();
+    let api_url = format!("http://{}", status.api_addr.unwrap());
+    let detail = loop {
+        let bytes = api
+            .get(format!("{api_url}/api/v1/status"))
+            .bearer_auth("test")
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["capture"]["enabled"], enabled);
+        if enabled && v["capture"]["counters"]["committed_imported"] == 1 {
+            break v;
+        }
+        if !enabled && handle.status().ingest.ignored == 1 {
+            break v;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{v}");
+        tokio::task::yield_now().await;
+    };
+    if !enabled {
+        assert_eq!(detail["capture"]["counters"]["started"], 0);
+        assert_eq!(detail["capture"]["counters"]["retained_bytes"], 0);
+    } else {
+        let bytes = api
+            .get(format!("{api_url}/api/v1/conversations"))
+            .bearer_auth("test")
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(list["items"].as_array().unwrap().len(), 1);
+        let id = list["items"][0]["id"].as_str().unwrap();
+        let mut url = reqwest::Url::parse(&format!("{api_url}/api/v1/conversations/")).unwrap();
+        url.path_segments_mut().unwrap().pop_if_empty().push(id);
+        let bytes = api
+            .get(url)
+            .bearer_auth("test")
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let graph: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 3);
+        assert_eq!(graph["selection"]["selected_node_id"], "right");
+        assert!(graph["messages"].to_string().contains("future_part"));
+    }
     let stats = tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
         .await
         .unwrap();
-    assert_eq!(stats.stored, 1);
+    assert_eq!(stats.stored, u64::from(enabled));
     assert_eq!(stats.failed, 0);
     assert_eq!(stats.unprocessed, 0);
     let store =
         chat_hub::store::Store::open(&root.join("db.sqlite").display().to_string()).unwrap();
-    let saved = store.read("tls-c1").unwrap().unwrap();
-    assert_eq!(saved["messages"].as_array().unwrap().len(), 2);
-    assert!(saved.to_string().contains("tls-assistant"));
+    assert_eq!(
+        store.library_snapshot().unwrap().conversations.len(),
+        usize::from(enabled)
+    );
+    if enabled {
+        let snapshot = store.library_snapshot().unwrap();
+        let saved = store
+            .read_normalized(snapshot.conversations[0]["id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["messages"].as_array().unwrap().len(), 2);
+        assert!(saved.to_string().contains("Selected synthetic answer"));
+    }
+    let counters = serde_json::to_value(capture.snapshot()).unwrap();
+    assert_eq!(counters["counters"]["active"], 0);
+    assert_eq!(counters["counters"]["retained_bytes"], 0);
     let _ = std::fs::remove_dir_all(root);
 }

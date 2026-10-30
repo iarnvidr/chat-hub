@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod importer;
 pub mod library_export;
+pub mod live_capture;
 pub mod proxy;
 pub mod runtime;
 pub mod server;

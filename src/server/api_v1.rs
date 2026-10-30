@@ -265,6 +265,7 @@ impl ReadAdapter for StoreReader {
 }
 #[derive(Clone)]
 struct ApiState {
+    capture: Option<super::CaptureStatusProvider>,
     token: Arc<str>,
     reader: Option<Reader>,
     db_ops: Arc<Semaphore>,
@@ -286,6 +287,7 @@ pub fn router(reader: Box<dyn ReadAdapter>, token: String) -> Router {
         Some(Arc::new(Mutex::new(reader))),
         Arc::new(Semaphore::new(super::MAX_DB_OPS)),
         None,
+        None,
     )
 }
 pub(super) fn routes(
@@ -293,6 +295,7 @@ pub(super) fn routes(
     reader: Option<Reader>,
     db_ops: Arc<Semaphore>,
     import_store: Option<Arc<Mutex<crate::store::Store>>>,
+    capture: Option<super::CaptureStatusProvider>,
 ) -> Router {
     let state = ApiState {
         token,
@@ -300,6 +303,7 @@ pub(super) fn routes(
         db_ops,
         import_store,
         import_ops: Arc::new(Semaphore::new(1)),
+        capture,
     };
     Router::new()
         .route("/api/v1/status", get(status))
@@ -427,23 +431,27 @@ fn checked_json(value: Value) -> ApiResult {
 
 async fn status(State(s): State<ApiState>) -> Response {
     match run_read(&s, |r| r.diagnostics()).await {
-        Ok(d) => {
+        Ok(mut d) => {
             // Never infer service readiness from a successful database probe.
             let healthy = d.status == "healthy"
                 && d.service.status == "ready"
                 && d.database.status == "healthy";
-            if healthy {
-                (StatusCode::OK, Json(d)).into_response()
-            } else {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(Diagnostics {
-                        status: "failed".into(),
-                        ..d
-                    }),
-                )
-                    .into_response()
+            if !healthy {
+                d.status = "failed".into();
             }
+            let mut body = json!(d);
+            if let Some(provider) = &s.capture {
+                body["capture"] = json!(provider());
+            }
+            (
+                if healthy {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                Json(body),
+            )
+                .into_response()
         }
         Err(error) => error.into_response(),
     }
@@ -936,6 +944,7 @@ mod tests {
             Arc::from("secret"),
             Some(Arc::new(Mutex::new(Box::new(reader)))),
             permits.clone(),
+            None,
             None,
         );
         let req = || {
