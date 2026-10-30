@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::store::{GraphNode, Observation, Store};
 use serde_json::{json, Value};
 use std::io::{self, Write};
@@ -65,12 +67,7 @@ fn deterministic_lossless_streamed_rows_and_no_clobber() {
         doc["observations"][0]["raw_payload"],
         "{\"payload\":[null,3]}"
     );
-    let path = std::env::temp_dir().join(format!(
-        "export-{}-{}.json",
-        std::process::id(),
-        meta.library_revision
-    ));
-    let _ = std::fs::remove_file(&path);
+    let path = common::temp_dir("store-export-json").join("export.json");
     let receipt = store.export_json_to(&path).unwrap();
     assert_eq!(receipt.metadata, meta);
     assert!(store.export_json_to(&path).is_err());
@@ -91,8 +88,7 @@ fn export_keeps_one_snapshot_while_wal_writer_commits() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    let db = std::env::temp_dir().join(format!("export-snapshot-{}.sqlite", std::process::id()));
-    let _ = std::fs::remove_file(&db);
+    let db = common::temp_dir("export-snapshot").join("snapshot.sqlite");
     let path = db.to_str().unwrap();
     let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();

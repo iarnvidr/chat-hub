@@ -24,15 +24,25 @@ internal bookkeeping is likewise not a portable API. Credentials/secrets are
 not specially stripped: archives contain personal conversation/library content
 and must be protected accordingly.
 
-Publication uses an adjacent staging file and a no-replace hard link. The
-completed file becomes atomically visible at the destination, so observers do
+On Unix, the adjacent staging file is created with mode `0600`, so the
+published backup/export remains private regardless of the process umask. On
+other platforms, creation follows platform defaults/umask; no equivalent mode
+is asserted here. Publication uses an adjacent staging file and a no-replace
+hard link. The completed file becomes atomically visible at the destination, so observers do
 not see a partially-written destination. The staging file is then unlinked and,
 on Unix, the parent directory is synced. Atomic visibility is distinct from
 crash durability: a failed post-publication unlink or directory sync returns an
 `ArchivePublished` error identifying the destination and failed operation. The
 target is already complete and published; durability is unconfirmed, so callers
 must not treat the result as an ordinary unpublished failure or blindly retry
-to the same existing destination. Staging cleanup is best-effort on errors and
+to the same existing destination. The backup busy-deadline test checks a
+specific timeout error, bounded elapsed time, preservation of an existing
+destination, and staging cleanup. Its concurrent WAL snapshot test verifies a
+transaction-consistent copy while a writer runs, including at least one commit
+before and after backup; its commit counter is sampled before and after the
+backup call, not instrumented during the snapshot itself. The separate JSON
+export concurrency test uses a barrier during the export. These tests do not
+establish a universal concurrency guarantee. Staging cleanup is best-effort on errors and
 drop; there is no absolute cleanup or crash-durability guarantee.
 
 ## JSON export

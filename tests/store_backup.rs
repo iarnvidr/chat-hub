@@ -1,3 +1,5 @@
+mod common;
+
 use chat_hub::{
     archive::BackupReceipt,
     store::{GraphNode, Observation, Store},
@@ -45,18 +47,6 @@ fn node(id: &str, parent: Option<&str>, parts: Vec<Value>) -> GraphNode {
         parts,
     }
 }
-fn temp_dir(label: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "chat-hub-backup-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 fn check_database(path: &std::path::Path) -> Connection {
     let db = Connection::open(path).unwrap();
     assert_eq!(
@@ -75,9 +65,7 @@ fn check_database(path: &std::path::Path) -> Connection {
 
 #[test]
 fn backup_is_independent_valid_and_never_overwrites() {
-    let dir = std::env::temp_dir().join(format!("chat-hub-backup-{}-{}", std::process::id(), 93));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::temp_dir("chat-hub-backup-basic");
     let source = dir.join("source.db");
     let dest = dir.join("backup.db");
     let mut store = Store::open(source.to_str().unwrap()).unwrap();
@@ -131,6 +119,14 @@ fn backup_is_independent_valid_and_never_overwrites() {
         receipt.conversation_count
     );
     assert_eq!(receipt.conversation_count, 2);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     assert_eq!(
         copy.query_row("SELECT count(*) FROM observations", [], |r| r
             .get::<_, i64>(0))
@@ -165,7 +161,7 @@ fn backup_is_independent_valid_and_never_overwrites() {
 
 #[test]
 fn populated_backup_is_a_consistent_snapshot_during_wal_writes() {
-    let dir = temp_dir("wal-concurrent");
+    let dir = common::temp_dir("wal-concurrent");
     let source = dir.join("source.db");
     let dest = dir.join("backup.db");
     let mut store = Store::open(source.to_str().unwrap()).unwrap();
@@ -269,7 +265,7 @@ fn populated_backup_is_a_consistent_snapshot_during_wal_writes() {
 #[test]
 fn backup_rejects_existing_aliases_and_cleans_failed_staging() {
     use std::os::unix::fs::symlink;
-    let dir = temp_dir("aliases");
+    let dir = common::temp_dir("aliases");
     let source = dir.join("source.db");
     let dest = dir.join("backup.db");
     let store = Store::open(source.to_str().unwrap()).unwrap();
@@ -297,7 +293,7 @@ fn backup_rejects_existing_aliases_and_cleans_failed_staging() {
 fn backup_busy_deadline_is_bounded_and_cleans_staging() {
     use chat_hub::archive::backup_to_completion;
     use rusqlite::backup::Backup;
-    let dir = temp_dir("busy-deadline");
+    let dir = common::temp_dir("busy-deadline");
     let source = dir.join("source.db");
     let store = Store::open(source.to_str().unwrap()).unwrap();
     let blocker = Connection::open(&source).unwrap();
@@ -317,7 +313,12 @@ fn backup_busy_deadline_is_bounded_and_cleans_staging() {
             Duration::from_millis(50),
         )
     };
-    assert!(result.is_err());
+    assert!(matches!(
+        result,
+        Err(chat_hub::error::Error::Configuration(message))
+            if message == "database backup busy timeout elapsed"
+                || message == "database backup deadline elapsed"
+    ));
     assert!(start.elapsed() < Duration::from_secs(2));
     assert_eq!(std::fs::read(&dest).unwrap(), b"preserved database");
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
@@ -331,7 +332,7 @@ fn backup_busy_deadline_is_bounded_and_cleans_staging() {
 #[test]
 fn atomic_output_destination_race_preserves_target_and_cleans_stage() {
     use chat_hub::archive::AtomicOutput;
-    let dir = temp_dir("publication-race");
+    let dir = common::temp_dir("publication-race");
     let dest = dir.join("backup.db");
     let mut output = AtomicOutput::new(&dest).unwrap();
     std::io::Write::write_all(output.file(), b"complete staged bytes").unwrap();

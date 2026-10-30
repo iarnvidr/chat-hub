@@ -1,23 +1,8 @@
+mod common;
+
 use chat_hub::store::{GraphNode, Observation, Store};
 use serde_json::{json, Value};
-use std::{
-    fs,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-fn temp_dir() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "chat-hub-cli-archive-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&d).unwrap();
-    d
-}
+use std::{fs, process::Command};
 fn invoke(command: &str, extra: &[&str], db: &std::path::Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_chat-hub"))
         .arg(command)
@@ -55,7 +40,7 @@ fn populate(path: &std::path::Path) {
 }
 #[test]
 fn cli_backup_and_export_json_use_store_and_emit_only_receipts() {
-    let d = temp_dir();
+    let d = common::temp_dir("chat-hub-cli-archive");
     let db = d.join("source.sqlite");
     populate(&db);
     for (cmd, dest) in [

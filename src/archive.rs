@@ -61,11 +61,14 @@ impl AtomicOutput {
         for _ in 0..128 {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
             let staging = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), n));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&staging)
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&staging) {
                 Ok(file) => {
                     return Ok(Self {
                         destination,
@@ -146,13 +149,24 @@ fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static TEST_NEXT: AtomicU64 = AtomicU64::new(0);
+
     #[test]
     fn sync_failure_reports_published_target_and_cleans_stage() {
-        let dir = std::env::temp_dir().join(format!(
-            "archive-publish-{}",
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = loop {
+            let dir = std::env::temp_dir().join(format!(
+                "archive-publish-{}-{}",
+                std::process::id(),
+                TEST_NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => break dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("reserve archive test directory: {error}"),
+            }
+        };
         let dest = dir.join("archive.db");
         let mut output = AtomicOutput::new(&dest).unwrap();
         use std::io::Write;
