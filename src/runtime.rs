@@ -318,13 +318,17 @@ mod publication_tests {
                 |name| {
                     if name == "service.token" {
                         blocked.send(()).unwrap();
-                        resume.recv().unwrap();
+                        resume
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("publisher barrier was not released");
                     }
                     Ok(())
                 },
             )
         });
-        entered.recv().unwrap();
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publisher did not reach credential barrier");
         // This barrier is inside the actual file publisher, immediately before
         // credential rename. No timing assumption, retry, or sleep is involved.
         let hidden = !dir.join("service.json").exists();

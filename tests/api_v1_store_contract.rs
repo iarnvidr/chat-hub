@@ -2,33 +2,10 @@
 //! No SQL, alternate schema, full-snapshot substitution, or canned DTO backend.
 use chat_hub::{
     error::Error,
+    server::api_v1::{SearchHit, Summary},
     store::{GraphNode, ListKey, Observation, Store},
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct Summary {
-    id: String,
-    provider: String,
-    account_scope: String,
-    source_id: String,
-    title: String,
-    updated_at_ms: Option<i64>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct SearchHit {
-    conversation: Summary,
-    node_id: Option<String>,
-    message_id: Option<String>,
-    leaf_node_id: Option<String>,
-    snippet: String,
-    score: f64,
-    selected_branch: bool,
-}
 
 fn observation(source: &str, text: &str) -> Observation {
     let node = |id: &str, parent: Option<&str>, role: Option<&str>, parts: Vec<Value>| GraphNode {

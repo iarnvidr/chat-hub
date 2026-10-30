@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+pub mod api_v1;
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<Store>>,
@@ -24,6 +26,15 @@ pub struct RuntimeIdentity {
     pub pid: u32,
     pub instance_id: String,
 }
+
+/// Neutral lifecycle snapshot supplied by the composition owner. A healthy DB
+/// does not imply a ready service; callers without a provider remain unknown.
+#[derive(Clone, Copy, Debug)]
+pub struct ServiceReadiness {
+    pub ready: bool,
+    pub code: Option<&'static str>,
+}
+pub type ReadinessProvider = Arc<dyn Fn() -> ServiceReadiness + Send + Sync>;
 const MAX_DB_OPS: usize = 16;
 fn overload() -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -129,7 +140,7 @@ async fn read(
     }
 }
 pub fn router(store: Store, token: String) -> Router {
-    build_router(store, token, None)
+    build_router(store, token, None, None)
 }
 
 /// Builds a router whose successful authenticated health response includes the runtime identity.
@@ -139,21 +150,60 @@ pub fn router_with_identity(store: Store, token: String, identity: RuntimeIdenti
         identity.instance_id.len() <= 128,
         "instance_id must be at most 128 bytes"
     );
-    build_router(store, token, Some(identity))
+    build_router(store, token, Some(identity), None)
 }
 
-fn build_router(store: Store, token: String, identity: Option<RuntimeIdentity>) -> Router {
+/// Additive shared-service entrypoint. The provider must take only a quick
+/// lifecycle snapshot; it must not perform I/O or wait for a contended lock.
+pub fn router_with_readiness(
+    store: Store,
+    token: String,
+    identity: RuntimeIdentity,
+    readiness: ReadinessProvider,
+) -> Router {
+    assert!(
+        identity.instance_id.len() <= 128,
+        "instance_id must be at most 128 bytes"
+    );
+    build_router(store, token, Some(identity), Some(readiness))
+}
+
+fn build_router(
+    store: Store,
+    token: String,
+    identity: Option<RuntimeIdentity>,
+    readiness: Option<ReadinessProvider>,
+) -> Router {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         token: Arc::from(token),
         db_ops: Arc::new(Semaphore::new(MAX_DB_OPS)),
         identity,
     };
+    // Share bounded Store reads and actual DB/lifecycle diagnostics with API v1.
+    let reader = api_v1::store_reader(state.store.clone(), readiness);
+    let v1 = api_v1::routes(
+        state.token.clone(),
+        Some(reader),
+        state.db_ops.clone(),
+        Some(state.store.clone()),
+    );
     Router::new()
         .route("/api/health", get(health))
         .route("/api/search", get(search))
         .route("/api/conversations/:id", get(read))
         .with_state(state)
+        .merge(v1)
+}
+
+#[cfg(test)]
+pub(crate) fn status_test_router(store: Arc<Mutex<Store>>, readiness: ReadinessProvider) -> Router {
+    api_v1::routes(
+        Arc::from("secret"),
+        Some(api_v1::store_reader(store.clone(), Some(readiness))),
+        Arc::new(Semaphore::new(MAX_DB_OPS)),
+        Some(store),
+    )
 }
 pub async fn serve(addr: std::net::SocketAddr, store: Store, token: String) -> Result<(), Error> {
     if !addr.ip().is_loopback() {
