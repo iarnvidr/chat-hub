@@ -593,7 +593,11 @@ fn main() {
                     url.password(),
                 )
             })
-            .build()?;
+            .build()
+            .map_err(|error| {
+                eprintln!("main webview setup failed: {error}");
+                error
+            })?;
         main.on_window_event({
             let ownership = main_ownership.clone();
             move |event| {

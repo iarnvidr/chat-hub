@@ -4,6 +4,19 @@ mod window_policy;
 use url::Url;
 
 #[test]
+fn packaged_config_disables_tauri_auto_creation_of_the_protected_main_window() {
+    let config: serde_json::Value =
+        serde_json::from_str(include_str!("../src-tauri/tauri.conf.json")).unwrap();
+    let windows = config["app"]["windows"].as_array().unwrap();
+    let main: Vec<_> = windows
+        .iter()
+        .filter(|window| window["label"].as_str().unwrap_or("main") == "main")
+        .collect();
+    assert_eq!(main.len(), 1);
+    assert_eq!(main[0]["create"], false);
+}
+
+#[test]
 fn parsed_origins_are_strict() {
     use window_policy::{allows_origin, is_provider_origin};
 

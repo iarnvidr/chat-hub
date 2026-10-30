@@ -66,14 +66,20 @@ mod macos {
     }
 }
 fn bounded_line(text: &str) -> String {
+    bounded_line_limit(text, 200)
+}
+fn bounded_panic_line(text: &str) -> String {
+    bounded_line_limit(text, 1000)
+}
+fn bounded_line_limit(text: &str, limit: usize) -> String {
     text.chars()
-        .take(200)
+        .take(limit)
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
 #[cfg(test)]
 mod tests {
-    use super::bounded_line;
+    use super::{bounded_line, bounded_panic_line};
 
     #[test]
     fn bounds_and_sanitizes_diagnostic_lines() {
@@ -82,6 +88,16 @@ mod tests {
         assert_eq!(result.chars().count(), 200);
         assert!(!result.chars().any(char::is_control));
         assert!(bounded_line("safe").contains("safe"));
+    }
+    #[test]
+    fn preserves_duplicate_main_panic_reason_within_panic_bound() {
+        let reason = format!("WebviewWindowBuilder::build: {}", "x".repeat(250));
+        let result = bounded_panic_line(&reason);
+        assert!(result.starts_with("WebviewWindowBuilder::build: "));
+        assert_eq!(result.chars().count(), 279);
+        let unicode = bounded_panic_line(&format!("{}🦀", "x".repeat(999)));
+        assert!(unicode.is_char_boundary(unicode.len()));
+        assert_eq!(unicode.chars().count(), 1000);
     }
 }
 fn panic_hook(info: &std::panic::PanicHookInfo<'_>) {
@@ -99,7 +115,7 @@ fn panic_hook(info: &std::panic::PanicHookInfo<'_>) {
     let mut report = format!(
         "Rust panic at {}: {}\n",
         bounded_line(&location),
-        bounded_line(payload)
+        bounded_panic_line(payload)
     );
     for line in backtrace.lines().take(200) {
         report.push_str(&bounded_line(line));
@@ -108,7 +124,8 @@ fn panic_hook(info: &std::panic::PanicHookInfo<'_>) {
     // Bound the complete diagnostic, not just individual lines, including evidence output.
     report = report
         .lines()
-        .map(bounded_line)
+        .enumerate()
+        .map(|(index, line)| bounded_line_limit(line, if index == 0 { 1030 } else { 200 }))
         .collect::<Vec<_>>()
         .join("\n");
     report.push('\n');

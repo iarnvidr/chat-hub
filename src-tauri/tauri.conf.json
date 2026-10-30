@@ -12,7 +12,8 @@
       {
         "title": "Chat Hub",
         "width": 1100,
-        "height": 760
+        "height": 760,
+        "create": false
       }
     ],
     "security": {

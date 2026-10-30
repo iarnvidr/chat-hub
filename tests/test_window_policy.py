@@ -32,9 +32,10 @@ class WindowPolicyTests(unittest.TestCase):
         setup = source[source.index(".setup(|app|"):]
         self.assertEqual(setup.count("WebviewWindowBuilder::from_config(app, &main_config)"), 1)
         self.assertEqual(setup.count("register_after_build()"), 1)
-        self.assertLess(setup.index(".build()?;"), setup.index("main.on_window_event("))
+        build_end = setup.index(".map_err(|error|", setup.index("WebviewWindowBuilder::from_config(app, &main_config)"))
+        self.assertLess(build_end, setup.index("main.on_window_event("))
         self.assertLess(setup.index("main.on_window_event("), setup.index("register_after_build()"))
-        self.assertNotIn(".on_window_event(", setup[:setup.index(".build()?;")])
+        self.assertNotIn(".on_window_event(", setup[:setup.index("WebviewWindowBuilder::from_config(app, &main_config)" )])
         self.assertIn("window_policy::allows_origin(", setup)
         self.assertIn("ownership.revoke()", setup)
         self.assertIn("move |event|", setup)
@@ -58,7 +59,9 @@ fn main() {{ crash_diagnostics::install(); panic!("{{}}", format!("UNICODE-λ-{{
             self.assertIn(b"Rust panic at", report)
             self.assertIn("UNICODE-λ-".encode(), report)
             self.assertLessEqual(len(report), 40 * 1024)
-            for line in report.splitlines():
+            lines = report.splitlines()
+            self.assertLessEqual(len(lines[0].decode("utf-8")), 1030)
+            for line in lines[1:]:
                 self.assertLessEqual(len(line.decode("utf-8")), 200)
             evidence = (temp / "evidence").read_bytes()
             self.assertLessEqual(len(evidence), 40 * 1024)
