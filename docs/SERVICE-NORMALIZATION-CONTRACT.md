@@ -1,6 +1,6 @@
 # Shared service and normalization contract
 
-**Status:** design contract, not implemented. **Version:** 0.1 (proposed). This document defines acceptance criteria for the next shared-service/model work; it does not authorize schema, proxy, or capture-worker changes. The current desktop native run at HEAD `3efa723` is a separate pending validation; this documentation commit changes no runtime behavior and is not evidence that run passed.
+**Status:** proposed full-contract requirements, not a current product/readiness report. **Version:** 0.1 (proposed). Some library capabilities discussed here, including normalized storage, import, graph navigation, and full-text search, have since landed. The broader requirements below for account scope, observation reconciliation, bounded durable ingestion, lifecycle, and cross-entrypoint equivalence remain design/acceptance work. Hosted PR23 debug-native run [41110436605](https://github.com/iarnvidr/chat-hub/actions/runs/41110436605) verifies only the bounded library fixture flow described in [updater/release status](UPDATES.md); it does not accept this full contract. This document does not authorize schema, proxy, or capture-worker changes.
 
 ## Goal and compatibility boundary
 
@@ -8,9 +8,9 @@ CLI and desktop are two entry points to one local service and one durable conver
 
 Preserve the current CLI commands (`status`, `search`, `read`, `serve`), API routes, and legacy four-field capture event/run integration during additive rollout. New capture metadata/context is additive; it must not silently alter old event meaning or make old callers fail to compile. This contract does not promise provider compatibility or permit proxy-scope expansion.
 
-## Current implementation and gaps (source locations)
+## Original implementation snapshot and remaining contract gaps
 
-Line numbers refer to the source at base HEAD `3efa723`; recheck them when implementing.
+The table describes source at base HEAD `3efa723`, before the later library and desktop work; its implementation column is historical. The broader contract gaps remain proposed requirements unless current source and acceptance evidence demonstrate them.
 
 | Location | Current behavior | Gap against this contract |
 |---|---|---|

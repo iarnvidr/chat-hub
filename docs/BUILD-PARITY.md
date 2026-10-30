@@ -1,5 +1,7 @@
 # Build and release parity audit
 
+This is a historical path-by-path port audit, not the current product-status or release-acceptance record. The current library implementation and bounded PR23 debug-native evidence are summarized in [architecture](ARCHITECTURE.md) and [updater/release status](UPDATES.md); the audit's implementation-gap statements below describe the earlier audit snapshot.
+
 Comparison performed against the already-present public `iarnvidr/muninn` shallow clone at `51bd490c9fbbcaec1abb7b6b153dc40617dea6de` (also observed as remote HEAD). Clone origin is `https://github.com/iarnvidr/muninn.git`; it is shallow and clean. No GitHub API calls or extra clones were used. This is a path-by-path implementation audit, not a claim that Chat Hub has Muninn's product functionality.
 
 ## File-by-file comparison
@@ -24,10 +26,10 @@ Comparison performed against the already-present public `iarnvidr/muninn` shallo
 
 ## Artifact and acceptance truth
 
-The previously observed `muninn-macos-arm64` artifact was only 253 bytes and contains no real app bundle; it is failed-artifact evidence, not a build. No app, mounted DMG, signature, or launch-health PASS is claimed here. This environment is Linux, so the macOS build, codesign, hdiutil mount, app launch and native WKWebView/updater UI acceptance were not executable. `verify-macos.txt` must only be emitted by successful real bundle verification. Hosted macos-15 acceptance remains PENDING per `docs/UPDATES.md`.
+The previously observed `muninn-macos-arm64` artifact was only 253 bytes and contains no real app bundle; it is failed-artifact evidence, not a build. This historical Linux audit did not produce an app, mounted DMG, signature, or launch-health result. Its local environment could not execute macOS build, codesign, hdiutil mount, app launch, or native WKWebView/updater UI acceptance. `verify-macos.txt` must only be emitted by successful real bundle verification. Current run-specific status is maintained in [updater and release status](UPDATES.md).
 
 The release path requires the configured updater public key, private signing secrets, and manual protected environment. It builds a real app, signs its update tarball, emits signature/manifest/source hashes and mount-verifies the DMG. Publication is gated by `publish=false` by default and is not performed by this audit.
 
 ## Exact remaining native shell integration gaps
 
-The permitted port scope excludes `src-tauri/src`, Cargo manifests, and `desktop-ui`. The updater-smoke README describes required debug-only native hook/API commands, but their implementation must be audited/ported in the next desktop integration task. The existing smoke scripts are fail-closed harnesses, not feature implementation. Remaining acceptance: make registered Tauri updater APIs and debug-only feed overrides real; prove native version-0.1.0 to 0.1.1 install/relaunch and wrong-key plus tamper rejection in app UI; prove packaged WKWebView capture and ingestion via synthetic HTTPS provider with auth-host tunnel evidence. Also supply actual library UI functionality before claiming meaningful native UI interactions. Then run on hosted `macos-15`, retain screenshots/logs, and update `docs/UPDATES.md` with run evidence. Real provider account and downloaded-app Gatekeeper behavior remain manual.
+The permitted port scope in this historical audit excluded `src-tauri/src`, Cargo manifests, and `desktop-ui`. Current source includes the native updater interfaces and the desktop library UI; run 41110436605 provides bounded debug-native fixture evidence, not genuine packaged updater or provider-capture acceptance. Remaining acceptance is recorded in [updater/release status](UPDATES.md) and the [release checklist](../RELEASE-CHECKLIST.md). Real provider account behavior and downloaded-app Gatekeeper behavior remain manual.
