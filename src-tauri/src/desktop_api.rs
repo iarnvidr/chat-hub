@@ -32,16 +32,15 @@ pub fn validate_import(data: &[u8]) -> Result<(), String> {
         return Err("file_too_large".into());
     }
     let value: serde_json::Value = serde_json::from_slice(data).map_err(|_| "invalid_json")?;
-    let count = if let Some(array) = value.as_array() {
-        array.len()
+    let conversations = if value.is_array() {
+        value.as_array()
     } else {
         value
             .get("conversations")
-            .and_then(|v| v.as_array())
-            .map(Vec::len)
-            .ok_or("invalid_export")?
-    };
-    if count > MAX_IMPORT_CONVERSATIONS {
+            .and_then(serde_json::Value::as_array)
+    }
+    .ok_or("invalid_export")?;
+    if conversations.len() > MAX_IMPORT_CONVERSATIONS {
         return Err("too_many_conversations".into());
     }
     Ok(())
@@ -103,8 +102,15 @@ pub struct Detail {
     pub conversation: serde_json::Value,
     pub selection: serde_json::Value,
     pub nodes: Vec<serde_json::Value>,
+    pub messages: Vec<serde_json::Value>,
     pub thread_node_ids: Vec<String>,
-    pub branches: Vec<String>,
+    pub branches: Vec<Branch>,
+    pub library_revision: Option<serde_json::Value>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Branch {
+    pub leaf_node_id: String,
+    pub selected: bool,
 }
 fn url(base: &str, segments: &[&str], query: &[(&str, &str)]) -> Result<Url, String> {
     let mut u = Url::parse(base).map_err(|_| "Desktop API unavailable")?;
@@ -157,6 +163,9 @@ fn map_http_error(status: StatusCode, code: Option<&str>) -> &'static str {
         StatusCode::UNAUTHORIZED => "unauthorized",
         StatusCode::NOT_FOUND => "not_found",
         StatusCode::SERVICE_UNAVAILABLE if code == Some("busy") => "busy",
+        StatusCode::SERVICE_UNAVAILABLE if code == Some("response_too_large") => {
+            "response_too_large"
+        }
         StatusCode::SERVICE_UNAVAILABLE => "service_unavailable",
         _ => "service_unavailable",
     }
@@ -174,17 +183,30 @@ async fn get<T: for<'de> Deserialize<'de>>(c: &Client, u: Url, token: &str) -> R
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| "service_unavailable")? {
             let remaining = 4096usize.saturating_sub(body.len());
-            if chunk.len() > remaining { body.extend_from_slice(&chunk[..remaining]); break; }
+            if chunk.len() > remaining {
+                body.extend_from_slice(&chunk[..remaining]);
+                break;
+            }
             body.extend_from_slice(&chunk);
         }
         let parsed: Option<Value> = serde_json::from_slice(&body).ok();
-        let code = parsed.as_ref().and_then(|v| v.get("error").and_then(|e| e.get("code"))
-            .or_else(|| v.get("code"))).and_then(Value::as_str);
+        let code = parsed
+            .as_ref()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("code"))
+                    .or_else(|| v.get("code"))
+            })
+            .and_then(Value::as_str);
         return Err(map_http_error(status, code).into());
     }
     let mut response = r;
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| "Desktop API unavailable")? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Desktop API unavailable")?
+    {
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE {
             return Err("response_too_large".into());
         }

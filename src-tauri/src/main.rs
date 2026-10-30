@@ -357,7 +357,6 @@ async fn import_chatgpt_export(
 }
 
 #[tauri::command]
-#[tauri::command]
 async fn service_health(
     window: tauri::WebviewWindow,
     s: State<'_, AppState>,
@@ -388,6 +387,7 @@ struct ServiceHealth {
     healthy: bool,
 }
 
+#[tauri::command]
 fn update_status(
     window: tauri::WebviewWindow,
     s: State<'_, AppState>,
@@ -585,7 +585,9 @@ fn persistent_token(path: &std::path::Path) -> Result<String, String> {
 fn main() {
     crash_diagnostics::install();
     let updater_builder = tauri_plugin_updater::Builder::new();
-    let builder = tauri::Builder::default().plugin(updater_builder.build()).plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default()
+        .plugin(updater_builder.build())
+        .plugin(tauri_plugin_dialog::init());
     let builder = builder.setup(|app| {
         let dir = {
             #[cfg(feature = "native-smoke")]
@@ -745,6 +747,7 @@ fn main() {
             list_conversations,
             get_conversation,
             import_chatgpt_export,
+            service_health,
             service_info,
             check_for_updates,
             install_update,
@@ -758,6 +761,7 @@ fn main() {
             list_conversations,
             get_conversation,
             import_chatgpt_export,
+            service_health,
             service_info,
             check_for_updates,
             install_update

@@ -26,14 +26,14 @@ export function fixtureAdapter() {
   return {
     async listConversations(query = '', cursor = null) {
       if (query) {
-        const data = await load('../tests/fixtures/desktop-f4/search-hits.json');
-        return data;
+        const data = await load('../tests/fixtures/api-v1/search-page-1.json');
+        const next = await load('../tests/fixtures/api-v1/search-page-2.json'); return {...data, items:[...data.items,...next.items]};
       }
-      return normalizeList(await load(`../tests/fixtures/desktop-f4/${cursor ? 'conversations-page-2.json' : 'conversations-page-1.json'}`));
+      return normalizeList(await load(`../tests/fixtures/api-v1/${cursor ? 'conversations-page-2.json' : 'conversations-page-1.json'}`));
     },
     async getConversation(id, leafNodeId) {
       const fixture = leafNodeId === 'n-b' ? 'conversation-alternate.json' : 'conversation-selected.json';
-      const detail = await load(`../tests/fixtures/desktop-f4/${fixture}`);
+      const detail = await load(`../tests/fixtures/api-v1/${fixture}`);
       if (detail.conversation.id !== id) throw new Error('Conversation not found');
       return detail;
     },
