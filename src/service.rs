@@ -210,7 +210,25 @@ pub async fn start(
 pub async fn start_with_proxy(
     config: Config,
     capacity: usize,
+    proxy_config: ProxyConfig,
+) -> Result<(ServiceHandle, mpsc::Sender<CaptureEvent>), String> {
+    start_internal(
+        config,
+        capacity,
+        proxy_config,
+        Duration::from_millis(100),
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn start_internal(
+    config: Config,
+    capacity: usize,
     mut proxy_config: ProxyConfig,
+    writer_busy_timeout: Duration,
+    #[cfg(test)] writer_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
 ) -> Result<(ServiceHandle, mpsc::Sender<CaptureEvent>), String> {
     if capacity == 0 {
         return Err("capture capacity must be positive".into());
@@ -299,7 +317,7 @@ pub async fn start_with_proxy(
                             return;
                         }
                     };
-                    let _ = store.connection.busy_timeout(Duration::from_millis(100));
+                    let _ = store.connection.busy_timeout(writer_busy_timeout);
                     let interrupt = Arc::new(store.connection.get_interrupt_handle());
                     let _ = writer_ready_tx.send(Ok(interrupt));
                     loop {
@@ -329,6 +347,14 @@ pub async fn start_with_proxy(
                         };
                         match received {
                             Ok(ev) => {
+                                #[cfg(test)]
+                                if let Some(gate) = &writer_gate {
+                                    let (lock, cv) = &**gate;
+                                    let mut released = lock.lock().unwrap();
+                                    while !*released {
+                                        released = cv.wait(released).unwrap();
+                                    }
+                                }
                                 let out = store.ingest_capture(ev);
                                 let mut s = lock_status(&writer_status);
                                 match out {
@@ -444,6 +470,82 @@ pub fn try_submit(
     event: CaptureEvent,
 ) -> Result<(), mpsc::error::TrySendError<CaptureEvent>> {
     sender.try_send(event)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn blocked_writer_hits_deadline_after_sender_drop_and_accounts_queue() {
+        let root = std::env::temp_dir().join(format!(
+            "chat-hub-deadline-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("db.sqlite");
+        let config = Config {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            bearer_token: "test".into(),
+            database_path: db.display().to_string(),
+            ca_dir: root.join("ca"),
+            proxy_addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (handle, tx) = start_internal(
+            config,
+            2,
+            ProxyConfig::loopback(""),
+            Duration::from_secs(30),
+            Some(gate.clone()),
+        )
+        .await
+        .unwrap();
+        let status = handle.status.clone();
+        let capture = |path: &str| CaptureEvent {
+            host: "example.test".into(),
+            path: path.into(),
+            status: 200,
+            body: br#"{"title":"t","mapping":{}}"#.to_vec(),
+        };
+        tx.send(capture("/backend-api/conversation/blocked"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.status().ingest.accepted != 1 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("writer did not dequeue first capture");
+        tx.try_send(capture("/backend-api/conversation/queued"))
+            .unwrap();
+        drop(tx);
+        let stats = handle.shutdown_timeout(Duration::from_millis(1)).await;
+        assert!(
+            matches!(lock_status(&status).state, ServiceState::Failed(ref reason) if reason.contains("shutdown deadline exceeded")),
+            "unexpected service state: {:?}",
+            lock_status(&status).state
+        );
+        assert_eq!(stats.accepted, 1, "{stats:?}");
+        assert_eq!(stats.unprocessed, 2, "{stats:?}");
+        assert_eq!(
+            stats.stored + stats.ignored + stats.failed + stats.unprocessed,
+            2,
+            "{stats:?}"
+        );
+        // Deadline has returned while writer is explicitly held in-flight by the private gate.
+        let (lock, cv) = &*gate;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+        // Give the released writer time to observe abandon_queue and exit before removing files.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]

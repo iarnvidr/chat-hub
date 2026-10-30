@@ -81,7 +81,7 @@ fn serve_rejects_existing_lock_without_overwriting_and_exits_cleanly() {
     );
     fs::remove_dir_all(d).unwrap();
 }
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn fresh_default_startup_creates_canonical_data_dir_and_sigint_cleans_runtime() {
     let d = temp();
