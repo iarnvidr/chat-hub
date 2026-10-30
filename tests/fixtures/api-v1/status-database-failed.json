@@ -1,0 +1,11 @@
+{
+  "status": "failed",
+  "service": {
+    "status": "failed",
+    "code": "database_unavailable"
+  },
+  "database": {
+    "status": "failed",
+    "code": "database_unavailable"
+  }
+}

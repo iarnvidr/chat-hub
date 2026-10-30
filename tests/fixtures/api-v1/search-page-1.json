@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "conversation": {
+        "id": "cv-a",
+        "provider": "chatgpt",
+        "account_scope": "provisional:default",
+        "source_id": "export-cv-a",
+        "title": "Synthetic branches",
+        "updated_at_ms": 1700000003000
+      },
+      "node_id": "n-a",
+      "message_id": "msg-a",
+      "leaf_node_id": "n-a",
+      "snippet": "println!(\"amber telescope\");",
+      "score": -2,
+      "selected_branch": true
+    }
+  ],
+  "next_cursor": "fixture-search-r7-after-n-a",
+  "library_revision": 7
+}
