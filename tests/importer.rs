@@ -146,6 +146,74 @@ fn duplicate_items_are_classified_after_each_commit() {
 }
 
 #[test]
+fn store_write_abort_rolls_back_only_failed_item_and_redacts_diagnostics() {
+    let dir = temporary_dir();
+    let path = dir.join("library.sqlite");
+    let mut store = Store::open(path.to_str().unwrap()).unwrap();
+    let injector = rusqlite::Connection::open(&path).unwrap();
+    // Abort after conversation insertion, while writing the observation, so the
+    // failed item's already-written rows must roll back with its transaction.
+    injector
+        .execute_batch(
+            "CREATE TRIGGER synthetic_import_abort BEFORE INSERT ON observations
+        WHEN (SELECT source_id FROM conversations WHERE id=NEW.conversation_id)='fail-item'
+        BEGIN SELECT RAISE(ABORT, 'PRIVATE_SQL_SENTINEL'); END;",
+        )
+        .unwrap();
+    let template = parse_export(ARRAY).unwrap().remove(0);
+    let entries: Vec<Value> = ["before-item", "fail-item", "after-item"]
+        .iter()
+        .map(|id| {
+            let mut doc = template.clone();
+            doc["id"] = json!(id);
+            doc
+        })
+        .collect();
+    let receipt = import_chatgpt(&mut store, &serde_json::to_vec(&entries).unwrap()).unwrap();
+    assert_eq!(
+        (
+            receipt.imported,
+            receipt.updated,
+            receipt.unchanged,
+            receipt.failed
+        ),
+        (2, 0, 0, 1)
+    );
+    assert_eq!(receipt.errors.len(), 1);
+    assert_eq!(receipt.errors[0].item_index, 1);
+    assert_eq!(receipt.errors[0].code, "store_failed");
+    assert!(!serde_json::to_string(&receipt)
+        .unwrap()
+        .contains("PRIVATE_SQL_SENTINEL"));
+    assert!(!receipt.errors_truncated);
+    drop(store);
+    let store = Store::open(path.to_str().unwrap()).unwrap();
+    let snapshot = store.library_snapshot().unwrap();
+    let mut sources: Vec<_> = snapshot
+        .conversations
+        .iter()
+        .map(|c| c["source_id"].as_str().unwrap())
+        .collect();
+    sources.sort();
+    assert_eq!(sources, ["after-item", "before-item"]);
+    let failed_rows: i64 = injector
+        .query_row(
+            "SELECT count(*) FROM conversations WHERE source_id='fail-item'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(failed_rows, 0);
+    let observations: i64 = injector
+        .query_row("SELECT count(*) FROM observations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(observations, 2);
+    drop(store);
+    drop(injector);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn global_envelopes_and_empty_input() {
     assert_eq!(parse_export(b"[]").unwrap().len(), 0);
     assert_eq!(
