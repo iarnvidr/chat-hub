@@ -4,8 +4,9 @@
 
 The CLI provides local backup and JSON export commands. Both use the configured
 library database (`CHAT_HUB_DATABASE`, or the normal `CHAT_HUB_DATA_DIR` / platform
-default) and initialize/open the shared Store directly; they do not start the
-service, proxy, or capture runtime.
+default) and open the existing shared Store directly; they do not start the
+service, proxy, or capture runtime. The configured source must be a preexisting
+regular file and is opened without SQLite's create flag.
 
 ```sh
 chat-hub backup /path/to/library.sqlite3
@@ -21,11 +22,13 @@ containing operation and record counts/versions; archive contents and secrets
 are not printed. `backup` is a SQLite online backup. It includes the ordinary
 Store schema and rows (including schema migrations, library state, conversations,
 observations, graph nodes, messages, and their associated relational data), not
-an alternate portable interchange format. FTS/search indexes are not part of the
-logical archive contract and can be rebuilt by opening the database. SQLite
-internal bookkeeping is likewise not a portable API. Credentials/secrets are
-not specially stripped: archives contain personal conversation/library content
-and must be protected accordingly.
+an alternate portable interchange format. SQLite backup includes the current
+FTS and search tables as they exist in the source database. SQLite internal
+bookkeeping is likewise not a portable API. Opening a current schema-8 Store
+does not automatically repair missing FTS/search indexes; index creation or
+repair occurs only through explicit maintenance or migrations where
+provided. Credentials/secrets are not specially stripped: archives contain
+personal conversation/library content and must be protected accordingly.
 
 On Unix, the adjacent staging file is created with mode `0600`, so the
 published backup/export remains private regardless of the process umask. On
@@ -58,6 +61,7 @@ order. SQL `NULL` is JSON `null`; text (including values whose content looks
 like JSON) is emitted as a JSON string; raw JSON payload/content columns are
 therefore string-encoded rather than embedded JSON values. This is an export
 representation, not a restore adapter: no JSON import/restore operation is
-provided. FTS/search indexes are excluded and rebuildable. As with SQLite
+provided. Derived FTS/search indexes are excluded from the logical JSON
+representation; JSON restore is not implemented. As with SQLite
 backups, exports may contain sensitive personal conversation content; no
 credential or content redaction is implied.
