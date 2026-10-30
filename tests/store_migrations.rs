@@ -1,5 +1,5 @@
 use chat_hub::store::{GraphNode, Observation, Store};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 fn obs(source: &str, text: &str) -> Observation {
@@ -50,10 +50,10 @@ fn fk_ok(path: &str) {
 }
 
 #[test]
-fn empty_file_opens_at_v3() {
+fn empty_file_opens_at_v4() {
     let p = temp("empty");
     let s = Store::open(&p).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(s.schema_version().unwrap(), 6);
     drop(s);
     fk_ok(&p);
     std::fs::remove_file(p).unwrap();
@@ -71,20 +71,73 @@ fn historical_v1_and_v2_fixtures_migrate_and_reopen_without_changes() {
         .unwrap();
         drop(c);
         let s = Store::open(&p).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 3);
-        assert!(!s.search(&format!("v{version}"), 10).unwrap().is_empty());
+        assert_eq!(s.schema_version().unwrap(), 6);
+        if version == 1 {
+            // Historical v1 has no messages; migration 2 creates the table.
+            let c = Connection::open(&p).unwrap();
+            let message_count: i64 = c
+                .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(message_count, 0);
+            assert!(s.search("v1 searchable", 10).unwrap().is_empty());
+        } else {
+            assert!(!s.search("v2 searchable", 10).unwrap().is_empty());
+        }
         drop(s);
         fk_ok(&p);
         let c = Connection::open(&p).unwrap();
-        let before: (String,String,String)=c.query_row("SELECT c.id,g.source_node_id,g.content FROM conversations c JOIN graph_nodes g ON g.conversation_id=c.id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-        assert_eq!(before.0, format!("legacy-v{version}"));
-        assert_eq!(before.1, "legacy-message");
+        let conversation: (String, String, String) = c
+            .query_row(
+                "SELECT id, title, provider FROM conversations WHERE id=?1",
+                [format!("legacy-v{version}")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            conversation,
+            (
+                format!("legacy-v{version}"),
+                format!("v{version} title"),
+                "legacy".into()
+            )
+        );
+        let before: Option<(String, String)> = c
+            .query_row(
+                "SELECT source_node_id, content FROM graph_nodes WHERE conversation_id=?1",
+                [&conversation.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        if version == 1 {
+            assert_eq!(before, None);
+        } else {
+            assert_eq!(
+                before,
+                Some(("legacy-message".into(), "v2 searchable".into()))
+            );
+        }
         drop(c);
         let s = Store::open(&p).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 3);
+        assert_eq!(s.schema_version().unwrap(), 6);
         drop(s);
         let c = Connection::open(&p).unwrap();
-        let after: (String,String,String)=c.query_row("SELECT c.id,g.source_node_id,g.content FROM conversations c JOIN graph_nodes g ON g.conversation_id=c.id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let after_conversation: (String, String, String) = c
+            .query_row(
+                "SELECT id, title, provider FROM conversations WHERE id=?1",
+                [format!("legacy-v{version}")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let after: Option<(String, String)> = c
+            .query_row(
+                "SELECT source_node_id, content FROM graph_nodes WHERE conversation_id=?1",
+                [&after_conversation.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(after_conversation, conversation);
         assert_eq!(after, before);
         drop(c);
         fk_ok(&p);
@@ -95,7 +148,7 @@ fn historical_v1_and_v2_fixtures_migrate_and_reopen_without_changes() {
 fn v3_failure_rolls_back_alter_and_retry_succeeds() {
     let p = temp("rollback");
     let c = Connection::open(&p).unwrap();
-    c.execute_batch(include_str!("fixtures/store/v1.sql"))
+    c.execute_batch(include_str!("fixtures/store/v2.sql"))
         .unwrap();
     c.execute_batch("CREATE TABLE graph_nodes(injected INTEGER)")
         .unwrap();
@@ -123,12 +176,12 @@ fn v3_failure_rolls_back_alter_and_retry_succeeds() {
             |r| r.get(0)
         )
         .unwrap(),
-        "v1 searchable"
+        "v2 searchable"
     );
     c.execute_batch("DROP TABLE graph_nodes").unwrap();
     drop(c);
     let s = Store::open(&p).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(s.schema_version().unwrap(), 6);
     assert_eq!(s.search("searchable", 10).unwrap().len(), 1);
     drop(s);
     fk_ok(&p);
@@ -138,7 +191,7 @@ fn v3_failure_rolls_back_alter_and_retry_succeeds() {
 fn migrated_schema_is_idempotent_and_fts_tracks_insert_update_delete_rebuild() {
     let p = temp("fts");
     let mut s = Store::open(&p).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(s.schema_version().unwrap(), 6);
     let id = s.ingest_observation(&obs("a", "alphaunique")).unwrap();
     assert_eq!(s.search("alphaunique", 10).unwrap(), vec![id.clone()]);
     s.ingest_observation(&obs("a", "betaunique")).unwrap();
@@ -160,7 +213,7 @@ fn migrated_schema_is_idempotent_and_fts_tracks_insert_update_delete_rebuild() {
         .unwrap();
     drop(c);
     let s = Store::open(&p).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(s.schema_version().unwrap(), 6);
     assert!(s.search("betaunique", 10).unwrap().is_empty());
     drop(s);
     fk_ok(&p);

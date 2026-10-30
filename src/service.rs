@@ -322,8 +322,8 @@ async fn start_internal(
                             return;
                         }
                     };
-                    let _ = store.connection.busy_timeout(writer_busy_timeout);
-                    let interrupt = Arc::new(store.connection.get_interrupt_handle());
+                    let _ = store.connection().busy_timeout(writer_busy_timeout);
+                    let interrupt = Arc::new(store.connection().get_interrupt_handle());
                     let _ = writer_ready_tx.send(Ok(interrupt));
                     loop {
                         if wf.load(Ordering::Acquire) {
@@ -704,7 +704,7 @@ mod writer_panic_tests {
             ServiceState::Failed("capture writer panicked".into())
         );
         let store = Store::in_memory().unwrap();
-        let interrupt = Arc::new(store.connection.get_interrupt_handle());
+        let interrupt = Arc::new(store.connection().get_interrupt_handle());
         let handle = ServiceHandle {
             status: status.clone(),
             shutdown: stop,
