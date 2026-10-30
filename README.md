@@ -1,14 +1,14 @@
 # Chat Hub
 
-Chat Hub is an early local-first conversation hub. PR1 provides a localhost Rust service and CLI, SQLite schema migration, and a selective TLS-intercepting CONNECT proxy. It is infrastructure, not yet a usable conversation library: provider ingestion, a browser UI, and the normalized conversation/message model are later-PR work.
+Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.0; a version bump is not a release or release acceptance.
 
-## PR1 status
+Provider capture is disabled by default. No real provider account, provider traffic capture, or production ingestion path has been accepted. The selective CONNECT proxy targets `chatgpt.com` and its subdomains; recognized authentication/sign-in hosts and other hosts tunnel without TLS decryption. The per-install CA is not automatically added to system trust. Linux proxy checks use synthetic traffic and do not establish real-provider behavior.
 
-The service exposes bearer-protected `GET /api/health`, `/api/search?q=...`, and `/api/conversations/{id}` endpoints. The CLI supports `status`, `search <query>`, `read <id>`, and `serve`. The SQLite store initializes its schema on open. `serve` starts the API and proxy; capture events currently are not ingested into the database. Search currently matches stored titles, not full conversation text.
+## Library and current evidence
 
-The loopback CONNECT proxy intercepts TLS for `chatgpt.com` and its subdomains, excluding recognized authentication/sign-in hosts, which tunnel without decryption. The configured CA is local and is not installed into system trust automatically. The exact capture host is `chatgpt.com`; other hosts, including sign-in hosts, tunnel. For this safe MVP, each intercepted HTTP request and response body is fully buffered and rejected with HTTP 413 if it exceeds 2 MiB; this hard limit bounds memory use, but streaming large provider payloads is deferred.
+The desktop library supports export import, conversation/message browsing, selected-branch and alternate-branch navigation, and body full-text search. A hosted debug-native smoke on Apple Silicon verified the official fixture import, library UI body, full-text search, selection, and alternate-branch detail and persistence in the same default OS-account app-data directory across same-process use, restart, and closure. The accepted run is [41110436605](https://github.com/iarnvidr/chat-hub/actions/runs/41110436605) for source `6b7f1f9a41daf4e9894e4ab946acb1639fa48c9d`. It did not test an alternate home/data-directory override, production DMG installation, real provider traffic, or native Save dialog/file acceptance. Raw native IPC health status was not retained as a separate artifact.
 
-Linux verification is synthetic: tests exercise CONNECT/TLS forwarding and a synthetic response, alongside unit tests. This is not live ChatGPT/provider validation. The desktop conversation library and import/UI paths are present in the current source. A narrowly scoped PR23 debug-native smoke has verified the official fixture import, library UI body, full-text search, selection, and alternate-branch detail and persistence in the same default app-data directory across same-process use, restart, and closure. This does not establish a production-packaged startup path, public DMG behavior, provider capture, or native save-dialog/file acceptance. The smoke used the same default app-data directory for alternate-branch detail and persistence across reopen/restart; it does not test an alternate home override. The protected hosted `macos-15` updater/WKWebView acceptance gate is separately pending; see below and the [updater policy](docs/UPDATES.md).
+The native library Save implementation reuses the store's consistent SQLite backup and streamed JSON export APIs; JSON export is not a restore format. Existing destinations are refused, cancellation creates no file, and a normal success receipt confirms durability after sync. `Error::ArchivePublished` means the archive was published but durability could not be confirmed; the UI warns that the file exists and must not automatically overwrite or retry it. Native OS Save dialog/file acceptance remains unverified.
 
 ## Build and run
 
@@ -16,25 +16,26 @@ Requires stable Rust, rustfmt, and Clippy.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets
 ```
 
-Set the following environment variables for CLI/service configuration:
+Set the following environment variables for the Rust CLI/service only; the production native desktop app uses Tauri's platform app-data directory and explicit database/CA paths, not these CLI/service overrides:
 
 - `CHAT_HUB_TOKEN` — required non-empty bearer token.
-- `CHAT_HUB_DATABASE` — SQLite path (default `chat-hub.sqlite3`).
+- `CHAT_HUB_DATA_DIR` — optional data-directory override; by default macOS uses `~/Library/Application Support/io.github.iarnvidr.chat-hub`, Linux uses `$XDG_DATA_HOME/io.github.iarnvidr.chat-hub` or `~/.local/share/io.github.iarnvidr.chat-hub`, and Windows uses `%APPDATA%/io.github.iarnvidr.chat-hub`.
+- `CHAT_HUB_DATABASE` — optional SQLite path; by default it is `chat-hub.sqlite3` inside the selected data directory.
 - `CHAT_HUB_BIND` — API bind address (default `127.0.0.1:0`; loopback required).
 - `CHAT_HUB_PROXY_ADDR` — proxy bind address (default `127.0.0.1:8788`; loopback required).
-- `CHAT_HUB_CA_DIR` — CA directory (default `chat-hub-ca`).
+- `CHAT_HUB_CA_DIR` — optional CA directory; by default it is `ca` inside the selected data directory.
+- `CHAT_HUB_CAPTURE_ENABLED` — snapshot capture opt-in; disabled unless set to `true` or `1`.
 
-For example, run `CHAT_HUB_TOKEN=local-secret cargo run -- serve`; use `cargo run -- status`, `cargo run -- search words`, or `cargo run -- read <id>` for CLI commands. The API uses a plaintext HTTP bearer token on loopback. This is suitable only for a trusted local environment: do not expose it on an untrusted network or treat the token as protection against local processes/users.
+For example, run `CHAT_HUB_TOKEN=local-secret cargo run -- serve`; use `cargo run -- status`, `cargo run -- search words`, or `cargo run -- read <id>` for CLI commands. The API uses plaintext HTTP with bearer authentication on loopback. It is suitable only for a trusted local environment, not an untrusted network or as protection from local processes/users.
 
-See [architecture](docs/ARCHITECTURE.md), [decisions](docs/DECISIONS.md), [known issues](KNOWN_ISSUES.md), [updater policy](docs/UPDATES.md), [shared service and normalization contract](docs/SERVICE-NORMALIZATION-CONTRACT.md) (design only; not implemented), and [release checklist](RELEASE-CHECKLIST.md).
-## Desktop app and updater (PR2)
+The browser fixture page is development-only and does not prove backend integration. The native desktop app uses the Rust/Tauri bridge. See [architecture](docs/ARCHITECTURE.md), [decisions](docs/DECISIONS.md), [known issues](KNOWN_ISSUES.md), [updater and release status](docs/UPDATES.md), [release checklist](RELEASE-CHECKLIST.md), [desktop UI](docs/DESKTOP_UI.md), and [data paths](docs/data-paths.md).
 
-The desktop process uses Tauri's async runtime as its sole Tokio runtime. Keep desktop `main` synchronous: entering Tokio before Tauri setup makes setup's synchronous runtime bootstrap waits panic with `Cannot start a runtime from within a runtime`, which can abort the macOS process. The previously observed startup failure was a Rust runtime-nesting panic, not an Objective-C `NSException`. The source fix does not replace the required packaged-app launch, authenticated health, startup poke, and 15-second survival gate or the still-unverified manual v0.1.0 DMG upgrade acceptance.
+## Release and platform limits
 
-PR2 adds the Tauri desktop application and a signed-update verification path. The updater is limited to GitHub's `releases/latest`; prereleases are excluded and must be installed manually. The app does not support preview update discovery. The updater uses the repository-pinned public key; ad-hoc app signing is not updater signing and does not imply notarization. Release notes for ad-hoc builds must state that they are not notarized and that Gatekeeper may block first launch.
+The updater checks GitHub's stable `releases/latest` endpoint; preview prereleases require manual installation. Its pinned public key verifies updates. Ad-hoc app signing is not notarization, and release notes must warn that Gatekeeper may block first launch. The protected release workflow retains required compile, package, DMG, signing, manifest, startup/health, native library persistence, and native launch checks. Provider capture remains advisory. The hosted PR23 library smoke is not evidence that those production release gates passed.
 
-Hosted macOS UI, launch, WKWebView, and updater-integration smokes are diagnostic and nonblocking; their success is not a release claim and failures are recorded as smoke failures. Release-blocking checks are the real ad-hoc-signed Tauri app build, DMG creation/mount verification, updater archive signing, independent verification against the configured pinned public key, and validation of the generated latest.json. The protected release workflow performs these checks before any separately authorized publication. The provider-proxy/capture assertion is advisory only; the basic native launch gate remains required and fails closed if the packaged bridge/API checks fail. The macOS provider capture path has not been verified and must not be represented as passing. The accepted debug-native smoke is limited to the library fixture/import/UI behaviors stated above; it is not evidence for production packaging, public DMG installation, provider capture, or save-dialog/file acceptance. The current backend exposes `backup_library` (consistent SQLite backup) and `export_library_json` (streamed JSON export) through native save handling; native dialog/file acceptance remains pending review and authorized future Mac verification. Export is not restore. See [data and runtime paths](docs/data-paths.md), [desktop UI](docs/DESKTOP_UI.md), and the [release checklist](RELEASE-CHECKLIST.md) for exact status and remaining manual checks.
+Public owner-downloaded DMG installation, downloaded-app quarantine/Gatekeeper behavior, native Save dialog/file acceptance, real provider capture, advisory updater UI behavior, and the genuine unmodified v0.1.1 stable-feed update to v0.2.0 remain unverified. The genuine baseline update is not automated and cannot be run until the published candidate is available at `releases/latest`; its ordering and execution feasibility plan remain pending in protected approval. The production baseline has no debug IPC, and runner OS automation/trust and WKWebView automation permissions are unverified. No waiver is assumed. See [updater and release status](docs/UPDATES.md) and [release checklist](RELEASE-CHECKLIST.md).

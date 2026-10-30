@@ -1,3 +1,3 @@
 # WKWebView native HTTPS smoke
 
-The required native app bridge does not yet exist. `run-macos.sh` intentionally fails closed; it must not be treated as evidence. Implement app-scoped CONNECT proxy, per-install CA trust, response capture/ingest and synthetic sign-in non-decryption before enabling this smoke.
+The Tauri service bridge exists, but this optional harness is fail-closed because packaged WKWebView synthetic-provider capture/ingestion and auth-host non-decryption are not accepted. `run-macos.sh` must not be treated as evidence while it fails closed. Provider capture remains advisory and unverified; see [updater and release status](../../docs/UPDATES.md).

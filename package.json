@@ -1,1 +1,1 @@
-{"name":"chat-hub-desktop","private":true,"version":"0.1.1","scripts":{"tauri":"tauri"},"devDependencies":{"@tauri-apps/cli":"^2.0.0"}}
+{"name":"chat-hub-desktop","private":true,"version":"0.2.0","scripts":{"tauri":"tauri"},"devDependencies":{"@tauri-apps/cli":"^2.0.0"}}

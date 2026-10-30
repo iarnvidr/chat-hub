@@ -1,5 +1,7 @@
 # Shared service and proposed normalized capture contract
 
+This note records the earlier shared-service/PR #9 design and review snapshot; its PR status and “no desktop integration proof” statements below are historical, not current product status. Since then the normalized library and desktop UI have landed, with bounded PR23 debug-native fixture evidence recorded in [updater/release status](UPDATES.md). Provider capture, broader lifecycle requirements, and real-provider acceptance remain separate.
+
 ## Implemented service
 
 `service::start(Config, capacity)` / `start_with_proxy` start the loopback API and interception proxy, open separate API and ingestion `Store` connections, and run a bounded Tokio `mpsc` capture queue with one dedicated SQLite writer thread. Capacity must be positive; API/proxy bind addresses must be loopback and the bearer token nonempty. For file databases, startup creates missing parent directories before opening the database; this filesystem work and initial store open/health check run via `spawn_blocking`, not on the async executor. Proxy capture events currently contain exactly the legacy fields `host`, `path`, `status`, and `body`; captured bodies are bounded to 2 MiB. `try_submit` is available when callers need immediate queue-full feedback. The API router exposes authenticated health and existing conversation endpoints; runtime identity includes PID and a generated instance ID.

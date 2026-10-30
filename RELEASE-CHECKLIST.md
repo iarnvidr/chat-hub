@@ -1,51 +1,51 @@
 # Release acceptance checklist
 
-Record actual evidence; do not infer success from synthetic/Linux tests. The release-blocking minimum is an actual ad-hoc-signed app build, verified/mounted DMG, cryptographically signed updater payload verified independently with the configured pinned public key, and valid latest.json. Native launch/UI/WKWebView/updater integration smokes are nonblocking diagnostics.
+This repository contains a v0.2.0 release candidate draft. Version metadata and documentation do not constitute a release, prove acceptance, create a tag, or authorize publication. Record evidence for the exact source and version; do not infer success from synthetic/Linux tests.
 
-## PR1 / Linux
+## Implemented library scope and existing evidence
 
-- [ ] `cargo fmt --all -- --check` passes.
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes.
-- [ ] `cargo test --all-targets` passes, including synthetic CONNECT/TLS forwarding and capture-event test.
-- [ ] Confirm API/CLI behavior, bearer auth, loopback-only binds, and SQLite initialization.
-- [ ] Confirm proxy streaming framing and allowlist fixes have landed and have focused tests; current work remains in progress.
-- [ ] Gitleaks/dependency checks pass where run; record actual CI evidence.
+- [x] Normalized local conversation store, export import, conversation graph/selected-branch support, body full-text search, and desktop library UI exist in source.
+- [x] Hosted PR23 debug-native run [41110436605](https://github.com/iarnvidr/chat-hub/actions/runs/41110436605), source `6b7f1f9a41daf4e9894e4ab946acb1639fa48c9d`, verified official fixture import, library UI body, body search, selection, alternate-branch detail, and persistence in the same default OS-account app-data directory across same-process use, restart, and closure.
+- [ ] Repeat required checks against the exact v0.2.0 candidate head; the earlier PR23 result is feature evidence, not candidate-version release evidence.
+- [ ] Native OS Save dialog/file acceptance; PR24 source and Linux checks do not prove the native dialog/file path.
+- [ ] Alternate home/data-directory override, public owner-downloaded DMG installation, or native Save acceptance; none is established by run 41110436605.
 
-## Release-blocking hosted macos-15 build gates
+Snapshot capture remains disabled by default. Real provider login, provider traffic capture/ingestion, and provider compatibility are not established by synthetic fixtures or the PR23 library smoke.
 
-- [ ] Record run/artifact evidence for real Tauri app build with ad-hoc signature (not notarization).
-- [ ] Record successful DMG create, verification, mount, and app-bundle checks.
-- [ ] Record signed `Chat-Hub.app.tar.gz` and independent minisign verification against the pinned updater public key.
-- [ ] Validate generated `latest.json` schema and payload signature; publish remains manual and defaults false.
+## Required protected hosted macos-15 release workflow gates
 
-## Required packaged-app startup gate
+The current protected workflow requires these checks before its prepare job can produce release artifacts. They must pass for the exact versioned candidate:
 
-- [ ] The actual packaged app passes launch, authenticated localhost health, startup poke, and 15-second survival smoke before release preparation can publish assets. Retain stdout/stderr and crash-report evidence; never record tokens.
-- [ ] The smoke collects relevant `chat-hub-desktop*.ips` reports from the runner's real and isolated diagnostic directories, with diagnostics enabled (`RUST_BACKTRACE=full`, `OBJC_DEBUG_MISSING_POOLS=NO`, `NSUnbufferedIO=YES`).
+- [ ] Production and native-smoke Cargo compilation succeeds.
+- [ ] Build and verify the ad-hoc-signed app and corresponding-source manifest.
+- [ ] Required positive persisted-library smoke succeeds in the verified debug bundle.
+- [ ] Required packaged-app startup and authenticated health smoke succeeds.
+- [ ] Required native launch/UI, health, update-status, reopen, and shutdown smoke succeeds.
+- [ ] Create, mount, and verify the DMG.
+- [ ] Sign the updater archive and independently verify it against the pinned public key.
+- [ ] Validate the generated `latest.json` and retained release evidence.
 
-## Diagnostic native smokes (nonblocking)
+These checks are required by the workflow, not nonblocking diagnostics. The provider proxy/capture smoke is advisory and remains unverified. The optional updater UI smoke is diagnostic and its acceptance remains unproven.
 
-- [ ] Native UI/WKWebView/updater integration smokes remain nonblocking diagnostics.
-- [ ] Stable feed is `releases/latest` only; preview prereleases require manual installation (no app preview-update support). Verify pinned public key applies to both channels.
-- [ ] Release notes identify ad-hoc builds as not notarized and disclose possible Gatekeeper block. Do not treat ad-hoc code signing as updater signing.
-- [ ] Prepare protected manual publication with `publish=false`; publish only after review and authorization.
+## Genuine stable-feed update — protected post-publication ordering
 
-## Manual residual acceptance
+- [ ] Preserve the genuine unmodified v0.1.1 stable-feed-to-v0.2.0 update as a pending post-publication acceptance item. The baseline app can only query GitHub's `releases/latest`; it cannot discover an unpublished candidate.
+- [ ] Before publication, the existing protected approval package must explicitly record the unavoidable ordering decision and a reviewed feasibility plan for the post-publication run. The production baseline has no debug IPC; runner OS automation permissions/trust and WKWebView automation allowlisting are unverified. Do not assume approval clicks alone make this test runnable. No waiver is assumed.
+- [ ] The current release workflow has no literal genuine-baseline integration step. After feasibility review and authorized publication makes v0.2.0 available, run the genuine baseline update and retain observable install/version evidence; also retain tampered and wrong-key rejection evidence for the packaged flow. Keep acceptance pending until feasibility and evidence are reviewed.
 
-- [ ] Validate actual ChatGPT login/account behavior with an authorized account.
-- [ ] Assess downloaded-build quarantine/Gatekeeper behavior manually on macOS.
+The controlled updater fixture verifier accepted a valid 0.1.0→0.1.1 fixture and rejected a tampered payload with `signature_verification_failed`. This is not genuine stable-feed update evidence and must not check the post-publication item above.
 
-## Not yet verified / later acceptance
+## Remaining manual acceptance
 
-- [ ] Capture event ingestion into the database and real conversation extraction.
-- [ ] ChatGPT data export import, complete conversation/message model, and full-text search.
-- [ ] Service-hosted UI, browser tests, and UI evidence.
-- [ ] Live ChatGPT capture with an authorized account. No real-provider behavior is implied by synthetic Linux tests.
-- [ ] Any additional physical-Mac behavior beyond the hosted macos-15 updater/WKWebView evidence gate; record OS/version, build and result when performed.
-- [ ] CA trust installation/removal and security review for local data and access controls.
+- [ ] Verify native OS Save dialog/file acceptance on an authorized Mac, including no-clobber, cancellation, and durability-warning behavior.
+- [ ] Verify public owner-downloaded DMG installation and downloaded-app quarantine/Gatekeeper behavior.
+- [ ] Verify real provider login/account behavior and provider capture/ingestion only with an authorized account. Do not treat advisory capture smoke or synthetic Linux tests as provider acceptance.
+- [ ] Retain raw native IPC health separately only if a future evidence run safely produces it; PR23 did not retain a separate raw-health artifact.
+- [ ] Verify CA trust installation/removal and review local data/access controls.
 
 ## Release hygiene
 
-- [ ] Keep documentation aligned with the implemented PR scope and explicit limitations.
-- [ ] Confirm no credentials, private conversations, or private infrastructure details are present.
-- [ ] Link passing CI and test evidence; retain untested items above until verified.
+- [ ] Review the draft v0.2.0 release notes in [CHANGELOG.md](CHANGELOG.md) and record any additional limitations.
+- [ ] Confirm the exact source/version, corresponding-source manifest, updater signature, app package, DMG, and test evidence before authorizing publication.
+- [ ] Preserve the two-stage release workflow: prepare only from exact protected main and an existing owner-created matching tag in protected `chat-hub-release` with read-only contents; separate publish requires successful prepare, explicit `publish=true`, and the same protected environment with contents-write. `publish` defaults to false; the workflow never creates a tag.
+- [ ] Keep credentials, private conversations, tokens, and signing private material out of artifacts and source control. Only the updater public key belongs in source.
