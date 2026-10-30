@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Required real-bundle WKWebView, API, relaunch, and shutdown smoke."""
 import json, os, pathlib, plistlib, signal, socket, subprocess, sys, time, traceback, urllib.error, urllib.request
+from native_capture_contract import validate as validate_capture_contract
 app, evidence = map(pathlib.Path, sys.argv[1:3]); evidence.mkdir(parents=True, exist_ok=True)
 data = pathlib.Path(os.environ['MUNINN_E2E_DATA_DIR']).resolve()
 e2e=pathlib.Path(os.environ['MUNINN_E2E_DIR']); bundle=plistlib.loads((app/'Contents/Info.plist').read_bytes()); bid=bundle['CFBundleIdentifier']
@@ -120,7 +121,7 @@ def health(info,token):
  if body.get('status')!='ok': raise RuntimeError('authenticated API health failed')
  return body
 
-def synthetic_tls_fixture(info, token):
+def synthetic_tls_fixture(info):
  # Exercise the app's advertised CONNECT proxy against loopback HTTPS override;
  # trust only the newly created per-install CA, never system roots.
  import ssl
@@ -144,19 +145,26 @@ def synthetic_tls_fixture(info, token):
     if not chunk: break
     data_bytes+=chunk
  if b'fixture response; no provider login' not in data_bytes: raise RuntimeError('synthetic fixture body did not traverse proxy')
- end=time.monotonic()+10
- while time.monotonic()<end:
-  req=urllib.request.Request(info['api']+'/api/conversations/native-smoke-synthetic',headers={'Authorization':'Bearer '+token})
-  try:
-   with urllib.request.urlopen(req,timeout=2) as r: record=json.load(r)
-   if record.get('provider')=='chatgpt' and 'fixture response; no provider login' in record['messages'][0]['content']:
-    content=record['messages'][0]['content'].encode()
-    import hashlib
-    return {'host':'chatgpt.com','fixture':'synthetic; not ChatGPT login','persisted_conversation_id':record['id'],'message_content_bytes':len(content),'message_content_sha256':hashlib.sha256(content).hexdigest(),'message_content_matches_fixture':True}
-  except urllib.error.HTTPError as exc:
-   if exc.code!=404: raise
-  time.sleep(.2)
- raise RuntimeError('synthetic capture missing from persisted conversation API')
+ return {'host':'chatgpt.com','fixture':'synthetic; not ChatGPT login','forwarded':True}
+
+def authenticated_json(info, token, path):
+ req=urllib.request.Request(info['api']+path,headers={'Authorization':'Bearer '+token})
+ with urllib.request.urlopen(req,timeout=5) as response: return json.load(response)
+
+def canonical_archive(info, token):
+ # API v1 list is the authoritative canonical archive, including revision.
+ value=authenticated_json(info,token,'/api/v1/conversations?limit=100')
+ if not isinstance(value,dict) or not isinstance(value.get('items'),list) or type(value.get('library_revision')) is not int:
+  raise RuntimeError('canonical API v1 archive snapshot has unknown schema')
+ if 'next_cursor' not in value or (value['next_cursor'] is not None and not isinstance(value['next_cursor'],str)):
+  raise RuntimeError('canonical API v1 archive cursor has unknown schema')
+ return {'library_revision':value['library_revision'],'items':value['items'],'next_cursor':value['next_cursor']}
+
+def capture_snapshot(info, token):
+ value=authenticated_json(info,token,'/api/v1/status')
+ if not isinstance(value,dict) or not isinstance(value.get('capture'),dict):
+  raise RuntimeError('typed status has no authoritative capture snapshot')
+ return value['capture']
 
 def wait_service():
  end=time.monotonic()+90
@@ -197,7 +205,11 @@ try:
  record['service_info']={'api':service.get('api'),'proxy':service.get('proxy'),'version':service.get('version'),'process_id':service.get('process_id')}
  if not isinstance(service,dict) or service.get('process_id')!=proc.pid or not service.get('api') or not service.get('proxy'): raise RuntimeError(f'service_info assertion failed: {service!r}')
  if os.environ.get('MUNINN_NATIVE_LAUNCH_MODE') != 'basic':
-  record['synthetic_tls_capture']=synthetic_tls_fixture(service,token)
+  archive_before=canonical_archive(service,token); capture_before=capture_snapshot(service,token)
+  tls=synthetic_tls_fixture(service)
+  archive_after=canonical_archive(service,token); capture_after=capture_snapshot(service,token)
+  validate_capture_contract(capture_before,capture_after,forwarding_ok=tls.get('forwarded') is True,archive_before=archive_before,archive_after=archive_after)
+  record['default_off_capture']={'tls_forwarded':True,'archive_unchanged':True,'archive_empty':True,'capture_before':capture_before,'capture_after':capture_after}
  js="const text=document.body.innerText; if(!text.includes('Chat Hub')||!document.querySelector('[data-testid=app-version]')?.textContent.includes('Version')||!document.querySelector('[data-testid=check-updates]')) throw Error('Chat Hub UI/version/control not rendered'); const s=await window.ChatHub.invoke('service_info'); if(!s.api||!s.proxy) throw Error('service addresses missing'); return {rendered:true,title:document.title,version:document.querySelector('[data-testid=app-version]').textContent,service:s};"
  rendered=bridge('eval',js='return await (async()=>{'+js+'})();')
  if not isinstance(rendered,dict) or rendered.get('rendered') is not True: raise RuntimeError(f'DOM assertion failed: {rendered!r}')
