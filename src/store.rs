@@ -1,15 +1,47 @@
 //! SQLite-backed normalized conversation graph store.
-use crate::error::Result;
+use crate::error::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 
 pub struct Store {
     connection: Connection,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestOutcome {
+    Imported { conversation_id: String },
+    Updated { conversation_id: String },
+    Unchanged { conversation_id: String },
+}
 #[derive(Clone, Debug)]
 pub struct LibrarySnapshot {
     pub library_revision: i64,
     pub conversations: Vec<Value>,
+}
+#[derive(Clone, Debug)]
+pub struct ListKey {
+    pub updated_at_ms: Option<i64>,
+    pub id: String,
+}
+#[derive(Clone, Debug)]
+pub struct SearchKey {
+    pub score: f64,
+    pub conversation_id: String,
+    pub node_id: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub struct ListPageSnapshot {
+    pub library_revision: i64,
+    pub items: Vec<Value>,
+}
+#[derive(Clone, Debug)]
+pub struct SearchPageSnapshot {
+    pub library_revision: i64,
+    pub hits: Vec<Value>,
+}
+#[derive(Clone, Debug)]
+pub struct DetailSnapshot {
+    pub library_revision: i64,
+    pub conversation: Option<Value>,
 }
 #[derive(Clone, Debug)]
 pub struct SearchSnapshot {
@@ -134,6 +166,7 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(6)", [])?;
             tx.commit()?;
         }
+        self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id);")?;
         Ok(())
     }
     pub fn health(&self) -> Result<bool> {
@@ -288,6 +321,215 @@ impl Store {
             hits,
         })
     }
+    pub fn list_page_snapshot(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot> {
+        let tx = self.connection.unchecked_transaction()?;
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut items = Vec::new();
+        if limit == 0 {
+            return Err(Error::Configuration("page limit must be at least 1".into()));
+        }
+        if expected_revision.is_none_or(|v| v == revision) {
+            let lim = limit.min(101) as i64;
+            let mut st=tx.prepare("SELECT id FROM conversations WHERE (?1 IS NULL OR (updated_at_ms IS NOT NULL AND (updated_at_ms < ?1 OR (updated_at_ms=?1 AND id>?2))) OR (updated_at_ms IS NULL AND ?1 IS NOT NULL)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?3")?;
+            let ids = st
+                .query_map(
+                    params![
+                        after.and_then(|k| k.updated_at_ms),
+                        after.map(|k| k.id.as_str()).unwrap_or(""),
+                        lim
+                    ],
+                    |r| r.get::<_, String>(0),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for id in ids {
+                if let Some(v) = read_normalized_conn(&tx, &id)? {
+                    items.push(v);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(ListPageSnapshot {
+            library_revision: revision,
+            items,
+        })
+    }
+    pub fn detail_snapshot(&self, canonical_id: &str) -> Result<DetailSnapshot> {
+        let tx = self.connection.unchecked_transaction()?;
+        let revision = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM graph_nodes WHERE conversation_id=?1",
+            [canonical_id],
+            |r| r.get(0),
+        )?;
+        if count > 100_000 {
+            return Err(Error::ReadBudgetExceeded {
+                kind: "detail nodes",
+                limit: 100_000,
+            });
+        }
+        // Bound source material before constructing the normalized DTO. The 6x allowance
+        // covers JSON escaping plus normalized wrappers; serialized output is checked too.
+        const RESPONSE_LIMIT: usize = 8 * 1024 * 1024 - 64 * 1024;
+        let bytes: i64 = tx.query_row("SELECT coalesce(sum(length(parts_json)+length(content)+coalesce(length(author_json),0)+coalesce(length(create_time_json),0)),0) FROM graph_nodes WHERE conversation_id=?1", [canonical_id], |r| r.get(0))?;
+        if (bytes.max(0) as usize)
+            .saturating_mul(6)
+            .saturating_add((count.max(0) as usize).saturating_mul(512))
+            > RESPONSE_LIMIT
+        {
+            return Err(Error::ReadBudgetExceeded {
+                kind: "detail encoded bytes",
+                limit: RESPONSE_LIMIT,
+            });
+        }
+        let conversation = read_normalized_conn(&tx, canonical_id)?;
+        if let Some(value) = &conversation {
+            let encoded =
+                serde_json::to_vec(value).map_err(|e| Error::Configuration(e.to_string()))?;
+            if encoded.len() > RESPONSE_LIMIT {
+                return Err(Error::ReadBudgetExceeded {
+                    kind: "detail encoded bytes",
+                    limit: RESPONSE_LIMIT,
+                });
+            }
+        }
+        tx.commit()?;
+        Ok(DetailSnapshot {
+            library_revision: revision,
+            conversation,
+        })
+    }
+    pub fn search_page_snapshot(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<SearchPageSnapshot> {
+        let terms: Vec<String> = raw_query
+            .split_whitespace()
+            .filter(|t| t.chars().any(char::is_alphanumeric))
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect();
+        if after.is_some_and(|k| !k.score.is_finite()) {
+            return Err(crate::error::Error::Configuration(
+                "search cursor score must be finite".into(),
+            ));
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut hits = Vec::new();
+        if limit == 0 {
+            return Err(Error::Configuration("page limit must be at least 1".into()));
+        }
+        if expected_revision.is_none_or(|v| v == revision) && !terms.is_empty() {
+            let q = terms.join(" AND ");
+            let lim = limit.min(101) as i64;
+            let mut st=tx.prepare("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,snippet(message_fts,3,'[',']','…',12) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1 UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1) SELECT conversation_id,node_id,message_id,snippet,score FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5")?;
+            let rows = st
+                .query_map(
+                    params![
+                        q,
+                        after.map(|k| k.score),
+                        after.map(|k| k.conversation_id.as_str()).unwrap_or(""),
+                        after.and_then(|k| k.node_id.as_deref()),
+                        lim
+                    ],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, f64>(4)?,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut cache = std::collections::HashMap::<String, Value>::new();
+            let mut total = 0usize;
+            for (id, node, msg, snip, score) in rows {
+                if !score.is_finite() {
+                    continue;
+                }
+                let graph = if let Some(g) = cache.get(&id) {
+                    g.clone()
+                } else {
+                    let count:i64=tx.query_row("SELECT count(*) FROM (SELECT 1 FROM graph_nodes WHERE conversation_id=?1 LIMIT 100001)",[&id],|r|r.get(0))?;
+                    total = total.saturating_add(count as usize);
+                    if count > 100000 || total > 100000 {
+                        return Err(Error::ReadBudgetExceeded {
+                            kind: "search graph nodes",
+                            limit: 100_000,
+                        });
+                    }
+                    let g = read_normalized_conn(&tx, &id)?.unwrap_or(Value::Null);
+                    cache.insert(id.clone(), g.clone());
+                    g
+                };
+                let leaf = if let Some(ref n) = node {
+                    let nodes = graph["nodes"].as_array().cloned().unwrap_or_default();
+                    let mut frontier = vec![n.clone()];
+                    let mut visited = std::collections::HashSet::new();
+                    let mut leaves = Vec::new();
+                    while let Some(c) = frontier.pop() {
+                        if !visited.insert(c.clone()) {
+                            continue;
+                        }
+                        let children: Vec<String> = nodes
+                            .iter()
+                            .filter(|x| x["parent_id"].as_str() == Some(c.as_str()))
+                            .filter_map(|x| x["id"].as_str().map(str::to_owned))
+                            .collect();
+                        if children.is_empty() {
+                            leaves.push(c)
+                        } else {
+                            frontier.extend(children)
+                        }
+                    }
+                    leaves.into_iter().min()
+                } else {
+                    None
+                };
+                if node.is_some() && leaf.is_none() {
+                    continue;
+                }
+                let selected = graph["thread_node_ids"].as_array().is_some_and(|xs| {
+                    node.as_ref()
+                        .is_some_and(|n| xs.iter().any(|x| x.as_str() == Some(n)))
+                });
+                hits.push(serde_json::json!({"conversation":{"id":id},"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
+                if serde_json::to_vec(&hits).map_or(true, |v| v.len() > 8 * 1024 * 1024 - 64 * 1024)
+                {
+                    return Err(Error::ReadBudgetExceeded {
+                        kind: "search encoded bytes",
+                        limit: 8 * 1024 * 1024 - 64 * 1024,
+                    });
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(SearchPageSnapshot {
+            library_revision: revision,
+            hits,
+        })
+    }
     pub fn search(&self, q: &str, limit: usize) -> Result<Vec<String>> {
         // Treat input as literal terms, never as FTS5 query syntax. Quoting each
         // whitespace-delimited term preserves AND-style matching without allowing
@@ -371,16 +613,46 @@ impl Store {
     }
 
     pub fn ingest_observation(&mut self, o: &Observation) -> Result<String> {
+        Ok(match self.ingest_observation_outcome(o)? {
+            IngestOutcome::Imported { conversation_id }
+            | IngestOutcome::Updated { conversation_id }
+            | IngestOutcome::Unchanged { conversation_id } => conversation_id,
+        })
+    }
+    pub fn ingest_observation_outcome(&mut self, o: &Observation) -> Result<IngestOutcome> {
         validate(o)?;
         let tx = self.connection.transaction()?;
+        let prior_revision: i64 = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let existed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE provider=?1 AND account_scope=?2 AND source_id=?3)", params![o.provider, o.account_scope, o.source_id], |r| r.get(0))?;
         ingest_tx(&tx, o)?;
         let id = tx.query_row(
             "SELECT id FROM conversations WHERE provider=?1 AND account_scope=?2 AND source_id=?3",
             params![o.provider, o.account_scope, o.source_id],
             |r| r.get(0),
         )?;
+        let after_revision: i64 = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
         tx.commit()?;
-        Ok(id)
+        Ok(if after_revision == prior_revision {
+            IngestOutcome::Unchanged {
+                conversation_id: id,
+            }
+        } else if existed {
+            IngestOutcome::Updated {
+                conversation_id: id,
+            }
+        } else {
+            IngestOutcome::Imported {
+                conversation_id: id,
+            }
+        })
     }
 }
 fn read_normalized_conn(conn: &Connection, id: &str) -> Result<Option<Value>> {

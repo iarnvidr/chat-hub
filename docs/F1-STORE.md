@@ -1,6 +1,6 @@
 # F1 conversation store: implemented contract
 
-This describes the implemented SQLite store and capture adapter, not a complete provider-sync or HTTP product contract. The schema currently migrates to version 6. `Store::open(path)` opens a file and applies pending migrations; `Store::in_memory()` creates the same schema in memory. `health()`, `schema_version()`, and `library_revision()` provide basic status. Store operations return the crate `Result` type.
+This describes the implemented SQLite store and capture adapter, not a complete provider-sync or HTTP product contract. The schema currently migrates to version 6 and creates additive list-order and graph lookup indexes. `Store::open(path)` opens a file and applies pending migrations; `Store::in_memory()` creates the same schema in memory. `health()`, `schema_version()`, and `library_revision()` provide basic status. Store operations return the crate `Result` type.
 
 ## Schema and migration behavior
 
@@ -39,3 +39,8 @@ Both `search(query, limit)` and `search_snapshot(query)` treat input as literal 
 ## Scope and verification limits
 
 F1 is a local store/read/search implementation. It does not provide multi-account support, a complete synchronization engine, HTTP endpoints, or the deferred F2 functionality. Tests establish Linux behavior in the current environment (64 tests verified); they have not been verified on macOS or the desktop application. Migration and transaction code is present, but there is not yet a dedicated concurrent-writer fixture/test. Do not infer cross-platform or concurrent-writer coverage from the transactional implementation alone.
+
+
+## Bounded page reads
+
+`ListKey`, `SearchKey` and the `ListPageSnapshot`, `SearchPageSnapshot`, and `DetailSnapshot` results back the bounded read APIs. Page methods reject zero limits and cap positive requested limits at 101. List ordering is `updated_at_ms DESC NULLS LAST, id ASC`; keysets continue that exact ordering. Search terms are literalized exactly as in the legacy search API, and results order by finite FTS rank ascending then conversation and node IDs. `expected_revision` mismatch returns an empty page with the observed revision before running page SQL. Revision and result reads share one SQLite read transaction. Detail IDs are exact canonical/local IDs, not source aliases. Detail and search graph routing have a typed read-budget error at 100,000 nodes; exceeding it never prunes or truncates the stored graph. Detail reads preflight stored text/parts against a conservative 6x JSON-expansion estimate plus fixed per-node allowance before DTO projection, then verify actual serialized DTO size against 8 MiB minus a 64 KiB envelope reserve. Search pages enforce the same serialized response ceiling, including snippets. This bounds accepted output, not peak allocator memory; the estimate and post-serialization check are not a hard process-memory guarantee. The legacy full snapshot methods remain for compatibility; production callers should use bounded pages.
