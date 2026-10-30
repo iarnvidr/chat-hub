@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::sync::Semaphore;
+
+mod imports;
 
 /// Every record and the revision in a snapshot must come from ONE store read
 /// transaction. Never implement this by reading the revision and rows separately.
@@ -218,6 +220,8 @@ struct ApiState {
     token: Arc<str>,
     reader: Option<Reader>,
     db_ops: Arc<Semaphore>,
+    import_store: Option<Arc<Mutex<crate::store::Store>>>,
+    import_ops: Arc<Semaphore>,
 }
 
 /// Explicit adapter injection for route tests and the eventual F1 integration.
@@ -227,13 +231,21 @@ pub fn router(reader: Box<dyn ReadAdapter>, token: String) -> Router {
         Arc::from(token),
         Some(Arc::new(Mutex::new(reader))),
         Arc::new(Semaphore::new(super::MAX_DB_OPS)),
+        None,
     )
 }
-pub(super) fn routes(token: Arc<str>, reader: Option<Reader>, db_ops: Arc<Semaphore>) -> Router {
+pub(super) fn routes(
+    token: Arc<str>,
+    reader: Option<Reader>,
+    db_ops: Arc<Semaphore>,
+    import_store: Option<Arc<Mutex<crate::store::Store>>>,
+) -> Router {
     let state = ApiState {
         token,
         reader,
         db_ops,
+        import_store,
+        import_ops: Arc::new(Semaphore::new(1)),
     };
     Router::new()
         .route("/api/v1/status", get(status))
@@ -241,6 +253,7 @@ pub(super) fn routes(token: Arc<str>, reader: Option<Reader>, db_ops: Arc<Semaph
         .route("/api/v1/conversations", get(list))
         .route("/api/v1/search", get(search))
         .route("/api/v1/conversations/:id", get(detail))
+        .route("/api/v1/imports/chatgpt", post(imports::import_chatgpt))
         // Auth runs before parameter extraction, including malformed queries.
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
@@ -261,6 +274,7 @@ async fn authenticate(
     next.run(request).await
 }
 type ApiResult = Result<Json<Value>, ApiError>;
+#[derive(Debug)]
 struct ApiError(StatusCode, &'static str, &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -868,6 +882,7 @@ mod tests {
             Arc::from("secret"),
             Some(Arc::new(Mutex::new(Box::new(reader)))),
             permits.clone(),
+            None,
         );
         let req = || {
             Request::builder()

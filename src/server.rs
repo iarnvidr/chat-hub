@@ -183,7 +183,12 @@ fn build_router(
     // Status/version use real DB/lifecycle facts; library reads still fail
     // closed until F1's bounded transactional adapter is connected.
     let reader = api_v1::store_reader(state.store.clone(), readiness);
-    let v1 = api_v1::routes(state.token.clone(), Some(reader), state.db_ops.clone());
+    let v1 = api_v1::routes(
+        state.token.clone(),
+        Some(reader),
+        state.db_ops.clone(),
+        Some(state.store.clone()),
+    );
     Router::new()
         .route("/api/health", get(health))
         .route("/api/search", get(search))
@@ -196,8 +201,9 @@ fn build_router(
 pub(crate) fn status_test_router(store: Arc<Mutex<Store>>, readiness: ReadinessProvider) -> Router {
     api_v1::routes(
         Arc::from("secret"),
-        Some(api_v1::store_reader(store, Some(readiness))),
+        Some(api_v1::store_reader(store.clone(), Some(readiness))),
         Arc::new(Semaphore::new(MAX_DB_OPS)),
+        Some(store),
     )
 }
 pub async fn serve(addr: std::net::SocketAddr, store: Store, token: String) -> Result<(), Error> {
