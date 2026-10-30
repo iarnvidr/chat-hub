@@ -1,5 +1,17 @@
 name: Apple Silicon build
 on:
+  pull_request:
+    paths:
+      - "src-tauri/**"
+      - "build/**"
+      - "tests/native/**"
+      - "package.json"
+      - "package-lock.json"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "tauri.conf.json"
+      - ".github/workflows/macos.yml"
   workflow_dispatch:
     inputs:
       native_library_smoke:
@@ -10,7 +22,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: macos-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   package:
@@ -78,7 +90,7 @@ jobs:
           codesign --verify --deep --strict "$app"
       - name: Optional native library persisted-data smoke (debug bundle only)
         id: native-library-smoke
-        if: ${{ inputs.native_library_smoke }}
+        if: ${{ github.event_name == 'pull_request' || inputs.native_library_smoke }}
         env:
           NATIVE_LIBRARY_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-library-evidence
         run: |
@@ -95,7 +107,7 @@ jobs:
             exit "$rc"
           fi
       - name: Report skipped native library smoke
-        if: ${{ !inputs.native_library_smoke }}
+        if: ${{ github.event_name != 'pull_request' && !inputs.native_library_smoke }}
         run: 'echo "native library smoke: skipped (input disabled; not an acceptance result)" >> "$GITHUB_STEP_SUMMARY"'
       - name: Required release app launch and localhost health smoke
         env:

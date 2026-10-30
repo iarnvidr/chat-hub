@@ -1,17 +1,21 @@
 name: Checks
 on:
-  push:
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   contracts:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - name: Python contract suites (tests and build helpers)
+        uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
         with:
-          python-version: '3.x'
-      - name: Python contract tests
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
+          version: 0.21.11
+          verb: call
+          module: ./ci/dagger/check
+          args: contracts --source .
