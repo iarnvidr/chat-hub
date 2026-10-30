@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"dagger/check/internal/dagger"
+	"dagger/chat-hub-ci/internal/dagger"
 )
 
 type ChatHubCi struct{}
