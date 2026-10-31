@@ -156,6 +156,21 @@ test('account change preserves the old scoped live tab and creates a separate pl
   assert.equal(ui.tabs.selected().localId, null);
 });
 
+test('continuing an imported copy binds its live session within the same conversation tab', async () => {
+  const cached = {id: 'cached', provider: 'paseo-chatgpt', source_id: UUID,
+    account_scope: 'paseo-cache:owner', title: 'Imported chat'};
+  const ui = bootApp({records: () => [cached],
+    detail: id => ({conversation: {...cached, id}, selection: {selected_node_id: 'cached-leaf'}})});
+  await ui.flush();
+  ui.elements.get('conversation-list').children[0].events.click(); await ui.flush();
+  ui.elements.get('continue-chatgpt').events.click();
+  ui.dispatch('chat-hub:provider-conversation', {conversationId: UUID, accountScope: SCOPE});
+  assert.equal(ui.tabs.all().length, 1);
+  assert.equal(ui.tabs.selected().localId, 'cached');
+  assert.equal(ui.tabs.selected().accountScope, SCOPE);
+  assert.equal(cached.account_scope, 'paseo-cache:owner');
+});
+
 test('rekeying a captured Paseo transcript to a verified raw capture clears its stale branch', async () => {
   let refreshed = false;
   const paseo = {id: 'paseo:cached', provider: 'paseo-chatgpt', source_id: UUID,

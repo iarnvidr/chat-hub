@@ -3,9 +3,11 @@
 use crate::{browser_history, desktop_api, desktop_archive, provider_view::ProviderViewState};
 use serde::Serialize;
 use std::{
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -13,7 +15,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct ChatgptHistoryStatus {
     pub state: String,
     pub message: String,
@@ -57,18 +59,29 @@ pub struct ChatgptHistoryState {
     status: Arc<Mutex<ChatgptHistoryStatus>>,
     cancel: Arc<AtomicBool>,
     next_attempt: Arc<Mutex<Option<Instant>>>,
+    status_path: PathBuf,
+    persist_lock: Arc<Mutex<()>>,
 }
 
+const STATUS_FILE_NAME: &str = "chatgpt-history-status.json";
+static NEXT_STATUS_TEMP: AtomicU64 = AtomicU64::new(0);
+
 impl ChatgptHistoryState {
-    pub fn new(_app_data_dir: PathBuf) -> Self {
+    pub fn new(app_data_dir: PathBuf) -> Self {
         Self {
             status: Arc::new(Mutex::new(ChatgptHistoryStatus::default())),
             cancel: Arc::new(AtomicBool::new(false)),
             next_attempt: Arc::new(Mutex::new(None)),
+            status_path: app_data_dir.join(STATUS_FILE_NAME),
+            persist_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn snapshot(&self) -> Result<ChatgptHistoryStatus, String> {
+        let _persist = self
+            .persist_lock
+            .lock()
+            .map_err(|_| "status_unavailable")?;
         let mut status = self
             .status
             .lock()
@@ -80,6 +93,9 @@ impl ChatgptHistoryState {
             .map_err(|_| "status_unavailable")?
             .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
             .map(|remaining| remaining.as_secs().saturating_add(1));
+        // Diagnostic persistence is best-effort: a filesystem error must not
+        // interrupt or fail the history job itself.
+        let _ = write_status_snapshot(&self.status_path, &status);
         Ok(status)
     }
 
@@ -216,6 +232,47 @@ impl ChatgptHistoryState {
     }
 }
 
+fn write_status_snapshot(destination: &Path, status: &ChatgptHistoryStatus) -> std::io::Result<()> {
+    let parent = destination.parent().ok_or_else(|| std::io::Error::other("missing status directory"))?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.file_type().is_dir() {
+        return Err(std::io::Error::other("status directory is not a regular directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::other("status path is not a regular file"));
+        }
+    }
+    let sequence = NEXT_STATUS_TEMP.fetch_add(1, Ordering::Relaxed);
+    let staging = parent.join(format!(".{STATUS_FILE_NAME}.{}.{}.tmp", std::process::id(), sequence));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staging)?;
+        serde_json::to_writer(&mut file, status).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&staging, destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(staging);
+    }
+    result
+}
+
 fn history_error_message(code: Option<&str>) -> &'static str {
     match code {
         Some("signed_out" | "login_required" | "chatgpt_not_open") => "Sign in to ChatGPT in this app, then sync history again. Your saved chats remain available.",
@@ -223,5 +280,51 @@ fn history_error_message(code: Option<&str>) -> &'static str {
         Some("cancelled" | "history_interrupted") => "History sync stopped. Conversations already saved remain in your library.",
         Some("network_error") => "ChatGPT could not be reached. Your saved chats remain available offline.",
         _ => "ChatGPT history could not finish. Any fetched conversations were saved; existing history was kept.",
+    }
+}
+
+#[cfg(test)]
+mod status_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_persists_only_status_dto_atomically_with_private_permissions() {
+        let root = std::env::temp_dir().join(format!(
+            "chat-hub-history-status-test-{}-{}",
+            std::process::id(),
+            NEXT_STATUS_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let state = ChatgptHistoryState::new(root.clone());
+        let status = state.snapshot().unwrap();
+        let path = root.join(STATUS_FILE_NAME);
+        let bytes = fs::read(&path).unwrap();
+        let stored: ChatgptHistoryStatus = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(stored.state, status.state);
+        assert_eq!(stored.message, status.message);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 14);
+        assert!(value.get("account_scope").is_none());
+        assert!(value.get("token").is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_write_failure_does_not_fail_status_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "chat-hub-history-status-failure-test-{}-{}",
+            std::process::id(),
+            NEXT_STATUS_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join(STATUS_FILE_NAME)).unwrap();
+        let state = ChatgptHistoryState::new(root.clone());
+        assert_eq!(state.snapshot().unwrap().state, "idle");
+        fs::remove_dir_all(root).unwrap();
     }
 }

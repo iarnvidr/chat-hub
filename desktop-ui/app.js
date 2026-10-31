@@ -123,6 +123,12 @@ function providerConversationChanged(event) {
     conversationTabs.open({id, title: 'ChatGPT conversation', mode: 'live', sourceConversationId, accountScope, localId: null, leafNodeId: null});
     tab = conversationTabs.get(id);
   } else if (tab.sourceConversationId === sourceConversationId &&
+      !/^chatgpt:observed:[0-9a-f]{64}$/.test(tab.accountScope || '')) {
+    // Continuing an imported copy binds this live tab to the current session,
+    // without changing the saved record's ownership or creating a duplicate tab.
+    conversationTabs.update(tab.id, {accountScope});
+    tab = conversationTabs.get(tab.id);
+  } else if (tab.sourceConversationId === sourceConversationId &&
       (tab.accountScope !== accountScope && (tab.accountScope !== null || accountScope !== null))) {
     // A matching URL cannot prove that the provider account stayed the same.
     // Keep the old tab scoped to its original account and start a separate live placeholder.
