@@ -41,6 +41,8 @@ def version(root):
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlsplit(newurl).scheme != 'https':
+            raise ValueError('refusing non-HTTPS artifact or API redirect')
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is not None and urlsplit(req.full_url).netloc != urlsplit(newurl).netloc:
             redirected.remove_header('Authorization')
@@ -250,15 +252,11 @@ def validate_files(record, members, build_version):
 def validate_pr_candidate(data, artifact, run, pr, merge_sha, merge_tree, build_version, api_fn):
     number = pr.get('number')
     head = (pr.get('head') or {}).get('sha')
-    linked = run.get('pull_requests', [])
-    tested_base = None
-    if len(linked) == 1 and linked[0].get('number') == number:
-        tested_base = (linked[0].get('base') or {}).get('sha')
     if (not number or not head or pr.get('merge_commit_sha') != merge_sha or not pr.get('merged')
             or (pr.get('base') or {}).get('ref') != 'main'
             or (pr.get('base') or {}).get('repo', {}).get('full_name') != REPOSITORY
             or (pr.get('head') or {}).get('repo', {}).get('full_name') != REPOSITORY
-            or len(linked) != 1 or linked[0].get('number') != number or not tested_base):
+            or (pr.get('head') or {}).get('sha') != run.get('head_sha')):
         raise ValueError('candidate PR is not the exact merged same-repository main PR')
     validate_run(run, artifact, 'pull_request', head, 'pr')
     if run.get('head_repository', {}).get('full_name') != REPOSITORY:
@@ -268,6 +266,13 @@ def validate_pr_candidate(data, artifact, run, pr, merge_sha, merge_tree, build_
                       f'Chat_Hub_{build_version}_macos-arm64.dmg', 'native-receipt.json'}
     members = zip_members(data, expected_files)
     record = json.loads(members['native-receipt.json'])
+    tested_base = record.get('tested_base')
+    if not isinstance(tested_base, str) or not re.fullmatch(r'[0-9a-f]{40}', tested_base):
+        raise ValueError('native receipt has no valid tested PR base')
+    linked = run.get('pull_requests') or []
+    if linked and (len(linked) != 1 or linked[0].get('number') != number
+                   or (linked[0].get('base') or {}).get('sha') != tested_base):
+        raise ValueError('native run association conflicts with its immutable PR receipt')
     expected = {
         'schema': 2, 'repository': REPOSITORY, 'workflow_path': NATIVE_WORKFLOW,
         'run_id': run['id'], 'run_attempt': run['run_attempt'], 'event': 'pull_request',
@@ -310,7 +315,6 @@ def workflow_runs(workflow_path, head_sha, event, api_fn):
 
 def verify_check_run(run, pr, merge_sha, merge_tree, api_fn):
     head = pr['head']['sha']
-    base_sha = run['pull_requests'][0]['base']['sha']
     artifacts = api_fn(f"repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts?per_page=100").get('artifacts', [])
     name = f'{CHECK_ARTIFACT_PREFIX}-{run["id"]}-{run["run_attempt"]}'
     found = [item for item in artifacts if item.get('name') == name and not item.get('expired')]
@@ -319,6 +323,12 @@ def verify_check_run(run, pr, merge_sha, merge_tree, api_fn):
     artifact = found[0]
     members = zip_members(artifact_bytes(artifact, api_fn), {'check-receipt.json'})
     record = json.loads(members['check-receipt.json'])
+    base_sha = record.get('base_sha')
+    linked = run.get('pull_requests') or []
+    if (not isinstance(base_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', base_sha)
+            or (linked and (len(linked) != 1 or linked[0].get('number') != pr['number']
+                            or (linked[0].get('base') or {}).get('sha') != base_sha))):
+        raise ValueError('Linux run association conflicts with its immutable PR receipt')
     expected = {
         'schema': 1, 'repository': REPOSITORY, 'workflow_path': CHECK_WORKFLOW,
         'run_id': run['id'], 'run_attempt': run['run_attempt'], 'event': 'pull_request',
@@ -344,10 +354,7 @@ def require_check_receipt(pr, tested_base, merge_sha, merge_tree, api_fn):
                and run.get('event') == 'pull_request' and run.get('head_sha') == head
                and run.get('conclusion') == 'success'
                and run.get('repository', {}).get('full_name') == REPOSITORY
-               and run.get('head_repository', {}).get('full_name') == REPOSITORY
-               and len(run.get('pull_requests', [])) == 1
-               and run['pull_requests'][0].get('number') == pr['number']
-               and (run['pull_requests'][0].get('base') or {}).get('sha') == tested_base]
+                and run.get('head_repository', {}).get('full_name') == REPOSITORY]
     accepted = []
     failures = []
     for run in matches:
@@ -383,8 +390,8 @@ def promote(root, merge_sha, api_fn=request):
     candidates = [run for run in runs if run.get('path') == NATIVE_WORKFLOW
                  and run.get('event') == 'pull_request' and run.get('head_sha') == head
                  and run.get('conclusion') == 'success'
-                 and len(run.get('pull_requests', [])) == 1
-                 and run['pull_requests'][0].get('number') == pr['number']]
+                  and run.get('repository', {}).get('full_name') == REPOSITORY
+                  and run.get('head_repository', {}).get('full_name') == REPOSITORY]
     accepted = []
     errors = []
     for run in candidates:
@@ -478,9 +485,10 @@ def verify_check_receipt(accepted, merge_sha, merge_tree, api_fn):
             or run.get('conclusion') != 'success' or run.get('head_sha') != accepted.get('pr_head_sha')
             or run.get('repository', {}).get('full_name') != REPOSITORY
             or run.get('head_repository', {}).get('full_name') != REPOSITORY
-            or len(run.get('pull_requests', [])) != 1
-            or run['pull_requests'][0].get('number') != accepted.get('pr_number')
-            or (run['pull_requests'][0].get('base') or {}).get('sha') != accepted.get('source_base_sha')):
+            or (run.get('pull_requests') and
+                (len(run['pull_requests']) != 1
+                 or run['pull_requests'][0].get('number') != accepted.get('pr_number')
+                 or (run['pull_requests'][0].get('base') or {}).get('sha') != accepted.get('source_base_sha')))):
         raise ValueError('Linux receipt is not from the successful accepted PR and exact base')
     artifacts = api_fn(f'repos/{REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=100').get('artifacts', [])
     name = f'{CHECK_ARTIFACT_PREFIX}-{run_id}-{attempt}'

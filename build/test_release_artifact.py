@@ -200,6 +200,15 @@ class ReleaseArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Linux check receipt unavailable'):
             self.promote()
 
+    def test_promoter_and_retriever_accept_successful_runs_after_github_drops_pr_associations(self):
+        self.native_run['pull_requests'] = []
+        self.check_run['pull_requests'] = []
+        mapping = self.promote()
+        self.assertEqual(mapping['pr_number'], 42)
+        self.install_mapping(mapping)
+        retrieved = self.retrieve(mapping_run_id=789)
+        self.assertEqual(retrieved['source_run_id'], 123)
+
     def test_promoter_rejects_wrong_tree_policy_or_base(self):
         self.build_native(tree='f' * 40)
         with self.assertRaisesRegex(ValueError, 'accepted PR tree'):
@@ -288,6 +297,21 @@ class ReleaseArtifactTests(unittest.TestCase):
     def test_retrieval_requires_exactly_one_mapping_or_fallback(self):
         with self.assertRaisesRegex(ValueError, 'exactly one'):
             self.retrieve(mapping_run_id=789, trusted_main_run_id=321)
+
+    def test_redirect_keeps_github_token_on_api_host_only_and_rejects_http(self):
+        handler = release.SafeRedirect()
+        request = __import__('urllib.request').request.Request(
+            'https://api.github.com/repos/iarnvidr/chat-hub/actions/artifacts/1/zip',
+            headers={'Authorization': 'Bearer fixture'})
+        redirected = handler.redirect_request(request, None, 302, 'Found', {},
+                                              'https://objects.example/artifact.zip')
+        self.assertNotIn('Authorization', redirected.headers)
+        same_host = handler.redirect_request(request, None, 302, 'Found', {},
+                                             'https://api.github.com/other')
+        self.assertEqual(same_host.get_header('Authorization'), 'Bearer fixture')
+        with self.assertRaisesRegex(ValueError, 'non-HTTPS'):
+            handler.redirect_request(request, None, 302, 'Found', {},
+                                     'http://objects.example/artifact.zip')
 
 
 if __name__ == '__main__':
