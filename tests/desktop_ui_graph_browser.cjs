@@ -30,6 +30,14 @@ async function canvasMetrics(page){
     return results;
   });
 }
+async function waitForPaintedCanvas(page){
+  await page.waitForFunction(()=>[...document.querySelectorAll('#graph-canvas canvas')].some(canvas=>{
+    const context=canvas.getContext('2d');if(!context||!canvas.width||!canvas.height)return false;
+    const pixels=context.getImageData(0,0,canvas.width,canvas.height).data;let painted=0;
+    for(let i=3;i<pixels.length;i+=64)if(pixels[i])painted++;
+    return painted>20;
+  }),null,{timeout:15000});
+}
 function assertPaintedCanvas(metrics,viewport){
   assert.ok(metrics.length>0,`${viewport}: Cytoscape created drawing canvases`);
   assert.ok(metrics.every(m=>Number.isFinite(m.width)&&Number.isFinite(m.height)&&m.width>100&&m.height>100),`${viewport}: canvas has finite viewport geometry`);
@@ -90,6 +98,7 @@ const server=http.createServer((req,res)=>{
       throw new Error(`graph UI did not populate: ${JSON.stringify({state,pageErrors,consoleErrors,wait:error.message})}`);
     }
     await page.locator('#graph-canvas canvas').first().waitFor({state:'visible'});
+    await waitForPaintedCanvas(page);
     assertPaintedCanvas(await canvasMetrics(page),'1280x900');
     for(const viewport of [{width:1100,height:760},{width:1700,height:1000}]){
       await page.setViewportSize(viewport);await page.waitForTimeout(100);
