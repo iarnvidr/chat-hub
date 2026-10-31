@@ -24,7 +24,7 @@ class NativeSmokeArtifact(unittest.TestCase):
         )
 
     def test_workflows_use_metadata_artifact_and_isolated_bundle(self):
-        for name in ("macos.yml", "release.yml"):
+        for name in ("macos.yml",):
             workflow = (ROOT / ".github/workflows" / name).read_text()
             prepare = workflow.index("Prepare isolated debug bundle")
             build = workflow.rindex("cargo build --locked", 0, prepare)
@@ -38,7 +38,8 @@ class NativeSmokeArtifact(unittest.TestCase):
         self.assertIn('"$RUNNER_TEMP/chat-hub/Chat Hub.app"', macos)
         self.assertIn('Chat Hub.app/**', macos)
         release = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn('"$RUNNER_TEMP/chat-hub/Chat Hub.app"', release)
+        self.assertIn('release_artifact.py retrieve', release)
+        self.assertNotIn('cargo build', release)
         self.assertIn("release-assets/Chat-Hub.app.tar.gz", release)
 
 

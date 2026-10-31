@@ -1,19 +1,41 @@
 name: Apple Silicon build
 on:
+  pull_request:
   workflow_dispatch:
-    inputs:
-      native_library_smoke:
-        description: Run the native-library smoke against the packaged app
-        required: true
-        default: false
-        type: boolean
 permissions:
   contents: read
 concurrency:
-  group: macos-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    outputs:
+      required: ${{ steps.native-scope.outputs.required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: native-scope
+        name: Determine whether native validation is required
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          result="$(python3 build/native_scope.py --root "$GITHUB_WORKSPACE" --base "$BASE_SHA" --head "$HEAD_SHA")"
+          echo "$result" >> "$GITHUB_STEP_SUMMARY"
+          required="$(printf '%s\n' "$result" | sed -n 's/^required=//p')"
+          test "$required" = true -o "$required" = false
+          echo "required=$required" >> "$GITHUB_OUTPUT"
   package:
+    needs: scope
+    if: >-
+      always() &&
+      ((github.event_name == 'pull_request' && needs.scope.result == 'success' && needs.scope.outputs.required == 'true') ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -76,9 +98,8 @@ jobs:
           cmp -s "$debug_binary" "$app/Contents/MacOS/$exe"
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
-      - name: Optional native library persisted-data smoke (debug bundle only)
+      - name: Required native library persisted-data smoke (debug bundle only)
         id: native-library-smoke
-        if: ${{ inputs.native_library_smoke }}
         env:
           NATIVE_LIBRARY_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-library-evidence
         run: |
@@ -94,9 +115,6 @@ jobs:
             echo "native library smoke: ran (failure, exit $rc)" | tee -a "$GITHUB_STEP_SUMMARY"
             exit "$rc"
           fi
-      - name: Report skipped native library smoke
-        if: ${{ !inputs.native_library_smoke }}
-        run: 'echo "native library smoke: skipped (input disabled; not an acceptance result)" >> "$GITHUB_STEP_SUMMARY"'
       - name: Required release app launch and localhost health smoke
         env:
           SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
@@ -153,7 +171,7 @@ jobs:
         if: always()
         run: |
           args=()
-          if [[ '${{ inputs.native_library_smoke }}' == 'true' ]]; then args+=(--native-library-source "$RUNNER_TEMP/chat-hub-native-library-evidence"); fi
+          args+=(--native-library-source "$RUNNER_TEMP/chat-hub-native-library-evidence")
           python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-debug-ui-evidence" "$RUNNER_TEMP/chat-hub-provider-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence" "${args[@]}"
       - name: Upload release startup evidence
         if: always()
@@ -181,6 +199,21 @@ jobs:
           if-no-files-found: error
           # Builds of main stay downloadable for a month; PR builds for a week.
           retention-days: ${{ github.event_name == 'pull_request' && 7 || 30 }}
+      - name: Retain accepted native release input
+        run: |
+          version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/chat-hub/Chat Hub.app" "artifacts/Chat_Hub_${version}_macos-arm64.zip"
+          (cd artifacts && shasum -a 256 "Chat_Hub_${version}_macos-arm64.zip" > "Chat_Hub_${version}_macos-arm64.zip.sha256")
+          cp "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg" artifacts/
+          python3 build/release_artifact.py receipt
+      - name: Upload accepted native release input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chat-hub-native-release-${{ github.event_name == 'pull_request' && 'pr' || 'main' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 90
       - name: Show where to download this build
         env:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
@@ -192,4 +225,33 @@ jobs:
             echo "Not a release: ad-hoc signed and not notarized. See README, Install on the Mac."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Download: $ARTIFACT_URL"
+  native-release-gate:
+    name: native-release-gate
+    if: always() && (github.event_name == 'pull_request' ||
+                     (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    needs: [scope, package]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require native build for in-scope changes and main manual builds
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          NATIVE_REQUIRED: ${{ needs.scope.outputs.required }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            test "$SCOPE_RESULT" = success || { echo "Native scope evaluation failed; failing closed." >&2; exit 1; }
+            case "$NATIVE_REQUIRED" in
+              true) test "$PACKAGE_RESULT" = success || { echo "Native changes require the complete macOS build and smoke suite." >&2; exit 1; } ;;
+              false) test "$PACKAGE_RESULT" = skipped || { echo "Unexpected native package result for out-of-scope changes." >&2; exit 1; } ;;
+              *) echo "Native scope result is missing or malformed." >&2; exit 1 ;;
+            esac
+          elif [[ "$EVENT_NAME" == workflow_dispatch && "$REF" == refs/heads/main ]]; then
+            test "$PACKAGE_RESULT" = success || { echo "Trusted-main manual native build did not succeed." >&2; exit 1; }
+          else
+            echo "Unsupported event/ref for required native gate." >&2
+            exit 1
+          fi
 # Deliberately no automatic GitHub release. See docs/PUBLICATION.md before releasing.

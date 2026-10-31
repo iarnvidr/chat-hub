@@ -8,7 +8,7 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-def parse_workflow_steps(text):
+def parse_workflow_steps(text, job='package'):
     """Parse this workflow's YAML step sequence using only the Python stdlib.
 
     This deliberately supports the block-scalar/key subset used by GitHub
@@ -17,7 +17,10 @@ def parse_workflow_steps(text):
     silently weaken these dependency assertions.
     """
     lines = text.splitlines()
-    start = next((i for i, line in enumerate(lines) if line == '    steps:'), None)
+    job_index = next((i for i, line in enumerate(lines) if line == f'  {job}:'), None)
+    if job_index is None:
+        raise ValueError('workflow has no jobs.package.steps sequence')
+    start = next((i for i in range(job_index + 1, len(lines)) if lines[i] == '    steps:'), None)
     if start is None:
         raise ValueError('workflow has no jobs.package.steps sequence')
     steps = []
@@ -103,8 +106,7 @@ def _assert_workflow_contract(test, steps, kind):
         test.assertTrue(matching, f'missing {marker}')
         test.assertGreater(min(matching), gate, marker)
     if kind == 'macos':
-        test.assertEqual(steps[gate].get('if'), '${{ inputs.native_library_smoke }}')
-        test.assertIn('native library smoke: skipped', steps[find('Report skipped native library smoke')]['run'])
+        test.assertNotIn('if', steps[gate])
         test.assertNotIn('continue-on-error', steps[gate])
         test.assertNotIn('for attempt', gate_run)
     else:
@@ -120,11 +122,17 @@ class NativeLibraryWorkflowTests(unittest.TestCase):
         _assert_workflow_contract(self, parse_workflow_steps((ROOT / '.github/workflows/macos.yml').read_text()), 'macos')
 
     def test_release_gate_has_correct_dependencies(self):
-        _assert_workflow_contract(self, parse_workflow_steps((ROOT / '.github/workflows/release.yml').read_text()), 'release')
+        text = (ROOT / '.github/workflows/release.yml').read_text()
+        steps = parse_workflow_steps(text, 'prepare')
+        retrieval = next(i for i, step in enumerate(steps) if 'release_artifact.py retrieve' in step.get('run', ''))
+        signing = next(i for i, step in enumerate(steps) if 'signer sign' in step.get('run', ''))
+        self.assertLess(retrieval, signing)
+        self.assertFalse(any('cargo build' in step.get('run', '') for step in steps))
+        self.assertIn('needs: [prepare, qualify]', text)
 
     def test_contract_rejects_debug_prepare_after_gate_and_wrong_artifact(self):
         import copy
-        for kind, filename in (('macos', 'macos.yml'), ('release', 'release.yml')):
+        for kind, filename in (('macos', 'macos.yml'),):
             with self.subTest(workflow=kind):
                 original = parse_workflow_steps((ROOT / '.github/workflows' / filename).read_text())
                 find = lambda fragment: next(i for i, step in enumerate(original) if fragment in step.get('name', '') or fragment in step.get('id', ''))

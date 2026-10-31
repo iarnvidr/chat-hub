@@ -1,0 +1,50 @@
+name: Map accepted Chat Hub macOS artifact
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src-tauri/**"
+      - "build/**"
+      - "tests/native/**"
+      - "src/**"
+      - "frontend/**"
+      - "desktop-ui/**"
+      - "package.json"
+      - "package-lock.json"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "tauri.conf.json"
+      - ".github/workflows/macos.yml"
+      - ".github/workflows/check.yml"
+      - ".github/workflows/accept-native.yml"
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: chat-hub-native-acceptance-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  map:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Map exact main merge to accepted PR artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 build/release_artifact.py promote --root "$GITHUB_WORKSPACE" --merge-sha "$GITHUB_SHA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chat-hub-accepted-native-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: accepted-native.json
+          if-no-files-found: error
+          retention-days: 90
