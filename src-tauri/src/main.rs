@@ -15,9 +15,11 @@ mod chatgpt_history;
 mod crash_diagnostics;
 mod desktop_api;
 mod desktop_archive;
+mod desktop_menu;
 mod desktop_runtime;
 #[cfg(feature = "native-smoke")]
 mod e2e_protocol;
+mod library_items;
 mod newcapture_settings;
 mod project_client_probe;
 mod service_health;
@@ -419,19 +421,21 @@ async fn list_conversations(
     cursor: Option<String>,
     source: Option<String>,
     project_key: Option<String>,
+    tag: Option<String>,
 ) -> Result<desktop_api::Page, String> {
     authorize_local_main(&window)?;
     match source.as_deref() {
         None | Some("all") | Some("chatgpt") | Some("codex") => {}
         _ => return Err("invalid_source".into()),
     }
-    desktop_api::list_in_scope(
+    desktop_api::list_in_scope_with_tag(
         &s.api,
         &s.token,
         &query,
         cursor.as_deref(),
         source.as_deref(),
         project_key.as_deref(),
+        tag.as_deref(),
     )
     .await
 }
@@ -453,10 +457,128 @@ async fn learned_project_operations(
     authorize_local_main(&window)?;
     desktop_api::learned_project_operations(&s.api, &s.token).await
 }
+
+struct ParsedUpstreamProjectKey {
+    account_scope: String,
+    project_id: String,
+    legacy_paseo: bool,
+}
+
+fn parse_upstream_project_key(project_key: &str) -> Result<ParsedUpstreamProjectKey, String> {
+    if project_key.len() > 1024 {
+        return Err("invalid_project".into());
+    }
+    let encoded = project_key
+        .strip_prefix("project:")
+        .ok_or_else(|| "invalid_project".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(encoded).map_err(|_| "invalid_project".to_string())?;
+    let parts = value
+        .as_array()
+        .ok_or_else(|| "invalid_project".to_string())?;
+    if parts.len() != 3 {
+        return Err("invalid_project".into());
+    }
+    let provider = parts[0]
+        .as_str()
+        .ok_or_else(|| "invalid_project".to_string())?;
+    let scope = parts[1]
+        .as_str()
+        .ok_or_else(|| "invalid_project".to_string())?;
+    let legacy_paseo = match provider {
+        "chatgpt" => scope
+            .strip_prefix("chatgpt:observed:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            }),
+        "paseo-chatgpt" => scope.strip_prefix("paseo-cache:").is_some_and(|owner| {
+            !owner.is_empty()
+                && owner.len() <= 64
+                && owner
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        }),
+        _ => false,
+    };
+    if !legacy_paseo && provider != "chatgpt" {
+        return Err("invalid_project".into());
+    }
+    if provider == "chatgpt"
+        && !scope
+            .strip_prefix("chatgpt:observed:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+    {
+        return Err("invalid_project".into());
+    }
+    let project_id = parts[2]
+        .as_str()
+        .filter(|id| {
+            id.strip_prefix("g-p-").is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.len() <= 128
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+        })
+        .ok_or_else(|| "invalid_project".to_string())?
+        .to_owned();
+    Ok(ParsedUpstreamProjectKey {
+        account_scope: scope.to_owned(),
+        project_id,
+        legacy_paseo: provider == "paseo-chatgpt",
+    })
+}
+
+#[cfg(test)]
+mod project_rename_key_tests {
+    use super::parse_upstream_project_key;
+
+    #[test]
+    fn upstream_project_key_requires_observed_chatgpt_scope_and_id() {
+        let scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        let key = format!("project:[\"chatgpt\",\"{scope}\",\"g-p-project_123\"]");
+        let parsed = parse_upstream_project_key(&key).unwrap();
+        assert_eq!(parsed.account_scope, scope);
+        assert_eq!(parsed.project_id, "g-p-project_123");
+        assert!(!parsed.legacy_paseo);
+        let legacy = parse_upstream_project_key(
+            "project:[\"paseo-chatgpt\",\"paseo-cache:owner-123\",\"g-p-project_123\"]",
+        )
+        .unwrap();
+        assert_eq!(legacy.account_scope, "paseo-cache:owner-123");
+        assert_eq!(legacy.project_id, "g-p-project_123");
+        assert!(legacy.legacy_paseo);
+        for key in [
+            "project:[\"codex\",\"chatgpt:observed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"g-p-project\"]".to_owned(),
+            format!("project:[\"chatgpt\",\"chatgpt:observed:{}\",\"g-p-project\"]", "A".repeat(64)),
+            format!("project:[\"chatgpt\",\"{scope}\",\"g-p-\"]"),
+            "project:[\"chatgpt\",\"chatgpt:oauth:opaque\",\"g-p-project\"]".to_owned(),
+            "project:[\"paseo-chatgpt\",\"chatgpt:observed:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"g-p-project\"]".to_owned(),
+            "project:[\"paseo-chatgpt\",\"paseo-cache:\",\"g-p-project\"]".to_owned(),
+            "project:[\"paseo-codex_local\",\"paseo-cache:owner\",\"g-p-project\"]".to_owned(),
+        ] {
+            assert!(parse_upstream_project_key(&key).is_err());
+        }
+    }
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects window/app/state alongside the rename inputs.
 async fn rename_project(
     window: tauri::Webview,
+    app: tauri::AppHandle,
     s: State<'_, AppState>,
+    provider: State<'_, ProviderViewState>,
+    history: State<'_, chatgpt_history::ChatgptHistoryState>,
     project_key: String,
     name: Option<String>,
     scope: Option<String>,
@@ -468,9 +590,69 @@ async fn rename_project(
         "local" => {
             desktop_api::rename_project(&s.api, &s.token, &project_key, name.as_deref()).await
         }
-        // Until the shipped client request is verified, fail closed instead
-        // of guessing an upstream mutation endpoint or replaying credentials.
-        "upstream" => Err("upstream_project_rename_unavailable".into()),
+        "upstream" => {
+            let name = name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "invalid_project_name".to_string())?;
+            if name.chars().count() > 120 || name.chars().any(char::is_control) {
+                return Err("invalid_project_name".into());
+            }
+            let project_target = parse_upstream_project_key(&project_key)?;
+            let cooldown = history.snapshot()?.retry_after.unwrap_or(0);
+            if cooldown > 0 {
+                return Err("chatgpt_rate_limited".into());
+            }
+            let connection = provider.chatgpt_connection().await;
+            if connection.state != provider_view::ChatGptConnectionState::Connected {
+                return Err(match connection.state {
+                    provider_view::ChatGptConnectionState::SignedOut => "chatgpt_signed_out",
+                    provider_view::ChatGptConnectionState::Loading => "chatgpt_loading",
+                    provider_view::ChatGptConnectionState::NotOpen => "chatgpt_not_open",
+                    _ => "chatgpt_unavailable",
+                }
+                .into());
+            }
+            let observed_scope = connection
+                .account_scope
+                .as_deref()
+                .ok_or_else(|| "chatgpt_account_unavailable".to_string())?;
+            if !project_target.legacy_paseo && observed_scope != project_target.account_scope {
+                return Err("chatgpt_account_mismatch".into());
+            }
+            let outcome = provider
+                .rename_project(&project_target.project_id, name, observed_scope)
+                .await?;
+            if outcome.error_code.as_deref() == Some("rate_limited") {
+                history.note_provider_rate_limit(outcome.retry_after);
+                return Err("chatgpt_rate_limited".into());
+            }
+            if outcome.state != "applied" || !outcome.verified {
+                return Err(outcome
+                    .error_code
+                    .unwrap_or_else(|| "project_rename_failed".into()));
+            }
+            let result = desktop_api::commit_verified_project_title(
+                &s.api,
+                &s.token,
+                &project_key,
+                observed_scope,
+                name,
+                project_target.legacy_paseo.then_some((
+                    project_target.account_scope.as_str(),
+                    project_target.project_id.as_str(),
+                )),
+            )
+            .await?;
+            let _ = app.emit("library-changed", ());
+            Ok(serde_json::json!({
+                "scope":"upstream",
+                "verified":true,
+                "project":result.get("project").cloned().unwrap_or(serde_json::Value::Null),
+                "library_revision":result.get("library_revision").cloned().unwrap_or(serde_json::Value::Null),
+            }))
+        }
         _ => Err("invalid_rename_scope".into()),
     }
 }
@@ -498,15 +680,17 @@ async fn catalog_graph(
     project_key: Option<String>,
     limit: Option<usize>,
     focus_id: Option<String>,
+    tag: Option<String>,
 ) -> Result<serde_json::Value, String> {
     authorize_local_main(&window)?;
-    desktop_api::catalog_graph(
+    desktop_api::catalog_graph_with_tag(
         &s.api,
         &s.token,
         source.as_deref().unwrap_or("all"),
         project_key.as_deref(),
         limit.unwrap_or(40),
         focus_id.as_deref(),
+        tag.as_deref(),
     )
     .await
 }
@@ -1242,7 +1426,9 @@ fn main() {
     let updater_builder = tauri_plugin_updater::Builder::new();
     let builder = tauri::Builder::default()
         .plugin(updater_builder.build())
-        .plugin(tauri_plugin_dialog::init());
+        .plugin(tauri_plugin_dialog::init())
+        .menu(desktop_menu::build)
+        .on_menu_event(desktop_menu::handle);
     let builder = builder.setup(|app| {
         let dir = {
             #[cfg(feature = "native-smoke")]
@@ -1413,6 +1599,17 @@ fn main() {
             catalog_overview,
             catalog_graph,
             rebuild_catalog_index,
+            library_items::catalog_entities,
+            library_items::catalog_entity,
+            library_items::list_local_tags,
+            library_items::get_target_tags,
+            library_items::set_target_tags,
+            library_items::tagged_targets,
+            library_items::saved_artifacts,
+            library_items::attach_artifact_file,
+            library_items::export_artifact_file,
+            library_items::open_artifact_file,
+            library_items::open_catalog_link,
             get_conversation,
             import_chatgpt_export,
             backup_library,
@@ -1472,6 +1669,17 @@ fn main() {
             catalog_overview,
             catalog_graph,
             rebuild_catalog_index,
+            library_items::catalog_entities,
+            library_items::catalog_entity,
+            library_items::list_local_tags,
+            library_items::get_target_tags,
+            library_items::set_target_tags,
+            library_items::tagged_targets,
+            library_items::saved_artifacts,
+            library_items::attach_artifact_file,
+            library_items::export_artifact_file,
+            library_items::open_artifact_file,
+            library_items::open_catalog_link,
             get_conversation,
             import_chatgpt_export,
             backup_library,

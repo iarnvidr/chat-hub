@@ -182,6 +182,16 @@ pub fn list_url_for_scope(
     source: Option<&str>,
     project_key: Option<&str>,
 ) -> Result<Url, String> {
+    list_url_for_scope_and_tag(base, query, cursor, source, project_key, None)
+}
+pub fn list_url_for_scope_and_tag(
+    base: &str,
+    query: &str,
+    cursor: Option<&str>,
+    source: Option<&str>,
+    project_key: Option<&str>,
+    tag: Option<&str>,
+) -> Result<Url, String> {
     let mut q = vec![("limit", "50")];
     if !query.trim().is_empty() {
         q.push(("q", query.trim()));
@@ -200,6 +210,12 @@ pub fn list_url_for_scope(
             return Err("invalid_project".into());
         }
         q.push(("project_key", project_key));
+    }
+    if let Some(tag) = tag {
+        if tag.trim().is_empty() || tag.len() > 256 {
+            return Err("invalid_tag".into());
+        }
+        q.push(("tag", tag));
     }
     let endpoint = if query.trim().is_empty() {
         "conversations"
@@ -295,11 +311,22 @@ pub async fn list_in_scope(
     source: Option<&str>,
     project_key: Option<&str>,
 ) -> Result<Page, String> {
+    list_in_scope_with_tag(base, token, q, cursor, source, project_key, None).await
+}
+pub async fn list_in_scope_with_tag(
+    base: &str,
+    token: &str,
+    q: &str,
+    cursor: Option<&str>,
+    source: Option<&str>,
+    project_key: Option<&str>,
+    tag: Option<&str>,
+) -> Result<Page, String> {
     let c = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| "Desktop API unavailable")?;
-    let u = list_url_for_scope(base, q, cursor, source, project_key)?;
+    let u = list_url_for_scope_and_tag(base, q, cursor, source, project_key, tag)?;
     get(&c, u, token).await
 }
 pub async fn projects(base: &str, token: &str, source: &str) -> Result<Value, String> {
@@ -338,6 +365,9 @@ pub async fn rename_project(
         .await
         .map_err(|_| "Desktop API unavailable")?;
     if !response.status().is_success() {
+        if response.status() == StatusCode::CONFLICT {
+            return Err("scope_mismatch".into());
+        }
         return Err(map_http_error(response.status(), None).into());
     }
     let mut response = response;
@@ -354,6 +384,74 @@ pub async fn rename_project(
     }
     serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
 }
+
+pub async fn commit_verified_project_title(
+    base: &str,
+    token: &str,
+    project_key: &str,
+    expected_scope: &str,
+    title: &str,
+    legacy_target: Option<(&str, &str)>,
+) -> Result<Value, String> {
+    if project_key.is_empty()
+        || project_key.len() > 1024
+        || expected_scope.len() > 128
+        || title.trim().is_empty()
+        || title.chars().count() > 120
+        || title.chars().any(char::is_control)
+    {
+        return Err("invalid_project".into());
+    }
+    let c = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = url(base, &["api", "v1", "projects", "title"], &[])?;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "project_key":project_key,
+        "expected_scope":expected_scope,
+        "title":title.trim(),
+        "legacy_target":legacy_target.map(|(account_scope,source_id)| serde_json::json!({
+            "account_scope":account_scope,
+            "source_id":source_id,
+        })),
+    }))
+    .map_err(|_| "invalid_request")?;
+    let response = c
+        .patch(u)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "Desktop API unavailable")?;
+    if !response.status().is_success() {
+        return Err(map_http_error(response.status(), None).into());
+    }
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Desktop API unavailable")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err("response_too_large".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let result: Value = serde_json::from_slice(&body).map_err(|_| "invalid_response")?;
+    if result.get("verified").and_then(Value::as_bool) != Some(true)
+        || !result
+            .get("library_revision")
+            .and_then(Value::as_i64)
+            .is_some_and(|revision| revision >= 0)
+    {
+        return Err("update_unconfirmed".into());
+    }
+    Ok(result)
+}
+
 pub async fn project_assignment_context(
     base: &str,
     token: &str,
@@ -496,16 +594,26 @@ pub async fn catalog_graph(
     limit: usize,
     focus_id: Option<&str>,
 ) -> Result<Value, String> {
+    catalog_graph_with_tag(base, token, source, project_key, limit, focus_id, None).await
+}
+pub async fn catalog_graph_with_tag(
+    base: &str,
+    token: &str,
+    source: &str,
+    project_key: Option<&str>,
+    limit: usize,
+    focus_id: Option<&str>,
+    tag: Option<&str>,
+) -> Result<Value, String> {
     let c = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|_| "Desktop API unavailable")?;
-    get(
-        &c,
-        catalog_url(base, "graph", source, project_key, Some(limit), focus_id)?,
-        token,
-    )
-    .await
+    let mut address = catalog_url(base, "graph", source, project_key, Some(limit), focus_id)?;
+    if let Some(tag) = tag {
+        address.query_pairs_mut().append_pair("tag", tag);
+    }
+    get(&c, address, token).await
 }
 pub async fn rebuild_catalog_index(base: &str, token: &str) -> Result<Value, String> {
     let c = Client::builder()
@@ -552,7 +660,7 @@ pub async fn detail(
 
 #[cfg(test)]
 mod source_list_tests {
-    use super::{catalog_url, list_url_for_scope, list_url_for_source};
+    use super::{catalog_url, list_url_for_scope, list_url_for_scope_and_tag, list_url_for_source};
 
     #[test]
     fn source_and_project_filters_are_sent_to_server_before_pagination() {
@@ -650,5 +758,31 @@ mod source_list_tests {
         assert!(catalog_url(base, "graph", "unknown", None, Some(80), None).is_err());
         assert!(catalog_url(base, "graph", "all", None, Some(201), None).is_err());
         assert!(catalog_url(base, "graph", "all", None, Some(80), Some(" ")).is_err());
+    }
+
+    #[test]
+    fn tag_filtered_list_url_preserves_tag_in_query_scope() {
+        let address = list_url_for_scope_and_tag(
+            "http://127.0.0.1:8000",
+            "search text",
+            None,
+            Some("chatgpt"),
+            Some("project:key"),
+            Some("Work Notes"),
+        )
+        .unwrap();
+        let pairs = address.query_pairs().collect::<Vec<_>>();
+        assert!(pairs
+            .iter()
+            .any(|(key, value)| key == "tag" && value == "Work Notes"));
+        assert!(list_url_for_scope_and_tag(
+            "http://127.0.0.1:8000",
+            "",
+            None,
+            None,
+            None,
+            Some("   "),
+        )
+        .is_err());
     }
 }

@@ -9,21 +9,23 @@ export function findCapturedChatRecord(items, sourceConversationId, accountScope
   return matches.length === 1 ? {...matches[0]} : null;
 }
 
-export function createConversationTabs({container, onSelect, onEmpty}) {
+export function createConversationTabs({container, onSelect, onEmpty, doc=globalThis.document}) {
   const tabs = new Map();
   let selected = null;
-  function render() {
+  function render(focusSelected = false) {
     container.replaceChildren();
     container.hidden = tabs.size === 0;
+    let selectedButton = null;
     for (const tab of tabs.values()) {
-      const group = document.createElement('div');
+      const group = doc.createElement('div');
       group.className = 'conversation-tab' + (tab.id === selected ? ' active' : '');
-      const button = document.createElement('button');
+      const button = doc.createElement('button');
       button.type = 'button'; button.setAttribute('role', 'tab');
       button.setAttribute('aria-selected', String(tab.id === selected));
       button.tabIndex = tab.id === selected ? 0 : -1;
       button.textContent = tab.title || 'Untitled conversation';
-      button.addEventListener('click', () => { selected = tab.id; render(); onSelect({...tab}); });
+      if (tab.id === selected) selectedButton = button;
+      button.addEventListener('click', () => select(tab.id));
       button.addEventListener('keydown', event => {
         const ids = [...tabs.keys()], index = ids.indexOf(tab.id);
         let next;
@@ -31,26 +33,55 @@ export function createConversationTabs({container, onSelect, onEmpty}) {
         if (event.key === 'ArrowLeft') next = ids[(index + ids.length - 1) % ids.length];
         if (event.key === 'Home') next = ids[0];
         if (event.key === 'End') next = ids.at(-1);
-        if (next) { event.preventDefault(); selected = next; render(); onSelect({...tabs.get(next)}); container.querySelector('[aria-selected="true"]')?.focus(); }
+        if (next) { event.preventDefault(); select(next, true); }
       });
-      const close = document.createElement('button');
+      const close = doc.createElement('button');
       close.type = 'button'; close.className = 'close-tab'; close.textContent = '×';
       close.setAttribute('aria-label', `Close ${tab.title || 'conversation'}`);
-      close.addEventListener('click', () => {
-        const ids = [...tabs.keys()], index = ids.indexOf(tab.id);
-        tabs.delete(tab.id);
-        if (selected === tab.id) {
-          selected = ids[index + 1] || ids[index - 1] || null;
-          if (selected) onSelect({...tabs.get(selected)}); else onEmpty();
-        }
-        render();
-      });
+      close.addEventListener('click', () => closeTab(tab.id));
       group.append(button, close); container.append(group);
     }
+    if (focusSelected) selectedButton?.focus();
+  }
+  function select(id, focus = false) {
+    const tab = tabs.get(id);
+    if (!tab) return false;
+    selected = id;
+    onSelect({...tab});
+    render(focus);
+    return true;
+  }
+  function closeTab(id) {
+    const ids = [...tabs.keys()], index = ids.indexOf(id);
+    if (index < 0) return false;
+    const wasSelected = selected === id;
+    tabs.delete(id);
+    if (wasSelected) {
+      selected = ids[index + 1] || ids[index - 1] || null;
+      if (selected) onSelect({...tabs.get(selected)}); else onEmpty();
+    }
+    render(wasSelected && selected !== null);
+    return true;
   }
   return {
     open(tab) { const existing = tabs.get(tab.id); tabs.set(tab.id, {...existing, ...tab}); selected = tab.id; render(); },
     update(id, changes) { if (tabs.has(id)) { tabs.set(id, {...tabs.get(id), ...changes}); render(); } },
+    select,
+    selectRelative(delta) {
+      const ids = [...tabs.keys()];
+      if (!ids.length || !Number.isInteger(delta)) return false;
+      const index = ids.indexOf(selected);
+      const next = ids[(Math.max(index, 0) + delta % ids.length + ids.length) % ids.length];
+      return select(next, true);
+    },
+    selectNumber(number) {
+      const ids = [...tabs.keys()];
+      if (!Number.isInteger(number) || number < 1 || number > 9 || !ids.length) return false;
+      const index = number === 9 ? ids.length - 1 : number - 1;
+      return ids[index] ? select(ids[index], true) : false;
+    },
+    closeTab,
+    closeSelected() { return selected === null ? false : closeTab(selected); },
     get(id) { const tab = tabs.get(id); return tab ? {...tab} : null; },
     selected() { const tab = tabs.get(selected); return tab ? {...tab} : null; },
     all() { return [...tabs.values()].map(tab => ({...tab})); },

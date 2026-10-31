@@ -202,6 +202,12 @@ fn backup_is_independent_valid_and_never_overwrites() {
             None,
         ))
         .unwrap();
+    store
+        .set_target_tags("conversation", &id1, &["reference".into()])
+        .unwrap();
+    store
+        .set_target_tags("entity", "entity:repository-opaque", &["reference".into()])
+        .unwrap();
     let receipt: BackupReceipt = store.backup_to(&dest).unwrap();
     assert_eq!(receipt.schema_version, store.schema_version().unwrap());
     assert_eq!(receipt.library_revision, store.library_revision().unwrap());
@@ -213,6 +219,15 @@ fn backup_is_independent_valid_and_never_overwrites() {
         receipt.conversation_count
     );
     assert_eq!(receipt.conversation_count, 2);
+    assert_eq!(
+        copy.query_row(
+            "SELECT count(*) FROM target_tags WHERE name_key='reference'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -233,6 +248,10 @@ fn backup_is_independent_valid_and_never_overwrites() {
     assert_eq!(
         reopened.library_revision().unwrap(),
         receipt.library_revision
+    );
+    assert_eq!(
+        reopened.target_tags("conversation", &id1).unwrap(),
+        ["reference"]
     );
     assert_eq!(
         reopened.search("branch searchable", 10).unwrap(),

@@ -16,6 +16,12 @@ The desktop opens saved conversations in individual tabs and defaults to ChatGPT
 
 The CLI restore command remains available for restoring into an empty library: set `CHAT_HUB_DATABASE` to the destination path and run `cargo run -- restore /path/to/library.sqlite3`. It validates the backup, applies compatible migrations, rebuilds all search indexes, and prints a receipt. JSON exports cannot be restored.
 
+The local index also extracts repositories, pull requests, issues, domains, links and file references with links back to their source chats and messages. Overview categories search the full index before pagination and respect source, project and local tag filters. File references distinguish produced files, attachments and mentions; content is saved only after an explicit local file attachment, with Open and Save copy actions for saved bytes. This is not automatic downloading from ChatGPT. SQLite backups include saved file bytes; JSON exports contain their metadata only.
+
+Local tags are stored independently of the derived index and survive rebuilds. The desktop uses the classified terminal palette, distinct speaker styles and stable graph positions. Cmd/Ctrl+W closes the selected tab and does nothing when no tabs are open. Native menu shortcuts also work while the embedded ChatGPT view has focus. Cmd/Ctrl+T opens a new chat; Ctrl+Tab cycles tabs and Cmd/Ctrl+1–9 selects tabs (9 selects the last).
+
+Projects expand inline in the sidebar, with the selected project retained when collapsed. Settings → Appearance offers five saved color schemes: Classified amber, Phosphor, Arctic, Violet and Field notes. Color changes also update the graph without losing its position.
+
 ## Build and run
 
 Requires stable Rust, rustfmt, and Clippy.

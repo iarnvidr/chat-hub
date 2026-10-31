@@ -31,6 +31,10 @@ pub struct ChatgptHistoryStatus {
     pub failed: u64,
     pub error_code: Option<String>,
     pub retry_after: Option<u64>,
+    pub automatic_retry_paused: bool,
+    pub response_content_type: Option<String>,
+    pub challenge_detected: bool,
+    pub provider_error_code: Option<String>,
 }
 
 impl Default for ChatgptHistoryStatus {
@@ -50,6 +54,10 @@ impl Default for ChatgptHistoryStatus {
             failed: 0,
             error_code: None,
             retry_after: None,
+            automatic_retry_paused: false,
+            response_content_type: None,
+            challenge_detected: false,
+            provider_error_code: None,
         }
     }
 }
@@ -103,8 +111,17 @@ impl ChatgptHistoryState {
     /// Extend the shared provider cooldown after a separate provider action
     /// receives HTTP 429. This deliberately leaves the last sync receipt intact.
     pub fn note_provider_rate_limit(&self, retry_after: Option<u64>) {
-        let seconds = retry_after.unwrap_or(60).clamp(1, 1800);
+        let seconds = retry_after.unwrap_or(60).max(1);
+        if seconds > MAX_AUTOMATIC_RETRY_AFTER_SECONDS {
+            if let Ok(mut status) = self.status.lock() {
+                status.automatic_retry_paused = true;
+            }
+            return;
+        }
         let Some(deadline) = Instant::now().checked_add(Duration::from_secs(seconds)) else {
+            if let Ok(mut status) = self.status.lock() {
+                status.automatic_retry_paused = true;
+            }
             return;
         };
         if let Ok(mut next_attempt) = self.next_attempt.lock() {
@@ -203,17 +220,27 @@ impl ChatgptHistoryState {
                             current.message =
                                 history_error_message(outcome.error_code.as_deref()).into();
                             current.error_code = outcome.error_code;
+                            current.response_content_type = outcome.response_content_type;
+                            current.challenge_detected = outcome.challenge_detected;
+                            current.provider_error_code = outcome.provider_error_code;
+                            current.automatic_retry_paused =
+                                outcome.retry_after_too_long || outcome.challenge_detected;
                             if let Some(seconds) = outcome
                                 .retry_after
                                 .filter(|_| current.error_code.as_deref() == Some("rate_limited"))
                             {
-                                if let Ok(mut deadline) = next_attempt.lock() {
-                                    *deadline = Some(
-                                        Instant::now()
-                                            + Duration::from_secs(seconds.clamp(1, 1800)),
-                                    );
+                                if seconds > MAX_AUTOMATIC_RETRY_AFTER_SECONDS {
+                                    current.automatic_retry_paused = true;
+                                } else if let Some(deadline_at) =
+                                    Instant::now().checked_add(Duration::from_secs(seconds.max(1)))
+                                {
+                                    if let Ok(mut deadline) = next_attempt.lock() {
+                                        *deadline = Some(deadline_at);
+                                    }
+                                    current.retry_after = Some(seconds.max(1));
+                                } else {
+                                    current.automatic_retry_paused = true;
                                 }
-                                current.retry_after = Some(seconds.clamp(1, 1800));
                             }
                         }
                         Err(code) => {
@@ -242,6 +269,8 @@ impl ChatgptHistoryState {
         self.snapshot()
     }
 }
+
+const MAX_AUTOMATIC_RETRY_AFTER_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 fn write_status_snapshot(destination: &Path, status: &ChatgptHistoryStatus) -> std::io::Result<()> {
     let parent = destination
@@ -294,11 +323,21 @@ fn write_status_snapshot(destination: &Path, status: &ChatgptHistoryStatus) -> s
 
 fn history_error_message(code: Option<&str>) -> &'static str {
     match code {
-        Some("signed_out" | "login_required" | "chatgpt_not_open") => "Sign in to ChatGPT in this app, then sync history again. Your saved chats remain available.",
-        Some("rate_limited") => "ChatGPT is limiting history requests. Fetched progress was saved; wait before retrying.",
-        Some("cancelled" | "history_interrupted") => "History sync stopped. Conversations already saved remain in your library.",
-        Some("network_error") => "ChatGPT could not be reached. Your saved chats remain available offline.",
-        _ => "ChatGPT history could not finish. Any fetched conversations were saved; existing history was kept.",
+        Some("signed_out" | "login_required" | "chatgpt_not_open") => {
+            "Sign in to ChatGPT in this app, then sync history again. Your saved chats remain available."
+        }
+        Some("rate_limited") => {
+            "ChatGPT is limiting history requests. Fetched progress was saved; wait before retrying."
+        }
+        Some("cancelled" | "history_interrupted") => {
+            "History sync stopped. Conversations already saved remain in your library."
+        }
+        Some("network_error") => {
+            "ChatGPT could not be reached. Your saved chats remain available offline."
+        }
+        _ => {
+            "ChatGPT history could not finish. Any fetched conversations were saved; existing history was kept."
+        }
     }
 }
 
@@ -322,7 +361,7 @@ mod status_snapshot_tests {
         assert_eq!(stored.state, status.state);
         assert_eq!(stored.message, status.message);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 14);
+        assert_eq!(value.as_object().unwrap().len(), 18);
         assert!(value.get("account_scope").is_none());
         assert!(value.get("token").is_none());
         #[cfg(unix)]
@@ -373,5 +412,25 @@ mod status_snapshot_tests {
             .unwrap()
             .as_secs();
         assert!(retry_after >= 118, "remaining retry seconds: {retry_after}");
+    }
+
+    #[test]
+    fn external_hour_retry_after_is_preserved_and_unsupported_huge_wait_pauses_auto() {
+        let state = ChatgptHistoryState::new(PathBuf::new());
+        state.note_provider_rate_limit(Some(3600));
+        let retry_after = state
+            .next_attempt
+            .lock()
+            .unwrap()
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            .unwrap()
+            .as_secs();
+        assert!(
+            retry_after >= 3598,
+            "remaining retry seconds: {retry_after}"
+        );
+
+        state.note_provider_rate_limit(Some(MAX_AUTOMATIC_RETRY_AFTER_SECONDS + 1));
+        assert!(state.status.lock().unwrap().automatic_retry_paused);
     }
 }

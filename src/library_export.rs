@@ -86,6 +86,33 @@ fn write_rows<W: Write>(
     w.write_all(b"]")?;
     Ok(())
 }
+
+fn write_artifact_metadata<W: Write>(conn: &Connection, w: &mut W) -> Result<()> {
+    w.write_all(b"\"artifact_contents\":[")?;
+    let mut stmt = conn.prepare("SELECT entity_id,conversation_id,filename,mime_type,byte_size,sha256,saved_at_ms FROM artifact_contents ORDER BY entity_id")?;
+    let mut rows = stmt.query([])?;
+    let mut first = true;
+    while let Some(row) = rows.next()? {
+        if !first {
+            w.write_all(b",")?;
+        }
+        first = false;
+        let value = serde_json::json!({
+            "entity_id": row.get::<_, String>(0)?,
+            "conversation_id": row.get::<_, String>(1)?,
+            "filename": row.get::<_, String>(2)?,
+            "mime_type": row.get::<_, Option<String>>(3)?,
+            "byte_size": row.get::<_, i64>(4)?,
+            "sha256": row.get::<_, String>(5)?,
+            "saved_at_ms": row.get::<_, i64>(6)?,
+            "content_included": false,
+        });
+        serde_json::to_writer(&mut *w, &value)
+            .map_err(|e| crate::error::Error::Configuration(e.to_string()))?;
+    }
+    w.write_all(b"]")?;
+    Ok(())
+}
 impl Store {
     pub fn write_library_json<W: Write>(&self, writer: &mut W) -> Result<ExportMetadata> {
         let tx = self.connection().unchecked_transaction()?;
@@ -110,6 +137,18 @@ impl Store {
         )?;
         writer.write_all(b",")?;
         write_rows(&tx, writer, "observations", "SELECT id,conversation_id,source_time,observed_ms,parser,completeness,raw_payload FROM observations ORDER BY id", &["id","conversation_id","source_time","observed_ms","parser","completeness","raw_payload"])?;
+        writer.write_all(b",")?;
+        write_rows(
+            &tx,
+            writer,
+            "tags",
+            "SELECT name_key,name FROM tags ORDER BY name_key",
+            &["name_key", "name"],
+        )?;
+        writer.write_all(b",")?;
+        write_rows(&tx, writer, "target_tags", "SELECT target_kind,target_id,name_key,ordinal FROM target_tags ORDER BY target_kind,target_id,ordinal", &["target_kind","target_id","name_key","ordinal"])?;
+        writer.write_all(b",")?;
+        write_artifact_metadata(&tx, writer)?;
         writer.write_all(b"}\n")?;
         tx.commit()?;
         Ok(meta)

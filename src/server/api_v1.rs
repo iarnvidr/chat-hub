@@ -20,6 +20,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+mod catalog_items;
 mod imports;
 
 /// Every record and the revision in a snapshot must come from ONE store read
@@ -57,6 +58,20 @@ pub trait ReadAdapter: Send {
             "chatgpt" => self.chat_list_page_snapshot(limit, after, expected_revision),
             _ => Err(ReadError::Unavailable),
         }
+    }
+    fn scoped_list_page_snapshot_with_tag(
+        &mut self,
+        source: &str,
+        project_key: Option<&str>,
+        tag: Option<&str>,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        if tag.is_some() {
+            return Err(ReadError::Unavailable);
+        }
+        self.scoped_list_page_snapshot(source, project_key, limit, after, expected_revision)
     }
     fn projects_snapshot(&mut self, _source: &str) -> Result<(i64, Vec<Value>), ReadError> {
         Err(ReadError::Unavailable)
@@ -98,6 +113,26 @@ pub trait ReadAdapter: Send {
             _ => Err(ReadError::Unavailable),
         }
     }
+    fn scoped_search_page_snapshot_with_tag(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        scope: crate::store::PageScope<'_>,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        if scope.tag.is_some() {
+            return Err(ReadError::Unavailable);
+        }
+        self.scoped_search_page_snapshot(
+            query,
+            limit,
+            after,
+            expected_revision,
+            scope.source,
+            scope.project_key,
+        )
+    }
     fn detail_snapshot(&mut self, canonical_id: &str) -> Result<DetailSnapshot, ReadError>;
     /// Service readiness must be known independently of the database probe.
     fn diagnostics(&mut self) -> Result<Diagnostics, ReadError>;
@@ -107,11 +142,13 @@ pub trait ReadAdapter: Send {
 #[derive(Clone, Debug)]
 pub struct ListPageSnapshot {
     pub library_revision: i64,
+    pub tag_revision: Option<i64>,
     pub items: Vec<Summary>,
 }
 #[derive(Clone, Debug)]
 pub struct SearchPageSnapshot {
     pub library_revision: i64,
+    pub tag_revision: Option<i64>,
     pub hits: Vec<SearchHit>,
 }
 #[derive(Clone, Debug)]
@@ -237,6 +274,7 @@ impl ReadAdapter for StoreReader {
             .map_err(store_read_error)?;
         Ok(ListPageSnapshot {
             library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
             items: snapshot
                 .items
                 .into_iter()
@@ -271,6 +309,7 @@ impl ReadAdapter for StoreReader {
             .map_err(store_read_error)?;
         Ok(ListPageSnapshot {
             library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
             items: snapshot
                 .items
                 .into_iter()
@@ -287,6 +326,43 @@ impl ReadAdapter for StoreReader {
             .projects_snapshot(source)
             .map_err(store_read_error)?;
         Ok((snapshot.library_revision, snapshot.projects))
+    }
+    fn scoped_list_page_snapshot_with_tag(
+        &mut self,
+        source: &str,
+        project_key: Option<&str>,
+        tag: Option<&str>,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        let after = after.map(|key| crate::store::ListKey {
+            updated_at_ms: key.updated_at_ms,
+            id: key.id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .source_list_page_snapshot_with_tag(
+                limit,
+                after.as_ref(),
+                expected_revision,
+                source,
+                project_key,
+                tag,
+            )
+            .map_err(store_read_error)?;
+        Ok(ListPageSnapshot {
+            library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
+            items: snapshot
+                .items
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
     }
     fn search_page_snapshot(
         &mut self,
@@ -308,6 +384,7 @@ impl ReadAdapter for StoreReader {
             .map_err(store_read_error)?;
         Ok(SearchPageSnapshot {
             library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
             hits: snapshot
                 .hits
                 .into_iter()
@@ -345,6 +422,43 @@ impl ReadAdapter for StoreReader {
             .map_err(store_read_error)?;
         Ok(SearchPageSnapshot {
             library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
+            hits: snapshot
+                .hits
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
+    }
+    fn scoped_search_page_snapshot_with_tag(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        scope: crate::store::PageScope<'_>,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        let after = after.map(|key| crate::store::SearchKey {
+            score: key.score,
+            conversation_id: key.conversation_id.clone(),
+            node_id: key.node_id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .source_search_page_snapshot_with_tag(
+                query,
+                limit,
+                after.as_ref(),
+                expected_revision,
+                scope,
+            )
+            .map_err(store_read_error)?;
+        Ok(SearchPageSnapshot {
+            library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
             hits: snapshot
                 .hits
                 .into_iter()
@@ -371,6 +485,7 @@ impl ReadAdapter for StoreReader {
             .map_err(store_read_error)?;
         Ok(ListPageSnapshot {
             library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
             items: snapshot
                 .items
                 .into_iter()
@@ -399,6 +514,7 @@ impl ReadAdapter for StoreReader {
             .map_err(store_read_error)?;
         Ok(SearchPageSnapshot {
             library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
             hits: snapshot
                 .hits
                 .into_iter()
@@ -506,11 +622,16 @@ pub(super) fn routes(
         capture,
     };
     Router::new()
+        .merge(catalog_items::routes())
         .route("/api/v1/status", get(status))
         .route("/api/v1/version", get(version))
         .route("/api/v1/conversations", get(list))
         .route("/api/v1/projects", get(projects))
         .route("/api/v1/projects/name", patch(rename_project))
+        .route(
+            "/api/v1/projects/title",
+            patch(commit_verified_project_title),
+        )
         .route(
             "/api/v1/project-assignment",
             get(project_assignment_context).patch(commit_project_assignment),
@@ -696,6 +817,7 @@ struct PageQuery {
     cursor: Option<String>,
     source: Option<String>,
     project_key: Option<String>,
+    tag: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -705,6 +827,7 @@ struct SearchQuery {
     cursor: Option<String>,
     source: Option<String>,
     project_key: Option<String>,
+    tag: Option<String>,
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -725,6 +848,10 @@ fn limit(value: Option<usize>) -> Result<usize, ApiError> {
         _ => Err(invalid_request()),
     }
 }
+fn tag_filter_key(tag: Option<&str>) -> Result<Option<String>, ApiError> {
+    tag.map(|value| crate::store::canonical_tag_key(value).map_err(|_| invalid_request()))
+        .transpose()
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -734,6 +861,8 @@ struct Cursor {
     query: Option<String>,
     order: String,
     revision: i64,
+    #[serde(default)]
+    tag_revision: Option<i64>,
     after: Key,
 }
 #[derive(Serialize, Deserialize)]
@@ -808,6 +937,7 @@ fn encode_cursor(
     route: &str,
     q: Option<&str>,
     revision: i64,
+    tag_revision: Option<i64>,
     after: Key,
 ) -> Result<String, ApiError> {
     let cursor = Cursor {
@@ -816,6 +946,7 @@ fn encode_cursor(
         query: q.map(query_fingerprint),
         order: format!("{route}-v1"),
         revision,
+        tag_revision,
         after,
     };
     let bytes = serde_json::to_vec(&cursor).map_err(|_| invalid_data())?;
@@ -834,6 +965,16 @@ fn revision(cursor: &Option<Cursor>, current: i64) -> Result<(), ApiError> {
             StatusCode::CONFLICT,
             "stale_cursor",
             "Library changed. Restart from the first page.",
+        ));
+    }
+    Ok(())
+}
+fn tag_revision(cursor: &Option<Cursor>, current: Option<i64>) -> Result<(), ApiError> {
+    if cursor.as_ref().is_some_and(|c| c.tag_revision != current) {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "stale_cursor",
+            "Tags changed. Restart from the first page.",
         ));
     }
     Ok(())
@@ -914,6 +1055,101 @@ async fn rename_project(
     .await
     .map_err(|_| unavailable())??;
     checked_json(renamed)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedProjectTitleRequest {
+    project_key: String,
+    expected_scope: String,
+    title: String,
+    #[serde(default)]
+    legacy_target: Option<VerifiedLegacyProjectTitleTarget>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedLegacyProjectTitleTarget {
+    account_scope: String,
+    source_id: String,
+}
+
+async fn commit_verified_project_title(
+    State(s): State<ApiState>,
+    Json(request): Json<VerifiedProjectTitleRequest>,
+) -> ApiResult {
+    if request.project_key.is_empty()
+        || request.project_key.len() > 1024
+        || request.expected_scope.len() > 128
+        || request.title.trim().is_empty()
+        || request.title.chars().count() > 120
+        || request.title.chars().any(char::is_control)
+    {
+        return Err(invalid_request());
+    }
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let import_permit = s.import_ops.clone().try_acquire_owned().map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "The library is busy.",
+        )
+    })?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _import_permit = import_permit;
+        let _db_permit = db_permit;
+        let mut store = store.lock().map_err(|_| unavailable())?;
+        let snapshot = match request.legacy_target.as_ref() {
+            Some(target) => store.commit_verified_legacy_project_title(
+                &request.project_key,
+                &request.expected_scope,
+                &target.account_scope,
+                &target.source_id,
+                &request.title,
+            ),
+            None => store.commit_verified_project_title(
+                &request.project_key,
+                &request.expected_scope,
+                &request.title,
+            ),
+        };
+        snapshot
+            .map(|snapshot| {
+                json!({
+                    "project":snapshot.project,
+                    "library_revision":snapshot.library_revision,
+                    "verified":true
+                })
+            })
+            .map_err(|err| match err {
+                crate::error::Error::Configuration(message)
+                    if message == "verified project scope mismatch" =>
+                {
+                    error(
+                        StatusCode::CONFLICT,
+                        "scope_mismatch",
+                        "The project does not belong to the connected ChatGPT account.",
+                    )
+                }
+                crate::error::Error::Configuration(message) if message == "unknown project" => {
+                    error(
+                        StatusCode::NOT_FOUND,
+                        "not_found",
+                        "The project is unavailable.",
+                    )
+                }
+                crate::error::Error::Configuration(_) => invalid_request(),
+                _ => unavailable(),
+            })
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(result)
 }
 
 #[derive(Default, Deserialize)]
@@ -1051,6 +1287,7 @@ struct CatalogQuery {
     project_key: Option<String>,
     limit: Option<usize>,
     focus_id: Option<String>,
+    tag: Option<String>,
 }
 
 fn validate_catalog_scope(source: &str, project_key: Option<&str>) -> Result<(), ApiError> {
@@ -1125,14 +1362,21 @@ async fn catalog_graph(
         .map_err(|_| unavailable())?;
     let project_key = q.project_key;
     let focus_id = q.focus_id;
+    let tag = q.tag;
     let value = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _db_permit = db_permit;
         let store = store.lock().map_err(|_| unavailable())?;
         let graph = if let Some(focus_id) = focus_id.as_deref() {
-            store.catalog_neighborhood(focus_id, &source, project_key.as_deref(), limit)
+            store.catalog_neighborhood_tagged(
+                focus_id,
+                &source,
+                project_key.as_deref(),
+                tag.as_deref(),
+                limit,
+            )
         } else {
-            store.catalog_graph(&source, project_key.as_deref(), limit)
+            store.catalog_graph_tagged(&source, project_key.as_deref(), tag.as_deref(), limit)
         }
         .map_err(|_| unavailable())?;
         serde_json::to_value(graph).map_err(|_| unavailable())
@@ -1186,8 +1430,13 @@ async fn list_route(
     {
         return Err(invalid_request());
     }
-    let cursor_scope = (source != "all" && forced_source.is_none() || q.project_key.is_some())
+    let tag_key = tag_filter_key(q.tag.as_deref())?;
+    let base_scope = (source != "all" && forced_source.is_none() || q.project_key.is_some())
         .then(|| format!("{source}|{}", q.project_key.as_deref().unwrap_or("")));
+    let cursor_scope = tag_key
+        .as_deref()
+        .map(|tag| format!("{}|tag:{tag}", base_scope.as_deref().unwrap_or("all")))
+        .or(base_scope);
     let cursor = decode_cursor(q.cursor.as_deref(), route, cursor_scope.as_deref())?;
     let after = cursor.as_ref().and_then(|c| match &c.after {
         Key::List { updated_at_ms, id } => Some(ListKey {
@@ -1198,10 +1447,12 @@ async fn list_route(
     });
     let expected = cursor.as_ref().map(|c| c.revision);
     let project_key = q.project_key.clone();
+    let tag = q.tag;
     let snapshot = run_read(&s, move |r| {
-        r.scoped_list_page_snapshot(
+        r.scoped_list_page_snapshot_with_tag(
             &source,
             project_key.as_deref(),
+            tag.as_deref(),
             limit + 1,
             after.as_ref(),
             expected,
@@ -1209,6 +1460,7 @@ async fn list_route(
     })
     .await?;
     revision(&cursor, snapshot.library_revision)?;
+    tag_revision(&cursor, snapshot.tag_revision)?;
     let mut items = snapshot.items;
     if items.len() > limit + 1
         || items
@@ -1228,6 +1480,7 @@ async fn list_route(
             route,
             cursor_scope.as_deref(),
             snapshot.library_revision,
+            snapshot.tag_revision,
             Key::List {
                 updated_at_ms: last.updated_at_ms,
                 id: last.id.clone(),
@@ -1298,7 +1551,8 @@ async fn search_route(
     if !normalized.chars().any(char::is_alphanumeric) {
         return Err(invalid_request());
     }
-    let cursor_scope = if (source == "all" || forced_source.is_some()) && q.project_key.is_none() {
+    let tag_key = tag_filter_key(q.tag.as_deref())?;
+    let base_scope = if (source == "all" || forced_source.is_some()) && q.project_key.is_none() {
         normalized.clone()
     } else {
         format!(
@@ -1306,10 +1560,15 @@ async fn search_route(
             q.project_key.as_deref().unwrap_or("")
         )
     };
+    let cursor_scope = tag_key
+        .as_deref()
+        .map(|tag| format!("{base_scope}|tag:{tag}"))
+        .unwrap_or(base_scope);
     let cursor = decode_cursor(q.cursor.as_deref(), route, Some(&cursor_scope))?;
     let raw_query = normalized.clone();
     let source = source.to_owned();
     let project_key = q.project_key.clone();
+    let tag = q.tag;
     let after = cursor.as_ref().and_then(|c| match &c.after {
         Key::Search {
             score,
@@ -1324,17 +1583,21 @@ async fn search_route(
     });
     let expected = cursor.as_ref().map(|c| c.revision);
     let snapshot = run_read(&s, move |r| {
-        r.scoped_search_page_snapshot(
+        r.scoped_search_page_snapshot_with_tag(
             &raw_query,
             limit + 1,
             after.as_ref(),
             expected,
-            &source,
-            project_key.as_deref(),
+            crate::store::PageScope {
+                source: &source,
+                project_key: project_key.as_deref(),
+                tag: tag.as_deref(),
+            },
         )
     })
     .await?;
     revision(&cursor, snapshot.library_revision)?;
+    tag_revision(&cursor, snapshot.tag_revision)?;
     for h in &snapshot.hits {
         let title = h.node_id.is_none()
             && h.message_id.is_none()
@@ -1366,6 +1629,7 @@ async fn search_route(
             route,
             Some(&cursor_scope),
             snapshot.library_revision,
+            snapshot.tag_revision,
             Key::Search {
                 score: h.score,
                 conversation_id: h.conversation.id.clone(),
@@ -1522,6 +1786,7 @@ mod tests {
             self.release.recv().unwrap();
             Ok(ListPageSnapshot {
                 library_revision: 0,
+                tag_revision: None,
                 items: vec![],
             })
         }
@@ -1593,6 +1858,7 @@ mod tests {
             "list",
             None,
             revision,
+            None,
             Key::List {
                 updated_at_ms: None,
                 id: "already-passed-null-row".into(),
@@ -1620,6 +1886,62 @@ mod tests {
         assert_eq!(page["library_revision"], revision);
     }
 
+    #[tokio::test]
+    async fn tag_edit_invalidates_a_real_tagged_list_cursor() {
+        let mut store = crate::store::Store::in_memory().unwrap();
+        let docs: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/chatgpt-export/array.json"
+        ))
+        .unwrap();
+        crate::importer::import_chatgpt(&mut store, &serde_json::to_vec(&docs).unwrap()).unwrap();
+        let first = store
+            .source_list_page_snapshot_with_tag(10, None, None, "chatgpt", None, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        let conversation_id = first["id"].as_str().unwrap().to_owned();
+        store
+            .set_target_tags("conversation", &conversation_id, &["work".into()])
+            .unwrap();
+        let tagged = store
+            .source_list_page_snapshot_with_tag(10, None, None, "chatgpt", None, Some("work"))
+            .unwrap();
+        let token = encode_cursor(
+            "list",
+            Some("all|tag:work"),
+            tagged.library_revision,
+            tagged.tag_revision,
+            Key::List {
+                updated_at_ms: None,
+                id: conversation_id.clone(),
+            },
+        )
+        .unwrap();
+        store
+            .set_target_tags("conversation", &conversation_id, &["later".into()])
+            .unwrap();
+
+        let app = super::super::router(store, "secret".into());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/conversations?tag=work&cursor={token}"))
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "stale_cursor");
+    }
+
     #[test]
     fn cursor_is_strictly_parsed_and_binds_order_and_long_unicode_query() {
         let query = "星空 ".repeat(1000);
@@ -1627,6 +1949,7 @@ mod tests {
             "search",
             Some(&query),
             7,
+            None,
             Key::Search {
                 score: -1.0,
                 conversation_id: "cv-a".into(),
@@ -1667,5 +1990,26 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn tagged_cursor_becomes_stale_when_tag_assignments_change() {
+        let cursor = Some(Cursor {
+            version: 1,
+            route: "list".into(),
+            query: None,
+            order: "list-v1".into(),
+            revision: 9,
+            tag_revision: Some(3),
+            after: Key::List {
+                updated_at_ms: Some(1),
+                id: "conversation:one".into(),
+            },
+        });
+        assert!(tag_revision(&cursor, Some(3)).is_ok());
+        let error = tag_revision(&cursor, Some(4)).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(error.1, "stale_cursor");
+        assert!(tag_revision(&None, None).is_ok());
     }
 }

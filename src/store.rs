@@ -3,6 +3,30 @@ use crate::error::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TagSnapshot {
+    pub name: String,
+    pub target_count: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TaggedTargetSnapshot {
+    pub target_kind: String,
+    pub target_id: String,
+    pub tags: Vec<String>,
+    pub tag_revision: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TaggedTargetsPage {
+    pub tag_revision: i64,
+    pub items: Vec<TaggedTargetSnapshot>,
+}
+
+pub(crate) fn canonical_tag_key(tag: &str) -> Result<String> {
+    tags::normalized_tag_key(tag)
+}
+
 #[cfg(test)]
 thread_local! { static CANDIDATE_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
@@ -31,14 +55,22 @@ pub struct SearchKey {
     pub conversation_id: String,
     pub node_id: Option<String>,
 }
+#[derive(Clone, Copy, Debug)]
+pub struct PageScope<'a> {
+    pub source: &'a str,
+    pub project_key: Option<&'a str>,
+    pub tag: Option<&'a str>,
+}
 #[derive(Clone, Debug)]
 pub struct ListPageSnapshot {
     pub library_revision: i64,
+    pub tag_revision: Option<i64>,
     pub items: Vec<Value>,
 }
 #[derive(Clone, Debug)]
 pub struct SearchPageSnapshot {
     pub library_revision: i64,
+    pub tag_revision: Option<i64>,
     pub hits: Vec<Value>,
 }
 #[derive(Clone, Debug)]
@@ -282,6 +314,17 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(11)", [])?;
             tx.commit()?;
         }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 12 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch("CREATE TABLE tag_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision INTEGER NOT NULL CHECK(revision>=0)); INSERT INTO tag_state(singleton,revision) VALUES(1,0); CREATE TABLE tags(name_key TEXT PRIMARY KEY,name TEXT NOT NULL); CREATE TABLE target_tags(target_kind TEXT NOT NULL CHECK(target_kind IN ('conversation','entity','file')),target_id TEXT NOT NULL,name_key TEXT NOT NULL REFERENCES tags(name_key) ON DELETE CASCADE,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(target_kind,target_id,name_key)); CREATE INDEX target_tags_by_tag ON target_tags(name_key,target_kind,target_id); CREATE INDEX target_tags_by_target ON target_tags(target_kind,target_id,ordinal); CREATE TRIGGER target_tags_conversation_cleanup AFTER DELETE ON conversations BEGIN DELETE FROM target_tags WHERE target_kind='conversation' AND target_id=old.id; END; CREATE TABLE artifact_contents(entity_id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,filename TEXT NOT NULL,mime_type TEXT,byte_size INTEGER NOT NULL CHECK(byte_size>=0 AND byte_size<=67108864),sha256 TEXT NOT NULL CHECK(length(sha256)=64),content BLOB NOT NULL CHECK(length(content)=byte_size),saved_at_ms INTEGER NOT NULL); CREATE INDEX artifact_contents_by_conversation ON artifact_contents(conversation_id,saved_at_ms DESC,entity_id);")?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(12)", [])?;
+            tx.commit()?;
+        }
         self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id); CREATE INDEX IF NOT EXISTS observations_conversation_order ON observations(conversation_id,id DESC);")?;
         Ok(())
     }
@@ -483,6 +526,128 @@ impl Store {
         let (display_name, name_source) =
             project_display_name(normalized.as_deref(), title.as_deref());
         let project = serde_json::json!({"project_key":project_key,"project_id":source_id,"title":title,"display_name":display_name,"name_source":name_source});
+        tx.commit()?;
+        Ok(ProjectRenameSnapshot {
+            library_revision: revision,
+            project,
+        })
+    }
+    /// Commit a project name only after the provider webview has verified the
+    /// upstream rename. The account scope must match the stored project exactly.
+    pub fn commit_verified_project_title(
+        &mut self,
+        project_key: &str,
+        expected_scope: &str,
+        title: &str,
+    ) -> Result<ProjectRenameSnapshot> {
+        self.commit_verified_project_title_for_target(project_key, expected_scope, title, None)
+    }
+
+    /// Commit a verified upstream rename onto an imported Paseo project row.
+    /// The imported cache scope identifies only the local row; `expected_scope`
+    /// remains the currently observed ChatGPT account proven by the provider
+    /// WebView before this method is called.
+    pub fn commit_verified_legacy_project_title(
+        &mut self,
+        project_key: &str,
+        expected_scope: &str,
+        legacy_account_scope: &str,
+        source_id: &str,
+        title: &str,
+    ) -> Result<ProjectRenameSnapshot> {
+        if !paseo_cache_account_scope(legacy_account_scope) || !valid_upstream_project_id(source_id)
+        {
+            return Err(Error::Configuration(
+                "invalid legacy project title target".into(),
+            ));
+        }
+        self.commit_verified_project_title_for_target(
+            project_key,
+            expected_scope,
+            title,
+            Some((legacy_account_scope, source_id)),
+        )
+    }
+
+    fn commit_verified_project_title_for_target(
+        &mut self,
+        project_key: &str,
+        expected_scope: &str,
+        title: &str,
+        legacy_source: Option<(&str, &str)>,
+    ) -> Result<ProjectRenameSnapshot> {
+        let title = title.trim();
+        if project_key.is_empty()
+            || project_key.len() > 1024
+            || !observed_account_scope(expected_scope)
+            || title.is_empty()
+            || title.chars().count() > 120
+            || title.chars().any(char::is_control)
+        {
+            return Err(Error::Configuration(
+                "invalid verified project title".into(),
+            ));
+        }
+        let tx = self.connection.transaction()?;
+        let prior: Option<(String, String, String, Option<String>)> = tx
+            .query_row(
+                "SELECT provider,account_scope,source_id,title FROM projects WHERE project_key=?1",
+                [project_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((provider, account_scope, source_id, old_title)) = prior else {
+            return Err(Error::Configuration("unknown project".into()));
+        };
+        let target_matches = match legacy_source {
+            Some((legacy_scope, legacy_source_id)) => {
+                provider == "paseo-chatgpt"
+                    && account_scope == legacy_scope
+                    && source_id == legacy_source_id
+                    && paseo_cache_account_scope(&account_scope)
+            }
+            None => {
+                provider == "chatgpt"
+                    && account_scope == expected_scope
+                    && valid_upstream_project_id(&source_id)
+            }
+        };
+        if !target_matches {
+            return Err(Error::Configuration(
+                "verified project scope mismatch".into(),
+            ));
+        }
+        let old_local_name: Option<String> = tx.query_row(
+            "SELECT local_name FROM projects WHERE project_key=?1",
+            [project_key],
+            |row| row.get(0),
+        )?;
+        let changed = old_title.as_deref() != Some(title)
+            || old_local_name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty());
+        if changed {
+            tx.execute(
+                "UPDATE projects SET title=?1,local_name=NULL WHERE project_key=?2",
+                params![title, project_key],
+            )?;
+            tx.execute(
+                "UPDATE library_state SET revision=revision+1 WHERE singleton=1",
+                [],
+            )?;
+        }
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let project = serde_json::json!({
+            "project_key":project_key,
+            "project_id":source_id,
+            "title":title,
+            "display_name":title,
+            "name_source":"upstream"
+        });
         tx.commit()?;
         Ok(ProjectRenameSnapshot {
             library_revision: revision,
@@ -854,7 +1019,33 @@ impl Store {
         source: &str,
         project_key: Option<&str>,
     ) -> Result<ListPageSnapshot> {
-        self.list_page_snapshot_scoped(limit, after, expected_revision, source, project_key)
+        self.source_list_page_snapshot_with_tag(
+            limit,
+            after,
+            expected_revision,
+            source,
+            project_key,
+            None,
+        )
+    }
+    pub fn source_list_page_snapshot_with_tag(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+        source: &str,
+        project_key: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<ListPageSnapshot> {
+        let tag_key = tag.map(tags::normalized_tag_key).transpose()?;
+        self.list_page_snapshot_scoped(
+            limit,
+            after,
+            expected_revision,
+            source,
+            project_key,
+            tag_key.as_deref(),
+        )
     }
     fn list_page_snapshot_filtered(
         &self,
@@ -869,6 +1060,7 @@ impl Store {
             expected_revision,
             if chat_only { "chatgpt" } else { "all" },
             None,
+            None,
         )
     }
     fn list_page_snapshot_scoped(
@@ -878,6 +1070,7 @@ impl Store {
         expected_revision: Option<i64>,
         source: &str,
         project_key: Option<&str>,
+        tag_key: Option<&str>,
     ) -> Result<ListPageSnapshot> {
         let tx = self.connection.unchecked_transaction()?;
         let revision: i64 = tx.query_row(
@@ -885,6 +1078,15 @@ impl Store {
             [],
             |r| r.get(0),
         )?;
+        let tag_revision = if tag_key.is_some() {
+            Some(tx.query_row(
+                "SELECT revision FROM tag_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?)
+        } else {
+            None
+        };
         let mut items = Vec::new();
         if limit == 0 {
             return Err(Error::Configuration("page limit must be at least 1".into()));
@@ -898,7 +1100,8 @@ impl Store {
                 _ => return Err(Error::Configuration("invalid source".into())),
             };
             let project_filter = "(?6 IS NULL OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=conversations.id AND cp.project_key=?6)) AND ";
-            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {source_filter}{project_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
+            let tag_filter = "(?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=conversations.id AND tt.name_key=?7)) AND ";
+            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {source_filter}{project_filter}{tag_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
             let mut pre = tx.prepare(&budget_sql)?;
             let source_bytes: i64 = pre.query_row(
                 params![
@@ -907,7 +1110,8 @@ impl Store {
                     after.map(|k| k.id.as_str()).unwrap_or(""),
                     after.is_some() as i64,
                     lim,
-                    project_key
+                    project_key,
+                    tag_key
                 ],
                 |r| r.get(0),
             )?;
@@ -921,11 +1125,11 @@ impl Store {
                     limit: 8 * 1024 * 1024 - 64 * 1024,
                 });
             }
-            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms,(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=conversations.id) FROM conversations WHERE {source_filter}{project_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
+            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms,(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=conversations.id) FROM conversations WHERE {source_filter}{project_filter}{tag_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
             let mut st = tx.prepare(&page_sql)?;
             let ids = st
                 .query_map(
-                    params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim, project_key],
+                    params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim, project_key, tag_key],
                     |r| { let project: Option<String> = r.get(6)?; Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"provider":r.get::<_,String>(1)?,"account_scope":r.get::<_,String>(2)?,"source_id":r.get::<_,String>(3)?,"title":r.get::<_,String>(4)?,"updated_at_ms":r.get::<_,Option<i64>>(5)?,"project":project.and_then(|value|serde_json::from_str::<Value>(&value).ok())})) },
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -934,6 +1138,7 @@ impl Store {
         tx.commit()?;
         Ok(ListPageSnapshot {
             library_revision: revision,
+            tag_revision,
             items,
         })
     }
@@ -1036,14 +1241,27 @@ impl Store {
         source: &str,
         project_key: Option<&str>,
     ) -> Result<SearchPageSnapshot> {
-        self.search_page_snapshot_scoped(
+        self.source_search_page_snapshot_with_tag(
             raw_query,
             limit,
             after,
             expected_revision,
-            source,
-            project_key,
+            PageScope {
+                source,
+                project_key,
+                tag: None,
+            },
         )
+    }
+    pub fn source_search_page_snapshot_with_tag(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        scope: PageScope<'_>,
+    ) -> Result<SearchPageSnapshot> {
+        self.search_page_snapshot_scoped(raw_query, limit, after, expected_revision, scope)
     }
     fn search_page_snapshot_filtered(
         &self,
@@ -1058,8 +1276,11 @@ impl Store {
             limit,
             after,
             expected_revision,
-            if chat_only { "chatgpt" } else { "all" },
-            None,
+            PageScope {
+                source: if chat_only { "chatgpt" } else { "all" },
+                project_key: None,
+                tag: None,
+            },
         )
     }
     fn search_page_snapshot_scoped(
@@ -1068,9 +1289,15 @@ impl Store {
         limit: usize,
         after: Option<&SearchKey>,
         expected_revision: Option<i64>,
-        source: &str,
-        project_key: Option<&str>,
+        scope: PageScope<'_>,
     ) -> Result<SearchPageSnapshot> {
+        let PageScope {
+            source,
+            project_key,
+            tag,
+        } = scope;
+        let tag_key = tag.map(tags::normalized_tag_key).transpose()?;
+        let tag_key = tag_key.as_deref();
         let terms = literal_search_terms(raw_query);
         if after.is_some_and(|k| !k.score.is_finite()) {
             return Err(crate::error::Error::Configuration(
@@ -1083,6 +1310,15 @@ impl Store {
             [],
             |r| r.get(0),
         )?;
+        let tag_revision = if tag_key.is_some() {
+            Some(tx.query_row(
+                "SELECT revision FROM tag_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?)
+        } else {
+            None
+        };
         let mut hits = Vec::new();
         if limit == 0 {
             return Err(Error::Configuration("page limit must be at least 1".into()));
@@ -1108,9 +1344,12 @@ impl Store {
                 };
                 let project_message_filter = " AND (?6 IS NULL OR f.conversation_id IN (SELECT conversation_id FROM conversation_projects WHERE project_key=?6))";
                 let project_title_filter = " AND (?6 IS NULL OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=c.id AND cp.project_key=?6))";
+                let tag_message_filter = " AND (?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=f.conversation_id AND tt.name_key=?7))";
+                let tag_title_filter = " AND (?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=c.id AND tt.name_key=?7))";
                 let chat_message_filter =
-                    format!("{source_message_filter}{project_message_filter}");
-                let chat_title_filter = format!("{source_title_filter}{project_title_filter}");
+                    format!("{source_message_filter}{project_message_filter}{tag_message_filter}");
+                let chat_title_filter =
+                    format!("{source_title_filter}{project_title_filter}{tag_title_filter}");
                 // FTS counts tokens, not bytes: a single token may contain an
                 // entire long URL or pasted blob. Bound the excerpt separately
                 // while keeping the complete text in the authoritative store.
@@ -1125,7 +1364,8 @@ impl Store {
                             cursor_conversation,
                             cursor_node,
                             lim,
-                            project_key
+                            project_key,
+                            tag_key
                         ],
                         |r| {
                             let estimate = r.get::<_, i64>(5)?;
@@ -1273,6 +1513,7 @@ impl Store {
         tx.commit()?;
         Ok(SearchPageSnapshot {
             library_revision: revision,
+            tag_revision,
             hits,
         })
     }
@@ -1651,6 +1892,16 @@ fn observed_account_scope(scope: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         })
+}
+
+fn paseo_cache_account_scope(scope: &str) -> bool {
+    scope.strip_prefix("paseo-cache:").is_some_and(|owner| {
+        !owner.is_empty()
+            && owner.len() <= 64
+            && owner
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    })
 }
 
 fn is_chatgpt_provider(provider: &str) -> bool {
@@ -2049,7 +2300,7 @@ mod identity_tests {
     #[test]
     fn migrated_legacy_ids_and_rows_survive_ingest() {
         let mut store = Store::in_memory().unwrap();
-        store.connection.execute_batch("DROP TABLE IF EXISTS conversation_projects; DROP TABLE IF EXISTS projects; DROP TRIGGER IF EXISTS message_fts_insert; DROP TRIGGER IF EXISTS message_fts_delete; DROP TRIGGER IF EXISTS message_fts_update; DROP TRIGGER IF EXISTS title_fts_insert; DROP TRIGGER IF EXISTS title_fts_update; DROP TRIGGER IF EXISTS title_fts_delete; DROP TABLE IF EXISTS message_fts; DROP TABLE IF EXISTS title_fts; DROP TABLE IF EXISTS library_state; DROP TABLE normalized_fts; DROP TABLE conversations_fts; DROP INDEX conversations_identity; DROP TRIGGER normalized_conv_insert; DROP TRIGGER normalized_conv_update; DROP TRIGGER normalized_conv_delete; DROP TRIGGER normalized_graph_insert; DROP TRIGGER normalized_graph_update; DROP TRIGGER normalized_graph_delete; DROP TABLE graph_nodes; DROP TABLE observations; DROP TABLE messages; DROP TABLE conversations; CREATE TABLE conversations(id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',provider TEXT NOT NULL DEFAULT '',url TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),parent_id TEXT,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT ''); INSERT INTO conversations(id,title,provider) VALUES('legacy-conv','old','legacy'); INSERT INTO messages(id,conversation_id,parent_id,role,content) VALUES('legacy-msg','legacy-conv',NULL,'user','kept'); DELETE FROM schema_migrations WHERE version>=3;").unwrap();
+        store.connection.execute_batch("DROP TRIGGER IF EXISTS target_tags_conversation_cleanup; DROP TABLE IF EXISTS artifact_contents; DROP TABLE IF EXISTS target_tags; DROP TABLE IF EXISTS tags; DROP TABLE IF EXISTS tag_state; DROP TABLE IF EXISTS conversation_projects; DROP TABLE IF EXISTS projects; DROP TRIGGER IF EXISTS message_fts_insert; DROP TRIGGER IF EXISTS message_fts_delete; DROP TRIGGER IF EXISTS message_fts_update; DROP TRIGGER IF EXISTS title_fts_insert; DROP TRIGGER IF EXISTS title_fts_update; DROP TRIGGER IF EXISTS title_fts_delete; DROP TABLE IF EXISTS message_fts; DROP TABLE IF EXISTS title_fts; DROP TABLE IF EXISTS library_state; DROP TABLE normalized_fts; DROP TABLE conversations_fts; DROP INDEX conversations_identity; DROP TRIGGER normalized_conv_insert; DROP TRIGGER normalized_conv_update; DROP TRIGGER normalized_conv_delete; DROP TRIGGER normalized_graph_insert; DROP TRIGGER normalized_graph_update; DROP TRIGGER normalized_graph_delete; DROP TABLE graph_nodes; DROP TABLE observations; DROP TABLE messages; DROP TABLE conversations; CREATE TABLE conversations(id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',provider TEXT NOT NULL DEFAULT '',url TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),parent_id TEXT,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT ''); INSERT INTO conversations(id,title,provider) VALUES('legacy-conv','old','legacy'); INSERT INTO messages(id,conversation_id,parent_id,role,content) VALUES('legacy-msg','legacy-conv',NULL,'user','kept'); DELETE FROM schema_migrations WHERE version>=3;").unwrap();
         store.migrate().unwrap();
         let observation = Observation {
             provider: "legacy".into(),
@@ -2144,6 +2395,84 @@ mod project_and_search_tests {
             .unwrap();
         assert_eq!(hits.hits.len(), 1);
         assert_eq!(hits.hits[0]["conversation"]["id"], "chat_project");
+    }
+
+    #[test]
+    fn verified_legacy_project_title_updates_only_the_exact_paseo_row_and_clears_alias() {
+        let mut store = Store::in_memory().unwrap();
+        let key = r#"project:["paseo-chatgpt","paseo-cache:owner-123","g-p-project_123"]"#;
+        store.connection.execute(
+            "INSERT INTO projects(project_key,provider,account_scope,source_id,title,local_name) VALUES(?1,'paseo-chatgpt','paseo-cache:owner-123','g-p-project_123','Cached title','Local alias')",
+            [key],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES('legacy-chat','Chat','paseo-chatgpt','paseo-cache:owner-123','legacy-chat',1)",
+            [],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO conversation_projects(conversation_id,project_key) VALUES('legacy-chat',?1)",
+            [key],
+        ).unwrap();
+        let scope = format!("chatgpt:observed:{}", "a".repeat(64));
+
+        let snapshot = store
+            .commit_verified_legacy_project_title(
+                key,
+                &scope,
+                "paseo-cache:owner-123",
+                "g-p-project_123",
+                "Renamed upstream",
+            )
+            .unwrap();
+        assert_eq!(snapshot.project["project_key"], key);
+        assert_eq!(snapshot.project["display_name"], "Renamed upstream");
+        let row: (String, String, String, String, Option<String>) = store.connection.query_row(
+            "SELECT provider,account_scope,source_id,title,local_name FROM projects WHERE project_key=?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(
+            row,
+            (
+                "paseo-chatgpt".into(),
+                "paseo-cache:owner-123".into(),
+                "g-p-project_123".into(),
+                "Renamed upstream".into(),
+                None
+            )
+        );
+        assert_eq!(store.connection.query_row::<i64, _, _>(
+            "SELECT count(*) FROM conversation_projects WHERE conversation_id='legacy-chat' AND project_key=?1",
+            [key], |row| row.get(0),
+        ).unwrap(), 1);
+
+        assert!(store
+            .commit_verified_legacy_project_title(
+                key,
+                &scope,
+                "paseo-cache:other-owner",
+                "g-p-project_123",
+                "Wrong row",
+            )
+            .is_err());
+        assert!(store
+            .commit_verified_legacy_project_title(
+                key,
+                &scope,
+                "paseo-cache:owner-123",
+                "g-p-other-project",
+                "Wrong project",
+            )
+            .is_err());
+        let final_title: String = store
+            .connection
+            .query_row(
+                "SELECT title FROM projects WHERE project_key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_title, "Renamed upstream");
     }
 
     #[test]
@@ -2292,7 +2621,7 @@ mod project_and_search_tests {
             [serde_json::json!({"paseo_cache":{"project":source_id}}).to_string()],
         ).unwrap();
         store.connection.execute_batch(
-            "DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;",
+            "DROP TRIGGER IF EXISTS target_tags_conversation_cleanup; DROP TABLE IF EXISTS artifact_contents; DROP TABLE IF EXISTS target_tags; DROP TABLE IF EXISTS tags; DROP TABLE IF EXISTS tag_state; DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;",
         ).unwrap();
         store.migrate().unwrap();
 
@@ -2498,7 +2827,7 @@ mod project_and_search_tests {
     #[test]
     fn project_migration_uses_only_latest_observation() {
         let mut store = Store::in_memory().unwrap();
-        store.connection.execute_batch("DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;").unwrap();
+        store.connection.execute_batch("DROP TRIGGER IF EXISTS target_tags_conversation_cleanup; DROP TABLE IF EXISTS artifact_contents; DROP TABLE IF EXISTS target_tags; DROP TABLE IF EXISTS tags; DROP TABLE IF EXISTS tag_state; DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;").unwrap();
         store.connection.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES('legacy','cached','paseo-chatgpt','paseo-cache:owner','legacy')", []).unwrap();
         store.connection.execute("INSERT INTO observations(id,conversation_id,source_time,observed_ms,parser,completeness,raw_payload) VALUES(1,'legacy',NULL,1,'p','complete','{\"paseo_cache\":{\"project\":\"old\"}}'),(2,'legacy',NULL,2,'p','complete','{\"paseo_cache\":{\"project\":\"new\"}}')", []).unwrap();
         store.migrate().unwrap();
@@ -2520,7 +2849,7 @@ mod project_and_search_tests {
     #[test]
     fn project_migration_ignores_empty_ids_and_v10_cleans_existing_empty_memberships() {
         let mut store = Store::in_memory().unwrap();
-        store.connection.execute_batch("DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;").unwrap();
+        store.connection.execute_batch("DROP TRIGGER IF EXISTS target_tags_conversation_cleanup; DROP TABLE IF EXISTS artifact_contents; DROP TABLE IF EXISTS target_tags; DROP TABLE IF EXISTS tags; DROP TABLE IF EXISTS tag_state; DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;").unwrap();
         store.connection.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES('legacy-empty','cached','paseo-chatgpt','paseo-cache:owner','legacy-empty')", []).unwrap();
         store.connection.execute("INSERT INTO observations(id,conversation_id,observed_ms,parser,completeness,raw_payload) VALUES(1,'legacy-empty',1,'p','complete','{\"paseo_cache\":{\"project\":\"\"}}')", []).unwrap();
         store.migrate().unwrap();
@@ -2531,13 +2860,13 @@ mod project_and_search_tests {
                 .unwrap(),
             0
         );
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 12);
 
         store.connection.execute("INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES('bad-empty','paseo-chatgpt','paseo-cache:owner','','Assigned project')", []).unwrap();
         store.connection.execute("INSERT INTO conversation_projects(conversation_id,project_key) VALUES('legacy-empty','bad-empty')", []).unwrap();
         store
             .connection
-            .execute_batch("DELETE FROM schema_migrations WHERE version>=10; ALTER TABLE projects DROP COLUMN local_name;")
+            .execute_batch("DROP TRIGGER IF EXISTS target_tags_conversation_cleanup; DROP TABLE IF EXISTS artifact_contents; DROP TABLE IF EXISTS target_tags; DROP TABLE IF EXISTS tags; DROP TABLE IF EXISTS tag_state; DELETE FROM schema_migrations WHERE version>=10; ALTER TABLE projects DROP COLUMN local_name;")
             .unwrap();
         store.migrate().unwrap();
         assert_eq!(
@@ -2579,5 +2908,7 @@ mod project_and_search_tests {
         }));
     }
 }
+mod artifacts;
 mod catalog;
 pub(crate) mod operation_learner;
+mod tags;

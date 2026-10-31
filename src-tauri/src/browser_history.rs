@@ -25,6 +25,10 @@ pub struct BrowserHistoryOutcome {
     pub complete: bool,
     pub error_code: Option<String>,
     pub retry_after: Option<u64>,
+    pub retry_after_too_long: bool,
+    pub response_content_type: Option<String>,
+    pub challenge_detected: bool,
+    pub provider_error_code: Option<String>,
     pub processed_conversations: u64,
     pub account_scope: Option<String>,
 }
@@ -222,7 +226,11 @@ fn validate_status_shape(value: &Value) -> bool {
         "conversations",
         "error_code",
         "retry_after",
+        "retry_after_too_long",
         "http_status",
+        "response_content_type",
+        "challenge_detected",
+        "provider_error_code",
         "project_count",
         "chunk",
     ];
@@ -253,11 +261,32 @@ fn validate_status_shape(value: &Value) -> bool {
         && value
             .get("retry_after")
             .and_then(Value::as_u64)
-            .is_some_and(|seconds| seconds <= 1800)
+            .is_some_and(|seconds| seconds <= 31_536_000)
+        && value
+            .get("retry_after_too_long")
+            .and_then(Value::as_bool)
+            .is_some_and(|too_long| {
+                !too_long
+                    || (status_str(value, "status") == Some("waiting")
+                        && status_str(value, "error_code") == Some("rate_limited")
+                        && status_u64(value, "retry_after") == 0)
+            })
         && value
             .get("http_status")
             .and_then(Value::as_u64)
             .is_some_and(|status| status <= 599)
+        && matches!(
+            status_str(value, "response_content_type"),
+            Some("json" | "html" | "other" | "missing")
+        )
+        && value
+            .get("challenge_detected")
+            .and_then(Value::as_bool)
+            .is_some()
+        && value
+            .get("provider_error_code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| code.is_empty() || allowed_provider_error_code(code))
         && value
             .get("project_count")
             .and_then(Value::as_u64)
@@ -294,12 +323,28 @@ fn safe_error_code(raw: &str) -> String {
     }
 }
 
+fn allowed_provider_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "rate_limit_exceeded"
+            | "rate_limit_reached"
+            | "too_many_requests"
+            | "insufficient_quota"
+            | "usage_limit_exceeded"
+            | "model_rate_limit_exceeded"
+    )
+}
+
 fn status_str<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
     value.get(field)?.as_str()
 }
 
 fn status_u64(value: &Value, field: &str) -> u64 {
     value.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn status_bool(value: &Value, field: &str) -> bool {
+    value.get(field).and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn set_cancelled(view: &Webview<Wry>, key_json: &str) {
@@ -324,6 +369,10 @@ fn terminal_outcome(
                 complete: succeeded,
                 error_code: (!succeeded).then(|| "sync_failed".into()),
                 retry_after: None,
+                retry_after_too_long: false,
+                response_content_type: None,
+                challenge_detected: false,
+                provider_error_code: None,
                 processed_conversations: processed,
                 account_scope,
             })
@@ -332,11 +381,20 @@ fn terminal_outcome(
             let error_code = status_str(value, "error_code")
                 .map(safe_error_code)
                 .unwrap_or_else(|| "sync_failed".into());
-            let retry_after = status_u64(value, "retry_after").min(1800);
+            let retry_after = status_u64(value, "retry_after");
             Some(BrowserHistoryOutcome {
                 complete: false,
                 error_code: Some(error_code),
-                retry_after: (retry_after > 0).then_some(retry_after),
+                retry_after: (!status_bool(value, "retry_after_too_long") && retry_after > 0)
+                    .then_some(retry_after),
+                retry_after_too_long: status_bool(value, "retry_after_too_long"),
+                response_content_type: Some(
+                    status_str(value, "response_content_type")?.to_string(),
+                ),
+                challenge_detected: status_bool(value, "challenge_detected"),
+                provider_error_code: status_str(value, "provider_error_code")
+                    .filter(|code| !code.is_empty())
+                    .map(ToOwned::to_owned),
                 processed_conversations: processed,
                 account_scope,
             })
@@ -345,6 +403,10 @@ fn terminal_outcome(
             complete: false,
             error_code: Some("cancelled".into()),
             retry_after: None,
+            retry_after_too_long: false,
+            response_content_type: None,
+            challenge_detected: false,
+            provider_error_code: None,
             processed_conversations: processed,
             account_scope,
         }),
@@ -399,6 +461,10 @@ pub fn run(
                     "timeout".into()
                 }),
                 retry_after: None,
+                retry_after_too_long: false,
+                response_content_type: None,
+                challenge_detected: false,
+                provider_error_code: None,
                 processed_conversations: imported_conversations,
                 account_scope,
             });
@@ -407,7 +473,7 @@ pub fn run(
         let (tx, rx) = mpsc::sync_channel(1);
         let tx_for_callback = tx.clone();
         let poll = format!(
-            r#"(()=>{{const s=window[{key_json_for_poll}];if(!s)return "null";const c=s.chunk;return JSON.stringify({{status:s.status,stage:s.stage,complete:s.complete,sequence:s.sequence,conversations:s.conversations,error_code:s.error_code,retry_after:s.retry_after,http_status:s.http_status,project_count:c&&Array.isArray(c.project_catalog)?c.project_catalog.length:0,chunk:c?{{sequence:c.sequence,owner:c.owner,account_scope:c.account_scope,format:c.format,conversations:c.conversations,project_catalog:c.project_catalog,conversation_projects:c.conversation_projects}}:null}})}})()"#
+            r#"(()=>{{const s=window[{key_json_for_poll}];if(!s)return "null";const c=s.chunk;return JSON.stringify({{status:s.status,stage:s.stage,complete:s.complete,sequence:s.sequence,conversations:s.conversations,error_code:s.error_code,retry_after:s.retry_after,retry_after_too_long:s.retry_after_too_long,http_status:s.http_status,response_content_type:s.response_content_type,challenge_detected:s.challenge_detected,provider_error_code:s.provider_error_code,project_count:c&&Array.isArray(c.project_catalog)?c.project_catalog.length:0,chunk:c?{{sequence:c.sequence,owner:c.owner,account_scope:c.account_scope,format:c.format,conversations:c.conversations,project_catalog:c.project_catalog,conversation_projects:c.conversation_projects}}:null}})}})()"#
         );
         if view
             .eval_with_callback(poll, move |result| {
@@ -701,7 +767,9 @@ mod tests {
         let valid = json!({
             "status": "running", "stage": "list", "complete": false,
             "sequence": 0, "conversations": 0, "error_code": "",
-            "retry_after": 0, "http_status": 0, "project_count": 0, "chunk": null
+            "retry_after": 0, "retry_after_too_long": false, "http_status": 0,
+            "response_content_type": "missing", "challenge_detected": false,
+            "provider_error_code": "", "project_count": 0, "chunk": null
         });
         assert!(validate_status_shape(&valid));
         let mut bad_http_status = valid.clone();
@@ -716,5 +784,25 @@ mod tests {
         let mut invalid_stage = valid;
         invalid_stage["stage"] = json!("provider supplied text");
         assert!(!validate_status_shape(&invalid_stage));
+    }
+
+    #[test]
+    fn status_projection_bounds_provider_codes_and_long_retry_marker() {
+        let mut value = json!({
+            "status":"waiting", "stage":"list", "complete":false,
+            "sequence":0, "conversations":0, "error_code":"rate_limited",
+            "retry_after":3600, "retry_after_too_long":false, "http_status":429,
+            "response_content_type":"json", "challenge_detected":false,
+            "provider_error_code":"rate_limit_exceeded", "project_count":0, "chunk":null
+        });
+        assert!(validate_status_shape(&value));
+        value["provider_error_code"] = json!("provider supplied text");
+        assert!(!validate_status_shape(&value));
+        value["provider_error_code"] = json!("");
+        value["retry_after"] = json!(0);
+        value["retry_after_too_long"] = json!(true);
+        assert!(validate_status_shape(&value));
+        value["retry_after"] = json!(1);
+        assert!(!validate_status_shape(&value));
     }
 }

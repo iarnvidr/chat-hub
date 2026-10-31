@@ -3,7 +3,9 @@
   const state = {
     status: 'starting', stage: 'auth', complete: false, cancelled: false,
     sequence: 0, ackSequence: 0, chunk: null, conversations: 0,
-    listed: 0, exports: 0, error_code: '', retry_after: 0, http_status: 0,
+    listed: 0, exports: 0, error_code: '', retry_after: 0, retry_after_too_long: false,
+    http_status: 0, response_content_type: 'missing', challenge_detected: false,
+    provider_error_code: '',
   };
   window[key] = state;
   const API = 'https://chatgpt.com/backend-api/';
@@ -13,6 +15,12 @@
   const SOFT_COUNT = 100;
   const MAX_ROWS = 100000;
   const MAX_PAGES = 1000;
+  const MAX_RETRY_AFTER_SECONDS = 365 * 24 * 60 * 60;
+  const MAX_ERROR_BODY = 4 * 1024;
+  const PROVIDER_ERROR_CODES = new Set([
+    'rate_limit_exceeded', 'rate_limit_reached', 'too_many_requests',
+    'insufficient_quota', 'usage_limit_exceeded', 'model_rate_limit_exceeded',
+  ]);
   const enc = new TextEncoder();
   let cancelled = false;
   let activeController = null;
@@ -57,12 +65,62 @@
     }
     return found;
   }
-  function safeFail(code, stage, retryAfter, httpStatus) {
+  function contentTypeClass(response) {
+    const raw = response.headers.get('content-type');
+    if (typeof raw !== 'string' || !raw.trim()) return 'missing';
+    const mime = raw.split(';', 1)[0].trim().toLowerCase();
+    if (mime === 'text/html' || mime === 'application/xhtml+xml') return 'html';
+    if (mime === 'application/json' || mime.endsWith('+json')) return 'json';
+    return 'other';
+  }
+  function safeProviderErrorCode(text) {
+    try {
+      const value = JSON.parse(text);
+      const candidates = [value?.code, value?.type, value?.error?.code,
+        value?.error?.type, value?.error?.error?.code, value?.detail?.code];
+      return candidates.find(code => typeof code === 'string' && PROVIDER_ERROR_CODES.has(code.toLowerCase()))?.toLowerCase() || '';
+    } catch (_) { return ''; }
+  }
+  async function rateLimitDiagnostics(response) {
+    const contentType = contentTypeClass(response);
+    const challengeDetected = response.headers.get('cf-mitigated')?.trim().toLowerCase() === 'challenge';
+    let providerErrorCode = '';
+    if (contentType === 'json') {
+      try { providerErrorCode = safeProviderErrorCode(await readBounded(response, MAX_ERROR_BODY)); }
+      catch (_) { try { await response.body?.cancel(); } catch (_) {} }
+    } else {
+      try { await response.body?.cancel(); } catch (_) {}
+    }
+    return {contentType, challengeDetected, providerErrorCode};
+  }
+  function retryAfterSeconds(header) {
+    const raw = typeof header === 'string' ? header.trim() : '';
+    if (!raw) return {seconds: 60, tooLong: false};
+    let seconds;
+    if (/^\d+$/.test(raw)) {
+      const parsed = Number(raw);
+      if (!Number.isSafeInteger(parsed) || parsed > MAX_RETRY_AFTER_SECONDS) return {seconds: 0, tooLong: true};
+      seconds = parsed;
+    } else {
+      const timestamp = Date.parse(raw);
+      if (!Number.isFinite(timestamp)) return {seconds: 60, tooLong: false};
+      seconds = Math.max(1, Math.ceil((timestamp - Date.now()) / 1000));
+      if (seconds > MAX_RETRY_AFTER_SECONDS) return {seconds: 0, tooLong: true};
+    }
+    return {seconds: Math.max(1, seconds), tooLong: false};
+  }
+  function safeFail(code, stage, retryAfter, httpStatus, diagnostics = {}) {
     state.status = code === 'rate_limited' ? 'waiting' : 'failed';
     state.stage = stage;
     state.error_code = code;
-    state.retry_after = Number.isFinite(retryAfter) ? Math.max(0, Math.min(1800, retryAfter)) : 0;
+    state.retry_after = Number.isFinite(retryAfter) ? Math.max(0, Math.floor(retryAfter)) : 0;
+    state.retry_after_too_long = diagnostics.retryAfterTooLong === true;
     state.http_status = Number.isInteger(httpStatus) ? Math.max(0, Math.min(599, httpStatus)) : 0;
+    state.response_content_type = ['json', 'html', 'other', 'missing'].includes(diagnostics.contentType)
+      ? diagnostics.contentType : 'missing';
+    state.challenge_detected = diagnostics.challengeDetected === true;
+    state.provider_error_code = PROVIDER_ERROR_CODES.has(diagnostics.providerErrorCode)
+      ? diagnostics.providerErrorCode : '';
     state.complete = false;
   }
   function checkCancelled() {
@@ -137,9 +195,13 @@
         credentials: 'include', cache: 'no-store', redirect: 'error', signal: controller.signal,
       });
       if (response.status === 429) {
-        const raw = Number(response.headers.get('retry-after') || 60);
-        try { await response.body?.cancel(); } catch (_) {}
-        throw Object.assign(new Error(), {code: 'rate_limited', retryAfter: Number.isFinite(raw) ? Math.max(1, Math.min(1800, raw)) : 60, httpStatus: response.status, stage});
+        const retry = retryAfterSeconds(response.headers.get('retry-after'));
+        const diagnostics = await rateLimitDiagnostics(response);
+        throw Object.assign(new Error(), {code: 'rate_limited', retryAfter: retry.seconds,
+          retryAfterTooLong: retry.tooLong, httpStatus: response.status, stage,
+          responseContentType: diagnostics.contentType,
+          challengeDetected: diagnostics.challengeDetected,
+          providerErrorCode: diagnostics.providerErrorCode});
       }
       if (response.status === 401) throw Object.assign(new Error(), {code: 'login_required', httpStatus: response.status, stage});
       if (response.status !== 200) throw Object.assign(new Error(), {code: 'http_error', httpStatus: response.status, stage});
@@ -372,7 +434,12 @@
         state.status = 'cancelled'; state.stage = 'cancelled'; state.complete = false;
       } else {
         safeFail(error && error.code || 'sync_failed', error && error.stage || state.stage,
-          error && error.retryAfter, error && error.httpStatus);
+          error && error.retryAfter, error && error.httpStatus, {
+            retryAfterTooLong: error && error.retryAfterTooLong,
+            contentType: error && error.responseContentType,
+            challengeDetected: error && error.challengeDetected,
+            providerErrorCode: error && error.providerErrorCode,
+          });
       }
     } finally {
       bearer = '';

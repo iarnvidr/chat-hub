@@ -72,6 +72,16 @@ pub struct ProjectAssignmentOutcome {
     pub project_title: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProjectRenameOutcome {
+    pub state: String,
+    pub verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+}
+
 impl ChatGptConnectionStatus {
     fn new(state: ChatGptConnectionState) -> Self {
         let message = match state {
@@ -107,6 +117,91 @@ enum ProbePoll {
 enum AssignmentPoll {
     Pending,
     Complete(ProjectAssignmentOutcome),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RenamePoll {
+    Pending,
+    Complete(ProjectRenameOutcome),
+}
+
+fn parse_project_rename_callback(raw: &str, expected_nonce: &str) -> Option<RenamePoll> {
+    if raw.len() > 8 * 1024 {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    for _ in 0..3 {
+        let Some(nested) = value.as_str() else { break };
+        if nested.len() > 8 * 1024 {
+            return None;
+        }
+        value = serde_json::from_str(nested).ok()?;
+    }
+    let object = value.as_object()?;
+    if object.get("nonce")?.as_str()? != expected_nonce {
+        return None;
+    }
+    match object.get("state")?.as_str()? {
+        "running" if object.len() == 3 && object.get("cancelled")?.as_bool()? == false => {
+            Some(RenamePoll::Pending)
+        }
+        "applied"
+            if object.len() == 4
+                && object.get("cancelled")?.as_bool()? == false
+                && object.get("verified")?.as_bool()? == true =>
+        {
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "nonce" | "state" | "cancelled" | "verified"))
+            {
+                return None;
+            }
+            Some(RenamePoll::Complete(ProjectRenameOutcome {
+                state: "applied".into(),
+                verified: true,
+                error_code: None,
+                retry_after: None,
+            }))
+        }
+        "failed" if (4..=5).contains(&object.len()) => {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "nonce" | "state" | "cancelled" | "error_code" | "retry_after"
+                )
+            }) || object.get("cancelled")?.as_bool()? != false
+            {
+                return None;
+            }
+            let error_code = object.get("error_code")?.as_str()?;
+            if !matches!(
+                error_code,
+                "cancelled"
+                    | "invalid_request"
+                    | "signed_out"
+                    | "account_unavailable"
+                    | "account_changed"
+                    | "project_shape_unavailable"
+                    | "request_failed"
+                    | "rate_limited"
+                    | "verification_failed"
+            ) {
+                return None;
+            }
+            let retry_after = match object.get("retry_after") {
+                None => None,
+                Some(value) if error_code == "rate_limited" => Some(value.as_u64()?.clamp(1, 1800)),
+                _ => return None,
+            };
+            Some(RenamePoll::Complete(ProjectRenameOutcome {
+                state: "failed".into(),
+                verified: false,
+                error_code: Some(error_code.into()),
+                retry_after,
+            }))
+        }
+        _ => None,
+    }
 }
 
 fn parse_assignment_callback(raw: &str, expected_nonce: &str) -> Option<AssignmentPoll> {
@@ -502,6 +597,119 @@ impl ProviderViewState {
         }
     }
 
+    /// Rename one existing ChatGPT project using the captured project PATCH
+    /// shape. The page verifies the account and reads back the changed record.
+    pub async fn rename_project(
+        &self,
+        project_id: &str,
+        name: &str,
+        expected_scope: &str,
+    ) -> Result<ProjectRenameOutcome, String> {
+        if !valid_observed_scope(expected_scope)
+            || project_id.len() > 132
+            || !project_id.starts_with("g-p-")
+            || !project_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            || name.trim().is_empty()
+            || name.chars().count() > 120
+            || name.chars().any(char::is_control)
+        {
+            return Err("invalid_project_rename".into());
+        }
+        let (webview, loaded) = self
+            .inner
+            .lock()
+            .map_err(|_| "provider_unavailable".to_string())
+            .map(|inner| (inner.webview.clone(), inner.loaded))?;
+        let generation = {
+            let page = self
+                .page
+                .lock()
+                .map_err(|_| "provider_unavailable".to_string())?;
+            if !page.exact_origin {
+                return Err("chatgpt_not_open".into());
+            }
+            if page.account_scope.as_deref() != Some(expected_scope) {
+                return Err("chatgpt_account_changed".into());
+            }
+            page.navigation_generation
+        };
+        if !loaded {
+            return Err("chatgpt_loading".into());
+        }
+        let nonce = fresh_probe_nonce().ok_or_else(|| "provider_unavailable".to_string())?;
+        let key = format!("__chatHubProjectRename_{nonce}");
+        let key_json = serde_json::to_string(&key).map_err(|_| "provider_unavailable")?;
+        let nonce_json = serde_json::to_string(&nonce).map_err(|_| "provider_unavailable")?;
+        let scope_json =
+            serde_json::to_string(expected_scope).map_err(|_| "invalid_project_rename")?;
+        let project_json =
+            serde_json::to_string(project_id).map_err(|_| "invalid_project_rename")?;
+        let name_json = serde_json::to_string(name.trim()).map_err(|_| "invalid_project_rename")?;
+        let script = format!(
+            "({})({key_json},{nonce_json},{scope_json},{project_json},{name_json})",
+            include_str!("project_rename.js")
+        );
+        webview
+            .eval(&script)
+            .map_err(|_| "provider_unavailable".to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                cleanup_probe(&webview, &key_json);
+                return Err("project_rename_timeout".into());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let tx = Mutex::new(Some(tx));
+            if webview
+                .eval_with_callback(
+                    format!("JSON.stringify(window[{key_json}]||null)"),
+                    move |value| {
+                        if let Ok(mut slot) = tx.lock() {
+                            if let Some(tx) = slot.take() {
+                                let _ = tx.send(value);
+                            }
+                        }
+                    },
+                )
+                .is_err()
+            {
+                cleanup_probe(&webview, &key_json);
+                return Err("provider_unavailable".into());
+            }
+            match tokio::time::timeout(remaining.min(Duration::from_secs(2)), rx).await {
+                Ok(Ok(raw)) => match parse_project_rename_callback(&raw, &nonce) {
+                    Some(RenamePoll::Pending) => {}
+                    Some(RenamePoll::Complete(outcome)) => {
+                        let same_page = self.page.lock().ok().is_some_and(|page| {
+                            page.navigation_generation == generation
+                                && page.exact_origin
+                                && page.account_scope.as_deref() == Some(expected_scope)
+                        });
+                        cleanup_probe(&webview, &key_json);
+                        return if same_page {
+                            Ok(outcome)
+                        } else {
+                            Err("chatgpt_page_changed".into())
+                        };
+                    }
+                    None => {
+                        cleanup_probe(&webview, &key_json);
+                        return Err("provider_unavailable".into());
+                    }
+                },
+                Ok(Err(_)) => {
+                    cleanup_probe(&webview, &key_json);
+                    return Err("provider_unavailable".into());
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Initialize the provider's own signed-in browser session in the hidden
     /// child webview. This never reveals the view or replaces a live page.
     pub fn prepare_session(&self) -> Result<bool, String> {
@@ -856,8 +1064,9 @@ mod target_url_tests {
     use super::{
         allowed_provider_navigation, current_chatgpt_conversation_id, exact_chatgpt_origin,
         page_metadata_script, parse_assignment_callback, parse_page_metadata_callback,
-        parse_probe_callback, should_prepare_session, target_url, valid_observed_scope,
-        AssignmentPoll, ChatGptConnectionState, ProbePoll,
+        parse_probe_callback, parse_project_rename_callback, should_prepare_session, target_url,
+        valid_observed_scope, AssignmentPoll, ChatGptConnectionState, ProbePoll,
+        ProjectRenameOutcome, RenamePoll,
     };
 
     #[test]
@@ -979,6 +1188,49 @@ mod target_url_tests {
             serde_json::json!({"nonce":"n1","state":"failed","error_code":"request_failed","retry_after":4}).to_string(),
         ] {
             assert_eq!(parse_assignment_callback(&invalid, "n1"), None);
+        }
+    }
+
+    #[test]
+    fn project_rename_callback_requires_verified_nonce_bound_receipt() {
+        let applied = serde_json::json!({
+            "nonce":"rename-1", "state":"applied", "cancelled":false,
+            "verified":true
+        });
+        assert!(matches!(
+            parse_project_rename_callback(&applied.to_string(), "rename-1"),
+            Some(RenamePoll::Complete(ProjectRenameOutcome {
+                verified: true,
+                ..
+            }))
+        ));
+        let failed = serde_json::json!({
+            "nonce":"rename-1", "state":"failed", "cancelled":false,
+            "error_code":"verification_failed"
+        });
+        assert!(matches!(
+            parse_project_rename_callback(&failed.to_string(), "rename-1"),
+            Some(RenamePoll::Complete(ProjectRenameOutcome {
+                verified: false,
+                error_code: Some(code),
+                ..
+            })) if code == "verification_failed"
+        ));
+        for invalid in [
+            serde_json::json!({
+                "nonce":"other", "state":"applied", "cancelled":false,
+                "verified":true
+            }),
+            serde_json::json!({
+                "nonce":"rename-1", "state":"applied", "cancelled":false,
+                "verified":false
+            }),
+            serde_json::json!({
+                "nonce":"rename-1", "state":"applied", "cancelled":false,
+                "verified":true, "project_name":"private"
+            }),
+        ] {
+            assert!(parse_project_rename_callback(&invalid.to_string(), "rename-1").is_none());
         }
     }
 

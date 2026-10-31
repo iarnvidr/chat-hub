@@ -1,12 +1,14 @@
 import {fixtureAdapter, normalizeList, normalizeSearch} from './data.js';
-import {branchChoices,orderedMessages,messageText,hasUnsupportedContent,renderMarkdown} from './render.js';
+import {branchChoices,orderedMessages,messageText,hasUnsupportedContent,renderMarkdown,speakerPresentation,decorateArchiveTranscript} from './render.js';
 import {updateStatus} from './status.js';
 import {createConversationTabs, findCapturedChatRecord} from './conversation-tabs.js';
+import {installTabShortcuts} from './tab-shortcuts.js';
 import {chatgptConversationId} from './continuation.js';
 import {groupSearchConversations, appendSearchHighlight} from './search.js';
+import {branchForAnchor} from './entity-model.js';
 const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';
 const adapter=fixture?fixtureAdapter():{
-  async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value,projectKey:$('project-filter').value||null});},
+  async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value,projectKey:$('project-filter').value||null,tag:$('tag-filter').value||null});},
   async getConversation(id,leafNodeId){return invoke('get_conversation',leafNodeId!==undefined?{id,leafNodeId}:{id});},
   async importChatgptExport(){return invoke('import_chatgpt_export');}
 };
@@ -70,6 +72,11 @@ const conversationTabs = createConversationTabs({
     $('messages').replaceChildren(); drawList();
     window.dispatchEvent(new Event('chat-hub:show-local'));
   },
+});
+installTabShortcuts({
+  target: window,
+  tabs: conversationTabs,
+  onNewTab: () => window.dispatchEvent(new Event('chat-hub:live-open')),
 });
 window.addEventListener('chat-hub:live-open', () => {
   ++readerToken;
@@ -244,6 +251,7 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   const token = ++readerToken;
   lastConversationButton = [...document.querySelectorAll('.conversation-item')].find(b => b.classList.contains('selected')) || document.activeElement;
   selected = id;
+  window.dispatchEvent(new CustomEvent('chat-hub:conversation-loading',{detail:{id}}));
   document.body.classList.add('mobile-reader');
   $('reader-empty').hidden = true;
   $('reader').hidden = false;
@@ -256,6 +264,7 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   adapter.getConversation(id, leafNodeId).then(c => {
     if(token!==readerToken)return;
     if (c?.conversation?.id !== id) throw Error('not_found');
+    if(anchorNodeId&&!leafNodeId){const leaf=branchForAnchor(c,anchorNodeId);if(leaf&&leaf!==c.selection?.selected_node_id){conversationTabs.update(options.tabId||id,{leafNodeId:leaf,anchorNodeId});openConversation(id,leaf,anchorNodeId,{...options,selectTab:false});return;}}
     conversation = {...c.conversation, ...c, selected_node_id: c.selection?.selected_node_id};
     $('continue-chatgpt').hidden = !chatgptConversationId(c.conversation);
     $('set-chat-project').hidden = !chatgptConversationId(c.conversation);
@@ -287,6 +296,7 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
     };
     drawMessages(c.selection?.selected_node_id);
     drawList();
+    window.dispatchEvent(new CustomEvent('chat-hub:conversation-loaded',{detail:c.conversation}));
     if (anchorNodeId) document.getElementById(messageDomId(id,anchorNodeId))?.scrollIntoView?.();
   }).catch(e => {
     if (token !== readerToken) return;
@@ -297,7 +307,9 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   });
 }
 function messageDomId(conversationId,nodeId){return `message-${encodeURIComponent(conversationId)}-${encodeURIComponent(nodeId)}`;}
-function drawMessages(leaf){const root=$('messages');root.replaceChildren();try{for(const m of orderedMessages(conversation,leaf)){const article=document.createElement('article'),role=document.createElement('div'),body=document.createElement('div');article.className='message';role.className='role';role.textContent=m.role==='archive'?'Saved transcript':m.role||'Message';body.className='markdown';const text=messageText(m);if(text)renderMarkdown(text,body);if(hasUnsupportedContent(m)){const marker=document.createElement('div');marker.className='unsupported-content';marker.textContent='[Unsupported content]';body.append(marker);}article.id=messageDomId(conversation.id,m.node_id||'unknown');article.dataset.nodeId=m.node_id||'';article.append(role,body);root.append(article);}}catch(e){root.textContent=safeError(errText(e));}}
+$('tag-filter').addEventListener('change',()=>loadList($('search').value,true));
+window.addEventListener('chat-hub:tags-updated',()=>loadList($('search').value,true));
+function drawMessages(leaf){const root=$('messages');root.replaceChildren();try{for(const m of orderedMessages(conversation,leaf)){const article=document.createElement('article'),role=document.createElement('div'),body=document.createElement('div'),speaker=speakerPresentation(m);article.className='message archive-message';article.dataset.speaker=speaker.key;role.className='role archive-message__meta';role.textContent=speaker.label;body.className='markdown archive-message__body';const text=messageText(m);if(text)renderMarkdown(text,body);if(m.role==='archive')decorateArchiveTranscript(body);if(hasUnsupportedContent(m)){const marker=document.createElement('div');marker.className='unsupported-content';marker.textContent='[Unsupported content]';body.append(marker);}article.id=messageDomId(conversation.id,m.node_id||'unknown');article.dataset.nodeId=m.node_id||'';article.append(role,body);root.append(article);}}catch(e){root.textContent=safeError(errText(e));}}
 $('back-to-library').addEventListener('click',()=>{document.body.classList.remove('mobile-reader');const target=lastConversationButton?.isConnected?lastConversationButton:$('search');target.focus();});$('search').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(()=>loadList($('search').value,true),150);});$('import').addEventListener('click',async()=>{const b=$('import');b.disabled=true;b.textContent='Importing…';try{const r=await adapter.importChatgptExport();if(r?.cancelled){$('app-status').textContent='Import cancelled.';return;}if(!r||!r.result||typeof r.result!=='object')throw Error('Invalid import receipt');const x=r?.result||{},errs=Array.isArray(x.errors)?x.errors:[];$('app-status').textContent=`Import finished: ${x.imported??0} imported, ${x.updated??0} updated, ${x.unchanged??0} unchanged, ${x.failed??0} failed${x.errors_truncated?` (error list truncated; showing ${errs.length})`:''}${errs.length?`. ${errs.map(e=>e.message||String(e)).join('; ')}`:'.'}`;await loadList($('search').value,true);}catch(e){showError(`Import failed: ${errText(e)}`);}finally{b.disabled=false;b.textContent='Import export';}});$('load-more')?.addEventListener('click',()=>{if(cursor)loadList(queryValue,false);});const status=()=>updateStatus({invoke:native?invoke:null,setVersion:v=>$('version').textContent=v,setMessage:v=>$('message').textContent=v,setHealth:v=>$('health').textContent=v,setRetryVisible:v=>{$('retry-health').hidden=!v;}});$('retry-health').addEventListener('click',status);
 let saveBusy=false;function setSaveBusy(v){saveBusy=v;$('backup-library').disabled=v;$('export-library-json').disabled=v;}const saveErrors={cancelled:'Save cancelled.',invalid_request:'The save request was invalid.',unauthorized:'Sign in to the desktop service before saving.',busy:'The desktop service is busy. Try again later.',archive_busy:'Another archive save is already in progress.',service_unavailable:'The desktop service is unavailable. Try again later.',not_found:'The library was not found.',permission_denied:'The destination could not be written.',io_error:'The destination could not be written.',archive_published:'The backup file was published, but its durability could not be confirmed. Check the saved file before trying again.'};async function saveLibrary(button,command,kind){if(!native||saveBusy)return;setSaveBusy(true);button.textContent=kind==='backup'?'Saving backup…':'Exporting JSON…';$('app-status').textContent=kind==='backup'?'Choose where to save the library backup.':'Choose where to export the library as JSON.';try{const r=await invoke(command);if(!r||typeof r.cancelled!=='boolean'||typeof r.published!=='boolean'||typeof r.durability_confirmed!=='boolean'||r.kind!==kind)throw Error('invalid_request');if(r.cancelled){$('app-status').textContent='Save cancelled.';return;}if(r.published&&!r.durability_confirmed){$('app-status').textContent='The file was published, but its durability could not be confirmed. Check the saved file before trying again.';return;}if(r.published&&r.durability_confirmed){$('app-status').textContent=kind==='backup'?'Library backup saved.':'Library JSON export saved.';return;}$('app-status').textContent='The save did not complete.';}catch(e){const code=typeof e==='string'?e:e?.code;const safe=String(code||'').toLowerCase().replace(/[^a-z0-9_]/g,'');$('app-status').textContent=saveErrors[safe]||'The save could not be completed.';}finally{setSaveBusy(false);button.textContent=kind==='backup'?'Save library backup':'Export library as JSON';}}$('backup-library').addEventListener('click',()=>saveLibrary($('backup-library'),'backup_library','backup'));$('export-library-json').addEventListener('click',()=>saveLibrary($('export-library-json'),'export_library_json','json'));
 let updateBusy=false;function setUpdateBusy(v){updateBusy=v;$('check').disabled=v;$('install').disabled=v;}

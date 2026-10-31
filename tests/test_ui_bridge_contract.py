@@ -140,6 +140,27 @@ class UiBridgeContract(unittest.TestCase):
                 self.assertIn("window: tauri::Webview", signature)
                 self.assertIn("authorize_local_main(&window)?;", body)
 
+    def test_library_item_commands_authorize_before_any_file_or_service_io(self):
+        source = (ROOT / "src-tauri/src/library_items.rs").read_text()
+        commands = re.findall(r"pub async fn\s+(\w+)\s*\(", source)
+        self.assertEqual(
+            set(commands),
+            {
+                "catalog_entities", "catalog_entity", "list_local_tags",
+                "get_target_tags", "set_target_tags", "tagged_targets",
+                "saved_artifacts", "attach_artifact_file", "export_artifact_file",
+                "open_artifact_file", "open_catalog_link",
+            },
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                function = rust_function(source, command)
+                self.assertIsNotNone(function)
+                signature, body = function
+                self.assertIn("window: tauri::Webview", signature)
+                first_statement = next(line.strip() for line in body.splitlines() if line.strip())
+                self.assertEqual(first_statement, "authorize_local_main(&window)?;")
+
     def test_chatgpt_project_assignment_is_server_verified_before_local_commit(self):
         main = (ROOT / "src-tauri/src/main.rs").read_text()
         function = rust_function(main, "set_conversation_project")
@@ -178,7 +199,7 @@ class UiBridgeContract(unittest.TestCase):
         api = (ROOT / "src-tauri/src/desktop_api.rs").read_text()
         self.assertIn('query.push(("focus_id", focus_id.to_owned()))', api)
         server = (ROOT / "src/server/api_v1.rs").read_text()
-        self.assertIn("store.catalog_neighborhood(focus_id, &source, project_key.as_deref(), limit)", server)
+        self.assertRegex(server, r"store\.catalog_neighborhood_tagged\(\s*focus_id,\s*&source,\s*project_key\.as_deref\(\),\s*tag\.as_deref\(\),\s*limit,?\s*\)")
 
     def test_guard_requires_live_native_main_ownership_and_local_origin(self):
         source = (ROOT / "src-tauri/src/main.rs").read_text()
@@ -206,7 +227,11 @@ class UiBridgeContract(unittest.TestCase):
         self.assertIn("scope: Option<String>", signature)
         self.assertIn('unwrap_or("upstream")', body)
         self.assertIn('"local" =>', body)
-        self.assertIn('"upstream" => Err("upstream_project_rename_unavailable".into())', body)
+        self.assertIn('"upstream" =>', body)
+        self.assertIn('outcome.state != "applied" || !outcome.verified', body)
+        self.assertIn('desktop_api::commit_verified_project_title(', body)
+        self.assertLess(body.index('outcome.state != "applied" || !outcome.verified'), body.index('desktop_api::commit_verified_project_title('))
+        self.assertIn('observed_scope != project_target.account_scope', body)
         self.assertIn("WindowEvent::Destroyed", source)
         self.assertIn("ownership.revoke()", source)
 

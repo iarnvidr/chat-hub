@@ -60,9 +60,11 @@ function bootApp({records = () => [], detail = id => ({conversation: {id, title:
   });
   const tabs = fs.readFileSync(`${ROOT}/desktop-ui/conversation-tabs.js`, 'utf8')
     .replaceAll('export function', 'function');
+  const shortcuts = fs.readFileSync(`${ROOT}/desktop-ui/tab-shortcuts.js`, 'utf8')
+    .replaceAll('export function', 'function');
   const app = fs.readFileSync(`${ROOT}/desktop-ui/app.js`, 'utf8')
     .replace(/^import .*;\s*$/gm, '') + '\nglobalThis.__tabs = conversationTabs;';
-  vm.runInContext(`${tabs}\n${app}`, context);
+  vm.runInContext(`${tabs}\n${shortcuts}\n${app}`, context);
   return {
     tabs: context.__tabs, elements, window,
     async flush() {

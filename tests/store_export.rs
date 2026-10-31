@@ -34,7 +34,17 @@ fn observation() -> Observation {
 #[test]
 fn deterministic_lossless_streamed_rows_and_no_clobber() {
     let mut store = Store::in_memory().unwrap();
-    store.ingest_observation(&observation()).unwrap();
+    let conversation_id = store.ingest_observation(&observation()).unwrap();
+    store
+        .set_target_tags(
+            "conversation",
+            &conversation_id,
+            &["Research".into(), "MVP".into()],
+        )
+        .unwrap();
+    store
+        .set_target_tags("entity", "entity:repository-digest", &["Research".into()])
+        .unwrap();
     let mut a = Vec::new();
     let meta = store.write_library_json(&mut a).unwrap();
     let mut b = Vec::new();
@@ -44,6 +54,9 @@ fn deterministic_lossless_streamed_rows_and_no_clobber() {
     assert_eq!(meta.observation_count, 1);
     let doc: Value = serde_json::from_slice(&a).unwrap();
     assert_eq!(doc["format"], "chat-hub-library");
+    assert_eq!(doc["tags"].as_array().unwrap().len(), 2);
+    assert_eq!(doc["target_tags"].as_array().unwrap().len(), 3);
+    assert_eq!(doc["target_tags"][0]["target_kind"], "conversation");
     assert!(doc["nodes"][0]["parts_json"]
         .as_str()
         .unwrap()

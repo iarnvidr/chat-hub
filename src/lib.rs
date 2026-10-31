@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod artifacts;
 pub mod ca;
 pub mod capture;
 pub mod capture_lane;

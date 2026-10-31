@@ -80,7 +80,8 @@ const server = http.createServer((request, response) => {
     assert.equal(await page.locator('#source-chat').getAttribute('aria-pressed'), 'true');
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_conversations' && args.source === 'chatgpt'));
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_projects' && args.source === 'chatgpt'));
-    await page.locator('#project-filter').selectOption('chat-project:key');
+    await page.locator('#project-disclosure summary').click();
+    await page.locator('#project-options button[data-project-key="chat-project:key"]').click();
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_conversations' && args.projectKey === 'chat-project:key'));
     assert.equal(await page.locator('#project-filter option:checked').innerText(), 'Chat Project (1)');
     assert.equal(await page.locator('.conversation-item .project-label').innerText(), 'Chat Project');
@@ -89,7 +90,7 @@ const server = http.createServer((request, response) => {
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_conversations' && args.source === 'codex'));
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_projects' && args.source === 'codex'));
     assert.equal(await page.locator('#project-filter option').nth(1).innerText(), 'Codex Project (2)');
-    await page.locator('#project-filter').selectOption('codex-project:key');
+    await page.locator('#project-options button[data-project-key="codex-project:key"]').click();
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_conversations' && args.projectKey === 'codex-project:key'));
     assert.equal(await page.locator('#source-codex').getAttribute('aria-pressed'), 'true');
 

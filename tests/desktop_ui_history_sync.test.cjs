@@ -1,12 +1,17 @@
-const test = require('node:test');
+const {test} = require('bun:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function boot(invoke, {buttonPresent = true} = {}) {
+function boot(invoke, {buttonPresent = true, storage = new Map(), initialTime = Date.now()} = {}) {
   const callbacks = new Map(), events = [], timers = new Map();
   let nextTimer = 1;
-  let now = Date.now();
+  let now = initialTime;
+  const localStorage = {
+    getItem: key => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, String(value)),
+    removeItem: key => storage.delete(key),
+  };
   class TestDate extends Date { static now() { return now; } }
   const button = buttonPresent ? {addEventListener: (_, fn) => {button.click = fn;}} : null;
   const settingsStatus = {}, appStatus = {}, footer = {};
@@ -15,7 +20,7 @@ function boot(invoke, {buttonPresent = true} = {}) {
       : id === 'history-sync-status' ? settingsStatus
         : id === 'app-status' ? appStatus
           : id === 'workspace-sync-state' ? footer : null},
-    window: {__TAURI_INTERNALS__: {invoke}, ChatHub: {invoke},
+    window: {__TAURI_INTERNALS__: {invoke}, ChatHub: {invoke}, localStorage,
       addEventListener: (name, fn) => callbacks.set(name, fn),
       dispatchEvent: event => {events.push(event.type); callbacks.get(event.type)?.(event);}},
     Event: class {constructor(type) {this.type = type;}},
@@ -28,6 +33,18 @@ function boot(invoke, {buttonPresent = true} = {}) {
     button, status: settingsStatus, appStatus, footer, events, timers,
     dispatch: name => callbacks.get(name)?.({type: name}),
     advance: ms => {now += ms;},
+    now: () => now,
+    runTimer: async predicate => {
+      const selected = [...timers.entries()].find(([, timer]) => predicate(timer));
+      if (!selected) return false;
+      const [id, timer] = selected;
+      timers.delete(id);
+      await timer.fn();
+      await new Promise(resolve => setImmediate(resolve));
+      await new Promise(resolve => setImmediate(resolve));
+      return true;
+    },
+    storage,
     flush: async () => {await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve));},
   };
 }
@@ -138,7 +155,7 @@ test('explicit sync connects the app account and resumes fetching when sign-in c
   assert.match(ui.status.textContent, /2 added/);
 });
 
-test('rate-limit cooldown blocks automatic and manual retries without polling loops', async () => {
+test('rate-limit cooldown waits quietly and resumes automatically after native deadline', async () => {
   let starts = 0, statusCalls = 0;
   const ui = boot(async command => {
     if (command === 'get_chatgpt_connection') return {state: 'not_open'};
@@ -152,12 +169,152 @@ test('rate-limit cooldown blocks automatic and manual retries without polling lo
   await ui.dispatch('chat-hub:chatgpt-connected'); await ui.flush();
   assert.equal(starts, 1);
   assert.match(ui.status.textContent, /progress was saved.*60 seconds/);
+  assert.equal(ui.footer.textContent, 'History sync waiting');
   assert.equal(ui.button.disabled, true);
   await ui.dispatch('chat-hub:chatgpt-connected');
   await ui.button.click();
   await ui.flush();
   assert.equal(starts, 1);
   assert.equal([...ui.timers.values()].some(timer => timer.ms === 2000), false);
+  assert.ok([...ui.timers.values()].some(timer => timer.ms === 1000), 'cooldown schedules a bounded timer');
+});
+
+test('a server Retry-After longer than the backoff cap is persisted without shortening', async () => {
+  const storage=new Map(), startTime=Date.now();
+  let failed=false;
+  const ui=boot(async command=>{
+    if(command==='get_chatgpt_connection')return{state:'not_open'};
+    if(command==='chatgpt_history_status')return failed
+      ? {state:'partial',error_code:'rate_limited',retry_after:3600,message:'progress saved'}
+      : {state:'idle',configured:true};
+    if(command==='sync_chatgpt_history'){failed=true;throw Error('history_rate_limited');}
+    return{};
+  },{storage,initialTime:startTime});
+  await ui.flush();
+  await ui.button.click();
+  await ui.flush();
+  const saved=JSON.parse(storage.get('chat-hub.chatgpt-history-cooldown.v1'));
+  assert.equal(saved.until,startTime+3_600_000);
+  assert.match(ui.status.textContent,/3600 seconds/);
+  ui.advance(30*60*1000);
+  assert.equal(await ui.runTimer(timer=>timer.ms>0),true);
+  assert.equal(ui.button.disabled,true,'the local 30 minute backoff cap cannot resume early');
+});
+
+test('verification challenges pause background retry and never open the provider automatically', async () => {
+  let starts=0;
+  const ui=boot(async command=>{
+    if(command==='get_chatgpt_connection')return{state:'not_open'};
+    if(command==='sync_chatgpt_history'){starts++;throw Error('history_rate_limited');}
+    if(command==='chatgpt_history_status')return starts
+      ? {state:'partial',error_code:'rate_limited',retry_after:60,challenge_detected:true,automatic_retry_paused:true}
+      : {state:'idle',configured:true};
+    return{};
+  });
+  await ui.flush();
+  await ui.button.click();
+  await ui.flush();
+  assert.equal(starts,1);
+  assert.match(ui.status.textContent,/verification challenge/);
+  assert.equal(ui.footer.textContent,'ChatGPT verification needed');
+  assert.equal(ui.events.includes('chat-hub:connect'),false);
+  ui.advance(60_000);
+  assert.equal(await ui.runTimer(timer=>timer.ms>0),true);
+  assert.equal(ui.footer.textContent,'ChatGPT verification needed');
+  assert.equal(await ui.runTimer(timer=>timer.ms===0),false);
+  assert.equal(starts,1,'verification-required cooldown does not launch background sync');
+});
+
+test('one manual session gets at most three automatic retries after a rate limit', async () => {
+  let starts = 0, statusCalls = 0, failedSinceStatus = false;
+  const ui = boot(async command => {
+    if (command === 'get_chatgpt_connection') return {state: 'not_open'};
+    if (command === 'sync_chatgpt_history') { starts++; failedSinceStatus=true; throw Error('history_rate_limited'); }
+    if (command === 'chatgpt_history_status') {
+      if (statusCalls++ === 0) return {state:'idle',configured:true};
+      const retry_after=failedSinceStatus?1:0;
+      failedSinceStatus=false;
+      return {state:'partial',error_code:'rate_limited',retry_after,message:'Fetched progress was saved.'};
+    }
+    return {};
+  });
+  await ui.flush();
+  await ui.button.click(); // explicit attempt, then background retries are bounded
+  await ui.flush();
+  assert.equal(starts,1);
+  for (const waitMs of [15_000, 30_000, 60_000]) {
+    ui.advance(waitMs);
+    assert.equal(await ui.runTimer(timer=>timer.ms>0),true);
+    const auto=await ui.runTimer(timer=>timer.ms===0);
+    assert.equal(auto,true);
+  }
+  ui.advance(1000);
+  assert.equal(await ui.runTimer(timer=>timer.ms===1000),true);
+  assert.equal(starts,4,'one explicit attempt plus at most three automatic attempts');
+  assert.match(ui.footer.textContent,/Sync paused/);
+  assert.equal([...ui.timers.values()].some(timer=>timer.ms===0),false);
+});
+
+test('provider cooldown deadline persists locally across app restart without account data', async () => {
+  const storage=new Map();
+  const startTime=Date.now();
+  let failed=false;
+  const first=boot(async command=>{
+    if(command==='get_chatgpt_connection')return{state:'not_open'};
+    if(command==='chatgpt_history_status'){
+      if(!failed)return{state:'idle',configured:true};
+      return{state:'partial',error_code:'rate_limited',retry_after:90,message:'progress saved'};
+    }
+    if(command==='sync_chatgpt_history'){failed=true;throw Error('history_rate_limited');}
+    return{};
+  },{storage,initialTime:startTime});
+  await first.flush();
+  await first.button.click();
+  await first.flush();
+  const saved=JSON.parse(storage.get('chat-hub.chatgpt-history-cooldown.v1'));
+  assert.deepEqual(Object.keys(saved).sort(),['automatic_retry_paused','provider','until','verification_needed']);
+  assert.equal(saved.provider,'chatgpt');
+  assert.equal(saved.automatic_retry_paused,false);
+
+  let starts=0;
+  const second=boot(async command=>{
+    if(command==='chatgpt_history_status')return{state:'idle',configured:true};
+    if(command==='get_chatgpt_connection')return{state:'connected'};
+    if(command==='sync_chatgpt_history')starts++;
+    return{};
+  },{storage,initialTime:startTime+1000});
+  await second.flush();
+  assert.equal(starts,0,'restart cannot bypass the saved cooldown');
+  assert.equal(second.button.disabled,true);
+  assert.equal(second.footer.textContent,'History sync waiting');
+});
+
+test('a challenge pause survives restart and startup does not sync until manual action', async () => {
+  const storage=new Map();
+  let attempted=false;
+  const first=boot(async command=>{
+    if(command==='get_chatgpt_connection')return{state:'not_open'};
+    if(command==='chatgpt_history_status')return attempted
+      ? {state:'partial',error_code:'rate_limited',retry_after:0,challenge_detected:true,automatic_retry_paused:true}
+      : {state:'idle',configured:true};
+    if(command==='sync_chatgpt_history'){attempted=true;throw Error('history_rate_limited');}
+    return{};
+  },{storage});
+  await first.flush();
+  await first.button.click();
+  await first.flush();
+  assert.equal(JSON.parse(storage.get('chat-hub.chatgpt-history-cooldown.v1')).verification_needed,true);
+
+  let starts=0;
+  const restarted=boot(async command=>{
+    if(command==='chatgpt_history_status')return{state:'idle',configured:true};
+    if(command==='get_chatgpt_connection')return{state:'connected'};
+    if(command==='sync_chatgpt_history')starts++;
+    return{};
+  },{storage});
+  await restarted.flush();
+  assert.equal(starts,0);
+  assert.equal(restarted.footer.textContent,'ChatGPT verification needed');
 });
 
 test('background sign-in failures do not navigate away from the current view', async () => {

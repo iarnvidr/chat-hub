@@ -3,12 +3,20 @@ const renameDialog = $('project-editor'), assignDialog = $('chat-project-editor'
 let projects = [], editingProject, editingChat, returnToChat = false, busy = false;
 const invoke = (command, args) => window.ChatHub.invoke(command, args);
 const label = (project, index = 0) => project.display_name || project.title || `Unnamed project ${index + 1}`;
+function projectProvider(project) {
+  try {
+    const key = project?.project_key;
+    return typeof key === 'string' && key.startsWith('project:') ? JSON.parse(key.slice(8))?.[0] : null;
+  } catch (_) { return null; }
+}
+const upstreamRenameAvailable = project => ['chatgpt','paseo-chatgpt'].includes(projectProvider(project));
 function errorMessage(error) {
   const code = String(error?.code || error?.message || error);
   if (/rate_limit/.test(code)) return 'ChatGPT is limiting requests. Wait before trying again. Nothing has been changed locally.';
   if (/signed_out|login_required|not_open|not_ready/.test(code)) return 'Connect ChatGPT in Settings, then try again.';
   if (/account|scope_mismatch/.test(code)) return 'The connected ChatGPT account does not match this project or conversation.';
-  if (/upstream_project_rename_unavailable/.test(code)) return 'The ChatGPT rename request is not available yet. The project name has not changed.';
+  if (/project_shape_unavailable/.test(code)) return 'ChatGPT returned an unrecognized project record. Nothing was renamed.';
+  if (/verification_failed|project_rename_failed|update_unconfirmed/.test(code)) return 'ChatGPT did not confirm the new name. Chat Hub was not updated.';
   if (/invalid|name/.test(code)) return 'Enter a project name of up to 120 characters.';
   if (/not_found/.test(code)) return 'This project or conversation is unavailable in the connected account.';
   return 'ChatGPT did not confirm the update. The saved project assignment or name has not changed.';
@@ -43,16 +51,21 @@ $('edit-project-name').addEventListener('click', async () => {
     await loadProjects(); editingProject = projects.find(project => project.project_key === $('project-filter').value);
     if (!editingProject) return;
     $('project-name-input').value = editingProject.display_name || editingProject.title || '';
-    $('project-edit-scope').value = 'upstream'; $('project-editor-status').textContent = '';
-    $('project-editor-save').textContent = 'Rename in ChatGPT';
-    $('project-editor-description').textContent = 'Updates the project name in your connected ChatGPT account.';
+    const upstreamOption = $('project-edit-scope').querySelector('option[value="upstream"]');
+    upstreamOption.disabled = !upstreamRenameAvailable(editingProject);
+    $('project-edit-scope').value = upstreamRenameAvailable(editingProject) && editingProject.name_source !== 'local' ? 'upstream' : 'local';
+    $('project-editor-status').textContent = '';
+    $('project-editor-save').textContent = $('project-edit-scope').value === 'local' ? 'Save local label' : 'Rename in ChatGPT';
+    $('project-editor-description').textContent = $('project-edit-scope').value === 'local'
+      ? 'Only changes the label in this library. Leave blank to use the ChatGPT name.'
+      : 'Changes the name in ChatGPT and Chat Hub. It also clears this project’s saved local label.';
     await openDialog(renameDialog); $('project-name-input').focus();
   } catch (error) { $('app-status').textContent = errorMessage(error); }
 });
 $('project-edit-scope').addEventListener('change', () => {
   const local = $('project-edit-scope').value === 'local';
   $('project-editor-save').textContent = local ? 'Save local label' : 'Rename in ChatGPT';
-  $('project-editor-description').textContent = local ? 'Only changes the label in this library. Leave blank to use the ChatGPT name.' : 'Updates the project name in your connected ChatGPT account.';
+  $('project-editor-description').textContent = local ? 'Only changes the label in this library. Leave blank to use the ChatGPT name.' : 'Changes the name in ChatGPT and Chat Hub. It also clears this project’s saved local label.';
 });
 $('project-editor-cancel').addEventListener('click', () => closeDialog(renameDialog));
 $('project-editor-form').addEventListener('submit', async event => {

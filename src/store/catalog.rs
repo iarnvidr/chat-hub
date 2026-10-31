@@ -1,6 +1,8 @@
 use crate::catalog::{
-    CatalogEdge, CatalogGraph, CatalogIndexStatus, CatalogNode, CatalogOverview,
-    CatalogProvenanceCoverage, CatalogSourceStats, CatalogStats, CATALOG_INDEX_VERSION,
+    CatalogEdge, CatalogEntity, CatalogEntityDetail, CatalogEntityKind, CatalogEntityPage,
+    CatalogEntityQuery, CatalogEntityReference, CatalogGraph, CatalogIndexStatus, CatalogNode,
+    CatalogOverview, CatalogProvenanceCoverage, CatalogSourceStats, CatalogStats,
+    CATALOG_INDEX_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::store::Store;
@@ -20,6 +22,10 @@ const PROJECT_CANDIDATE_NEIGHBORS: usize = 3;
 const MAX_NEIGHBOR_DEGREE: usize = 4;
 const KEYWORD_CANDIDATE_SCAN: usize = 100;
 const MAX_EDGES_IN_GRAPH: usize = MAX_CHATS_IN_GRAPH * MAX_NEIGHBOR_DEGREE / 2;
+const MAX_ENTITY_SCAN_PER_CHAT: usize = 32 * 1024 * 1024;
+const MAX_ENTITY_SCAN_PER_FIELD: usize = 8 * 1024 * 1024;
+const MAX_ENTITY_OCCURRENCES_PER_CHAT: usize = 2_000;
+const MAX_ENTITY_REFS_PER_ENTITY: usize = 20_000;
 
 const CREATE_CATALOG_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS catalog_meta(
@@ -66,6 +72,44 @@ CREATE TABLE IF NOT EXISTS catalog_edges(
   PRIMARY KEY(source_id,target_id,basis)
 );
 CREATE INDEX IF NOT EXISTS catalog_edges_target ON catalog_edges(target_id,basis,source_id);
+CREATE TABLE IF NOT EXISTS catalog_entities(
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  account_scope TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  label TEXT NOT NULL,
+  canonical_url TEXT,
+  domain TEXT,
+  repository_id TEXT,
+  filename TEXT,
+  mime_type TEXT,
+  provider_file_id TEXT,
+  canonical_locator TEXT,
+  artifact_state TEXT,
+  content_saved INTEGER NOT NULL DEFAULT 0,
+  reference_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS catalog_entities_kind ON catalog_entities(kind,id);
+CREATE TABLE IF NOT EXISTS catalog_entity_refs(
+  entity_id TEXT NOT NULL REFERENCES catalog_entities(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  message_id TEXT,
+  source_message_id TEXT,
+  source_node_id TEXT NOT NULL,
+  role TEXT,
+  source_field TEXT NOT NULL,
+  provenance TEXT NOT NULL,
+  relation TEXT NOT NULL,
+  PRIMARY KEY(entity_id,conversation_id,source_field,relation,source_node_id)
+);
+CREATE INDEX IF NOT EXISTS catalog_entity_refs_chat ON catalog_entity_refs(conversation_id,entity_id);
+CREATE TABLE IF NOT EXISTS catalog_scan_coverage(
+  conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+  truncated INTEGER NOT NULL
+);
 ";
 
 #[derive(Debug)]
@@ -120,6 +164,9 @@ impl Store {
         tx.execute_batch(CREATE_CATALOG_TABLES)?;
         let library_revision = current_revision(&tx)?;
         tx.execute("DELETE FROM catalog_edges", [])?;
+        tx.execute("DELETE FROM catalog_entity_refs", [])?;
+        tx.execute("DELETE FROM catalog_entities", [])?;
+        tx.execute("DELETE FROM catalog_scan_coverage", [])?;
         tx.execute("DELETE FROM catalog_terms", [])?;
         tx.execute("DELETE FROM catalog_chats", [])?;
 
@@ -143,6 +190,7 @@ impl Store {
                 );
                 let (sample, sample_bytes) = read_bounded_sample(&tx, &chat.conversation_id)?;
                 let terms = choose_keywords(&title, &sample);
+                index_chat_entities(&tx, &chat, &title)?;
 
                 tx.execute(
                     "INSERT INTO catalog_chats(catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes)
@@ -227,14 +275,250 @@ impl Store {
         Ok(CatalogOverview { index, stats })
     }
 
+    /// List explicitly extracted entities with keyset pagination. Entity IDs are opaque;
+    /// file artifacts are scoped to their source chat/message and are never merged by name.
+    #[allow(clippy::too_many_arguments)]
+    pub fn catalog_entities(
+        &self,
+        source: &str,
+        project_key: Option<&str>,
+        conversation_id: Option<&str>,
+        kind: Option<CatalogEntityKind>,
+        artifact_state: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<CatalogEntityPage> {
+        self.catalog_entities_search(CatalogEntityQuery {
+            source,
+            project_key,
+            conversation_id,
+            kind,
+            artifact_state,
+            cursor,
+            limit,
+            ..CatalogEntityQuery::default()
+        })
+    }
+
+    /// Like `catalog_entities`, with an exact normalized local tag filter applied
+    /// before count and cursor pagination.
+    #[allow(clippy::too_many_arguments)]
+    pub fn catalog_entities_tagged(
+        &self,
+        source: &str,
+        project_key: Option<&str>,
+        conversation_id: Option<&str>,
+        kind: Option<CatalogEntityKind>,
+        artifact_state: Option<&str>,
+        tag: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<CatalogEntityPage> {
+        self.catalog_entities_search(CatalogEntityQuery {
+            source,
+            project_key,
+            conversation_id,
+            kind,
+            artifact_state,
+            tag,
+            cursor,
+            limit,
+            ..CatalogEntityQuery::default()
+        })
+    }
+
+    /// Search the full entity index, applying text, source, project, tag, and
+    /// category filters before page counts and keyset pagination.
+    pub fn catalog_entities_search(
+        &self,
+        options: CatalogEntityQuery<'_>,
+    ) -> Result<CatalogEntityPage> {
+        let CatalogEntityQuery {
+            source,
+            project_key,
+            conversation_id,
+            kind,
+            artifact_state,
+            tag,
+            query,
+            cursor,
+            limit,
+        } = options;
+        let source_filter = source_filter(source)?;
+        validate_project_filter(project_key)?;
+        validate_entity_filters(conversation_id, artifact_state, cursor)?;
+        let query = query.map(str::trim).filter(|value| !value.is_empty());
+        if query.is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control)) {
+            return Err(Error::Configuration("invalid catalog entity query".into()));
+        }
+        let tag_key = tag.map(crate::store::canonical_tag_key).transpose()?;
+        if limit == 0 {
+            return Err(Error::Configuration(
+                "entity page limit must be positive".into(),
+            ));
+        }
+        let limit = limit.min(100);
+        let tx = self.connection.unchecked_transaction()?;
+        let index = index_status(&tx)?;
+        if !entity_tables_exist(&tx)? {
+            tx.commit()?;
+            return Ok(CatalogEntityPage {
+                index,
+                source: source.into(),
+                project_key: project_key.map(str::to_owned),
+                conversation_id: conversation_id.map(str::to_owned),
+                kind: kind.map(|v| v.as_str().into()),
+                artifact_state: artifact_state.map(str::to_owned),
+                tag: tag.map(str::to_owned),
+                limit,
+                ..CatalogEntityPage::default()
+            });
+        }
+        let where_sql = entity_filter_sql(source_filter)
+            .replace("e.artifact_state=?4", "(e.artifact_state=?4 OR (?4='saved_locally' AND EXISTS(SELECT 1 FROM artifact_contents ac WHERE ac.entity_id=e.id)))");
+        let count_sql = format!(
+            "SELECT count(DISTINCT e.id) FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql}"
+        );
+        let total: i64 = tx.query_row(
+            &count_sql,
+            params![
+                project_key,
+                conversation_id,
+                kind.map(|v| v.as_str()),
+                artifact_state,
+                tag_key.as_deref(),
+                query,
+                Option::<&str>::None,
+            ],
+            |row| row.get(0),
+        )?;
+        let sql = format!(
+            "SELECT DISTINCT e.id,e.kind,e.label,e.canonical_url,e.domain,e.repository_id,e.filename,e.mime_type,e.provider_file_id,e.canonical_locator,e.artifact_state,e.content_saved,e.reference_count,(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='produces'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='attaches'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='mentions') FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql} ORDER BY e.id LIMIT ?8"
+        );
+        let mut statement = tx.prepare(&sql)?;
+        let mut items = statement
+            .query_map(
+                params![
+                    project_key,
+                    conversation_id,
+                    kind.map(|v| v.as_str()),
+                    artifact_state,
+                    tag_key.as_deref(),
+                    query,
+                    cursor,
+                    (limit + 1) as i64
+                ],
+                entity_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for entity in &mut items {
+            apply_saved_artifact_state(&tx, entity)?;
+        }
+        let has_more = items.len() > limit;
+        if has_more {
+            items.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            items.last().map(|entity| entity.id.clone())
+        } else {
+            None
+        };
+        let coverage_sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM catalog_scan_coverage x JOIN catalog_chats c ON c.conversation_id=x.conversation_id WHERE x.truncated=1 AND ({source_filter}) AND (?1 IS NULL OR c.project_key=?1) AND (?2 IS NULL OR c.conversation_id=?2))"
+        );
+        let coverage_truncated: bool = tx
+            .query_row(
+                &coverage_sql,
+                params![project_key, conversation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)?;
+        tx.commit()?;
+        Ok(CatalogEntityPage {
+            index,
+            source: source.into(),
+            project_key: project_key.map(str::to_owned),
+            conversation_id: conversation_id.map(str::to_owned),
+            kind: kind.map(|v| v.as_str().into()),
+            artifact_state: artifact_state.map(str::to_owned),
+            tag: tag.map(str::to_owned),
+            limit,
+            next_cursor,
+            total,
+            coverage_truncated,
+            items,
+        })
+    }
+
+    /// Return an entity and a bounded list of exact source-chat/message references.
+    pub fn catalog_entity(&self, id: &str) -> Result<Option<CatalogEntityDetail>> {
+        if id.trim().is_empty() || id.len() > 256 {
+            return Err(Error::Configuration("invalid catalog entity id".into()));
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        if !entity_tables_exist(&tx)? {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let entity = tx.query_row(
+            "SELECT id,kind,label,canonical_url,domain,repository_id,filename,mime_type,provider_file_id,canonical_locator,artifact_state,content_saved,reference_count,(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=catalog_entities.id AND rr.relation='produces'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=catalog_entities.id AND rr.relation='attaches'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=catalog_entities.id AND rr.relation='mentions') FROM catalog_entities WHERE id=?1",
+            [id], entity_from_row,
+        ).optional()?;
+        let Some(mut entity) = entity else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        apply_saved_artifact_state(&tx, &mut entity)?;
+        let mut statement = tx.prepare("SELECT conversation_id,source_id,title,provider,message_id,source_message_id,source_node_id,role,source_field,provenance,relation FROM catalog_entity_refs WHERE entity_id=?1 ORDER BY conversation_id,source_node_id LIMIT 101")?;
+        let mut references = statement
+            .query_map([id], |row| {
+                Ok(CatalogEntityReference {
+                    conversation_id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    title: row.get(2)?,
+                    provider: row.get(3)?,
+                    message_id: row.get(4)?,
+                    source_message_id: row.get(5)?,
+                    source_node_id: row.get(6)?,
+                    role: row.get(7)?,
+                    source_field: row.get(8)?,
+                    provenance: row.get(9)?,
+                    relation: row.get(10)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let references_truncated = references.len() > 100;
+        references.truncate(100);
+        drop(statement);
+        tx.commit()?;
+        Ok(Some(CatalogEntityDetail {
+            entity,
+            references,
+            references_truncated,
+        }))
+    }
+
     pub fn catalog_graph(
         &self,
         source: &str,
         project_key: Option<&str>,
         limit: usize,
     ) -> Result<CatalogGraph> {
+        self.catalog_graph_tagged(source, project_key, None, limit)
+    }
+
+    /// Build the same bounded graph over only chats carrying an exact local tag.
+    pub fn catalog_graph_tagged(
+        &self,
+        source: &str,
+        project_key: Option<&str>,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<CatalogGraph> {
         let source_filter = source_filter(source)?;
         validate_project_filter(project_key)?;
+        let tag_key = tag.map(crate::store::canonical_tag_key).transpose()?;
         if limit == 0 {
             return Err(Error::Configuration(
                 "catalog graph limit must be positive".into(),
@@ -252,9 +536,16 @@ impl Store {
             });
         }
         let stats = read_stats(&tx, source_filter, project_key)?;
-        let (nodes, edges, truncated) =
-            read_global_relationship_map(&tx, source_filter, project_key, limit)?;
-        let unmapped_count = (stats.chats - nodes.len() as i64).max(0);
+        let (nodes, edges, truncated) = read_global_relationship_map(
+            &tx,
+            source_filter,
+            project_key,
+            tag_key.as_deref(),
+            limit,
+        )?;
+        let eligible_count =
+            read_tagged_chat_count(&tx, source_filter, project_key, tag_key.as_deref())?;
+        let unmapped_count = (eligible_count - nodes.len() as i64).max(0);
         tx.commit()?;
         Ok(CatalogGraph {
             index,
@@ -277,8 +568,22 @@ impl Store {
         project_key: Option<&str>,
         limit: usize,
     ) -> Result<CatalogGraph> {
+        self.catalog_neighborhood_tagged(conversation_id, source, project_key, None, limit)
+    }
+
+    /// Return a neighborhood where both the focus chat and every neighbor must
+    /// carry the requested local tag.
+    pub fn catalog_neighborhood_tagged(
+        &self,
+        conversation_id: &str,
+        source: &str,
+        project_key: Option<&str>,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<CatalogGraph> {
         let source_filter = source_filter(source)?;
         validate_project_filter(project_key)?;
+        let tag_key = tag.map(crate::store::canonical_tag_key).transpose()?;
         if conversation_id.trim().is_empty() || conversation_id.len() > 256 || limit == 0 {
             return Err(Error::Configuration(
                 "invalid catalog neighborhood request".into(),
@@ -296,8 +601,13 @@ impl Store {
             });
         }
         let stats = read_stats(&tx, source_filter, project_key)?;
-        let Some(focus) =
-            read_chat_by_conversation(&tx, source_filter, project_key, conversation_id)?
+        let Some(focus) = read_chat_by_conversation(
+            &tx,
+            source_filter,
+            project_key,
+            tag_key.as_deref(),
+            conversation_id,
+        )?
         else {
             tx.commit()?;
             return Ok(CatalogGraph {
@@ -311,8 +621,14 @@ impl Store {
         let mut seen = HashSet::new();
         let mut truncated = false;
         if focus.project_key.is_some() {
-            let projects =
-                read_project_neighbors(&tx, source_filter, project_key, &focus, limit + 1)?;
+            let projects = read_project_neighbors(
+                &tx,
+                source_filter,
+                project_key,
+                tag_key.as_deref(),
+                &focus,
+                limit + 1,
+            )?;
             truncated |= projects.len() > limit;
             for neighbor in projects.into_iter().take(limit) {
                 seen.insert(neighbor.catalog_id.clone());
@@ -326,6 +642,7 @@ impl Store {
                 &tx,
                 source_filter,
                 project_key,
+                tag_key.as_deref(),
                 &focus,
                 (limit - neighbors.len()) + 1,
             )?;
@@ -351,7 +668,9 @@ impl Store {
             nodes.push(chat_node(&neighbor));
             edges.push(edge);
         }
-        let unmapped_count = (stats.chats - nodes.len() as i64).max(0);
+        let eligible_count =
+            read_tagged_chat_count(&tx, source_filter, project_key, tag_key.as_deref())?;
+        let unmapped_count = (eligible_count - nodes.len() as i64).max(0);
         tx.commit()?;
         Ok(CatalogGraph {
             index,
@@ -376,12 +695,14 @@ fn read_global_relationship_map(
     conn: &Connection,
     source_filter: &str,
     project_filter: Option<&str>,
+    tag_filter: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<CatalogNode>, Vec<CatalogEdge>, bool)> {
     let mut chats = read_chat_rows(
         conn,
         source_filter,
         project_filter,
+        tag_filter,
         MAX_GLOBAL_GRAPH_CANDIDATES + 1,
     )?;
     let candidate_truncated = chats.len() > MAX_GLOBAL_GRAPH_CANDIDATES;
@@ -440,7 +761,7 @@ fn read_global_relationship_map(
     // considered only within the exact provider/account and requires two terms.
     type TermKey = (String, String, String);
     let sql = format!(
-        "SELECT c.catalog_id,c.provider,c.account_scope,t.term,t.chat_count
+        "SELECT c.catalog_id,c.provider,c.account_scope,t.term
          FROM catalog_chats c
          JOIN catalog_edges e ON e.source_id=c.catalog_id AND e.basis='shared_keyword'
          JOIN catalog_terms t ON t.term_id=e.target_id
@@ -454,46 +775,42 @@ fn read_global_relationship_map(
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, i64>(4)?,
         ))
     })?;
     let mut postings = BTreeMap::<TermKey, Vec<(usize, i64)>>::new();
     let mut chat_terms = vec![Vec::<(TermKey, i64)>::new(); chats.len()];
     let mut chat_count_by_scope = HashMap::<(String, String), i64>::new();
-    let mut scope_counts = conn.prepare(
-        "SELECT provider,account_scope,count(*) FROM catalog_chats GROUP BY provider,account_scope",
-    )?;
-    for row in scope_counts.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })? {
-        let (provider, account_scope, count) = row?;
-        chat_count_by_scope.insert((provider, account_scope), count);
+    for chat in &chats {
+        *chat_count_by_scope
+            .entry((chat.provider.clone(), chat.account_scope.clone()))
+            .or_default() += 1;
     }
     for row in rows {
-        let (catalog_id, provider, account_scope, term, document_frequency) = row?;
-        if document_frequency > MAX_KEYWORD_POSTING as i64 {
-            truncated = true;
-            continue;
-        }
+        let (catalog_id, provider, account_scope, term) = row?;
         let Some(&index) = by_catalog_id.get(catalog_id.as_str()) else {
             continue;
         };
         let key = (provider, account_scope, term);
-        postings
-            .entry(key.clone())
-            .or_default()
-            .push((index, document_frequency));
-        chat_terms[index].push((key, document_frequency));
+        postings.entry(key.clone()).or_default().push((index, 0));
+        chat_terms[index].push((key, 0));
+    }
+    for terms in &mut chat_terms {
+        for (key, document_frequency) in terms {
+            let count = postings.get(key).map_or(0, Vec::len);
+            *document_frequency = count as i64;
+            if count > MAX_KEYWORD_POSTING {
+                truncated = true;
+            }
+        }
     }
 
     for (left, terms) in chat_terms.iter().enumerate() {
         let mut neighbors = BTreeMap::<usize, Vec<(String, i64)>>::new();
         for (key, document_frequency) in terms {
             if let Some(members) = postings.get(key) {
+                if members.len() > MAX_KEYWORD_POSTING {
+                    continue;
+                }
                 for &(right, _) in members {
                     if right > left {
                         neighbors
@@ -685,15 +1002,20 @@ fn read_chat_rows(
     conn: &Connection,
     source_filter: &str,
     project_key: Option<&str>,
+    tag_key: Option<&str>,
     limit: usize,
 ) -> Result<Vec<IndexedChat>> {
     let sql = format!(
         "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
          FROM catalog_chats c WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1)
-         ORDER BY c.updated_at_ms DESC NULLS LAST,catalog_id LIMIT ?2"
+           AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2))
+         ORDER BY c.updated_at_ms DESC NULLS LAST,catalog_id LIMIT ?3"
     );
     let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map(params![project_key, limit as i64], indexed_chat_from_row)?;
+    let rows = statement.query_map(
+        params![project_key, tag_key, limit as i64],
+        indexed_chat_from_row,
+    )?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
@@ -701,16 +1023,18 @@ fn read_chat_by_conversation(
     conn: &Connection,
     source_filter: &str,
     project_key: Option<&str>,
+    tag_key: Option<&str>,
     conversation_id: &str,
 ) -> Result<Option<IndexedChat>> {
     let sql = format!(
         "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
-         FROM catalog_chats c WHERE c.conversation_id=?1 AND ({source_filter}) AND (?2 IS NULL OR c.project_key=?2) LIMIT 1"
+         FROM catalog_chats c WHERE c.conversation_id=?1 AND ({source_filter}) AND (?2 IS NULL OR c.project_key=?2)
+           AND (?3 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?3)) LIMIT 1"
     );
     Ok(conn
         .query_row(
             &sql,
-            params![conversation_id, project_key],
+            params![conversation_id, project_key, tag_key],
             indexed_chat_from_row,
         )
         .optional()?)
@@ -731,6 +1055,7 @@ fn read_project_neighbors(
     conn: &Connection,
     source_filter: &str,
     project_filter: Option<&str>,
+    tag_filter: Option<&str>,
     focus: &IndexedChat,
     limit: usize,
 ) -> Result<Vec<IndexedChat>> {
@@ -741,7 +1066,8 @@ fn read_project_neighbors(
         "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
          FROM catalog_chats c WHERE c.project_key=?1 AND c.catalog_id<>?2 AND c.provider=?3 AND c.account_scope=?4
            AND ({source_filter}) AND (?5 IS NULL OR c.project_key=?5)
-         ORDER BY c.updated_at_ms DESC NULLS LAST,c.catalog_id LIMIT ?6"
+           AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?6))
+         ORDER BY c.updated_at_ms DESC NULLS LAST,c.catalog_id LIMIT ?7"
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(
@@ -751,6 +1077,7 @@ fn read_project_neighbors(
             focus.provider,
             focus.account_scope,
             project_filter,
+            tag_filter,
             limit as i64,
         ],
         indexed_chat_from_row,
@@ -770,16 +1097,23 @@ fn read_keyword_neighbors(
     conn: &Connection,
     source_filter: &str,
     project_filter: Option<&str>,
+    tag_filter: Option<&str>,
     focus: &IndexedChat,
     limit: usize,
 ) -> Result<Vec<KeywordCandidate>> {
     let scope_chat_count: i64 = conn.query_row(
-        "SELECT count(*) FROM catalog_chats WHERE provider=?1 AND account_scope=?2",
-        params![focus.provider, focus.account_scope],
+        "SELECT count(*) FROM catalog_chats c WHERE provider=?1 AND account_scope=?2 AND (?3 IS NULL OR c.project_key=?3)
+           AND (?4 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?4))",
+        params![focus.provider, focus.account_scope, project_filter, tag_filter],
         |row| row.get(0),
     )?;
     let sql = format!(
-        "SELECT c.catalog_id,c.updated_at_ms,group_concat(t.term || ':' || t.chat_count,char(31))
+        "SELECT c.catalog_id,c.updated_at_ms,group_concat(t.term || ':' || (
+             SELECT count(DISTINCT e2.source_id) FROM catalog_edges e2 JOIN catalog_chats c2 ON c2.catalog_id=e2.source_id
+             WHERE e2.target_id=t.term_id AND e2.basis='shared_keyword' AND c2.provider=?3 AND c2.account_scope=?4
+               AND (?5 IS NULL OR c2.project_key=?5)
+               AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c2.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?6))
+         ),char(31))
          FROM catalog_edges f
          JOIN catalog_terms t ON t.term_id=f.target_id
          JOIN catalog_edges e ON e.target_id=t.term_id AND e.basis='shared_keyword'
@@ -787,10 +1121,11 @@ fn read_keyword_neighbors(
          WHERE f.source_id=?1 AND f.basis='shared_keyword' AND c.catalog_id<>?2
            AND c.provider=?3 AND c.account_scope=?4 AND ({source_filter})
            AND (?5 IS NULL OR c.project_key=?5)
+           AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?6))
          GROUP BY c.catalog_id
          HAVING count(DISTINCT t.term_id)>=2
          ORDER BY sum(1000000.0 / t.chat_count) DESC,c.updated_at_ms DESC NULLS LAST,c.catalog_id
-         LIMIT ?6"
+         LIMIT ?7"
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(
@@ -800,6 +1135,7 @@ fn read_keyword_neighbors(
             focus.provider,
             focus.account_scope,
             project_filter,
+            tag_filter,
             KEYWORD_CANDIDATE_SCAN as i64,
         ],
         |row| {
@@ -961,6 +1297,18 @@ fn source_filter(source: &str) -> Result<&'static str> {
     }
 }
 
+fn read_tagged_chat_count(
+    conn: &Connection,
+    source_filter: &str,
+    project_key: Option<&str>,
+    tag_key: Option<&str>,
+) -> Result<i64> {
+    let sql = format!(
+        "SELECT count(*) FROM catalog_chats c WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2))"
+    );
+    Ok(conn.query_row(&sql, params![project_key, tag_key], |row| row.get(0))?)
+}
+
 fn validate_project_filter(project_key: Option<&str>) -> Result<()> {
     if project_key.is_some_and(|key| key.trim().is_empty() || key.len() > 1024) {
         return Err(Error::Configuration("invalid catalog project key".into()));
@@ -1028,6 +1376,76 @@ fn catalog_tables_exist(conn: &Connection) -> Result<bool> {
         [],
         |row| row.get::<_, i64>(0),
     )? != 0)
+}
+
+fn entity_tables_exist(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_entities')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn apply_saved_artifact_state(conn: &Connection, entity: &mut CatalogEntity) -> Result<()> {
+    if entity.kind != CatalogEntityKind::FileArtifact {
+        return Ok(());
+    }
+    let table_exists = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_contents')", [], |row| row.get::<_,i64>(0))? != 0;
+    if !table_exists {
+        return Ok(());
+    }
+    let saved = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM artifact_contents WHERE entity_id=?1)",
+        [&entity.id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if saved {
+        entity.content_saved = true;
+        entity.artifact_state = Some("saved_locally".into());
+    }
+    Ok(())
+}
+
+fn entity_from_row(row: &Row<'_>) -> rusqlite::Result<CatalogEntity> {
+    Ok(CatalogEntity {
+        id: row.get(0)?,
+        kind: CatalogEntityKind::parse(&row.get::<_, String>(1)?).unwrap_or_default(),
+        label: row.get(2)?,
+        canonical_url: row.get(3)?,
+        domain: row.get(4)?,
+        repository_id: row.get(5)?,
+        filename: row.get(6)?,
+        mime_type: row.get(7)?,
+        provider_file_id: row.get(8)?,
+        canonical_locator: row.get(9)?,
+        artifact_state: row.get(10)?,
+        content_saved: row.get::<_, i64>(11)? != 0,
+        reference_count: row.get(12)?,
+        produced_reference_count: row.get(13)?,
+        attachment_reference_count: row.get(14)?,
+        mentioned_reference_count: row.get(15)?,
+    })
+}
+
+fn validate_entity_filters(
+    conversation_id: Option<&str>,
+    artifact_state: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<()> {
+    if conversation_id.is_some_and(|v| v.trim().is_empty() || v.len() > 256)
+        || cursor.is_some_and(|v| v.trim().is_empty() || v.len() > 256)
+        || artifact_state
+            .is_some_and(|v| !matches!(v, "link_only" | "metadata_present" | "saved_locally"))
+    {
+        return Err(Error::Configuration("invalid catalog entity filter".into()));
+    }
+    Ok(())
+}
+
+fn entity_filter_sql(source: &str) -> String {
+    format!(
+        "({source}) AND (?1 IS NULL OR c.project_key=?1) AND (?2 IS NULL OR c.conversation_id=?2) AND (?3 IS NULL OR e.kind=?3) AND (?4 IS NULL OR e.artifact_state=?4) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=e.id AND tt.target_kind=CASE WHEN e.kind='file_artifact' THEN 'file' ELSE 'entity' END AND t.name_key=?5)) AND (?6 IS NULL OR instr(lower(e.label),lower(?6))>0 OR instr(lower(coalesce(e.canonical_url,'')),lower(?6))>0 OR instr(lower(coalesce(e.domain,'')),lower(?6))>0 OR instr(lower(coalesce(e.filename,'')),lower(?6))>0) AND (?7 IS NULL OR e.id>?7)"
+    )
 }
 
 fn index_status(conn: &Connection) -> Result<CatalogIndexStatus> {
@@ -1145,6 +1563,11 @@ fn read_stats(
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let entity_counts = if entity_tables_exist(conn)? {
+        entity_counts(conn, source_filter, project_key)?
+    } else {
+        (0, 0, 0, 0, 0, 0, 0)
+    };
     Ok(CatalogStats {
         chats,
         projects,
@@ -1152,6 +1575,13 @@ fn read_stats(
         messages,
         graph_nodes,
         branch_points,
+        entities: entity_counts.0,
+        repositories: entity_counts.1,
+        pull_requests: entity_counts.2,
+        issues: entity_counts.3,
+        domains: entity_counts.4,
+        links: entity_counts.5,
+        file_artifacts: entity_counts.6,
         latest_activity_ms,
         source_coverage,
         provenance: CatalogProvenanceCoverage {
@@ -1162,6 +1592,39 @@ fn read_stats(
             full_graphs,
         },
     })
+}
+
+fn entity_counts(
+    conn: &Connection,
+    source_filter: &str,
+    project_key: Option<&str>,
+) -> Result<(i64, i64, i64, i64, i64, i64, i64)> {
+    let sql = format!(
+        "SELECT e.kind,count(DISTINCT e.id) FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1) GROUP BY e.kind"
+    );
+    let mut counts = HashMap::new();
+    let mut statement = conn.prepare(&sql)?;
+    for row in statement.query_map([project_key], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })? {
+        let (kind, count) = row?;
+        counts.insert(kind, count);
+    }
+    let get = |kind: &str| counts.get(kind).copied().unwrap_or_default();
+    Ok((
+        get("repository")
+            + get("pull_request")
+            + get("issue")
+            + get("domain")
+            + get("link")
+            + get("file_artifact"),
+        get("repository"),
+        get("pull_request"),
+        get("issue"),
+        get("domain"),
+        get("link"),
+        get("file_artifact"),
+    ))
 }
 
 fn read_bounded_sample(tx: &Transaction<'_>, conversation_id: &str) -> Result<(String, usize)> {
@@ -1190,6 +1653,554 @@ fn read_bounded_sample(tx: &Transaction<'_>, conversation_id: &str) -> Result<(S
         byte_count += bytes.len();
     }
     Ok((sample, byte_count))
+}
+
+#[derive(Clone)]
+struct EntityOccurrence {
+    kind: CatalogEntityKind,
+    label: String,
+    canonical_url: Option<String>,
+    domain: Option<String>,
+    repository_id: Option<String>,
+    filename: Option<String>,
+    mime_type: Option<String>,
+    provider_file_id: Option<String>,
+    canonical_locator: Option<String>,
+    artifact_state: Option<String>,
+    content_saved: bool,
+    source_field: String,
+    provenance: String,
+    relation: String,
+    identity: String,
+}
+
+fn index_chat_entities(tx: &Transaction<'_>, chat: &SourceChat, title: &str) -> Result<()> {
+    let mut bytes_scanned = 0_usize;
+    let mut occurrence_count = 0_usize;
+    let mut truncated = false;
+    let mut statement = tx.prepare(
+        "SELECT source_node_id,message_id,source_message_id,role,substr(CAST(coalesce(content,'') AS BLOB),1,?2),substr(CAST(coalesce(parts_json,'') AS BLOB),1,?2),length(CAST(coalesce(content,'') AS BLOB)),length(CAST(coalesce(parts_json,'') AS BLOB)) FROM graph_nodes WHERE conversation_id=?1 ORDER BY source_node_id",
+    )?;
+    let rows = statement.query_map(
+        params![&chat.conversation_id, MAX_ENTITY_SCAN_PER_FIELD as i64],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
+                row.get::<_, Option<usize>>(6)?.unwrap_or_default(),
+                row.get::<_, Option<usize>>(7)?.unwrap_or_default(),
+            ))
+        },
+    )?;
+    for row in rows {
+        let (node_id, message_id, source_message_id, role, content, parts, content_len, parts_len) =
+            row?;
+        if content_len > MAX_ENTITY_SCAN_PER_FIELD || parts_len > MAX_ENTITY_SCAN_PER_FIELD {
+            truncated = true;
+        }
+        let mut node_occurrences = Vec::new();
+        let mut fields = vec![
+            ("graph_nodes.content", content),
+            ("graph_nodes.parts_json", parts),
+        ];
+        for (source_field, raw) in fields.drain(..) {
+            if bytes_scanned >= MAX_ENTITY_SCAN_PER_CHAT {
+                truncated = true;
+                break;
+            }
+            let remaining = MAX_ENTITY_SCAN_PER_CHAT - bytes_scanned;
+            let take = raw.len().min(MAX_ENTITY_SCAN_PER_FIELD).min(remaining);
+            if take < raw.len() {
+                truncated = true;
+            }
+            let text = String::from_utf8_lossy(&raw[..take]);
+            bytes_scanned += take;
+            let provenance = if source_field.ends_with("parts_json") {
+                "normalized_parts"
+            } else {
+                "normalized_text"
+            };
+            for url in extract_explicit_links(&text) {
+                append_link_occurrences(
+                    &mut node_occurrences,
+                    &url,
+                    &chat.provider,
+                    &chat.account_scope,
+                    source_field,
+                    provenance,
+                );
+            }
+            if source_field.ends_with("parts_json") {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw[..take]) {
+                    extract_structured_artifacts(
+                        &value,
+                        &mut node_occurrences,
+                        source_field,
+                        provenance,
+                    );
+                }
+            }
+            if node_occurrences.len() >= MAX_ENTITY_OCCURRENCES_PER_CHAT {
+                node_occurrences.truncate(MAX_ENTITY_OCCURRENCES_PER_CHAT);
+                truncated = true;
+            }
+        }
+        if occurrence_count + node_occurrences.len() > MAX_ENTITY_OCCURRENCES_PER_CHAT {
+            node_occurrences
+                .truncate(MAX_ENTITY_OCCURRENCES_PER_CHAT.saturating_sub(occurrence_count));
+            truncated = true;
+        }
+        occurrence_count += node_occurrences.len();
+        persist_occurrences(
+            tx,
+            chat,
+            title,
+            &node_id,
+            message_id.as_deref(),
+            source_message_id.as_deref(),
+            role.as_deref(),
+            node_occurrences,
+        )?;
+        if bytes_scanned >= MAX_ENTITY_SCAN_PER_CHAT
+            || occurrence_count >= MAX_ENTITY_OCCURRENCES_PER_CHAT
+        {
+            truncated = true;
+            break;
+        }
+    }
+    drop(statement);
+    if bytes_scanned < MAX_ENTITY_SCAN_PER_CHAT
+        && occurrence_count < MAX_ENTITY_OCCURRENCES_PER_CHAT
+    {
+        let raw: Option<(i64,Vec<u8>,usize)> = tx.query_row(
+            "SELECT id,substr(CAST(raw_payload AS BLOB),1,?2),length(CAST(raw_payload AS BLOB)) FROM observations WHERE conversation_id=?1 ORDER BY id DESC LIMIT 1",
+            params![&chat.conversation_id,MAX_ENTITY_SCAN_PER_FIELD as i64],
+            |row| Ok((row.get(0)?,row.get::<_,Option<Vec<u8>>>(1)?.unwrap_or_default(),row.get::<_,Option<usize>>(2)?.unwrap_or_default())),
+        ).optional()?;
+        if let Some((observation_id, raw, raw_len)) = raw {
+            if raw_len > raw.len() {
+                truncated = true;
+            }
+            let take = raw.len().min(MAX_ENTITY_SCAN_PER_CHAT - bytes_scanned);
+            let text = String::from_utf8_lossy(&raw[..take]);
+            let mut raw_occurrences = Vec::new();
+            for url in extract_explicit_links(&text) {
+                append_link_occurrences(
+                    &mut raw_occurrences,
+                    &url,
+                    &chat.provider,
+                    &chat.account_scope,
+                    "observations.raw_payload",
+                    "observation_metadata",
+                );
+            }
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw[..take]) {
+                extract_structured_artifacts(
+                    &value,
+                    &mut raw_occurrences,
+                    "observations.raw_payload",
+                    "observation_metadata",
+                );
+            }
+            if raw_occurrences.len() + occurrence_count > MAX_ENTITY_OCCURRENCES_PER_CHAT {
+                raw_occurrences
+                    .truncate(MAX_ENTITY_OCCURRENCES_PER_CHAT.saturating_sub(occurrence_count));
+                truncated = true;
+            }
+            persist_occurrences(
+                tx,
+                chat,
+                title,
+                &format!("observation:{observation_id}"),
+                None,
+                None,
+                None,
+                raw_occurrences,
+            )?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO catalog_scan_coverage(conversation_id,truncated) VALUES(?1,?2)",
+        params![chat.conversation_id, i64::from(truncated)],
+    )?;
+    Ok(())
+}
+
+fn extract_explicit_links(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for token in text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    }) {
+        let candidate =
+            token.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '`'));
+        if (candidate.starts_with("https://")
+            || candidate.starts_with("http://")
+            || candidate.starts_with("sandbox:/mnt/data/"))
+            && candidate.len() <= 4096
+            && !found.iter().any(|v| v == candidate)
+        {
+            found.push(candidate.to_owned());
+        }
+    }
+    found
+}
+
+fn sanitize_http_url(input: &str) -> Option<(String, String, String)> {
+    let rest = input
+        .strip_prefix("https://")
+        .or_else(|| input.strip_prefix("http://"))?;
+    let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains('?')
+        || authority.contains('#')
+    {
+        return None;
+    }
+    let host = authority
+        .split(':')
+        .next()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty() || host.len() > 253 || !host.contains('.') {
+        return None;
+    }
+    let path = tail.split(['?', '#']).next().unwrap_or("");
+    let path = format!("/{}", path.trim_start_matches('/'));
+    let scheme = if input.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    let canonical = format!("{scheme}://{host}{path}");
+    Some((canonical, host, path))
+}
+
+fn append_link_occurrences(
+    out: &mut Vec<EntityOccurrence>,
+    raw: &str,
+    provider: &str,
+    scope: &str,
+    source_field: &str,
+    provenance: &str,
+) {
+    if raw.starts_with("sandbox:/mnt/data/") {
+        let path = raw
+            .strip_prefix("sandbox:")
+            .unwrap_or(raw)
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("");
+        let filename = path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Generated file")
+            .to_owned();
+        let locator = format!("sandbox:{path}");
+        out.push(EntityOccurrence {
+            kind: CatalogEntityKind::FileArtifact,
+            label: filename.clone(),
+            canonical_url: None,
+            domain: None,
+            repository_id: None,
+            filename: Some(filename),
+            mime_type: None,
+            provider_file_id: None,
+            canonical_locator: Some(locator.clone()),
+            artifact_state: Some("link_only".into()),
+            content_saved: false,
+            source_field: source_field.into(),
+            provenance: provenance.into(),
+            relation: "mentions".into(),
+            identity: format!("file:{}:{}", provider, scope),
+        });
+        return;
+    }
+    let Some((canonical, host, path)) = sanitize_http_url(raw) else {
+        return;
+    };
+    let repo = classify_code_host(&host, &path);
+    let (kind, label, repo_path, repo_entity_id) = if let Some((kind, label, repo_path)) = repo {
+        let repository_id = entity_id(&[provider, scope, "repository", &repo_path]);
+        if kind != CatalogEntityKind::Repository {
+            let repo_url = format!("https://{host}/{repo_path}");
+            out.push(EntityOccurrence {
+                kind: CatalogEntityKind::Repository,
+                label: repo_path.clone(),
+                canonical_url: Some(repo_url),
+                domain: Some(host.clone()),
+                repository_id: None,
+                filename: None,
+                mime_type: None,
+                provider_file_id: None,
+                canonical_locator: None,
+                artifact_state: None,
+                content_saved: false,
+                source_field: source_field.into(),
+                provenance: provenance.into(),
+                relation: "mentions".into(),
+                identity: format!("id:{repository_id}"),
+            });
+        }
+        (kind, label, repo_path, Some(repository_id))
+    } else {
+        (
+            CatalogEntityKind::Link,
+            canonical.clone(),
+            String::new(),
+            None,
+        )
+    };
+    let entity_identity = match kind {
+        CatalogEntityKind::Repository => entity_id(&[provider, scope, "repository", &repo_path]),
+        CatalogEntityKind::PullRequest | CatalogEntityKind::Issue => {
+            entity_id(&[provider, scope, kind.as_str(), &canonical])
+        }
+        _ => entity_id(&[provider, scope, "link", &canonical]),
+    };
+    out.push(EntityOccurrence {
+        kind,
+        label,
+        canonical_url: Some(canonical),
+        domain: Some(host.clone()),
+        repository_id: repo_entity_id,
+        filename: None,
+        mime_type: None,
+        provider_file_id: None,
+        canonical_locator: None,
+        artifact_state: None,
+        content_saved: false,
+        source_field: source_field.into(),
+        provenance: provenance.into(),
+        relation: "mentions".into(),
+        identity: format!("id:{entity_identity}"),
+    });
+    let domain_id = entity_id(&[provider, scope, "domain", &host]);
+    out.push(EntityOccurrence {
+        kind: CatalogEntityKind::Domain,
+        label: host.clone(),
+        canonical_url: Some(format!("https://{host}/")),
+        domain: Some(host),
+        repository_id: None,
+        filename: None,
+        mime_type: None,
+        provider_file_id: None,
+        canonical_locator: None,
+        artifact_state: None,
+        content_saved: false,
+        source_field: source_field.into(),
+        provenance: provenance.into(),
+        relation: "mentions".into(),
+        identity: format!("id:{domain_id}"),
+    });
+}
+
+fn classify_code_host(host: &str, path: &str) -> Option<(CatalogEntityKind, String, String)> {
+    let segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    if host == "github.com" && segments.len() >= 2 {
+        let repo_path = format!("{}/{}", segments[0], segments[1].trim_end_matches(".git"));
+        if segments.len() >= 3
+            && segments[2] == "pull"
+            && segments
+                .get(3)
+                .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Some((
+                CatalogEntityKind::PullRequest,
+                format!("{repo_path} #{}", segments[3]),
+                repo_path,
+            ));
+        }
+        if segments.len() >= 3
+            && segments[2] == "issues"
+            && segments
+                .get(3)
+                .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Some((
+                CatalogEntityKind::Issue,
+                format!("{repo_path} #{}", segments[3]),
+                repo_path,
+            ));
+        }
+        return Some((CatalogEntityKind::Repository, repo_path.clone(), repo_path));
+    }
+    if host.ends_with("gitlab.com") && !segments.is_empty() {
+        if let Some(i) = segments.iter().position(|s| *s == "-") {
+            let project = segments[..i].join("/");
+            if segments.get(i + 1) == Some(&"merge_requests")
+                && segments
+                    .get(i + 2)
+                    .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+            {
+                return Some((
+                    CatalogEntityKind::PullRequest,
+                    format!("{project} !{}", segments[i + 2]),
+                    project,
+                ));
+            }
+            if segments.get(i + 1) == Some(&"issues")
+                && segments
+                    .get(i + 2)
+                    .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+            {
+                return Some((
+                    CatalogEntityKind::Issue,
+                    format!("{project} #{}", segments[i + 2]),
+                    project,
+                ));
+            }
+            return Some((CatalogEntityKind::Repository, project.clone(), project));
+        }
+        let project = segments.join("/");
+        return Some((CatalogEntityKind::Repository, project.clone(), project));
+    }
+    None
+}
+
+fn extract_structured_artifacts(
+    value: &serde_json::Value,
+    out: &mut Vec<EntityOccurrence>,
+    source_field: &str,
+    provenance: &str,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let string = |keys: &[&str]| {
+                keys.iter()
+                    .find_map(|k| map.get(*k).and_then(|v| v.as_str()))
+                    .filter(|s| !s.trim().is_empty() && s.len() <= 4096)
+            };
+            let filename = string(&["filename", "file_name"]);
+            let file_id = string(&["file_id", "fileId", "asset_pointer", "assetPointer"]);
+            let locator = string(&["download_url", "downloadUrl", "url", "href"]);
+            let mime = string(&["mime_type", "mimeType", "content_type"]);
+            if let Some(filename) = filename.filter(|_| file_id.is_some() || locator.is_some()) {
+                let filename = filename.to_owned();
+                let provider_file_id = file_id.map(str::to_owned);
+                let locator = locator.and_then(|v| {
+                    if v.starts_with("sandbox:/mnt/data/") {
+                        Some(v.split(['?', '#']).next().unwrap_or(v).to_owned())
+                    } else {
+                        sanitize_http_url(v).map(|v| v.0)
+                    }
+                });
+                let identity = format!(
+                    "file:{}",
+                    provider_file_id
+                        .as_deref()
+                        .unwrap_or(locator.as_deref().unwrap_or(&filename))
+                );
+                out.push(EntityOccurrence {
+                    kind: CatalogEntityKind::FileArtifact,
+                    label: filename.clone(),
+                    canonical_url: None,
+                    domain: None,
+                    repository_id: None,
+                    filename: Some(filename),
+                    mime_type: mime.map(str::to_owned),
+                    provider_file_id,
+                    canonical_locator: locator,
+                    artifact_state: Some("metadata_present".into()),
+                    content_saved: false,
+                    source_field: source_field.into(),
+                    provenance: provenance.into(),
+                    relation: "attaches".into(),
+                    identity,
+                });
+            }
+            for child in map.values() {
+                extract_structured_artifacts(child, out, source_field, provenance);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                extract_structured_artifacts(child, out, source_field, provenance);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn entity_id(parts: &[&str]) -> String {
+    let encoded = serde_json::to_vec(parts).unwrap_or_default();
+    let digest = ring::digest::digest(&ring::digest::SHA256, &encoded);
+    let hex = digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    format!("entity:{hex}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_occurrences(
+    tx: &Transaction<'_>,
+    chat: &SourceChat,
+    title: &str,
+    node_id: &str,
+    message_id: Option<&str>,
+    source_message_id: Option<&str>,
+    role: Option<&str>,
+    occurrences: Vec<EntityOccurrence>,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for occurrence in occurrences {
+        let id = if occurrence.identity.starts_with("id:") {
+            occurrence.identity[3..].to_owned()
+        } else if occurrence.kind == CatalogEntityKind::FileArtifact
+            && occurrence.provider_file_id.is_some()
+        {
+            entity_id(&[
+                &chat.provider,
+                &chat.account_scope,
+                "file_artifact",
+                occurrence.provider_file_id.as_deref().unwrap_or_default(),
+            ])
+        } else {
+            let identity = occurrence
+                .identity
+                .strip_prefix("file:")
+                .unwrap_or(&occurrence.identity);
+            entity_id(&[
+                &chat.provider,
+                &chat.account_scope,
+                occurrence.kind.as_str(),
+                &chat.conversation_id,
+                node_id,
+                identity,
+            ])
+        };
+        let fingerprint = format!("{id}:{}:{}", occurrence.source_field, occurrence.relation);
+        if !seen.insert(fingerprint) {
+            continue;
+        }
+        tx.execute("INSERT INTO catalog_entities(id,provider,account_scope,kind,label,canonical_url,domain,repository_id,filename,mime_type,provider_file_id,canonical_locator,artifact_state,content_saved,reference_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0) ON CONFLICT(id) DO UPDATE SET label=excluded.label,filename=coalesce(catalog_entities.filename,excluded.filename),mime_type=coalesce(catalog_entities.mime_type,excluded.mime_type),provider_file_id=coalesce(catalog_entities.provider_file_id,excluded.provider_file_id),canonical_locator=coalesce(catalog_entities.canonical_locator,excluded.canonical_locator),artifact_state=coalesce(catalog_entities.artifact_state,excluded.artifact_state)",params![id,chat.provider,chat.account_scope,occurrence.kind.as_str(),occurrence.label,occurrence.canonical_url,occurrence.domain,occurrence.repository_id,occurrence.filename,occurrence.mime_type,occurrence.provider_file_id,occurrence.canonical_locator,occurrence.artifact_state,i64::from(occurrence.content_saved)])?;
+        let relation = if occurrence.kind == CatalogEntityKind::FileArtifact
+            && occurrence.artifact_state.as_deref() == Some("metadata_present")
+            && role == Some("assistant")
+        {
+            "produces"
+        } else {
+            occurrence.relation.as_str()
+        };
+        tx.execute("INSERT OR IGNORE INTO catalog_entity_refs(entity_id,conversation_id,source_id,title,provider,message_id,source_message_id,source_node_id,role,source_field,provenance,relation) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12 WHERE (SELECT count(*) FROM catalog_entity_refs WHERE entity_id=?1)<?13",params![id,chat.conversation_id,chat.source_id,title,chat.provider,message_id,source_message_id,node_id,role,occurrence.source_field,occurrence.provenance,relation,MAX_ENTITY_REFS_PER_ENTITY as i64])?;
+        tx.execute("UPDATE catalog_entities SET reference_count=(SELECT count(*) FROM catalog_entity_refs WHERE entity_id=?1) WHERE id=?1",[&id])?;
+    }
+    Ok(())
 }
 
 fn project_label(local: Option<&str>, upstream: Option<&str>) -> (Option<String>, Option<String>) {
@@ -1641,6 +2652,423 @@ mod tests {
     }
 
     #[test]
+    fn entity_index_classifies_links_and_keeps_file_artifacts_chat_scoped() {
+        let mut store = Store::in_memory().unwrap();
+        let sandbox = "sandbox:/mnt/data/report.xlsx";
+        let first_id = ingest(
+            &mut store,
+            "chatgpt",
+            "account-a",
+            "entity-chat-a",
+            "First source",
+            vec![graph_node(
+                "assistant-node",
+                None,
+                "assistant",
+                &format!(
+                    "See https://github.com/acme/chat/pull/7?token=private#diff and {sandbox}"
+                ),
+            )],
+            "complete",
+        );
+        let second_id = ingest(
+            &mut store,
+            "chatgpt",
+            "account-a",
+            "entity-chat-b",
+            "Second source",
+            vec![graph_node("user-node", None, "user", sandbox)],
+            "complete",
+        );
+        store.rebuild_catalog_index().unwrap();
+
+        let page = store
+            .catalog_entities("chatgpt", None, None, None, None, None, 100)
+            .unwrap();
+        assert!(!page.coverage_truncated);
+        let prs = page
+            .items
+            .iter()
+            .filter(|e| e.kind == CatalogEntityKind::PullRequest)
+            .collect::<Vec<_>>();
+        assert_eq!(prs.len(), 1);
+        assert!(prs[0]
+            .canonical_url
+            .as_deref()
+            .unwrap()
+            .ends_with("/pull/7"));
+        assert!(!prs[0].canonical_url.as_deref().unwrap().contains("token"));
+        assert!(prs[0].repository_id.is_some());
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|e| e.kind == CatalogEntityKind::Repository)
+                .count(),
+            1
+        );
+        assert_eq!(
+            page.items
+                .iter()
+                .filter(|e| e.kind == CatalogEntityKind::Domain)
+                .count(),
+            1
+        );
+        let files = page
+            .items
+            .iter()
+            .filter(|e| e.kind == CatalogEntityKind::FileArtifact)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files.len(),
+            2,
+            "identical sandbox paths in different chats are distinct artifacts"
+        );
+        assert!(files
+            .iter()
+            .all(|f| f.artifact_state.as_deref() == Some("link_only") && !f.content_saved));
+        assert_ne!(files[0].id, files[1].id);
+        let detail = store.catalog_entity(&prs[0].id).unwrap().unwrap();
+        assert_eq!(
+            detail.references.len(),
+            2,
+            "the same explicit URL is present in normalized content and parts"
+        );
+        assert!(detail
+            .references
+            .iter()
+            .all(|reference| reference.conversation_id == first_id));
+        assert!(detail
+            .references
+            .iter()
+            .all(|reference| reference.source_node_id.as_deref() == Some("assistant-node")));
+        assert!(detail
+            .references
+            .iter()
+            .all(|reference| reference.role.as_deref() == Some("assistant")));
+        let filtered = store
+            .catalog_entities(
+                "chatgpt",
+                None,
+                Some(&second_id),
+                Some(CatalogEntityKind::FileArtifact),
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].filename.as_deref(), Some("report.xlsx"));
+    }
+
+    #[test]
+    fn file_relation_counts_distinguish_produced_attached_and_mentioned_references() {
+        let mut store = Store::in_memory().unwrap();
+        let artifact_node = |node_id: &str, role: &str, part: Value| GraphNode {
+            source_node_id: node_id.into(),
+            source_message_id: Some(format!("message-{node_id}")),
+            parent_id: None,
+            role: Some(role.into()),
+            author: None,
+            create_time: None,
+            parts: vec![part],
+        };
+        ingest(
+            &mut store,
+            "chatgpt",
+            "account-a",
+            "file-relation-chat",
+            "File relation evidence",
+            vec![
+                artifact_node(
+                    "generated",
+                    "assistant",
+                    json!({"filename":"produced.csv","file_id":"generated-file","mime_type":"text/csv"}),
+                ),
+                artifact_node(
+                    "attached",
+                    "user",
+                    json!({"filename":"attached.csv","file_id":"attached-file","mime_type":"text/csv"}),
+                ),
+                artifact_node(
+                    "mentioned",
+                    "assistant",
+                    json!("sandbox:/mnt/data/mentioned.csv"),
+                ),
+            ],
+            "complete",
+        );
+        store.rebuild_catalog_index().unwrap();
+        let page = store
+            .catalog_entities(
+                "chatgpt",
+                None,
+                None,
+                Some(CatalogEntityKind::FileArtifact),
+                None,
+                None,
+                20,
+            )
+            .unwrap();
+        let by_filename = |filename: &str| {
+            page.items
+                .iter()
+                .find(|entity| entity.filename.as_deref() == Some(filename))
+                .unwrap_or_else(|| panic!("missing {filename}"))
+        };
+        let produced = by_filename("produced.csv");
+        let produced_detail = store.catalog_entity(&produced.id).unwrap().unwrap();
+        let produced_refs = produced_detail
+            .references
+            .iter()
+            .filter(|reference| reference.relation == "produces")
+            .count() as i64;
+        assert!(produced_refs > 0);
+        assert_eq!(produced.produced_reference_count, produced_refs);
+        assert_eq!(produced.attachment_reference_count, 0);
+        assert_eq!(produced.mentioned_reference_count, 0);
+        let attached = by_filename("attached.csv");
+        assert_eq!(attached.produced_reference_count, 0);
+        let attached_detail = store.catalog_entity(&attached.id).unwrap().unwrap();
+        let attached_refs = attached_detail
+            .references
+            .iter()
+            .filter(|reference| reference.relation == "attaches")
+            .count() as i64;
+        assert!(attached_refs > 0);
+        assert_eq!(attached.attachment_reference_count, attached_refs);
+        assert_eq!(attached.mentioned_reference_count, 0);
+        let mentioned = by_filename("mentioned.csv");
+        assert_eq!(mentioned.produced_reference_count, 0);
+        assert_eq!(mentioned.attachment_reference_count, 0);
+        let mentioned_detail = store.catalog_entity(&mentioned.id).unwrap().unwrap();
+        let mentioned_refs = mentioned_detail
+            .references
+            .iter()
+            .filter(|reference| reference.relation == "mentions")
+            .count() as i64;
+        assert!(mentioned_refs > 0);
+        assert_eq!(mentioned.mentioned_reference_count, mentioned_refs);
+
+        assert_eq!(
+            produced_detail.entity.produced_reference_count,
+            produced_refs
+        );
+    }
+
+    #[test]
+    fn entity_search_filters_before_pagination_with_literal_text_source_and_tag() {
+        let mut store = Store::in_memory().unwrap();
+        let sources = [
+            (
+                "chatgpt",
+                "chatgpt-scope",
+                "search-chat-a",
+                "special%_invoice.csv",
+            ),
+            (
+                "chatgpt",
+                "chatgpt-scope",
+                "search-chat-b",
+                "special-summary.csv",
+            ),
+            ("chatgpt", "chatgpt-scope", "search-chat-c", "ordinary.csv"),
+            ("codex", "codex-scope", "search-codex", "special-codex.csv"),
+        ];
+        for (provider, scope, source_id, filename) in sources {
+            ingest(
+                &mut store,
+                provider,
+                scope,
+                source_id,
+                "Entity search fixture",
+                vec![graph_node(
+                    "file-link",
+                    None,
+                    "assistant",
+                    &format!("sandbox:/mnt/data/{filename}"),
+                )],
+                "complete",
+            );
+        }
+        store.rebuild_catalog_index().unwrap();
+        let initial = store
+            .catalog_entities_search(CatalogEntityQuery {
+                source: "all",
+                kind: Some(CatalogEntityKind::FileArtifact),
+                query: Some("special"),
+                limit: 20,
+                ..CatalogEntityQuery::default()
+            })
+            .unwrap();
+        assert_eq!(initial.total, 3);
+        for entity in &initial.items {
+            store
+                .set_target_tags("file", &entity.id, &["search-ready".into()])
+                .unwrap();
+        }
+
+        let first = store
+            .catalog_entities_search(CatalogEntityQuery {
+                source: "chatgpt",
+                kind: Some(CatalogEntityKind::FileArtifact),
+                tag: Some("search-ready"),
+                query: Some("special"),
+                limit: 1,
+                ..CatalogEntityQuery::default()
+            })
+            .unwrap();
+        assert_eq!(first.total, 2);
+        assert_eq!(first.items.len(), 1);
+        let cursor = first.next_cursor.clone().expect("second matching row");
+        let second = store
+            .catalog_entities_search(CatalogEntityQuery {
+                source: "chatgpt",
+                kind: Some(CatalogEntityKind::FileArtifact),
+                tag: Some("search-ready"),
+                query: Some("special"),
+                cursor: Some(&cursor),
+                limit: 1,
+                ..CatalogEntityQuery::default()
+            })
+            .unwrap();
+        assert_eq!(second.total, 2);
+        assert_eq!(second.items.len(), 1);
+        assert_ne!(first.items[0].id, second.items[0].id);
+        assert!(first.items[0].id < second.items[0].id);
+
+        let literal = store
+            .catalog_entities_search(CatalogEntityQuery {
+                source: "chatgpt",
+                kind: Some(CatalogEntityKind::FileArtifact),
+                tag: Some("search-ready"),
+                query: Some("%_"),
+                limit: 10,
+                ..CatalogEntityQuery::default()
+            })
+            .unwrap();
+        assert_eq!(literal.total, 1, "% and _ are literal search characters");
+        assert_eq!(
+            literal.items[0].filename.as_deref(),
+            Some("special%_invoice.csv")
+        );
+    }
+
+    #[test]
+    fn explicit_file_metadata_is_not_claimed_saved_and_large_fields_report_truncation() {
+        let mut store = Store::in_memory().unwrap();
+        let metadata_graph = GraphNode {
+            source_node_id: "assistant-file".into(),
+            source_message_id: Some("m-file".into()),
+            parent_id: None,
+            role: Some("assistant".into()),
+            author: None,
+            create_time: None,
+            parts: vec![
+                json!({"filename":"analysis.csv","file_id":"provider-file-22","mime_type":"text/csv"}),
+            ],
+        };
+        ingest(
+            &mut store,
+            "chatgpt",
+            "account-a",
+            "metadata-chat",
+            "Generated file",
+            vec![metadata_graph],
+            "complete",
+        );
+        let long_text = format!(
+            "{} https://late.example.test/only-at-end",
+            "x".repeat(MAX_ENTITY_SCAN_PER_FIELD + 20)
+        );
+        ingest(
+            &mut store,
+            "chatgpt",
+            "account-a",
+            "large-chat",
+            "Large source",
+            vec![graph_node("large", None, "user", &long_text)],
+            "complete",
+        );
+        store.rebuild_catalog_index().unwrap();
+        let page = store
+            .catalog_entities(
+                "chatgpt",
+                None,
+                None,
+                Some(CatalogEntityKind::FileArtifact),
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+        let artifact = page
+            .items
+            .iter()
+            .find(|e| e.filename.as_deref() == Some("analysis.csv"))
+            .unwrap();
+        assert_eq!(artifact.artifact_state.as_deref(), Some("metadata_present"));
+        assert!(!artifact.content_saved);
+        let artifact_id = artifact.id.clone();
+        let conversation_id: String = store
+            .connection
+            .query_row(
+                "SELECT conversation_id FROM catalog_entity_refs WHERE entity_id=?1",
+                [&artifact_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store.connection.execute("INSERT INTO artifact_contents(entity_id,conversation_id,filename,mime_type,byte_size,sha256,content,saved_at_ms) VALUES(?1,?2,'analysis.csv','text/csv',3,?3,x'616263',1)",params![artifact_id,conversation_id,"a".repeat(64)]).unwrap();
+        let saved_page = store
+            .catalog_entities(
+                "chatgpt",
+                None,
+                None,
+                Some(CatalogEntityKind::FileArtifact),
+                Some("saved_locally"),
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(saved_page.items.len(), 1);
+        assert!(saved_page.items[0].content_saved);
+        assert_eq!(
+            saved_page.items[0].artifact_state.as_deref(),
+            Some("saved_locally")
+        );
+        let detail = store.catalog_entity(&artifact.id).unwrap().unwrap();
+        assert!(detail.entity.content_saved);
+        assert_eq!(
+            detail.entity.artifact_state.as_deref(),
+            Some("saved_locally")
+        );
+        assert_eq!(detail.references[0].relation, "produces");
+        assert_eq!(
+            detail.references[0].source_message_id.as_deref(),
+            Some("m-file")
+        );
+        assert!(
+            store
+                .catalog_entities("chatgpt", None, None, None, None, None, 100)
+                .unwrap()
+                .coverage_truncated
+        );
+        assert!(!store
+            .catalog_entities(
+                "chatgpt",
+                None,
+                None,
+                Some(CatalogEntityKind::Link),
+                None,
+                None,
+                100
+            )
+            .unwrap()
+            .items
+            .iter()
+            .any(|e| e.canonical_url.as_deref() == Some("https://late.example.test/only-at-end")));
+    }
+
+    #[test]
     fn overview_and_graph_are_account_scoped_and_project_links_are_explicit() {
         let mut store = seeded_store();
         let revision = store.library_revision().unwrap();
@@ -1757,6 +3185,136 @@ mod tests {
             .edges
             .iter()
             .all(|edge| edge.basis == "shared_keyword" && edge.evidence.len() >= 2));
+    }
+
+    #[test]
+    fn tagged_graphs_include_old_tagged_chats_and_exclude_untagged_neighbors() {
+        let mut store = Store::in_memory().unwrap();
+        let mut memberships = Vec::new();
+        let mut tagged_ids = Vec::new();
+        for index in 0..105 {
+            let source_id = format!("recent-untagged-{index:03}");
+            ingest(
+                &mut store,
+                "chatgpt",
+                "scope-a",
+                &source_id,
+                &format!("Recent unrelated {index}"),
+                vec![graph_node(
+                    "node",
+                    None,
+                    "user",
+                    &format!("unique topic token{index}"),
+                )],
+                "complete",
+            );
+            store
+                .connection
+                .execute(
+                    "UPDATE conversations SET updated_at_ms=?1 WHERE source_id=?2",
+                    params![1_800_000_000_000_i64 + index, source_id],
+                )
+                .unwrap();
+        }
+        for (index, source_id) in ["focus-old", "tagged-neighbor", "tagged-neighbor-two"]
+            .iter()
+            .enumerate()
+        {
+            let id = ingest(
+                &mut store,
+                "chatgpt",
+                "scope-a",
+                source_id,
+                "Shared project context",
+                vec![graph_node(
+                    "node",
+                    None,
+                    "user",
+                    "quartz lantern observatory",
+                )],
+                "complete",
+            );
+            store
+                .connection
+                .execute(
+                    "UPDATE conversations SET updated_at_ms=?1 WHERE source_id=?2",
+                    params![1_600_000_000_000_i64 + index as i64, source_id],
+                )
+                .unwrap();
+            store
+                .set_target_tags("conversation", &id, &["Reference Set".into()])
+                .unwrap();
+            tagged_ids.push((id, source_id.to_string()));
+            memberships.push(ProjectMembership {
+                source_id: source_id.to_string(),
+                project_id: Some("shared-project".into()),
+                title: Some("Shared project".into()),
+            });
+        }
+        ingest(
+            &mut store,
+            "chatgpt",
+            "scope-a",
+            "untagged-project-peer",
+            "Recent project peer",
+            vec![graph_node("node", None, "user", "different content")],
+            "complete",
+        );
+        memberships.push(ProjectMembership {
+            source_id: "untagged-project-peer".into(),
+            project_id: Some("shared-project".into()),
+            title: Some("Shared project".into()),
+        });
+        store
+            .apply_project_memberships("chatgpt", "scope-a", &memberships)
+            .unwrap();
+        store.rebuild_catalog_index().unwrap();
+
+        let graph = store
+            .catalog_graph_tagged("chatgpt", None, Some(" reference  set "), 100)
+            .unwrap();
+        let sources = graph
+            .nodes
+            .iter()
+            .filter_map(|node| node.source_id.as_deref())
+            .collect::<HashSet<_>>();
+        assert_eq!(sources.len(), 3);
+        assert!(
+            sources.contains("focus-old"),
+            "old tagged chats are considered before the global card cap"
+        );
+        assert!(!sources.contains("untagged-project-peer"));
+        assert!(graph.edges.iter().all(|edge| edge.basis == "project"));
+
+        let neighborhood = store
+            .catalog_neighborhood_tagged(
+                &tagged_ids[0].0,
+                "chatgpt",
+                None,
+                Some("reference set"),
+                10,
+            )
+            .unwrap();
+        let neighbors = neighborhood
+            .nodes
+            .iter()
+            .filter_map(|node| node.source_id.as_deref())
+            .collect::<HashSet<_>>();
+        assert_eq!(neighbors.len(), 3);
+        assert!(!neighbors.contains("untagged-project-peer"));
+        let unmatched = store
+            .catalog_neighborhood_tagged(
+                &tagged_ids[0].0,
+                "chatgpt",
+                None,
+                Some("different tag"),
+                10,
+            )
+            .unwrap();
+        assert!(
+            unmatched.nodes.is_empty(),
+            "tag filter also restricts focus chat eligibility"
+        );
     }
 
     #[test]
