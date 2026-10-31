@@ -8,7 +8,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -510,6 +510,18 @@ pub(super) fn routes(
         .route("/api/v1/version", get(version))
         .route("/api/v1/conversations", get(list))
         .route("/api/v1/projects", get(projects))
+        .route("/api/v1/projects/name", patch(rename_project))
+        .route(
+            "/api/v1/project-assignment",
+            get(project_assignment_context).patch(commit_project_assignment),
+        )
+        .route("/api/v1/catalog/overview", get(catalog_overview))
+        .route("/api/v1/catalog/graph", get(catalog_graph))
+        .route("/api/v1/catalog/rebuild", post(rebuild_catalog))
+        .route(
+            "/api/v1/learned-project-operations",
+            get(learned_project_operations),
+        )
         .route("/api/v1/search", get(search))
         .route("/api/v1/chat/conversations", get(chat_list))
         .route("/api/v1/chat/search", get(chat_search))
@@ -861,6 +873,299 @@ async fn projects(
     let (library_revision, projects) =
         run_read(&s, move |reader| reader.projects_snapshot(&source)).await?;
     checked_json(json!({"projects":projects,"library_revision":library_revision}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameProjectRequest {
+    project_key: String,
+    name: Option<String>,
+}
+
+async fn rename_project(
+    State(s): State<ApiState>,
+    Json(request): Json<RenameProjectRequest>,
+) -> ApiResult {
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let import_permit = s.import_ops.clone().try_acquire_owned().map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "The library is busy.",
+        )
+    })?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let renamed = tokio::task::spawn_blocking(move || {
+        let _import_permit = import_permit;
+        let _db_permit = db_permit;
+        let mut store = store.lock().map_err(|_| unavailable())?;
+        store
+            .rename_project(&request.project_key, request.name.as_deref())
+            .map(|snapshot| json!({"project":snapshot.project,"library_revision":snapshot.library_revision}))
+            .map_err(|error| match error {
+                crate::error::Error::Configuration(_) => invalid_request(),
+                _ => unavailable(),
+            })
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(renamed)
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectAssignmentQuery {
+    conversation_id: Option<String>,
+    project_key: Option<String>,
+}
+
+async fn project_assignment_context(
+    State(s): State<ApiState>,
+    q: Result<Query<ProjectAssignmentQuery>, QueryRejection>,
+) -> ApiResult {
+    let q = query(q)?;
+    let conversation_id = q
+        .conversation_id
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .ok_or_else(invalid_request)?;
+    if q.project_key
+        .as_deref()
+        .is_some_and(|key| key.is_empty() || key.len() > 1024)
+    {
+        return Err(invalid_request());
+    }
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let permit = s
+        .import_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let project_key = q.project_key;
+    let value = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _db_permit = db_permit;
+        store
+            .lock()
+            .map_err(|_| unavailable())?
+            .project_assignment_context(&conversation_id, project_key.as_deref())
+            .map_err(|error| match error {
+                crate::error::Error::Configuration(_) => invalid_request(),
+                _ => unavailable(),
+            })
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(value)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitProjectAssignmentRequest {
+    conversation_id: String,
+    expected_conversation_scope: String,
+    project_key: Option<String>,
+    verified_project_title: Option<String>,
+}
+
+async fn commit_project_assignment(
+    State(s): State<ApiState>,
+    Json(request): Json<CommitProjectAssignmentRequest>,
+) -> ApiResult {
+    if request.conversation_id.is_empty()
+        || request.conversation_id.len() > 256
+        || request.expected_conversation_scope.is_empty()
+        || request.expected_conversation_scope.len() > 256
+        || request
+            .project_key
+            .as_deref()
+            .is_some_and(|key| key.is_empty() || key.len() > 1024)
+    {
+        return Err(invalid_request());
+    }
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let permit = s
+        .import_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _db_permit = db_permit;
+        store
+            .lock()
+            .map_err(|_| unavailable())?
+            .commit_project_assignment(
+                &request.conversation_id,
+                &request.expected_conversation_scope,
+                request.project_key.as_deref(),
+                request.verified_project_title.as_deref(),
+            )
+            .map_err(|error| match error {
+                crate::error::Error::Configuration(_) => invalid_request(),
+                _ => unavailable(),
+            })
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(result)
+}
+
+async fn learned_project_operations(State(s): State<ApiState>) -> ApiResult {
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let value = tokio::task::spawn_blocking(move || {
+        let _db_permit = db_permit;
+        store
+            .lock()
+            .map_err(|_| unavailable())?
+            .learned_project_operations()
+            .map_err(|_| unavailable())
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(value)
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogQuery {
+    source: Option<String>,
+    project_key: Option<String>,
+    limit: Option<usize>,
+    focus_id: Option<String>,
+}
+
+fn validate_catalog_scope(source: &str, project_key: Option<&str>) -> Result<(), ApiError> {
+    if !matches!(source, "all" | "chatgpt" | "codex")
+        || project_key.is_some_and(|key| key.is_empty() || key.len() > 1024)
+    {
+        return Err(invalid_request());
+    }
+    Ok(())
+}
+
+async fn catalog_overview(
+    State(s): State<ApiState>,
+    q: Result<Query<CatalogQuery>, QueryRejection>,
+) -> ApiResult {
+    let q = query(q)?;
+    let source = q.source.unwrap_or_else(|| "all".into());
+    validate_catalog_scope(&source, q.project_key.as_deref())?;
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let permit = s
+        .import_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let project_key = q.project_key;
+    let value = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _db_permit = db_permit;
+        let store = store.lock().map_err(|_| unavailable())?;
+        let overview = store
+            .catalog_overview(&source, project_key.as_deref())
+            .map_err(|_| unavailable())?;
+        serde_json::to_value(overview).map_err(|_| unavailable())
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(value)
+}
+
+async fn catalog_graph(
+    State(s): State<ApiState>,
+    q: Result<Query<CatalogQuery>, QueryRejection>,
+) -> ApiResult {
+    let q = query(q)?;
+    let source = q.source.unwrap_or_else(|| "all".into());
+    validate_catalog_scope(&source, q.project_key.as_deref())?;
+    let limit = q.limit.unwrap_or(40);
+    if !(1..=200).contains(&limit) {
+        return Err(invalid_request());
+    }
+    if q.focus_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.len() > 256)
+    {
+        return Err(invalid_request());
+    }
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let permit = s
+        .import_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let project_key = q.project_key;
+    let focus_id = q.focus_id;
+    let value = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _db_permit = db_permit;
+        let store = store.lock().map_err(|_| unavailable())?;
+        let graph = if let Some(focus_id) = focus_id.as_deref() {
+            store.catalog_neighborhood(focus_id, &source, project_key.as_deref(), limit)
+        } else {
+            store.catalog_graph(&source, project_key.as_deref(), limit)
+        }
+        .map_err(|_| unavailable())?;
+        serde_json::to_value(graph).map_err(|_| unavailable())
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(value)
+}
+
+async fn rebuild_catalog(State(s): State<ApiState>) -> ApiResult {
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let permit = s
+        .import_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let status = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _db_permit = db_permit;
+        store
+            .lock()
+            .map_err(|_| unavailable())?
+            .rebuild_catalog_index()
+            .map_err(|_| unavailable())
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(serde_json::to_value(status).map_err(|_| unavailable())?)
 }
 async fn list_route(
     State(s): State<ApiState>,

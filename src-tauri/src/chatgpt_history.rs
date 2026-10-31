@@ -100,6 +100,20 @@ impl ChatgptHistoryState {
         self.cancel.store(true, Ordering::Release);
     }
 
+    /// Extend the shared provider cooldown after a separate provider action
+    /// receives HTTP 429. This deliberately leaves the last sync receipt intact.
+    pub fn note_provider_rate_limit(&self, retry_after: Option<u64>) {
+        let seconds = retry_after.unwrap_or(60).clamp(1, 1800);
+        let Some(deadline) = Instant::now().checked_add(Duration::from_secs(seconds)) else {
+            return;
+        };
+        if let Ok(mut next_attempt) = self.next_attempt.lock() {
+            if next_attempt.is_none_or(|current| current < deadline) {
+                *next_attempt = Some(deadline);
+            }
+        }
+    }
+
     pub fn start(
         &self,
         app: AppHandle,
@@ -334,5 +348,30 @@ mod status_snapshot_tests {
         let state = ChatgptHistoryState::new(root.clone());
         assert_eq!(state.snapshot().unwrap().state, "idle");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_rate_limit_extends_cooldown_without_replacing_sync_receipt() {
+        let state = ChatgptHistoryState::new(PathBuf::new());
+        {
+            let mut status = state.status.lock().unwrap();
+            status.state = "complete".into();
+            status.imported = 7;
+            status.updated = 3;
+        }
+        state.note_provider_rate_limit(Some(120));
+        state.note_provider_rate_limit(Some(1));
+        let status = state.status.lock().unwrap().clone();
+        assert_eq!(status.state, "complete");
+        assert_eq!(status.imported, 7);
+        assert_eq!(status.updated, 3);
+        let retry_after = state
+            .next_attempt
+            .lock()
+            .unwrap()
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            .unwrap()
+            .as_secs();
+        assert!(retry_after >= 118, "remaining retry seconds: {retry_after}");
     }
 }

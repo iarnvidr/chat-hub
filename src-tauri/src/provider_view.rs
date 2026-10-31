@@ -61,6 +61,17 @@ pub struct ChatGptConnectionStatus {
     pub account_scope: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProjectAssignmentOutcome {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_title: Option<String>,
+}
+
 impl ChatGptConnectionStatus {
     fn new(state: ChatGptConnectionState) -> Self {
         let message = match state {
@@ -90,6 +101,107 @@ impl ChatGptConnectionStatus {
 enum ProbePoll {
     Pending,
     Complete(ChatGptConnectionState, Option<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AssignmentPoll {
+    Pending,
+    Complete(ProjectAssignmentOutcome),
+}
+
+fn parse_assignment_callback(raw: &str, expected_nonce: &str) -> Option<AssignmentPoll> {
+    if raw.len() > 16 * 1024 {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    for _ in 0..3 {
+        let Some(nested) = value.as_str() else { break };
+        if nested.len() > 16 * 1024 {
+            return None;
+        }
+        value = serde_json::from_str(nested).ok()?;
+    }
+    let object = value.as_object()?;
+    if object.get("nonce")?.as_str()? != expected_nonce {
+        return None;
+    }
+    match object.get("state")?.as_str()? {
+        "running" if object.len() == 3 && object.get("cancelled")?.as_bool()? == false => {
+            Some(AssignmentPoll::Pending)
+        }
+        "applied" if (2..=4).contains(&object.len()) => {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "nonce" | "state" | "project_title" | "cancelled"
+                )
+            }) {
+                return None;
+            }
+            let project_title = match object.get("project_title") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(title))
+                    if !title.trim().is_empty() && title.len() <= 4096 =>
+                {
+                    Some(title.clone())
+                }
+                _ => return None,
+            };
+            Some(AssignmentPoll::Complete(ProjectAssignmentOutcome {
+                state: "applied".into(),
+                error_code: None,
+                retry_after: None,
+                project_title,
+            }))
+        }
+        "failed" if (3..=5).contains(&object.len()) => {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "nonce" | "state" | "error_code" | "retry_after" | "cancelled"
+                )
+            }) {
+                return None;
+            }
+            let code = object.get("error_code")?.as_str()?;
+            if !matches!(
+                code,
+                "invalid_context"
+                    | "signed_out"
+                    | "account_unavailable"
+                    | "account_changed"
+                    | "conversation_unavailable"
+                    | "project_catalog_unavailable"
+                    | "project_unavailable"
+                    | "project_name_unavailable"
+                    | "verification_failed"
+                    | "rate_limited"
+                    | "request_failed"
+            ) {
+                return None;
+            }
+            let retry_after = match object.get("retry_after") {
+                None => None,
+                Some(value) if code == "rate_limited" => Some(value.as_u64()?.clamp(1, 1800)),
+                _ => return None,
+            };
+            Some(AssignmentPoll::Complete(ProjectAssignmentOutcome {
+                state: "failed".into(),
+                error_code: Some(code.into()),
+                retry_after,
+                project_title: None,
+            }))
+        }
+        "cancelled" if object.len() == 3 && object.get("cancelled")?.as_bool()? => {
+            Some(AssignmentPoll::Complete(ProjectAssignmentOutcome {
+                state: "cancelled".into(),
+                error_code: None,
+                retry_after: None,
+                project_title: None,
+            }))
+        }
+        _ => None,
+    }
 }
 
 fn valid_observed_scope(scope: &str) -> bool {
@@ -278,6 +390,118 @@ pub struct ProviderViewState {
 }
 
 impl ProviderViewState {
+    /// Assign or unassign one conversation through the already-open ChatGPT
+    /// session. Only a server-confirmed result and safe title leave the page.
+    pub async fn set_conversation_project(
+        &self,
+        conversation_id: &str,
+        project_id: Option<&str>,
+        expected_scope: &str,
+    ) -> Result<ProjectAssignmentOutcome, String> {
+        if !valid_conversation_id(conversation_id)
+            || !valid_observed_scope(expected_scope)
+            || project_id.is_some_and(|id| {
+                !id.starts_with("g-p-")
+                    || id.len() > 132
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+        {
+            return Err("invalid_assignment".into());
+        }
+        let (webview, loaded) = self
+            .inner
+            .lock()
+            .map_err(|_| "provider_unavailable".to_string())
+            .map(|inner| (inner.webview.clone(), inner.loaded))?;
+        let generation = {
+            let page = self
+                .page
+                .lock()
+                .map_err(|_| "provider_unavailable".to_string())?;
+            if !page.exact_origin {
+                return Err("chatgpt_not_open".into());
+            }
+            if page.account_scope.as_deref() != Some(expected_scope) {
+                return Err("chatgpt_account_changed".into());
+            }
+            page.navigation_generation
+        };
+        if !loaded {
+            return Err("chatgpt_loading".into());
+        }
+        let nonce = fresh_probe_nonce().ok_or_else(|| "provider_unavailable".to_string())?;
+        let key = format!("__chatHubProjectAssignment_{nonce}");
+        let key_json = serde_json::to_string(&key).map_err(|_| "provider_unavailable")?;
+        let nonce_json = serde_json::to_string(&nonce).map_err(|_| "provider_unavailable")?;
+        let scope_json = serde_json::to_string(expected_scope).map_err(|_| "invalid_assignment")?;
+        let conversation_json =
+            serde_json::to_string(conversation_id).map_err(|_| "invalid_assignment")?;
+        let project_json = serde_json::to_string(&project_id).map_err(|_| "invalid_assignment")?;
+        let script = format!(
+            "({})( {key_json}, {nonce_json}, {scope_json}, {conversation_json}, {project_json} )",
+            include_str!("project_assignment.js")
+        );
+        webview
+            .eval(&script)
+            .map_err(|_| "provider_unavailable".to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                cleanup_probe(&webview, &key_json);
+                return Err("project_assignment_timeout".into());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let tx = Mutex::new(Some(tx));
+            if webview
+                .eval_with_callback(
+                    format!("JSON.stringify(window[{key_json}]||null)"),
+                    move |value| {
+                        if let Ok(mut slot) = tx.lock() {
+                            if let Some(tx) = slot.take() {
+                                let _ = tx.send(value);
+                            }
+                        }
+                    },
+                )
+                .is_err()
+            {
+                cleanup_probe(&webview, &key_json);
+                return Err("provider_unavailable".into());
+            }
+            match tokio::time::timeout(remaining.min(Duration::from_secs(2)), rx).await {
+                Ok(Ok(raw)) => match parse_assignment_callback(&raw, &nonce) {
+                    Some(AssignmentPoll::Pending) => {}
+                    Some(AssignmentPoll::Complete(outcome)) => {
+                        let same_page = self.page.lock().ok().is_some_and(|page| {
+                            page.navigation_generation == generation
+                                && page.exact_origin
+                                && page.account_scope.as_deref() == Some(expected_scope)
+                        });
+                        cleanup_probe(&webview, &key_json);
+                        return if same_page {
+                            Ok(outcome)
+                        } else {
+                            Err("chatgpt_page_changed".into())
+                        };
+                    }
+                    None => {
+                        cleanup_probe(&webview, &key_json);
+                        return Err("provider_unavailable".into());
+                    }
+                },
+                Ok(Err(_)) => {
+                    cleanup_probe(&webview, &key_json);
+                    return Err("provider_unavailable".into());
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Initialize the provider's own signed-in browser session in the hidden
     /// child webview. This never reveals the view or replaces a live page.
     pub fn prepare_session(&self) -> Result<bool, String> {
@@ -631,9 +855,9 @@ impl ProviderViewState {
 mod target_url_tests {
     use super::{
         allowed_provider_navigation, current_chatgpt_conversation_id, exact_chatgpt_origin,
-        page_metadata_script, parse_page_metadata_callback, parse_probe_callback,
-        should_prepare_session, target_url, valid_observed_scope, ChatGptConnectionState,
-        ProbePoll,
+        page_metadata_script, parse_assignment_callback, parse_page_metadata_callback,
+        parse_probe_callback, should_prepare_session, target_url, valid_observed_scope,
+        AssignmentPoll, ChatGptConnectionState, ProbePoll,
     };
 
     #[test]
@@ -722,6 +946,39 @@ mod target_url_tests {
                 None,
                 "{url}"
             );
+        }
+    }
+
+    #[test]
+    fn project_assignment_callback_accepts_only_nonce_bound_safe_receipts() {
+        let applied = serde_json::json!({
+            "nonce":"n1", "state":"applied", "cancelled":false,
+            "project_title":"Research"
+        })
+        .to_string();
+        assert_eq!(
+            parse_assignment_callback(&applied, "n1"),
+            Some(AssignmentPoll::Complete(super::ProjectAssignmentOutcome {
+                state: "applied".into(),
+                error_code: None,
+                retry_after: None,
+                project_title: Some("Research".into()),
+            }))
+        );
+        let limited = serde_json::json!({
+            "nonce":"n1", "state":"failed", "cancelled":false,
+            "error_code":"rate_limited", "retry_after":7200
+        })
+        .to_string();
+        assert!(
+            matches!(parse_assignment_callback(&limited, "n1"), Some(AssignmentPoll::Complete(outcome)) if outcome.retry_after == Some(1800))
+        );
+        for invalid in [
+            serde_json::json!({"nonce":"wrong","state":"running","cancelled":false}).to_string(),
+            serde_json::json!({"nonce":"n1","state":"applied","project_title":"x","token":"secret"}).to_string(),
+            serde_json::json!({"nonce":"n1","state":"failed","error_code":"request_failed","retry_after":4}).to_string(),
+        ] {
+            assert_eq!(parse_assignment_callback(&invalid, "n1"), None);
         }
     }
 

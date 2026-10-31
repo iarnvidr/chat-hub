@@ -12,6 +12,8 @@ function showSettings(open) {
   else if (returnFocus?.isConnected) returnFocus.focus();
 }
 trigger.addEventListener('click', () => showSettings(settings.hidden));
+window.addEventListener('chat-hub:open-settings', () => showSettings(true));
+window.addEventListener('chat-hub:close-settings', () => showSettings(false));
 document.getElementById('workspace-sync-state').addEventListener('click', () => showSettings(true));
 document.getElementById('settings-back').addEventListener('click', () => showSettings(false));
 for (const name of ['chat-hub:show-local', 'chat-hub:show-live', 'chat-hub:live-open', 'chat-hub:connect']) {

@@ -16,7 +16,7 @@ function providerLabel(provider) {
 }
 const projectNames = new Map();
 function projectLabel(project) {
-  return project.title || projectNames.get(project.project_key) || 'Project name pending';
+  return project.display_name || project.title || projectNames.get(project.project_key) || 'Project name pending';
 }
 function drawList() {
   const box = $('conversation-list');
@@ -212,17 +212,30 @@ async function loadProjects() {
     const all = document.createElement('option'); all.value = ''; all.textContent = 'All projects'; select.append(all);
     for (const [index, project] of response.projects.entries()) {
       const option = document.createElement('option'); option.value = project.project_key;
-      const label = project.title || `Unnamed project ${index + 1}`;
+      const label = project.display_name || project.title || `Unnamed project ${index + 1}`;
       projectNames.set(project.project_key, label);
       option.textContent = `${label} (${project.conversation_count})`;
       option.selected = option.value === selectedProject; select.append(option);
     }
     if (selectedProject && response.projects.some(project => project.project_key === selectedProject)) select.value = selectedProject;
+    $('edit-project-name').disabled = !select.value;
     drawList();
     if (conversation?.conversation?.project) $('reader-project').textContent = projectLabel(conversation.conversation.project);
   } catch { /* Saved chats remain usable while project metadata is unavailable. */ }
 }
 loadProjects();
+window.addEventListener('chat-hub:open-conversation', event => {
+  if (typeof event.detail?.id === 'string') openConversation(event.detail.id, event.detail.leafNodeId, event.detail.anchorNodeId);
+});
+$('show-message-graph').addEventListener('click', () => {
+  if (conversation?.conversation) window.dispatchEvent(new CustomEvent('chat-hub:show-message-graph', {detail: conversation}));
+});
+$('show-chat-connections').addEventListener('click', () => {
+  if (conversation?.conversation) window.dispatchEvent(new CustomEvent('chat-hub:show-chat-connections', {detail: conversation.conversation}));
+});
+$('set-chat-project').addEventListener('click', () => {
+  if (conversation?.conversation) window.dispatchEvent(new CustomEvent('chat-hub:edit-chat-project', {detail: conversation.conversation}));
+});
 function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   const focus = options.focus !== false;
   if (focus) window.dispatchEvent(new Event('chat-hub:show-local'));
@@ -238,12 +251,14 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   $('account-attribution').textContent = '';
   $('messages').replaceChildren();
   $('continue-chatgpt').hidden = true;
+  $('set-chat-project').hidden = true;
   $('reader-project').hidden = true;
   adapter.getConversation(id, leafNodeId).then(c => {
     if(token!==readerToken)return;
     if (c?.conversation?.id !== id) throw Error('not_found');
     conversation = {...c.conversation, ...c, selected_node_id: c.selection?.selected_node_id};
     $('continue-chatgpt').hidden = !chatgptConversationId(c.conversation);
+    $('set-chat-project').hidden = !chatgptConversationId(c.conversation);
     $('title').textContent = c.conversation?.title ?? 'Untitled conversation';
     const project = c.conversation?.project;
     $('reader-project').hidden = !project;

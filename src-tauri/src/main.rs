@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 mod browser_history;
 mod chatgpt_history;
@@ -19,6 +19,7 @@ mod desktop_runtime;
 #[cfg(feature = "native-smoke")]
 mod e2e_protocol;
 mod newcapture_settings;
+mod project_client_probe;
 mod service_health;
 use service_health::healthy_response;
 mod provider_view;
@@ -445,6 +446,79 @@ async fn list_projects(
     desktop_api::projects(&s.api, &s.token, source).await
 }
 #[tauri::command]
+async fn learned_project_operations(
+    window: tauri::Webview,
+    s: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    desktop_api::learned_project_operations(&s.api, &s.token).await
+}
+#[tauri::command]
+async fn rename_project(
+    window: tauri::Webview,
+    s: State<'_, AppState>,
+    project_key: String,
+    name: Option<String>,
+    scope: Option<String>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    match scope.as_deref().unwrap_or("upstream") {
+        // The local override is an explicit fallback capability. It never
+        // changes ChatGPT's own project title.
+        "local" => {
+            desktop_api::rename_project(&s.api, &s.token, &project_key, name.as_deref()).await
+        }
+        // Until the shipped client request is verified, fail closed instead
+        // of guessing an upstream mutation endpoint or replaying credentials.
+        "upstream" => Err("upstream_project_rename_unavailable".into()),
+        _ => Err("invalid_rename_scope".into()),
+    }
+}
+#[tauri::command]
+async fn catalog_overview(
+    window: tauri::Webview,
+    s: State<'_, AppState>,
+    source: Option<String>,
+    project_key: Option<String>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    desktop_api::catalog_overview(
+        &s.api,
+        &s.token,
+        source.as_deref().unwrap_or("all"),
+        project_key.as_deref(),
+    )
+    .await
+}
+#[tauri::command]
+async fn catalog_graph(
+    window: tauri::Webview,
+    s: State<'_, AppState>,
+    source: Option<String>,
+    project_key: Option<String>,
+    limit: Option<usize>,
+    focus_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    desktop_api::catalog_graph(
+        &s.api,
+        &s.token,
+        source.as_deref().unwrap_or("all"),
+        project_key.as_deref(),
+        limit.unwrap_or(40),
+        focus_id.as_deref(),
+    )
+    .await
+}
+#[tauri::command]
+async fn rebuild_catalog_index(
+    window: tauri::Webview,
+    s: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    desktop_api::rebuild_catalog_index(&s.api, &s.token).await
+}
+#[tauri::command]
 async fn get_conversation(
     window: tauri::Webview,
     s: State<'_, AppState>,
@@ -848,6 +922,135 @@ async fn get_chatgpt_connection(
 }
 
 #[tauri::command]
+async fn inspect_project_client(
+    window: tauri::Webview,
+    provider: State<'_, ProviderViewState>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    if !cfg!(debug_assertions) {
+        return Err("project_client_probe_unavailable".into());
+    }
+    let view = provider.history_webview()?;
+    tauri::async_runtime::spawn_blocking(move || project_client_probe::inspect(view))
+        .await
+        .map_err(|_| "project_client_probe_unavailable".to_string())?
+}
+
+#[tauri::command]
+async fn set_conversation_project(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    provider: State<'_, ProviderViewState>,
+    history: State<'_, chatgpt_history::ChatgptHistoryState>,
+    conversation_id: String,
+    project_key: Option<String>,
+    scope: Option<String>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    let scope = scope.as_deref().unwrap_or("upstream");
+    if !matches!(scope, "upstream" | "local") {
+        return Err("invalid_assignment_scope".into());
+    }
+    let _archive_permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    let context = desktop_api::project_assignment_context(
+        &state.api,
+        &state.token,
+        &conversation_id,
+        project_key.as_deref(),
+    )
+    .await?;
+    let conversation_source_id = context
+        .get("conversation_source_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "invalid_assignment_context".to_string())?;
+    let conversation_scope = context
+        .get("conversation_scope")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "invalid_assignment_context".to_string())?;
+    let project_id = context
+        .get("project_id")
+        .and_then(serde_json::Value::as_str);
+
+    if scope == "local" {
+        let result = desktop_api::commit_project_assignment(
+            &state.api,
+            &state.token,
+            &conversation_id,
+            conversation_scope,
+            project_key.as_deref(),
+            None,
+        )
+        .await?;
+        return Ok(serde_json::json!({
+            "scope":"local",
+            "project":result.get("project").cloned().unwrap_or(serde_json::Value::Null),
+            "library_revision":result.get("library_revision").cloned().unwrap_or(serde_json::Value::Null),
+        }));
+    }
+
+    let cooldown = history.snapshot()?.retry_after.unwrap_or(0);
+    if cooldown > 0 {
+        return Err("chatgpt_rate_limited".into());
+    }
+    let connection = provider.chatgpt_connection().await;
+    if connection.state != provider_view::ChatGptConnectionState::Connected {
+        return Err(match connection.state {
+            provider_view::ChatGptConnectionState::SignedOut => "chatgpt_signed_out",
+            provider_view::ChatGptConnectionState::Loading => "chatgpt_loading",
+            provider_view::ChatGptConnectionState::NotOpen => "chatgpt_not_open",
+            _ => "chatgpt_unavailable",
+        }
+        .into());
+    }
+    let observed_scope = connection
+        .account_scope
+        .as_deref()
+        .ok_or_else(|| "chatgpt_account_unavailable".to_string())?;
+    for stored_scope in [
+        Some(conversation_scope),
+        context
+            .get("project_scope")
+            .and_then(serde_json::Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if stored_scope.starts_with("chatgpt:observed:") && stored_scope != observed_scope {
+            return Err("chatgpt_account_mismatch".into());
+        }
+    }
+    let outcome = provider
+        .set_conversation_project(conversation_source_id, project_id, observed_scope)
+        .await?;
+    if outcome.error_code.as_deref() == Some("rate_limited") {
+        history.note_provider_rate_limit(outcome.retry_after);
+        return Err("chatgpt_rate_limited".into());
+    }
+    if outcome.state != "applied" {
+        return Err(outcome
+            .error_code
+            .unwrap_or_else(|| "chatgpt_assignment_failed".into()));
+    }
+    let result = desktop_api::commit_project_assignment(
+        &state.api,
+        &state.token,
+        &conversation_id,
+        conversation_scope,
+        project_key.as_deref(),
+        outcome.project_title.as_deref(),
+    )
+    .await?;
+    let _ = app.emit("library-changed", ());
+    Ok(serde_json::json!({
+        "scope":"upstream",
+        "verified":true,
+        "project":result.get("project").cloned().unwrap_or(serde_json::Value::Null),
+        "library_revision":result.get("library_revision").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+#[tauri::command]
 fn prepare_chatgpt_session(
     window: tauri::Webview,
     state: State<'_, ProviderViewState>,
@@ -1205,6 +1408,11 @@ fn main() {
             update_status,
             list_conversations,
             list_projects,
+            learned_project_operations,
+            rename_project,
+            catalog_overview,
+            catalog_graph,
+            rebuild_catalog_index,
             get_conversation,
             import_chatgpt_export,
             backup_library,
@@ -1218,6 +1426,8 @@ fn main() {
             set_provider_view,
             open_provider_conversation,
             get_chatgpt_connection,
+            inspect_project_client,
+            set_conversation_project,
             prepare_chatgpt_session,
             sync_chatgpt_history,
             chatgpt_history_status,
@@ -1257,6 +1467,11 @@ fn main() {
             update_status,
             list_conversations,
             list_projects,
+            learned_project_operations,
+            rename_project,
+            catalog_overview,
+            catalog_graph,
+            rebuild_catalog_index,
             get_conversation,
             import_chatgpt_export,
             backup_library,
@@ -1270,6 +1485,8 @@ fn main() {
             set_provider_view,
             open_provider_conversation,
             get_chatgpt_connection,
+            inspect_project_client,
+            set_conversation_project,
             prepare_chatgpt_session,
             sync_chatgpt_history,
             chatgpt_history_status,

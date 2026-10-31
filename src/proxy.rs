@@ -3,6 +3,7 @@ use crate::ca::{allowed_capture_host, Ca};
 use crate::capture_lane::{
     Accumulator, CaptureContext, CaptureLane, CaptureLimits, CaptureMetadata, RequestBodyCapture,
 };
+use crate::store::operation_learner::{self, OperationSink};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -46,6 +47,7 @@ use tokio::{
 };
 pub const MAX_CAPTURE_BODY: usize = 2 * 1024 * 1024;
 const MAX_REQUEST_CAPTURE_BODY: usize = 512 * 1024;
+const OPERATION_BODY_LIMIT: usize = 64 * 1024;
 const REQUEST_CAPTURE_SLOTS: usize = 8;
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
@@ -129,29 +131,50 @@ pub async fn run_with_capture_context(
 pub(crate) async fn run_live(
     config: ProxyConfig,
     sink: crate::live_capture::LiveSink,
+    operations: OperationSink,
     profile_scope: String,
 ) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
-    run_source(config, CaptureSource::Live(sink), profile_scope).await
+    run_source(
+        config,
+        CaptureSource::Live { sink, operations },
+        profile_scope,
+    )
+    .await
 }
 
 #[derive(Clone)]
 enum CaptureSource {
     Legacy(CaptureLane),
-    Live(crate::live_capture::LiveSink),
+    Live {
+        sink: crate::live_capture::LiveSink,
+        operations: OperationSink,
+    },
 }
 enum BodyCapture {
     Legacy(Accumulator),
     Live(crate::live_capture::Accumulator),
+    Operation(operation_learner::Accumulator),
 }
 impl CaptureSource {
     fn request_capture_enabled(&self) -> bool {
-        matches!(self, Self::Live(sink) if sink.request_capture_enabled())
+        matches!(self, Self::Live { sink, .. } if sink.request_capture_enabled())
     }
 
     fn begin(&self, context: CaptureContext, metadata: CaptureMetadata) -> Option<BodyCapture> {
         match self {
             Self::Legacy(lane) => Some(BodyCapture::Legacy(lane.begin(context, metadata))),
-            Self::Live(sink) => sink.begin(context, metadata).map(BodyCapture::Live),
+            Self::Live { sink, operations } => sink
+                .begin(context.clone(), metadata.clone())
+                .map(BodyCapture::Live)
+                .or_else(|| {
+                    if sink.request_capture_enabled() {
+                        operations
+                            .begin(context, metadata)
+                            .map(BodyCapture::Operation)
+                    } else {
+                        None
+                    }
+                }),
         }
     }
 }
@@ -160,18 +183,21 @@ impl BodyCapture {
         match self {
             Self::Legacy(c) => c.observe(bytes),
             Self::Live(c) => c.observe(bytes),
+            Self::Operation(c) => c.observe(bytes),
         }
     }
     fn finish(self) {
         match self {
             Self::Legacy(c) => c.finish(),
             Self::Live(c) => c.finish(),
+            Self::Operation(c) => c.finish(),
         }
     }
     fn interrupt(self) {
         match self {
             Self::Legacy(c) => c.interrupt(),
             Self::Live(c) => c.interrupt(),
+            Self::Operation(c) => c.interrupt(),
         }
     }
 }
@@ -517,11 +543,20 @@ async fn client(mut s: TcpStream, context: ClientContext) -> std::io::Result<()>
                     .and_then(|value| value.split(';').next())
                     .map(str::trim)
                     .unwrap_or("");
-                let request_capture = if lane.request_capture_enabled()
-                    && req.method().as_str() == "POST"
+                let create_chat_request = req.method().as_str() == "POST"
                     && path.split('?').next() == Some("/backend-api/conversation")
-                    && content_type.eq_ignore_ascii_case("application/json")
+                    && content_type.eq_ignore_ascii_case("application/json");
+                let learn_operation_request = operation_learner::OperationSink::is_candidate_request(
+                    req.method().as_str(), &path,
+                ) && content_type.eq_ignore_ascii_case("application/json");
+                let request_capture = if lane.request_capture_enabled()
+                    && (create_chat_request || learn_operation_request)
                 {
+                    let limit = if learn_operation_request && !create_chat_request {
+                        OPERATION_BODY_LIMIT
+                    } else {
+                        MAX_REQUEST_CAPTURE_BODY
+                    };
                     request_capture_slots
                         .clone()
                         .try_acquire_owned()
@@ -529,21 +564,21 @@ async fn client(mut s: TcpStream, context: ClientContext) -> std::io::Result<()>
                         .map(|permit| {
                             Arc::new(Mutex::new(RequestBodyCapture::new(
                                 permit,
-                                MAX_REQUEST_CAPTURE_BODY,
+                                limit,
                             )))
                         })
                 } else {
                     None
                 };
                 let mut context = CaptureContext::at_entry(
-                    if matches!(&lane, CaptureSource::Live(_)) && lane.request_capture_enabled() {
+                    if matches!(&lane, CaptureSource::Live { .. }) && lane.request_capture_enabled() {
                         request_identity
                             .resolve(&profile_scope, req.headers())
                             .unwrap_or_default()
                     } else {
                         profile_scope.clone()
                     },
-                    if matches!(&lane, CaptureSource::Live(_)) && path.len() > 4096 {
+                    if matches!(&lane, CaptureSource::Live { .. }) && path.len() > 4096 {
                         ""
                     } else {
                         req.method().as_str()

@@ -447,9 +447,12 @@ async fn start_internal(
     let api_addr = listener.local_addr().map_err(|e| e.to_string())?;
     let (tx, rx) = mpsc::channel(capacity);
     let (live_sink, live_rx) = crate::live_capture::channel(config.capture_enabled);
+    let (operation_sink, operation_rx) = crate::store::operation_learner::channel();
     let capture = live_sink.status.clone();
     let live_receiver = Arc::new(Mutex::new(live_rx));
+    let operation_receiver = Arc::new(Mutex::new(operation_rx));
     let writer_live = live_receiver.clone();
+    let writer_operations = operation_receiver.clone();
     let capture_enabled = config.capture_enabled;
     let receiver = Arc::new(Mutex::new(rx));
     let writer_receiver = receiver.clone();
@@ -513,6 +516,10 @@ async fn start_internal(
                     let _ = writer_ready_tx.send(Ok(interrupt));
                     loop {
                         if wf.load(Ordering::Acquire) {
+                            writer_operations
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .close();
                             writer_live
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
@@ -523,6 +530,11 @@ async fn start_internal(
                                 .close()
                         }
                         if wa.load(Ordering::Acquire) {
+                            let mut operations =
+                                writer_operations.lock().unwrap_or_else(|p| p.into_inner());
+                            operations.close();
+                            while operations.try_recv().is_ok() {}
+                            drop(operations);
                             let mut live = writer_live.lock().unwrap_or_else(|p| p.into_inner());
                             live.close();
                             while live.try_recv().is_ok() {}
@@ -553,6 +565,14 @@ async fn start_internal(
                                 }
                                 assert!(!writer_panics, "synthetic live writer panic");
                             });
+                            continue;
+                        }
+                        let operation = writer_operations
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .try_recv();
+                        if let Ok(observation) = operation {
+                            let _ = store.record_project_operation(&observation);
                             continue;
                         }
                         let received = {
@@ -628,6 +648,7 @@ async fn start_internal(
     let (proxy, pt) = match proxy::run_live(
         proxy_config,
         live_sink,
+        operation_sink,
         config.capture_profile_scope.clone(),
     )
     .await

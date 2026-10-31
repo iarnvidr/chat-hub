@@ -89,6 +89,18 @@ impl RequestBodyCapture {
     pub(crate) fn body(&self) -> Option<&[u8]> {
         (self.state == RequestBodyState::Complete).then_some(self.body.as_slice())
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.body.fill(0);
+        self.body.clear();
+        self.body.shrink_to_fit();
+        self.state = RequestBodyState::Invalid;
+    }
+}
+impl Drop for RequestBodyCapture {
+    fn drop(&mut self) {
+        self.body.fill(0);
+    }
 }
 
 impl std::fmt::Debug for CaptureContext {

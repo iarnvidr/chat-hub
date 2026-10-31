@@ -124,6 +124,11 @@ class UiBridgeContract(unittest.TestCase):
             "update_status", "service_info", "check_for_updates", "install_update",
             "e2e_result", "set_provider_view", "open_provider_conversation",
             "get_chatgpt_connection", "prepare_chatgpt_session",
+            "set_conversation_project",
+            "inspect_project_client",
+            "learned_project_operations",
+            "rename_project",
+            "catalog_overview", "catalog_graph", "rebuild_catalog_index",
             "get_capture_preferences", "set_capture_preferences", "restart_capture_settings",
             "sync_chatgpt_history", "chatgpt_history_status",
         )
@@ -134,6 +139,46 @@ class UiBridgeContract(unittest.TestCase):
                 signature, body = function
                 self.assertIn("window: tauri::Webview", signature)
                 self.assertIn("authorize_local_main(&window)?;", body)
+
+    def test_chatgpt_project_assignment_is_server_verified_before_local_commit(self):
+        main = (ROOT / "src-tauri/src/main.rs").read_text()
+        function = rust_function(main, "set_conversation_project")
+        self.assertIsNotNone(function)
+        _, body = function
+        self.assertIn('unwrap_or("upstream")', body)
+        self.assertIn('scope == "local"', body)
+        self.assertIn(".set_conversation_project(", body)
+        self.assertLess(body.index('if outcome.state != "applied"'), body.rindex("commit_project_assignment("))
+        self.assertIn('"verified":true', body)
+        worker = (ROOT / "src-tauri/src/project_assignment.js").read_text()
+        self.assertIn('method: "PATCH"', worker)
+        self.assertIn("await readConversation()", worker)
+        self.assertIn("actual !== targetProjectId", worker)
+        self.assertIn("Authorization: `Bearer ${token}`", worker)
+
+    def test_project_client_probe_is_debug_only_and_read_only(self):
+        main = (ROOT / "src-tauri/src/main.rs").read_text()
+        function = rust_function(main, "inspect_project_client")
+        self.assertIsNotNone(function)
+        _, body = function
+        self.assertIn("cfg!(debug_assertions)", body)
+        self.assertIn("project_client_probe::inspect(view)", body)
+        probe = (ROOT / "src-tauri/src/project_client_probe.js").read_text()
+        self.assertIn('credentials: "omit"', probe)
+        self.assertNotIn("Authorization", probe)
+        self.assertNotIn("document.cookie", probe)
+
+    def test_catalog_graph_optional_focus_id_is_forwarded_end_to_end(self):
+        main = (ROOT / "src-tauri/src/main.rs").read_text()
+        function = rust_function(main, "catalog_graph")
+        self.assertIsNotNone(function)
+        signature, body = function
+        self.assertIn("focus_id: Option<String>", signature)
+        self.assertIn("focus_id.as_deref()", body)
+        api = (ROOT / "src-tauri/src/desktop_api.rs").read_text()
+        self.assertIn('query.push(("focus_id", focus_id.to_owned()))', api)
+        server = (ROOT / "src/server/api_v1.rs").read_text()
+        self.assertIn("store.catalog_neighborhood(focus_id, &source, project_key.as_deref(), limit)", server)
 
     def test_guard_requires_live_native_main_ownership_and_local_origin(self):
         source = (ROOT / "src-tauri/src/main.rs").read_text()
@@ -152,6 +197,16 @@ class UiBridgeContract(unittest.TestCase):
         self.assertIn('password.is_none()', policy)
         self.assertIn('port.is_none()', policy)
         self.assertIn("main_ownership.register_after_build()", source)
+
+    def test_project_rename_defaults_to_upstream_and_fails_closed_until_verified(self):
+        source = (ROOT / "src-tauri/src/main.rs").read_text()
+        function = rust_function(source, "rename_project")
+        self.assertIsNotNone(function)
+        signature, body = function
+        self.assertIn("scope: Option<String>", signature)
+        self.assertIn('unwrap_or("upstream")', body)
+        self.assertIn('"local" =>', body)
+        self.assertIn('"upstream" => Err("upstream_project_rename_unavailable".into())', body)
         self.assertIn("WindowEvent::Destroyed", source)
         self.assertIn("ownership.revoke()", source)
 

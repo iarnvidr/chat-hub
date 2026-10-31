@@ -313,6 +313,229 @@ pub async fn projects(base: &str, token: &str, source: &str) -> Result<Value, St
     let u = url(base, &["api", "v1", "projects"], &[("source", source)])?;
     get(&c, u, token).await
 }
+pub async fn rename_project(
+    base: &str,
+    token: &str,
+    project_key: &str,
+    name: Option<&str>,
+) -> Result<Value, String> {
+    if project_key.is_empty() || project_key.len() > 1024 {
+        return Err("invalid_project".into());
+    }
+    let c = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = url(base, &["api", "v1", "projects", "name"], &[])?;
+    let body = serde_json::to_vec(&serde_json::json!({"project_key":project_key,"name":name}))
+        .map_err(|_| "invalid_request")?;
+    let response = c
+        .patch(u)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "Desktop API unavailable")?;
+    if !response.status().is_success() {
+        return Err(map_http_error(response.status(), None).into());
+    }
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Desktop API unavailable")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err("response_too_large".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
+}
+pub async fn project_assignment_context(
+    base: &str,
+    token: &str,
+    conversation_id: &str,
+    project_key: Option<&str>,
+) -> Result<Value, String> {
+    if conversation_id.is_empty()
+        || conversation_id.len() > 256
+        || project_key.is_some_and(|key| key.is_empty() || key.len() > 1024)
+    {
+        return Err("invalid_request".into());
+    }
+    let c = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let mut query = vec![("conversation_id", conversation_id)];
+    if let Some(project_key) = project_key {
+        query.push(("project_key", project_key));
+    }
+    let u = url(base, &["api", "v1", "project-assignment"], &query)?;
+    get(&c, u, token).await
+}
+pub async fn learned_project_operations(base: &str, token: &str) -> Result<Value, String> {
+    let c = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = url(base, &["api", "v1", "learned-project-operations"], &[])?;
+    get(&c, u, token).await
+}
+
+pub async fn commit_project_assignment(
+    base: &str,
+    token: &str,
+    conversation_id: &str,
+    expected_conversation_scope: &str,
+    project_key: Option<&str>,
+    verified_project_title: Option<&str>,
+) -> Result<Value, String> {
+    if conversation_id.is_empty()
+        || conversation_id.len() > 256
+        || expected_conversation_scope.is_empty()
+        || expected_conversation_scope.len() > 256
+        || project_key.is_some_and(|key| key.is_empty() || key.len() > 1024)
+    {
+        return Err("invalid_request".into());
+    }
+    let c = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = url(base, &["api", "v1", "project-assignment"], &[])?;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "conversation_id":conversation_id,
+        "expected_conversation_scope":expected_conversation_scope,
+        "project_key":project_key,
+        "verified_project_title":verified_project_title,
+    }))
+    .map_err(|_| "invalid_request")?;
+    let response = c
+        .patch(u)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "Desktop API unavailable")?;
+    if !response.status().is_success() {
+        return Err(map_http_error(response.status(), None).into());
+    }
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Desktop API unavailable")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err("response_too_large".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
+}
+fn catalog_url(
+    base: &str,
+    endpoint: &str,
+    source: &str,
+    project_key: Option<&str>,
+    limit: Option<usize>,
+    focus_id: Option<&str>,
+) -> Result<Url, String> {
+    if !matches!(source, "all" | "chatgpt" | "codex")
+        || project_key.is_some_and(|key| key.is_empty() || key.len() > 1024)
+        || limit.is_some_and(|value| !(1..=200).contains(&value))
+        || focus_id.is_some_and(|value| value.trim().is_empty() || value.len() > 256)
+    {
+        return Err("invalid_request".into());
+    }
+    let mut query = vec![("source", source.to_owned())];
+    if let Some(project_key) = project_key {
+        query.push(("project_key", project_key.to_owned()));
+    }
+    let limit_text = limit.map(|value| value.to_string());
+    if let Some(value) = limit_text.as_deref() {
+        query.push(("limit", value.to_owned()));
+    }
+    if let Some(focus_id) = focus_id {
+        query.push(("focus_id", focus_id.to_owned()));
+    }
+    let pairs = query
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect::<Vec<_>>();
+    url(base, &["api", "v1", "catalog", endpoint], &pairs)
+}
+pub async fn catalog_overview(
+    base: &str,
+    token: &str,
+    source: &str,
+    project_key: Option<&str>,
+) -> Result<Value, String> {
+    let c = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    get(
+        &c,
+        catalog_url(base, "overview", source, project_key, None, None)?,
+        token,
+    )
+    .await
+}
+pub async fn catalog_graph(
+    base: &str,
+    token: &str,
+    source: &str,
+    project_key: Option<&str>,
+    limit: usize,
+    focus_id: Option<&str>,
+) -> Result<Value, String> {
+    let c = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    get(
+        &c,
+        catalog_url(base, "graph", source, project_key, Some(limit), focus_id)?,
+        token,
+    )
+    .await
+}
+pub async fn rebuild_catalog_index(base: &str, token: &str) -> Result<Value, String> {
+    let c = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = url(base, &["api", "v1", "catalog", "rebuild"], &[])?;
+    let response = c
+        .post(u)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|_| "Desktop API unavailable")?;
+    if !response.status().is_success() {
+        return Err(map_http_error(response.status(), None).into());
+    }
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Desktop API unavailable")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err("response_too_large".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
+}
 pub async fn detail(
     base: &str,
     token: &str,
@@ -329,7 +552,7 @@ pub async fn detail(
 
 #[cfg(test)]
 mod source_list_tests {
-    use super::{list_url_for_scope, list_url_for_source};
+    use super::{catalog_url, list_url_for_scope, list_url_for_source};
 
     #[test]
     fn source_and_project_filters_are_sent_to_server_before_pagination() {
@@ -371,5 +594,61 @@ mod source_list_tests {
                 .1,
             "project:key"
         );
+    }
+
+    #[test]
+    fn catalog_requests_keep_source_project_and_node_limit_scoped() {
+        let base = "http://127.0.0.1:8000";
+        let overview = catalog_url(
+            base,
+            "overview",
+            "chatgpt",
+            Some("project:[id]"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(overview.path(), "/api/v1/catalog/overview");
+        assert_eq!(
+            overview
+                .query_pairs()
+                .find(|(k, _)| k == "source")
+                .unwrap()
+                .1,
+            "chatgpt"
+        );
+        assert_eq!(
+            overview
+                .query_pairs()
+                .find(|(k, _)| k == "project_key")
+                .unwrap()
+                .1,
+            "project:[id]"
+        );
+        let graph = catalog_url(
+            base,
+            "graph",
+            "codex",
+            None,
+            Some(80),
+            Some("local-chat-id"),
+        )
+        .unwrap();
+        assert_eq!(graph.path(), "/api/v1/catalog/graph");
+        assert_eq!(
+            graph.query_pairs().find(|(k, _)| k == "limit").unwrap().1,
+            "80"
+        );
+        assert_eq!(
+            graph
+                .query_pairs()
+                .find(|(k, _)| k == "focus_id")
+                .unwrap()
+                .1,
+            "local-chat-id"
+        );
+        assert!(catalog_url(base, "graph", "unknown", None, Some(80), None).is_err());
+        assert!(catalog_url(base, "graph", "all", None, Some(201), None).is_err());
+        assert!(catalog_url(base, "graph", "all", None, Some(80), Some(" ")).is_err());
     }
 }

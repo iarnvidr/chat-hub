@@ -352,6 +352,9 @@ fn decode_body(encoding: Encoding, body: &[u8], limit: usize) -> Result<Vec<u8>,
     }
     Ok(decoded)
 }
+pub(crate) fn decode_schema_body(encoding: &str, body: &[u8], limit: usize) -> Option<Vec<u8>> {
+    decode_body(parse_encoding(Some(encoding)).ok()?, body, limit).ok()
+}
 impl Accumulator {
     pub fn observe(&mut self, bytes: &[u8]) {
         let Some(work) = &mut self.work else {

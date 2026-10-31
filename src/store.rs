@@ -47,6 +47,11 @@ pub struct ProjectSnapshot {
     pub projects: Vec<Value>,
 }
 #[derive(Clone, Debug)]
+pub struct ProjectRenameSnapshot {
+    pub library_revision: i64,
+    pub project: Value,
+}
+#[derive(Clone, Debug)]
 pub struct ProjectMembership {
     pub source_id: String,
     pub project_id: Option<String>,
@@ -260,6 +265,17 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(10)", [])?;
             tx.commit()?;
         }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 11 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch("ALTER TABLE projects ADD COLUMN local_name TEXT;")?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(11)", [])?;
+            tx.commit()?;
+        }
         self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id); CREATE INDEX IF NOT EXISTS observations_conversation_order ON observations(conversation_id,id DESC);")?;
         Ok(())
     }
@@ -348,15 +364,275 @@ impl Store {
             "all" => "1=1",
             _ => return Err(Error::Configuration("invalid source".into())),
         };
-        let sql = format!("SELECT p.project_key,p.source_id,p.title,count(cp.conversation_id) FROM projects p LEFT JOIN conversation_projects cp ON cp.project_key=p.project_key WHERE {filter} GROUP BY p.project_key,p.source_id,p.title ORDER BY coalesce(p.title,p.source_id) COLLATE NOCASE,p.project_key");
+        let sql = format!("SELECT p.project_key,p.source_id,p.title,p.local_name,count(cp.conversation_id) FROM projects p LEFT JOIN conversation_projects cp ON cp.project_key=p.project_key WHERE {filter} GROUP BY p.project_key,p.source_id,p.title,p.local_name ORDER BY coalesce(nullif(trim(p.local_name),''),nullif(trim(p.title),''),p.source_id) COLLATE NOCASE,p.project_key");
         let mut st = tx.prepare(&sql)?;
-        let projects = st.query_map([], |r| Ok(serde_json::json!({"project_key":r.get::<_,String>(0)?,"project_id":r.get::<_,String>(1)?,"title":r.get::<_,Option<String>>(2)?,"conversation_count":r.get::<_,i64>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let projects = st.query_map([], |r| {
+            let local_name: Option<String> = r.get(3)?;
+            let title: Option<String> = r.get(2)?;
+            let (display_name, name_source) = project_display_name(local_name.as_deref(), title.as_deref());
+            Ok(serde_json::json!({"project_key":r.get::<_,String>(0)?,"project_id":r.get::<_,String>(1)?,"title":title,"display_name":display_name,"name_source":name_source,"conversation_count":r.get::<_,i64>(4)?}))
+        })?.collect::<std::result::Result<Vec<_>,_>>()?;
         drop(st);
         tx.commit()?;
         Ok(ProjectSnapshot {
             library_revision: revision,
             projects,
         })
+    }
+    pub fn rename_project(
+        &mut self,
+        project_key: &str,
+        name: Option<&str>,
+    ) -> Result<ProjectRenameSnapshot> {
+        if project_key.is_empty() || project_key.len() > 1024 {
+            return Err(Error::Configuration("invalid project key".into()));
+        }
+        let normalized = name.map(str::trim).filter(|value| !value.is_empty());
+        if normalized
+            .is_some_and(|value| value.chars().count() > 120 || value.chars().any(char::is_control))
+        {
+            return Err(Error::Configuration("invalid project name".into()));
+        }
+        let tx = self.connection.transaction()?;
+        let prior: Option<(String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT source_id,local_name,title FROM projects WHERE project_key=?1",
+                [project_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((source_id, old_name, title)) = prior else {
+            return Err(Error::Configuration("unknown project".into()));
+        };
+        let normalized = normalized.map(str::to_owned);
+        let changed = old_name != normalized;
+        if changed {
+            tx.execute(
+                "UPDATE projects SET local_name=?1 WHERE project_key=?2",
+                params![normalized, project_key],
+            )?;
+            tx.execute(
+                "UPDATE library_state SET revision=revision+1 WHERE singleton=1",
+                [],
+            )?;
+        }
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let (display_name, name_source) =
+            project_display_name(normalized.as_deref(), title.as_deref());
+        let project = serde_json::json!({"project_key":project_key,"project_id":source_id,"title":title,"display_name":display_name,"name_source":name_source});
+        tx.commit()?;
+        Ok(ProjectRenameSnapshot {
+            library_revision: revision,
+            project,
+        })
+    }
+    pub fn project_assignment_context(
+        &self,
+        conversation_id: &str,
+        project_key: Option<&str>,
+    ) -> Result<Value> {
+        let conversation: Option<(String, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT provider,account_scope,source_id FROM conversations WHERE id=?1",
+                [conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((conversation_provider, conversation_scope, conversation_source_id)) =
+            conversation
+        else {
+            return Err(Error::Configuration("unknown conversation".into()));
+        };
+        if !is_chatgpt_provider(&conversation_provider)
+            || !valid_upstream_conversation_id(&conversation_source_id)
+        {
+            return Err(Error::Configuration(
+                "conversation is not an upstream ChatGPT record".into(),
+            ));
+        }
+        let project = if let Some(key) = project_key {
+            if key.is_empty() || key.len() > 1024 {
+                return Err(Error::Configuration("invalid project key".into()));
+            }
+            let value: Option<(String, String, String, Option<String>, Option<String>)> = self
+                .connection
+                .query_row(
+                    "SELECT provider,account_scope,source_id,title,local_name FROM projects WHERE project_key=?1",
+                    [key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .optional()?;
+            let Some((provider, account_scope, source_id, title, local_name)) = value else {
+                return Err(Error::Configuration("unknown project".into()));
+            };
+            if !is_chatgpt_provider(&provider) || !valid_upstream_project_id(&source_id) {
+                return Err(Error::Configuration(
+                    "project is not an upstream ChatGPT project".into(),
+                ));
+            }
+            if observed_account_scope(&conversation_scope)
+                && observed_account_scope(&account_scope)
+                && conversation_scope != account_scope
+            {
+                return Err(Error::Configuration(
+                    "conversation and project belong to different observed accounts".into(),
+                ));
+            }
+            Some((
+                key.to_owned(),
+                provider,
+                account_scope,
+                source_id,
+                title,
+                local_name,
+            ))
+        } else {
+            None
+        };
+        let (project_key, project_provider, project_scope, project_id, project_title, local_name) =
+            project.map_or(
+                (None, None, None, None, None, None),
+                |(key, provider, scope, id, title, local)| {
+                    (
+                        Some(key),
+                        Some(provider),
+                        Some(scope),
+                        Some(id),
+                        title,
+                        local,
+                    )
+                },
+            );
+        Ok(serde_json::json!({
+            "conversation_id": conversation_id,
+            "conversation_provider": conversation_provider,
+            "conversation_scope": conversation_scope,
+            "conversation_source_id": conversation_source_id,
+            "project_key": project_key,
+            "project_provider": project_provider,
+            "project_scope": project_scope,
+            "project_id": project_id,
+            "project_title": project_title,
+            "project_local_name": local_name,
+        }))
+    }
+    pub fn commit_project_assignment(
+        &mut self,
+        conversation_id: &str,
+        expected_conversation_scope: &str,
+        project_key: Option<&str>,
+        verified_project_title: Option<&str>,
+    ) -> Result<Value> {
+        let tx = self.connection.transaction()?;
+        let conversation: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT provider,account_scope,source_id FROM conversations WHERE id=?1",
+                [conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((provider, account_scope, source_id)) = conversation else {
+            return Err(Error::Configuration("unknown conversation".into()));
+        };
+        if !is_chatgpt_provider(&provider)
+            || account_scope != expected_conversation_scope
+            || !valid_upstream_conversation_id(&source_id)
+        {
+            return Err(Error::Configuration(
+                "conversation changed before project assignment commit".into(),
+            ));
+        }
+        let mut changed = false;
+        let result_project = if let Some(project_key) = project_key {
+            let project: Option<(String, String, String, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT provider,source_id,account_scope,title,local_name FROM projects WHERE project_key=?1",
+                    [project_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .optional()?;
+            let Some((project_provider, project_id, project_scope, old_title, local_name)) =
+                project
+            else {
+                return Err(Error::Configuration(
+                    "project changed before assignment commit".into(),
+                ));
+            };
+            if !is_chatgpt_provider(&project_provider) || !valid_upstream_project_id(&project_id) {
+                return Err(Error::Configuration(
+                    "project is not an upstream ChatGPT project".into(),
+                ));
+            }
+            if observed_account_scope(&account_scope)
+                && observed_account_scope(&project_scope)
+                && account_scope != project_scope
+            {
+                return Err(Error::Configuration(
+                    "conversation and project belong to different observed accounts".into(),
+                ));
+            }
+            let title = verified_project_title
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if title.is_some_and(|value| {
+                value.chars().count() > 4096 || value.chars().any(char::is_control)
+            }) {
+                return Err(Error::Configuration(
+                    "invalid verified project title".into(),
+                ));
+            }
+            if let Some(title) = title {
+                if old_title.as_deref() != Some(title) {
+                    tx.execute(
+                        "UPDATE projects SET title=?1 WHERE project_key=?2",
+                        params![title, project_key],
+                    )?;
+                    changed = true;
+                }
+            }
+            let prior: Option<String> = tx
+                .query_row(
+                    "SELECT project_key FROM conversation_projects WHERE conversation_id=?1",
+                    [conversation_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if prior.as_deref() != Some(project_key) {
+                tx.execute("INSERT INTO conversation_projects(conversation_id,project_key) VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET project_key=excluded.project_key", params![conversation_id,project_key])?;
+                changed = true;
+            }
+            let (display_name, name_source) =
+                project_display_name(local_name.as_deref(), title.or(old_title.as_deref()));
+            Some(
+                serde_json::json!({"project_key":project_key,"project_id":project_id,"title":title.or(old_title.as_deref()),"display_name":display_name,"name_source":name_source}),
+            )
+        } else {
+            changed |= tx.execute(
+                "DELETE FROM conversation_projects WHERE conversation_id=?1",
+                [conversation_id],
+            )? > 0;
+            None
+        };
+        if changed {
+            tx.execute(
+                "UPDATE library_state SET revision=revision+1 WHERE singleton=1",
+                [],
+            )?;
+        }
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(
+            serde_json::json!({"conversation_id":conversation_id,"project":result_project,"library_revision":revision,"provider":provider,"account_scope":account_scope}),
+        )
     }
     pub fn library_revision(&self) -> Result<i64> {
         Ok(self.connection.query_row(
@@ -586,7 +862,7 @@ impl Store {
                     limit: 8 * 1024 * 1024 - 64 * 1024,
                 });
             }
-            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms,(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=conversations.id) FROM conversations WHERE {source_filter}{project_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
+            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms,(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=conversations.id) FROM conversations WHERE {source_filter}{project_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
             let mut st = tx.prepare(&page_sql)?;
             let ids = st
                 .query_map(
@@ -916,7 +1192,7 @@ impl Store {
                     let selected = node
                         .as_ref()
                         .is_some_and(|n| graph.selected_thread.contains(n));
-                    let summary: Value=tx.query_row("SELECT json_object('id',c.id,'provider',c.provider,'account_scope',c.account_scope,'source_id',c.source_id,'title',c.title,'updated_at_ms',c.updated_at_ms,'project',(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=c.id)) FROM conversations c WHERE c.id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
+                    let summary: Value=tx.query_row("SELECT json_object('id',c.id,'provider',c.provider,'account_scope',c.account_scope,'source_id',c.source_id,'title',c.title,'updated_at_ms',c.updated_at_ms,'project',(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=c.id)) FROM conversations c WHERE c.id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
                     hits.push(serde_json::json!({"conversation":summary,"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
                     if serde_json::to_vec(&hits)
                         .map_or(true, |v| v.len() > 8 * 1024 * 1024 - 64 * 1024)
@@ -1307,6 +1583,58 @@ fn project_key(provider: &str, account_scope: &str, source_id: &str) -> String {
     )
 }
 
+fn observed_account_scope(scope: &str) -> bool {
+    scope
+        .strip_prefix("chatgpt:observed:")
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}
+
+fn is_chatgpt_provider(provider: &str) -> bool {
+    matches!(provider, "chatgpt" | "paseo-chatgpt")
+}
+
+fn valid_upstream_conversation_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn valid_upstream_project_id(id: &str) -> bool {
+    id.strip_prefix("g-p-").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.len() <= 128
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
+}
+
+fn project_display_name(
+    local_name: Option<&str>,
+    upstream_name: Option<&str>,
+) -> (Option<String>, &'static str) {
+    if let Some(name) = local_name.map(str::trim).filter(|value| !value.is_empty()) {
+        (Some(name.to_owned()), "local")
+    } else if let Some(name) = upstream_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        (Some(name.to_owned()), "upstream")
+    } else {
+        (None, "unknown")
+    }
+}
+
 fn canonical_message_id(conversation_id: &str, node_id: &str) -> String {
     format!("message:{}", serde_json::json!([conversation_id, node_id]))
 }
@@ -1662,7 +1990,7 @@ mod identity_tests {
     #[test]
     fn migrated_legacy_ids_and_rows_survive_ingest() {
         let mut store = Store::in_memory().unwrap();
-        store.connection.execute_batch("DROP TRIGGER IF EXISTS message_fts_insert; DROP TRIGGER IF EXISTS message_fts_delete; DROP TRIGGER IF EXISTS message_fts_update; DROP TRIGGER IF EXISTS title_fts_insert; DROP TRIGGER IF EXISTS title_fts_update; DROP TRIGGER IF EXISTS title_fts_delete; DROP TABLE IF EXISTS message_fts; DROP TABLE IF EXISTS title_fts; DROP TABLE IF EXISTS library_state; DROP TABLE normalized_fts; DROP TABLE conversations_fts; DROP INDEX conversations_identity; DROP TRIGGER normalized_conv_insert; DROP TRIGGER normalized_conv_update; DROP TRIGGER normalized_conv_delete; DROP TRIGGER normalized_graph_insert; DROP TRIGGER normalized_graph_update; DROP TRIGGER normalized_graph_delete; DROP TABLE graph_nodes; DROP TABLE observations; DROP TABLE messages; DROP TABLE conversations; CREATE TABLE conversations(id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',provider TEXT NOT NULL DEFAULT '',url TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),parent_id TEXT,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT ''); INSERT INTO conversations(id,title,provider) VALUES('legacy-conv','old','legacy'); INSERT INTO messages(id,conversation_id,parent_id,role,content) VALUES('legacy-msg','legacy-conv',NULL,'user','kept'); DELETE FROM schema_migrations WHERE version>=3;").unwrap();
+        store.connection.execute_batch("DROP TABLE IF EXISTS conversation_projects; DROP TABLE IF EXISTS projects; DROP TRIGGER IF EXISTS message_fts_insert; DROP TRIGGER IF EXISTS message_fts_delete; DROP TRIGGER IF EXISTS message_fts_update; DROP TRIGGER IF EXISTS title_fts_insert; DROP TRIGGER IF EXISTS title_fts_update; DROP TRIGGER IF EXISTS title_fts_delete; DROP TABLE IF EXISTS message_fts; DROP TABLE IF EXISTS title_fts; DROP TABLE IF EXISTS library_state; DROP TABLE normalized_fts; DROP TABLE conversations_fts; DROP INDEX conversations_identity; DROP TRIGGER normalized_conv_insert; DROP TRIGGER normalized_conv_update; DROP TRIGGER normalized_conv_delete; DROP TRIGGER normalized_graph_insert; DROP TRIGGER normalized_graph_update; DROP TRIGGER normalized_graph_delete; DROP TABLE graph_nodes; DROP TABLE observations; DROP TABLE messages; DROP TABLE conversations; CREATE TABLE conversations(id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',provider TEXT NOT NULL DEFAULT '',url TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id),parent_id TEXT,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT ''); INSERT INTO conversations(id,title,provider) VALUES('legacy-conv','old','legacy'); INSERT INTO messages(id,conversation_id,parent_id,role,content) VALUES('legacy-msg','legacy-conv',NULL,'user','kept'); DELETE FROM schema_migrations WHERE version>=3;").unwrap();
         store.migrate().unwrap();
         let observation = Observation {
             provider: "legacy".into(),
@@ -1787,6 +2115,176 @@ mod project_and_search_tests {
     }
 
     #[test]
+    fn local_project_name_overrides_upstream_without_changing_project_identity() {
+        let mut store = Store::in_memory().unwrap();
+        conversation(&store, "named_chat", "chatgpt", "alpha");
+        store
+            .apply_project_memberships(
+                "chatgpt",
+                "scope",
+                &[ProjectMembership {
+                    source_id: "named_chat".into(),
+                    project_id: Some("opaque-upstream-id".into()),
+                    title: Some("  Upstream title  ".into()),
+                }],
+            )
+            .unwrap();
+        let project = store
+            .projects_snapshot("chatgpt")
+            .unwrap()
+            .projects
+            .remove(0);
+        assert_eq!(project["display_name"], "Upstream title");
+        assert_eq!(project["name_source"], "upstream");
+        let key = project["project_key"].as_str().unwrap().to_owned();
+        assert_eq!(project["project_id"], "opaque-upstream-id");
+
+        let renamed = store.rename_project(&key, Some("  Local label  ")).unwrap();
+        assert_eq!(renamed.project["display_name"], "Local label");
+        assert_eq!(renamed.project["name_source"], "local");
+        store
+            .apply_project_memberships(
+                "chatgpt",
+                "scope",
+                &[ProjectMembership {
+                    source_id: "named_chat".into(),
+                    project_id: Some("opaque-upstream-id".into()),
+                    title: Some("Updated upstream title".into()),
+                }],
+            )
+            .unwrap();
+        let project = store
+            .projects_snapshot("chatgpt")
+            .unwrap()
+            .projects
+            .remove(0);
+        assert_eq!(project["title"], "Updated upstream title");
+        assert_eq!(project["display_name"], "Local label");
+        assert_eq!(project["name_source"], "local");
+
+        let cleared = store.rename_project(&key, Some("  ")).unwrap();
+        assert_eq!(cleared.project["display_name"], "Updated upstream title");
+        assert_eq!(cleared.project["name_source"], "upstream");
+        assert_eq!(cleared.project["project_id"], "opaque-upstream-id");
+    }
+
+    #[test]
+    fn unknown_project_names_remain_unknown_and_rename_validates_input() {
+        let mut store = Store::in_memory().unwrap();
+        conversation(&store, "unnamed_chat", "chatgpt", "alpha");
+        store
+            .apply_project_memberships(
+                "chatgpt",
+                "scope",
+                &[ProjectMembership {
+                    source_id: "unnamed_chat".into(),
+                    project_id: Some("g-opaque-id".into()),
+                    title: None,
+                }],
+            )
+            .unwrap();
+        let project = store
+            .projects_snapshot("chatgpt")
+            .unwrap()
+            .projects
+            .remove(0);
+        assert_eq!(project["display_name"], Value::Null);
+        assert_eq!(project["name_source"], "unknown");
+        let key = project["project_key"].as_str().unwrap();
+        assert!(store.rename_project(key, Some(&"x".repeat(121))).is_err());
+        assert!(store.rename_project(key, Some("bad\nname")).is_err());
+        assert!(store.rename_project("missing", Some("name")).is_err());
+    }
+
+    #[test]
+    fn project_assignment_context_allows_explicitly_verified_legacy_scope_without_relabeling_it() {
+        let mut store = Store::in_memory().unwrap();
+        let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+        let project_id = format!("g-p-{}", "a".repeat(32));
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Legacy chat','paseo-chatgpt','paseo-cache:owner',?1,1)",
+            [conversation_id],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO projects(project_key,provider,account_scope,source_id,title,local_name) VALUES('current-project','chatgpt','chatgpt:observed:'||?1,?2,'Old title','Local name')",
+            params!["b".repeat(64), project_id],
+        ).unwrap();
+        let target = store
+            .project_assignment_context(conversation_id, Some("current-project"))
+            .unwrap();
+        assert_eq!(target["conversation_source_id"], conversation_id);
+        assert_eq!(target["conversation_scope"], "paseo-cache:owner");
+        assert_eq!(target["project_id"], project_id);
+        let receipt = store
+            .commit_project_assignment(
+                conversation_id,
+                "paseo-cache:owner",
+                Some("current-project"),
+                Some("Verified current title"),
+            )
+            .unwrap();
+        assert_eq!(receipt["project"]["display_name"], "Local name");
+        let persisted_scope: String = store
+            .connection
+            .query_row(
+                "SELECT account_scope FROM conversations WHERE id=?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_scope, "paseo-cache:owner");
+        let upstream_title: String = store
+            .connection
+            .query_row(
+                "SELECT title FROM projects WHERE project_key='current-project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(upstream_title, "Verified current title");
+        store
+            .commit_project_assignment(conversation_id, "paseo-cache:owner", None, None)
+            .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM conversation_projects WHERE conversation_id=?1",
+                    [conversation_id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn project_assignment_rejects_observed_account_mismatch_and_nonupstream_ids() {
+        let mut store = Store::in_memory().unwrap();
+        let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+        let scope_a = format!("chatgpt:observed:{}", "a".repeat(64));
+        let scope_b = format!("chatgpt:observed:{}", "b".repeat(64));
+        let project_id = format!("g-p-{}", "c".repeat(32));
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Chat','chatgpt',?2,?1,1)",
+            params![conversation_id,scope_a],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES('other-account','chatgpt',?1,?2,'Title')",
+            params![scope_b,project_id],
+        ).unwrap();
+        assert!(store
+            .project_assignment_context(conversation_id, Some("other-account"))
+            .is_err());
+        assert!(store
+            .commit_project_assignment(conversation_id, &scope_a, Some("other-account"), None)
+            .is_err());
+        assert!(store
+            .project_assignment_context("chat_project", Some("other-account"))
+            .is_err());
+    }
+
+    #[test]
     fn project_migration_uses_only_latest_observation() {
         let mut store = Store::in_memory().unwrap();
         store.connection.execute_batch("DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;").unwrap();
@@ -1822,13 +2320,13 @@ mod project_and_search_tests {
                 .unwrap(),
             0
         );
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
 
         store.connection.execute("INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES('bad-empty','paseo-chatgpt','paseo-cache:owner','','Assigned project')", []).unwrap();
         store.connection.execute("INSERT INTO conversation_projects(conversation_id,project_key) VALUES('legacy-empty','bad-empty')", []).unwrap();
         store
             .connection
-            .execute("DELETE FROM schema_migrations WHERE version=10", [])
+            .execute_batch("DELETE FROM schema_migrations WHERE version>=10; ALTER TABLE projects DROP COLUMN local_name;")
             .unwrap();
         store.migrate().unwrap();
         assert_eq!(
@@ -1870,3 +2368,5 @@ mod project_and_search_tests {
         }));
     }
 }
+mod catalog;
+pub(crate) mod operation_learner;

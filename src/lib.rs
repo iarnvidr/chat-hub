@@ -2,6 +2,7 @@ pub mod archive;
 pub mod ca;
 pub mod capture;
 pub mod capture_lane;
+pub mod catalog;
 pub mod config;
 pub mod error;
 pub mod importer;

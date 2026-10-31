@@ -1,5 +1,15 @@
 # Implementation plan
 
+## Current development checkpoint — chat catalog and navigation
+
+The active branch is `codex/direct-chat-service` (PR #28). Chat is the default source; Codex stays behind its own toggle. The application and CI use Rust/Cargo, Bun, Python and Go without a Node runtime. Checks, Security and Apple Silicon packaging passed at `68091ae`; later feature commits need their own CI evidence. Preserve the separate trusted-main and release-gate work.
+
+The local catalog persists a revisioned index of chats, projects, bounded text samples, original messages and parent relationships. The overview uses the vendored MIT Cytoscape.js 3.34.4 browser module. It starts with 12 recent named chats; selecting one finds at most five related chats across the full index, within the same provider/account and current project filter. Connections explain shared project membership or at least two filtered shared terms weighted by rarity. These are lexical suggestions, not semantic similarity claims. Message drilldown follows stored parent links and preserves branch navigation. Imported transcripts remain archives; unavailable message boundaries and branches are not invented.
+
+Project assignment supports a user-requested upstream change in the owned ChatGPT WebView and commits the local assignment only after a subsequent read verifies it. Local project labels remain a separate explicit option. Upstream project rename is still unavailable: the read-only client probe did not establish its write contract. The bounded passive proxy learner records only normalized operation schemas for future observed project mutations; it stores no request/response values, credentials or raw bodies. No live project mutation was performed during implementation checks.
+
+Fresh ChatGPT history fetching currently encounters HTTP 429 in the connected owner session. Synthetic tests and the existing local archive do not establish successful fresh-history or streamed-capture acceptance. Continue that acceptance work independently of graph presentation. Background CI/release coordination should continue while product work proceeds.
+
 ## Status snapshot — 2026-10-31
 
 The offline-library milestone now has import, branch-aware reading, message search, SQLite backup/export, and a `chat-hub restore <backup.sqlite3>` path for restoring into an empty library. Restore validates SQLite integrity, refuses a populated destination, runs migrations, and rebuilds all search indexes. Focused local acceptance on `codex/mvp-stage` passes: 2 CLI archive tests and 6 store backup/restore tests. The Apple Silicon run for PR #26, head `036bb2bbaa0016793cf8abd03a595f4b965f81d3`, passed production and native-smoke compilation, package/DMG validation, persisted-library, app launch/health, UI/API, updater, reopen and shutdown checks: [run 41155128445](https://github.com/iarnvidr/chat-hub/actions/runs/41155128445). That hosted run predates the restore change and is not evidence for it. The current main commit is newer than the assessment's PR #6 snapshot; recheck source and evidence before carrying forward its historical findings.
