@@ -18,4 +18,4 @@ jobs:
           version: 0.21.11
           verb: call
           module: ./ci/dagger/check
-          args: contracts --source .
+          args: checks --source .
