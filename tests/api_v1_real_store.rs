@@ -4,7 +4,10 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use chat_hub::{server, store::Store};
+use chat_hub::{
+    server,
+    store::{GraphNode, Observation, Store},
+};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -26,6 +29,32 @@ fn document(id: &str, time: i64) -> Value {
     doc["mapping"]["right"]["message"]["content"]["parts"][0] =
         json!("bodyonlyneedle selected answer\n\n```rust\nlet n = 1;\n```");
     doc
+}
+
+fn source_observation(provider: &str, id: &str, title: &str, time: i64) -> Observation {
+    let node_id = format!("{id}-message");
+    Observation {
+        provider: provider.into(),
+        account_scope: "paseo:test-owner".into(),
+        source_id: id.into(),
+        title: title.into(),
+        url: None,
+        current_node: Some(node_id.clone()),
+        graph: vec![GraphNode {
+            source_node_id: node_id.clone(),
+            source_message_id: Some(node_id),
+            parent_id: None,
+            role: Some("user".into()),
+            author: None,
+            create_time: None,
+            parts: vec![json!("chatfilterneedle shared")],
+        }],
+        raw_payload: Value::Null,
+        source_time: None,
+        observed_ms: time,
+        parser: "test".into(),
+        completeness: "complete".into(),
+    }
 }
 
 async fn request(app: &Router, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -54,6 +83,28 @@ async fn import(app: &Router, docs: Value) -> Value {
     assert_eq!(status, StatusCode::OK, "{receipt}");
     assert_eq!(receipt["failed"], 0, "{receipt}");
     receipt
+}
+
+#[tokio::test]
+async fn large_local_transcript_detail_and_search_preserve_exact_text() {
+    let mut store = Store::in_memory().unwrap();
+    let text = "archivebodyneedle café 🧭 \"quotation\"\n".repeat(25_000);
+    let mut o = source_observation("paseo-chatgpt", "large-cache", "Large saved chat", 1);
+    o.graph[0].role = Some("archive".into());
+    o.graph[0].parts = vec![json!(text)];
+    o.completeness = "cached_transcript".into();
+    let id = store.ingest_observation(&o).unwrap();
+    let app = server::router(store, "secret".into());
+    let (status, detail) = request(&app, &format!("/api/v1/conversations/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["messages"][0]["role"], "archive");
+    assert_eq!(detail["messages"][0]["content"], text);
+    assert_eq!(detail["messages"][0]["parts"][0]["text"], text);
+    assert_eq!(detail["messages"][0]["parts"][0]["raw"], text);
+    let (status, search) = request(&app, "/api/v1/chat/search?q=archivebodyneedle", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search["items"].as_array().unwrap().len(), 1);
+    assert_eq!(search["items"][0]["node_id"], o.current_node.unwrap());
 }
 
 #[tokio::test]
@@ -159,4 +210,144 @@ async fn empty_unknown_and_oversized_detail_have_explicit_responses() {
     assert_eq!(error["error"]["code"], "response_too_large");
     assert!(error.get("nodes").is_none());
     assert!(error.get("messages").is_none());
+}
+
+#[tokio::test]
+async fn chat_routes_filter_server_side_and_bind_their_cursors() {
+    let mut store = Store::in_memory().unwrap();
+    for (provider, id, title, time) in [
+        ("chatgpt", "chat-old", "ChatGPT older", 10),
+        ("paseo-chatgpt", "chat-new", "Paseo ChatGPT newer", 30),
+        ("paseo-codex_local", "codex-mid", "Codex in between", 20),
+    ] {
+        store
+            .ingest_observation(&source_observation(provider, id, title, time))
+            .unwrap();
+    }
+    let app = server::router(store, "secret".into());
+
+    let (status, chat_first) = request(&app, "/api/v1/chat/conversations?limit=1", None).await;
+    assert_eq!(status, StatusCode::OK, "{chat_first}");
+    let chat_cursor = chat_first["next_cursor"].as_str().unwrap();
+    assert!(matches!(
+        chat_first["items"][0]["provider"].as_str(),
+        Some("chatgpt" | "paseo-chatgpt")
+    ));
+    let (status, chat_second) = request(
+        &app,
+        &format!("/api/v1/chat/conversations?limit=1&cursor={chat_cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{chat_second}");
+    assert_eq!(chat_second["items"].as_array().unwrap().len(), 1);
+    assert!(matches!(
+        chat_second["items"][0]["provider"].as_str(),
+        Some("chatgpt" | "paseo-chatgpt")
+    ));
+    assert!(chat_second["next_cursor"].is_null());
+
+    let (status, all_first) = request(&app, "/api/v1/conversations?limit=1", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let all_cursor = all_first["next_cursor"].as_str().unwrap();
+    let (status, all_second) = request(
+        &app,
+        &format!("/api/v1/conversations?limit=1&cursor={all_cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{all_second}");
+    assert!(all_second["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["provider"] == "paseo-codex_local"));
+    assert_eq!(
+        request(
+            &app,
+            &format!("/api/v1/conversations?cursor={chat_cursor}"),
+            None,
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(
+            &app,
+            &format!("/api/v1/chat/conversations?cursor={all_cursor}"),
+            None,
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let (status, chat_search_first) =
+        request(&app, "/api/v1/chat/search?q=chatfilterneedle&limit=1", None).await;
+    assert_eq!(status, StatusCode::OK, "{chat_search_first}");
+    let chat_search_cursor = chat_search_first["next_cursor"].as_str().unwrap();
+    assert!(matches!(
+        chat_search_first["items"][0]["conversation"]["provider"].as_str(),
+        Some("chatgpt" | "paseo-chatgpt")
+    ));
+    let (status, chat_search_second) = request(
+        &app,
+        &format!("/api/v1/chat/search?q=chatfilterneedle&limit=1&cursor={chat_search_cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{chat_search_second}");
+    assert_eq!(chat_search_second["items"].as_array().unwrap().len(), 1);
+    assert!(matches!(
+        chat_search_second["items"][0]["conversation"]["provider"].as_str(),
+        Some("chatgpt" | "paseo-chatgpt")
+    ));
+    assert!(chat_search_second["next_cursor"].is_null());
+
+    let (status, all_search) =
+        request(&app, "/api/v1/search?q=chatfilterneedle&limit=1", None).await;
+    assert_eq!(status, StatusCode::OK, "{all_search}");
+    let all_search_cursor = all_search["next_cursor"].as_str().unwrap();
+    let (status, all_search_second) = request(
+        &app,
+        &format!("/api/v1/search?q=chatfilterneedle&limit=1&cursor={all_search_cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{all_search_second}");
+    let (status, all_search_third) = request(
+        &app,
+        &format!(
+            "/api/v1/search?q=chatfilterneedle&limit=1&cursor={}",
+            all_search_second["next_cursor"].as_str().unwrap()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{all_search_third}");
+    assert!(matches!(
+        all_search_third["items"][0]["conversation"]["provider"].as_str(),
+        Some("chatgpt" | "paseo-chatgpt" | "paseo-codex_local")
+    ));
+    assert_eq!(
+        request(
+            &app,
+            &format!("/api/v1/search?q=chatfilterneedle&cursor={chat_search_cursor}"),
+            None,
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(
+            &app,
+            &format!("/api/v1/chat/search?q=chatfilterneedle&cursor={all_search_cursor}"),
+            None,
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
 }

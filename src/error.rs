@@ -6,6 +6,9 @@ pub enum Error {
     Database(rusqlite::Error),
     Configuration(String),
     Http(String),
+    RestoreRecovery {
+        details: String,
+    },
     ReadBudgetExceeded {
         kind: &'static str,
         limit: usize,
@@ -23,6 +26,7 @@ impl fmt::Display for Error {
             Self::Database(e) => write!(f, "database error: {e}"),
             Self::Configuration(e) => write!(f, "configuration error: {e}"),
             Self::Http(e) => write!(f, "HTTP error: {e}"),
+            Self::RestoreRecovery { details } => write!(f, "Restore recovery required: {details}"),
             Self::ReadBudgetExceeded { kind, limit } => {
                 write!(f, "read budget exceeded ({kind}, limit {limit})")
             }

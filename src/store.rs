@@ -105,8 +105,21 @@ impl Store {
         s.migrate()?;
         Ok(s)
     }
+    /// Read-only connection to an already migrated service-owned database.
+    /// It has its own transaction/mutex so imports do not block library reads.
+    pub(crate) fn open_reader(path: &str) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON;")?;
+        Ok(Self { connection })
+    }
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
+    }
+    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
     }
     fn migrate(&mut self) -> Result<()> {
         self.connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);")?;
@@ -207,8 +220,11 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(8)", [])?;
             tx.commit()?;
         }
-        self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id);")?;
+        self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id); CREATE INDEX IF NOT EXISTS observations_conversation_order ON observations(conversation_id,id DESC);")?;
         Ok(())
+    }
+    pub(crate) fn migrate_for_restore(&mut self) -> Result<()> {
+        self.migrate()
     }
     pub fn health(&self) -> Result<bool> {
         Ok(self
@@ -368,6 +384,25 @@ impl Store {
         after: Option<&ListKey>,
         expected_revision: Option<i64>,
     ) -> Result<ListPageSnapshot> {
+        self.list_page_snapshot_filtered(limit, after, expected_revision, false)
+    }
+    /// Chat-side listing keeps the existing keyset, revision, and response-budget
+    /// contract while restricting candidates to ChatGPT conversation providers.
+    pub fn chat_list_page_snapshot(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot> {
+        self.list_page_snapshot_filtered(limit, after, expected_revision, true)
+    }
+    fn list_page_snapshot_filtered(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+        chat_only: bool,
+    ) -> Result<ListPageSnapshot> {
         let tx = self.connection.unchecked_transaction()?;
         let revision: i64 = tx.query_row(
             "SELECT revision FROM library_state WHERE singleton=1",
@@ -380,7 +415,13 @@ impl Store {
         }
         if expected_revision.is_none_or(|v| v == revision) {
             let lim = limit.min(101) as i64;
-            let mut pre=tx.prepare("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE (?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)")?;
+            let chat_filter = if chat_only {
+                "provider IN ('chatgpt','paseo-chatgpt') AND "
+            } else {
+                ""
+            };
+            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {chat_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
+            let mut pre = tx.prepare(&budget_sql)?;
             let source_bytes: i64 = pre.query_row(
                 params![
                     after.is_none() as i64,
@@ -401,7 +442,8 @@ impl Store {
                     limit: 8 * 1024 * 1024 - 64 * 1024,
                 });
             }
-            let mut st=tx.prepare("SELECT id,provider,account_scope,source_id,title,updated_at_ms FROM conversations WHERE (?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5")?;
+            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms FROM conversations WHERE {chat_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
+            let mut st = tx.prepare(&page_sql)?;
             let ids = st
                 .query_map(
                     params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim],
@@ -434,16 +476,36 @@ impl Store {
                 limit: 100_000,
             });
         }
-        // Bound source material before constructing the normalized DTO. The 6x allowance
-        // covers JSON escaping plus normalized wrappers; serialized output is checked too.
+        // Bound raw material before asking SQLite to inspect JSON or constructing a
+        // DTO. Then budget the actual JSON string escaping and normalized part
+        // duplication. Multiplying all source bytes by six incorrectly rejects
+        // ordinary cached transcripts that fit comfortably in the response limit.
         const RESPONSE_LIMIT: usize = 8 * 1024 * 1024 - 64 * 1024;
         let bytes: i64 = tx.query_row("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))+coalesce(length(CAST(url AS BLOB)),0)+coalesce(length(CAST(current_node AS BLOB)),0)),0) FROM conversations WHERE id=?1", [canonical_id], |r| r.get(0))?;
         let bytes = bytes.saturating_add(tx.query_row("SELECT coalesce(sum(length(CAST(source_node_id AS BLOB))+coalesce(length(CAST(source_message_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+coalesce(length(CAST(parent_id AS BLOB)),0)+coalesce(length(CAST(role AS BLOB)),0)+coalesce(length(CAST(author_json AS BLOB)),0)+coalesce(length(CAST(create_time_json AS BLOB)),0)+length(CAST(parts_json AS BLOB))+length(CAST(content AS BLOB))),0) FROM graph_nodes WHERE conversation_id=?1", [canonical_id], |r| r.get::<_,i64>(0))?);
-        if (bytes.max(0) as usize)
-            .saturating_mul(6)
-            .saturating_add((count.max(0) as usize).saturating_mul(512))
-            > RESPONSE_LIMIT
-        {
+        if bytes.max(0) as usize > RESPONSE_LIMIT {
+            return Err(Error::ReadBudgetExceeded {
+                kind: "detail source bytes",
+                limit: RESPONSE_LIMIT,
+            });
+        }
+        // json_quote counts UTF-8 bytes after escaping, without transferring the
+        // text to Rust. A node ID occurs in the node twice, its message and the
+        // selected ancestry. Message IDs occur in the node and message. Text
+        // parts occur twice (text/raw); unknown parts occur once. Doubling the
+        // original parts JSON and allowing 48 bytes per part covers both forms.
+        // Fixed wrapper/number/null fields fit within 512 bytes per node and
+        // another 512 bytes for the conversation. The selected fallback node
+        // gets a separate allowance because it need not equal current_node.
+        let encoded: i64 = tx.query_row(
+            "SELECT coalesce(sum(length(CAST(json_quote(id) AS BLOB))+length(CAST(json_quote(provider) AS BLOB))+2*length(CAST(json_quote(account_scope) AS BLOB))+length(CAST(json_quote(source_id) AS BLOB))+length(CAST(json_quote(title) AS BLOB))+length(CAST(json_quote(url) AS BLOB))+length(CAST(json_quote(current_node) AS BLOB))),0) FROM conversations WHERE id=?1",
+            [canonical_id], |r| r.get(0),
+        )?;
+        let encoded = encoded.saturating_add(tx.query_row(
+            "SELECT coalesce(sum(4*length(CAST(json_quote(source_node_id) AS BLOB))+length(CAST(json_quote(source_message_id) AS BLOB))+2*length(CAST(json_quote(message_id) AS BLOB))+length(CAST(json_quote(parent_id) AS BLOB))+length(CAST(json_quote(role) AS BLOB))+coalesce(length(CAST(author_json AS BLOB)),4)+coalesce(length(CAST(create_time_json AS BLOB)),4)+2*length(CAST(parts_json AS BLOB))+48*json_array_length(parts_json)+length(CAST(json_quote(content) AS BLOB))+512),0)+coalesce(max(length(CAST(json_quote(source_node_id) AS BLOB))),0) FROM graph_nodes WHERE conversation_id=?1",
+            [canonical_id], |r| r.get::<_, i64>(0),
+        )?).saturating_add(512);
+        if encoded.max(0) as usize > RESPONSE_LIMIT {
             return Err(Error::ReadBudgetExceeded {
                 kind: "detail encoded bytes",
                 limit: RESPONSE_LIMIT,
@@ -473,6 +535,27 @@ impl Store {
         after: Option<&SearchKey>,
         expected_revision: Option<i64>,
     ) -> Result<SearchPageSnapshot> {
+        self.search_page_snapshot_filtered(raw_query, limit, after, expected_revision, false)
+    }
+    /// Chat-side search uses the same FTS ranking and bounded keyset walk as the
+    /// all-source search, with the provider predicate applied inside FTS results.
+    pub fn chat_search_page_snapshot(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<SearchPageSnapshot> {
+        self.search_page_snapshot_filtered(raw_query, limit, after, expected_revision, true)
+    }
+    fn search_page_snapshot_filtered(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        chat_only: bool,
+    ) -> Result<SearchPageSnapshot> {
         let terms: Vec<String> = raw_query
             .split_whitespace()
             .filter(|t| t.chars().any(char::is_alphanumeric))
@@ -500,12 +583,26 @@ impl Store {
                 after.map(|k| k.conversation_id.clone()).unwrap_or_default();
             let mut cursor_node = after.and_then(|k| k.node_id.clone());
             let mut scanned = 0usize;
-            let mut cache = std::collections::HashMap::<String, Value>::new();
+            let mut cache = std::collections::HashMap::<String, SearchTopology>::new();
             let mut total = 0usize;
             let mut total_bytes = 0usize;
             while hits.len() < limit.min(101) && scanned < 1024 {
                 let lim = (limit.min(101) - hits.len()).min(1024 - scanned) as i64;
-                let mut st=tx.prepare("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,snippet(message_fts,3,'','','…',12) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1 UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5")?;
+                let chat_message_filter = if chat_only {
+                    " AND f.conversation_id IN (SELECT id FROM conversations WHERE provider IN ('chatgpt','paseo-chatgpt'))"
+                } else {
+                    ""
+                };
+                let chat_title_filter = if chat_only {
+                    " AND c.provider IN ('chatgpt','paseo-chatgpt')"
+                } else {
+                    ""
+                };
+                // FTS counts tokens, not bytes: a single token may contain an
+                // entire long URL or pasted blob. Bound the excerpt separately
+                // while keeping the complete text in the authoritative store.
+                let sql = format!("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,substr(snippet(message_fts,3,'','','…',12),1,2048) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1{chat_message_filter} UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1{chat_title_filter}) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5");
+                let mut st = tx.prepare(&sql)?;
                 let mut prospective_bytes = total_bytes;
                 let rows = st
                     .query_map(
@@ -571,8 +668,10 @@ impl Store {
                                 limit: 100_000,
                             });
                         }
+                        // Search only needs graph identity and parent edges. Do not
+                        // hydrate or budget transcript parts/content/author payloads.
                         let bytes:i64=tx.query_row("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))+coalesce(length(CAST(url AS BLOB)),0)+coalesce(length(CAST(current_node AS BLOB)),0)),0) FROM conversations WHERE id=?1",[&id],|r|r.get(0))?;
-                        let bytes=bytes.saturating_add(tx.query_row("SELECT coalesce(sum(length(CAST(source_node_id AS BLOB))+coalesce(length(CAST(source_message_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+coalesce(length(CAST(parent_id AS BLOB)),0)+coalesce(length(CAST(role AS BLOB)),0)+coalesce(length(CAST(author_json AS BLOB)),0)+coalesce(length(CAST(create_time_json AS BLOB)),0)+length(CAST(parts_json AS BLOB))+length(CAST(content AS BLOB))),0) FROM graph_nodes WHERE conversation_id=?1",[&id],|r|r.get::<_,i64>(0))?);
+                        let bytes=bytes.saturating_add(tx.query_row("SELECT coalesce(sum(length(CAST(source_node_id AS BLOB))+coalesce(length(CAST(parent_id AS BLOB)),0)),0) FROM graph_nodes WHERE conversation_id=?1",[&id],|r|r.get::<_,i64>(0))?);
                         let graph_bytes = (bytes.max(0) as usize)
                             .saturating_mul(6)
                             .saturating_add((count.max(0) as usize).saturating_mul(512));
@@ -583,12 +682,11 @@ impl Store {
                                 limit: 8 * 1024 * 1024 - 64 * 1024,
                             });
                         }
-                        let g = read_normalized_conn(&tx, &id)?.unwrap_or(Value::Null);
+                        let g = read_search_topology_conn(&tx, &id)?.unwrap_or_default();
                         cache.insert(id.clone(), g.clone());
                         g
                     };
                     let leaf = if let Some(ref n) = node {
-                        let nodes = graph["nodes"].as_array().cloned().unwrap_or_default();
                         let mut frontier = vec![n.clone()];
                         let mut visited = std::collections::HashSet::new();
                         let mut leaves = Vec::new();
@@ -596,42 +694,30 @@ impl Store {
                             if !visited.insert(c.clone()) {
                                 continue;
                             }
-                            let children: Vec<String> = nodes
-                                .iter()
-                                .filter(|x| x["parent_id"].as_str() == Some(c.as_str()))
-                                .filter_map(|x| x["id"].as_str().map(str::to_owned))
-                                .collect();
+                            let children = graph.children.get(&c).cloned().unwrap_or_default();
                             if children.is_empty() {
                                 leaves.push(c)
                             } else {
                                 frontier.extend(children)
                             }
                         }
-                        let selected_leaf = graph["selected_node_id"].as_str().filter(|selected| {
-                            !nodes
-                                .iter()
-                                .any(|x| x["parent_id"].as_str() == Some(*selected))
-                                && {
-                                    let mut cur = Some(selected.to_string());
-                                    let mut seen = std::collections::HashSet::new();
-                                    let mut found = false;
-                                    while let Some(c) = cur {
-                                        if !seen.insert(c.clone()) {
-                                            break;
-                                        }
-                                        if c == *n {
-                                            found = true;
-                                            break;
-                                        }
-                                        cur = nodes
-                                            .iter()
-                                            .find(|x| x["id"].as_str() == Some(c.as_str()))
-                                            .and_then(|x| {
-                                                x["parent_id"].as_str().map(str::to_owned)
-                                            });
+                        let selected_leaf = graph.selected_node_id.as_deref().filter(|selected| {
+                            !graph.children.contains_key(*selected) && {
+                                let mut cur = Some(selected.to_string());
+                                let mut seen = std::collections::HashSet::new();
+                                let mut found = false;
+                                while let Some(c) = cur {
+                                    if !seen.insert(c.clone()) {
+                                        break;
                                     }
-                                    found
+                                    if c == *n {
+                                        found = true;
+                                        break;
+                                    }
+                                    cur = graph.parents.get(&c).cloned().flatten();
                                 }
+                                found
+                            }
                         });
                         selected_leaf
                             .map(str::to_owned)
@@ -642,10 +728,9 @@ impl Store {
                     if node.is_some() && leaf.is_none() {
                         continue;
                     }
-                    let selected = graph["thread_node_ids"].as_array().is_some_and(|xs| {
-                        node.as_ref()
-                            .is_some_and(|n| xs.iter().any(|x| x.as_str() == Some(n)))
-                    });
+                    let selected = node
+                        .as_ref()
+                        .is_some_and(|n| graph.selected_thread.contains(n));
                     let summary: Value=tx.query_row("SELECT json_object('id',id,'provider',provider,'account_scope',account_scope,'source_id',source_id,'title',title,'updated_at_ms',updated_at_ms) FROM conversations WHERE id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
                     hits.push(serde_json::json!({"conversation":summary,"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
                     if serde_json::to_vec(&hits)
@@ -692,6 +777,13 @@ impl Store {
     }
     pub fn rebuild_search_index(&self) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM message_fts", [])?;
+        tx.execute("INSERT INTO message_fts SELECT g.conversation_id,g.source_node_id,g.message_id,g.content FROM graph_nodes g WHERE g.role IS NOT NULL OR g.source_message_id IS NOT NULL", [])?;
+        tx.execute("DELETE FROM title_fts", [])?;
+        tx.execute(
+            "INSERT INTO title_fts SELECT id,title FROM conversations",
+            [],
+        )?;
         tx.execute("DELETE FROM normalized_fts", [])?;
         tx.execute("INSERT INTO normalized_fts(id,title,body) SELECT c.id,c.title,coalesce((SELECT group_concat(content,' ') FROM graph_nodes g WHERE g.conversation_id=c.id),'') FROM conversations c", [])?;
         tx.commit()?;
@@ -796,6 +888,76 @@ impl Store {
         })
     }
 }
+#[derive(Clone, Debug, Default)]
+struct SearchTopology {
+    parents: std::collections::HashMap<String, Option<String>>,
+    children: std::collections::HashMap<String, Vec<String>>,
+    selected_node_id: Option<String>,
+    selected_thread: std::collections::HashSet<String>,
+}
+
+/// Minimal graph projection used by search. This intentionally excludes all
+/// transcript and presentation fields so large local messages do not block hits.
+fn read_search_topology_conn(conn: &Connection, id: &str) -> Result<Option<SearchTopology>> {
+    let Some(current) = conn
+        .query_row(
+            "SELECT current_node FROM conversations WHERE id=?1",
+            [id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+
+    let mut topology = SearchTopology::default();
+    let mut statement = conn.prepare(
+        "SELECT source_node_id,parent_id FROM graph_nodes WHERE conversation_id=?1 ORDER BY source_node_id",
+    )?;
+    let rows = statement.query_map([id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (node, parent) = row?;
+        if let Some(parent_id) = &parent {
+            topology
+                .children
+                .entry(parent_id.clone())
+                .or_default()
+                .push(node.clone());
+        }
+        topology.parents.insert(node, parent);
+    }
+
+    topology.selected_node_id = current
+        .filter(|selected| topology.parents.contains_key(selected))
+        .or_else(|| {
+            topology
+                .parents
+                .keys()
+                .filter(|node| !topology.children.contains_key(*node))
+                .min()
+                .cloned()
+        });
+    let mut ancestry = Vec::new();
+    let mut cursor = topology.selected_node_id.clone();
+    while let Some(node) = cursor {
+        if ancestry.contains(&node) {
+            ancestry.clear();
+            break;
+        }
+        ancestry.push(node.clone());
+        cursor = topology
+            .parents
+            .get(&node)
+            .cloned()
+            .flatten()
+            .filter(|parent| topology.parents.contains_key(parent));
+    }
+    topology.selected_thread.extend(ancestry);
+    Ok(Some(topology))
+}
+
 fn read_normalized_conn(conn: &Connection, id: &str) -> Result<Option<Value>> {
     let row = conn.query_row("SELECT id,title,provider,account_scope,source_id,url,current_node,updated_at_ms FROM conversations WHERE id=?1", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<i64>>(7)?))).optional()?;
     let Some((id, title, provider, scope, source, url, current, updated)) = row else {
@@ -1119,7 +1281,7 @@ fn ingest_tx(tx: &Transaction<'_>, o: &Observation) -> Result<()> {
         rows
     };
     if accept {
-        tx.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id,url,current_node,last_source_updated_ms,ordering_payload,ordering_observed_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(provider,account_scope,source_id) DO UPDATE SET title=excluded.title,url=coalesce(excluded.url,conversations.url),current_node=excluded.current_node,last_source_updated_ms=coalesce(excluded.last_source_updated_ms,conversations.last_source_updated_ms),ordering_payload=excluded.ordering_payload,ordering_observed_ms=excluded.ordering_observed_ms",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node,source_ms,incoming_key,o.observed_ms])?;
+        tx.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id,url,current_node,last_source_updated_ms,ordering_payload,ordering_observed_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(provider,account_scope,source_id) DO UPDATE SET title=CASE WHEN excluded.title='' THEN conversations.title ELSE excluded.title END,url=coalesce(excluded.url,conversations.url),current_node=excluded.current_node,last_source_updated_ms=coalesce(excluded.last_source_updated_ms,conversations.last_source_updated_ms),ordering_payload=excluded.ordering_payload,ordering_observed_ms=excluded.ordering_observed_ms",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node,source_ms,incoming_key,o.observed_ms])?;
     } else {
         tx.execute("INSERT OR IGNORE INTO conversations(id,title,provider,account_scope,source_id,url,current_node) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node])?;
     }

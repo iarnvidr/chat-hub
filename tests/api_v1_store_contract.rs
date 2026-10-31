@@ -48,7 +48,7 @@ fn bounded_list_returns_summaries_even_when_detail_exceeds_budget() {
     let id = store
         .ingest_observation(&observation(
             "large-list",
-            "x".repeat(2 * 1024 * 1024).as_str(),
+            "x".repeat(5 * 1024 * 1024).as_str(),
         ))
         .unwrap();
     assert!(matches!(
@@ -107,19 +107,22 @@ fn bounded_unknown_time_keyset_does_not_restart_known_time_rows() {
 }
 
 #[test]
-fn bounded_search_preflights_large_source_graph_before_materializing_dto() {
+fn bounded_search_reads_topology_without_materializing_large_transcript() {
     let mut store = Store::in_memory().unwrap();
-    let text = format!("needle {}", "x".repeat(2 * 1024 * 1024));
-    store
+    let text = format!("needle {}", "x".repeat(5 * 1024 * 1024));
+    let id = store
         .ingest_observation(&observation("large-search", &text))
         .unwrap();
-    assert!(
-        matches!(
-            store.search_page_snapshot("needle", 2, None, None),
-            Err(Error::ReadBudgetExceeded { .. })
-        ),
-        "bounded search must reject oversized graph source before loading its full payload"
-    );
+    assert!(matches!(
+        store.detail_snapshot(&id),
+        Err(Error::ReadBudgetExceeded { .. })
+    ));
+    let page = store.search_page_snapshot("needle", 2, None, None).unwrap();
+    assert_eq!(page.hits.len(), 1);
+    assert_eq!(page.hits[0]["node_id"], "a");
+    assert_eq!(page.hits[0]["leaf_node_id"], "a");
+    assert_eq!(page.hits[0]["selected_branch"], true);
+    assert!(page.hits[0]["snippet"].as_str().unwrap().contains("needle"));
 }
 
 #[test]

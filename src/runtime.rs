@@ -286,6 +286,7 @@ mod publication_tests {
         fs::create_dir_all(&dir).unwrap();
         Config {
             capture_enabled: false,
+            capture_profile_scope: "provisional:default".into(),
             bind_addr: "127.0.0.1:41001".parse().unwrap(),
             proxy_addr: "127.0.0.1:41002".parse().unwrap(),
             bearer_token: "synthetic-publication-token".into(),

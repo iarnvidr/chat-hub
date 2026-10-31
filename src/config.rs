@@ -5,6 +5,14 @@ pub const APP_NAME: &str = "chat-hub";
 /// Must match `src-tauri/tauri.conf.json`'s application identifier.
 pub const APP_IDENTIFIER: &str = "io.github.iarnvidr.chat-hub";
 
+pub fn valid_capture_profile_scope(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope.len() <= 256
+        && scope
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'_' | b'.'))
+}
+
 /// Resolve Tauri's app-data directory from platform-specific base directories.
 /// Inputs are explicit to keep path selection testable without process-global env.
 pub fn app_data_dir_for(
@@ -48,6 +56,7 @@ pub fn default_data_dir() -> Result<PathBuf, String> {
 #[derive(Clone)]
 pub struct Config {
     pub capture_enabled: bool,
+    pub capture_profile_scope: String,
     pub bind_addr: SocketAddr,
     pub bearer_token: String,
     pub database_path: String,
@@ -59,6 +68,7 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("capture_enabled", &self.capture_enabled)
+            .field("capture_profile_scope", &self.capture_profile_scope)
             .field("bind_addr", &self.bind_addr)
             .field("bearer_token", &"[REDACTED]")
             .field("database_path", &self.database_path)
@@ -69,6 +79,22 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    pub fn capture_settings_from_env() -> Result<(bool, String), String> {
+        let enabled = match env::var("CHAT_HUB_CAPTURE_ENABLED").as_deref() {
+            Err(env::VarError::NotPresent) | Ok("false" | "0") => false,
+            Ok("true" | "1") => true,
+            _ => {
+                return Err("invalid CHAT_HUB_CAPTURE_ENABLED; expected true, false, 1 or 0".into())
+            }
+        };
+        let scope = env::var("CHAT_HUB_CAPTURE_PROFILE_SCOPE")
+            .unwrap_or_else(|_| "provisional:default".into());
+        if !valid_capture_profile_scope(&scope) {
+            return Err("invalid CHAT_HUB_CAPTURE_PROFILE_SCOPE".into());
+        }
+        Ok((enabled, scope))
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let bind_addr: SocketAddr = env::var("CHAT_HUB_BIND")
             .unwrap_or_else(|_| "127.0.0.1:0".into())
@@ -93,16 +119,10 @@ impl Config {
             .map(PathBuf::from)
             .map(Ok)
             .unwrap_or_else(default_data_dir)?;
+        let (capture_enabled, capture_profile_scope) = Self::capture_settings_from_env()?;
         Ok(Self {
-            capture_enabled: match env::var("CHAT_HUB_CAPTURE_ENABLED").as_deref() {
-                Err(env::VarError::NotPresent) | Ok("false" | "0") => false,
-                Ok("true" | "1") => true,
-                _ => {
-                    return Err(
-                        "invalid CHAT_HUB_CAPTURE_ENABLED; expected true, false, 1 or 0".into(),
-                    )
-                }
-            },
+            capture_enabled,
+            capture_profile_scope,
             bind_addr,
             bearer_token,
             database_path: env::var("CHAT_HUB_DATABASE").unwrap_or_else(|_| {
@@ -134,6 +154,7 @@ mod tests {
             "CHAT_HUB_CA_DIR",
             "CHAT_HUB_DATA_DIR",
             "CHAT_HUB_CAPTURE_ENABLED",
+            "CHAT_HUB_CAPTURE_PROFILE_SCOPE",
         ] {
             env::remove_var(key);
         }
@@ -145,6 +166,10 @@ mod tests {
         clear();
         env::set_var("CHAT_HUB_TOKEN", "synthetic-test");
         assert!(!Config::from_env().unwrap().capture_enabled);
+        assert_eq!(
+            Config::from_env().unwrap().capture_profile_scope,
+            "provisional:default"
+        );
         for (value, enabled) in [("true", true), ("1", true), ("false", false), ("0", false)] {
             env::set_var("CHAT_HUB_CAPTURE_ENABLED", value);
             assert_eq!(Config::from_env().unwrap().capture_enabled, enabled);
@@ -161,9 +186,30 @@ mod tests {
     }
 
     #[test]
+    fn capture_profile_scope_is_explicit_validated_and_not_truncated() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear();
+        env::set_var("CHAT_HUB_TOKEN", "synthetic-test");
+        env::set_var("CHAT_HUB_CAPTURE_PROFILE_SCOPE", "profile:personal-1");
+        assert_eq!(
+            Config::from_env().unwrap().capture_profile_scope,
+            "profile:personal-1"
+        );
+        for value in ["", "profile/email", &"p".repeat(257)] {
+            env::set_var("CHAT_HUB_CAPTURE_PROFILE_SCOPE", value);
+            assert_eq!(
+                Config::from_env().unwrap_err(),
+                "invalid CHAT_HUB_CAPTURE_PROFILE_SCOPE"
+            );
+        }
+        clear();
+    }
+
+    #[test]
     fn debug_redacts_bearer_token_and_preserves_other_fields() {
         let c = Config {
             capture_enabled: false,
+            capture_profile_scope: "provisional:default".into(),
             bind_addr: "127.0.0.1:1".parse().unwrap(),
             bearer_token: "sensitive-marker".into(),
             database_path: "/tmp/db".into(),

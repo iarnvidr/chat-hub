@@ -198,8 +198,16 @@ fn build_router_capture(
     readiness: Option<ReadinessProvider>,
     capture: Option<CaptureStatusProvider>,
 ) -> Router {
+    let disk_reader = store
+        .connection()
+        .path()
+        .filter(|path| !path.is_empty() && *path != ":memory:")
+        .and_then(|path| Store::open_reader(path).ok());
+    let import_store = Arc::new(Mutex::new(store));
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: disk_reader
+            .map(|store| Arc::new(Mutex::new(store)))
+            .unwrap_or_else(|| import_store.clone()),
         token: Arc::from(token),
         db_ops: Arc::new(Semaphore::new(MAX_DB_OPS)),
         identity,
@@ -210,7 +218,7 @@ fn build_router_capture(
         state.token.clone(),
         Some(reader),
         state.db_ops.clone(),
-        Some(state.store.clone()),
+        Some(import_store),
         capture,
     );
     Router::new()

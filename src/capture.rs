@@ -11,6 +11,24 @@ pub fn normalize_chatgpt_document(
     parser: &str,
     observed_ms: i64,
 ) -> Result<Observation> {
+    normalize_chatgpt_document_in_scope(doc, parser, observed_ms, "provisional:default")
+}
+
+pub fn normalize_chatgpt_document_in_scope(
+    doc: &Value,
+    parser: &str,
+    observed_ms: i64,
+    account_scope: impl Into<String>,
+) -> Result<Observation> {
+    let account_scope = account_scope.into();
+    if account_scope.is_empty()
+        || account_scope.len() > 256
+        || !account_scope
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'_' | b'.'))
+    {
+        return Err(Error::Configuration("invalid capture profile scope".into()));
+    }
     let mapping = doc
         .get("mapping")
         .and_then(Value::as_object)
@@ -97,7 +115,7 @@ pub fn normalize_chatgpt_document(
         .collect();
     Ok(Observation {
         provider: "chatgpt".into(),
-        account_scope: "provisional:default".into(),
+        account_scope,
         source_id: source_id.into(),
         title: doc["title"].as_str().unwrap_or("").into(),
         url: Some(format!("https://chatgpt.com/c/{encoded}")),

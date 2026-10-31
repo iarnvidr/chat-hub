@@ -28,7 +28,7 @@ class ProviderDenialContract(unittest.TestCase):
         result = subprocess.run(["node", "-e", probe], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("pub fn e2e_result", source)
-        self.assertIn('get_webview_window("provider")', source)
+        self.assertIn('app.get_webview("provider")', source)
         self.assertIn('window_policy::is_provider_origin(u.scheme()', source)
         self.assertIn('provider webview readiness timed out', source)
         self.assertIn('"readiness":readiness', source)

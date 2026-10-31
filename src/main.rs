@@ -39,6 +39,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(())
         }
+        Some("restore") => {
+            let source = args
+                .next()
+                .ok_or("usage: chat-hub restore <backup.sqlite3>")?;
+            if args.next().is_some() {
+                return Err("usage: chat-hub restore <backup.sqlite3>".into());
+            }
+            let c = Config::from_env()?;
+            if c.database_path == ":memory:" {
+                return Err("restore requires a file-backed library".into());
+            }
+            if let Some(parent) = std::path::Path::new(&c.database_path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| "unable to create library directory")?;
+            }
+            let mut store = chat_hub::store::Store::open(&c.database_path)
+                .map_err(|_| "unable to open restore destination")?;
+            let receipt = store.restore_from(source)?;
+            println!("{{\"operation\":\"restore\",\"schema_version\":{},\"library_revision\":{},\"conversation_count\":{}}}", receipt.schema_version, receipt.library_revision, receipt.conversation_count);
+            Ok(())
+        }
         Some(command @ ("backup" | "export-json")) => {
             let usage = if command == "backup" {
                 "usage: chat-hub backup <destination>"

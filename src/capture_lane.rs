@@ -1,10 +1,10 @@
-//! Bounded capture accumulator. Inputs are UTF-8 safely truncated to documented
-//! limits: profile scope 256 bytes, method 32 bytes, path 4096 bytes.
+//! Bounded capture accumulator. Context identifiers are validated; method and
+//! path are UTF-8 safely truncated to their documented limits.
 use crate::proxy::CaptureEvent;
 use std::{
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -24,13 +24,85 @@ pub enum CaptureState {
     Dropped,
     UnsupportedEncoding,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct CaptureContext {
     pub profile_scope: String,
     pub observed_unix_millis: u128,
     pub correlation: u64,
     pub method: String,
     pub path: String,
+    pub(crate) request_body: Option<Arc<Mutex<RequestBodyCapture>>>,
+}
+
+pub(crate) struct RequestBodyCapture {
+    body: Vec<u8>,
+    limit: usize,
+    state: RequestBodyState,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestBodyState {
+    Recording,
+    Complete,
+    Invalid,
+}
+
+impl RequestBodyCapture {
+    pub(crate) fn new(permit: tokio::sync::OwnedSemaphorePermit, limit: usize) -> Self {
+        Self {
+            body: Vec::new(),
+            limit,
+            state: RequestBodyState::Recording,
+            _permit: permit,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, bytes: &[u8]) {
+        if self.state != RequestBodyState::Recording {
+            return;
+        }
+        if self
+            .body
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|length| length > self.limit)
+        {
+            self.body.clear();
+            self.state = RequestBodyState::Invalid;
+            return;
+        }
+        self.body.extend_from_slice(bytes);
+    }
+
+    pub(crate) fn complete(&mut self) {
+        if self.state == RequestBodyState::Recording {
+            self.state = RequestBodyState::Complete;
+        }
+    }
+
+    pub(crate) fn interrupt(&mut self) {
+        self.body.clear();
+        self.state = RequestBodyState::Invalid;
+    }
+
+    pub(crate) fn body(&self) -> Option<&[u8]> {
+        (self.state == RequestBodyState::Complete).then_some(self.body.as_slice())
+    }
+}
+
+impl std::fmt::Debug for CaptureContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureContext")
+            .field("profile_scope", &self.profile_scope)
+            .field("observed_unix_millis", &self.observed_unix_millis)
+            .field("correlation", &self.correlation)
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("has_request_body", &self.request_body.is_some())
+            .finish()
+    }
 }
 pub(crate) fn bounded(s: &str, max: usize) -> String {
     let mut end = max.min(s.len());
@@ -46,8 +118,15 @@ impl CaptureContext {
         method: impl AsRef<str>,
         path: impl AsRef<str>,
     ) -> Self {
+        let profile_scope = profile_scope.as_ref();
         Self {
-            profile_scope: bounded(profile_scope.as_ref(), PROFILE_MAX),
+            // Scope identifiers are keys. Truncating them could collapse two
+            // profiles into one identity, so reject overlong values downstream.
+            profile_scope: if profile_scope.len() <= PROFILE_MAX {
+                profile_scope.to_owned()
+            } else {
+                String::new()
+            },
             observed_unix_millis: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -55,6 +134,7 @@ impl CaptureContext {
             correlation: NEXT_CORRELATION.fetch_add(1, Ordering::Relaxed),
             method: bounded(method.as_ref(), METHOD_MAX),
             path: bounded(path.as_ref(), PATH_MAX),
+            request_body: None,
         }
     }
     pub fn provisional(method: impl AsRef<str>, path: impl AsRef<str>) -> Self {
@@ -541,6 +621,27 @@ mod tests {
             CONTENT_ENCODING_MAX
         );
         assert_eq!(obs.try_recv().unwrap().state, CaptureState::Dropped);
+    }
+    #[test]
+    fn request_body_capture_is_bounded_complete_only_and_never_debug_prints_content() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let capture = Arc::new(Mutex::new(RequestBodyCapture::new(permit, 4)));
+        capture.lock().unwrap().observe(b"secret");
+        let mut context = ctx();
+        context.request_body = Some(capture.clone());
+        assert!(!format!("{context:?}").contains("secret"));
+        capture.lock().unwrap().complete();
+        assert_eq!(capture.lock().unwrap().body(), None);
+        drop(context);
+        drop(capture);
+
+        let permit = slots.try_acquire_owned().unwrap();
+        let bounded = Arc::new(Mutex::new(RequestBodyCapture::new(permit, 8)));
+        bounded.lock().unwrap().observe(b"request");
+        assert_eq!(bounded.lock().unwrap().body(), None);
+        bounded.lock().unwrap().complete();
+        assert_eq!(bounded.lock().unwrap().body(), Some(b"request".as_slice()));
     }
     #[tokio::test]
     async fn limits_must_be_nonzero() {

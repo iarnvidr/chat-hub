@@ -480,6 +480,8 @@ name = "chat-hub"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",

@@ -1,11 +1,13 @@
-use chat_hub::{config::APP_NAME, proxy::ProxyConfig};
+use chat_hub::{
+    config::{Config, APP_NAME},
+    proxy::ProxyConfig,
+};
 use serde::Serialize;
-use std::{
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+#[cfg(feature = "native-smoke")]
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
 };
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -15,18 +17,16 @@ mod desktop_archive;
 mod desktop_runtime;
 #[cfg(feature = "native-smoke")]
 mod e2e_protocol;
+mod paseo_history;
 mod service_health;
 use service_health::healthy_response;
+mod provider_view;
+use provider_view::ProviderViewState;
 mod window_policy;
 use window_policy::MainWindowOwnership;
 #[cfg(target_os = "macos")]
 mod trust_mac;
 
-#[cfg(target_os = "macos")]
-struct ProviderProxy {
-    url: String,
-    ca_der: Vec<u8>,
-}
 #[derive(Clone)]
 struct AppState {
     updater: Arc<Mutex<UpdateStatus>>,
@@ -166,7 +166,14 @@ mod e2e {
                 }
             }
             "provider_denial" => {
-                let w = app.get_webview_window("provider");
+                let Some(main) = app.get_webview("main") else {
+                    return json!({"ok":false,"error":"main window missing"});
+                };
+                let provider_state = app.state::<crate::ProviderViewState>();
+                if let Err(error) = provider_state.set_smoke_view(&main) {
+                    return json!({"ok":false,"error":format!("provider fixture view unavailable: {error}")});
+                }
+                let w = app.get_webview("provider");
                 let Some(w) = w else {
                     return json!({"ok":false,"error":"provider webview missing"});
                 };
@@ -182,7 +189,7 @@ mod e2e {
                 let operation_deadline = std::time::Instant::now() + Duration::from_secs(28);
                 let ready_deadline =
                     operation_deadline.min(std::time::Instant::now() + Duration::from_secs(10));
-                let mut readiness = json!({"href":null,"readyState":null,"windowLabel":w.label()});
+                let mut readiness = json!({"href":null,"readyState":null,"title":null,"bodyTextLength":null,"windowLabel":w.label()});
                 let mut readiness_polls = 0u64;
                 loop {
                     readiness_polls += 1;
@@ -193,7 +200,7 @@ mod e2e {
                         json!({"polls":readiness_polls,"href":readiness["href"],"readyState":readiness["readyState"]}),
                     );
                     let (tx, rx) = std::sync::mpsc::channel();
-                    if w.eval_with_callback("JSON.stringify({href:location.href,readyState:document.readyState,label:window.__TAURI_INTERNALS__?'tauri':'no-tauri'})", move |v| { let _ = tx.send(v); }).is_ok() {
+                    if w.eval_with_callback("JSON.stringify({href:location.href,readyState:document.readyState,title:document.title,bodyTextLength:(document.body?.innerText||'').length,label:window.__TAURI_INTERNALS__?'tauri':'no-tauri'})", move |v| { let _ = tx.send(v); }).is_ok() {
                         if let Ok(Ok(value)) = rx.recv_timeout(Duration::from_secs(1)).map(|v| serde_json::from_str::<Value>(&v)) {
                             if let Some(parsed) = value.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
                                 readiness = parsed;
@@ -212,7 +219,7 @@ mod e2e {
                     d,
                     id,
                     "provider_probe_started",
-                    json!({"href":readiness["href"],"readyState":readiness["readyState"]}),
+                    json!({"href":readiness["href"],"readyState":readiness["readyState"],"title":readiness["title"],"bodyTextLength":readiness["bodyTextLength"]}),
                 );
                 let nonce = format!(
                     "{}-{}",
@@ -264,7 +271,7 @@ mod e2e {
                                 }
                                 if result["attempted"].as_bool() == Some(true) {
                                     let denied = result["denied"].as_bool() == Some(true);
-                                    return json!({"ok":denied,"denied":denied,"category":result["error"].as_str().unwrap_or("")});
+                                    return json!({"ok":denied,"denied":denied,"category":result["error"].as_str().unwrap_or(""),"readiness":readiness});
                                 }
                             }
                         }
@@ -315,11 +322,11 @@ mod e2e {
                 }
             }
             "state" => {
-                let window = app.get_webview_window("main");
+                let window = app.get_webview("main").map(|webview| webview.window());
                 json!({"ok":true,"process_id":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"executable_path":std::env::current_exe().ok().map(|p|p.to_string_lossy().into_owned()),"window_visible":window.and_then(|w|w.is_visible().ok()).unwrap_or(false)})
             }
             "eval" => {
-                let w = app.get_webview_window("main");
+                let w = app.get_webview("main");
                 let Some(w) = w else {
                     return json!({"ok":false,"error":"main webview missing"});
                 };
@@ -349,7 +356,7 @@ mod e2e {
             .map_err(|e| e.to_string())
     }
 }
-fn authorize_local_main(window: &tauri::WebviewWindow) -> Result<(), String> {
+fn authorize_local_main(window: &tauri::Webview) -> Result<(), String> {
     if window.label() != "main" {
         return Err("privileged command is restricted to the main application window".into());
     }
@@ -366,17 +373,29 @@ fn authorize_local_main(window: &tauri::WebviewWindow) -> Result<(), String> {
 
 #[tauri::command]
 async fn list_conversations(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     s: State<'_, AppState>,
     query: String,
     cursor: Option<String>,
+    source: Option<String>,
 ) -> Result<desktop_api::Page, String> {
     authorize_local_main(&window)?;
-    desktop_api::list(&s.api, &s.token, &query, cursor.as_deref()).await
+    match source.as_deref() {
+        None | Some("all") | Some("chatgpt") => {}
+        _ => return Err("invalid_source".into()),
+    }
+    desktop_api::list_in_source(
+        &s.api,
+        &s.token,
+        &query,
+        cursor.as_deref(),
+        source.as_deref(),
+    )
+    .await
 }
 #[tauri::command]
 async fn get_conversation(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     s: State<'_, AppState>,
     id: String,
     leaf_node_id: Option<String>,
@@ -386,7 +405,7 @@ async fn get_conversation(
 }
 #[tauri::command]
 async fn import_chatgpt_export(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     app: tauri::AppHandle,
     s: State<'_, AppState>,
 ) -> Result<desktop_api::ImportResult, String> {
@@ -449,7 +468,7 @@ struct ArchiveReceipt {
 
 #[tauri::command]
 async fn backup_library(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     app: tauri::AppHandle,
     s: State<'_, AppState>,
 ) -> Result<ArchiveReceipt, String> {
@@ -459,12 +478,90 @@ async fn backup_library(
 
 #[tauri::command]
 async fn export_library_json(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     app: tauri::AppHandle,
     s: State<'_, AppState>,
 ) -> Result<ArchiveReceipt, String> {
     authorize_local_main(&window)?;
     save_library_archive(app, s, "json").await
+}
+
+#[derive(Serialize)]
+struct DesktopRestoreReceipt {
+    cancelled: bool,
+    conversation_count: u64,
+}
+
+#[tauri::command]
+async fn restore_library_backup(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    s: State<'_, AppState>,
+) -> Result<DesktopRestoreReceipt, String> {
+    authorize_local_main(&window)?;
+    let _permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .add_filter("Chat Hub SQLite backup", &["sqlite3", "db"])
+        .pick_file(move |file| {
+            let _ = tx.send(file);
+        });
+    let Some(file) = rx.await.map_err(|_| "file picker unavailable")? else {
+        return Ok(DesktopRestoreReceipt {
+            cancelled: true,
+            conversation_count: 0,
+        });
+    };
+    let source = file.into_path().map_err(|_| "invalid_backup")?;
+    let metadata = std::fs::symlink_metadata(&source).map_err(|_| "invalid_backup")?;
+    if !metadata.file_type().is_file() {
+        return Err("invalid_backup".into());
+    }
+    let database_path = {
+        let guard = s
+            .runtime
+            .lock()
+            .map_err(|_| "library_unavailable".to_string())?;
+        guard
+            .as_ref()
+            .ok_or_else(|| "library_unavailable".to_string())?
+            .database_path
+            .clone()
+    };
+    let source = std::fs::canonicalize(source).map_err(|_| "invalid_backup")?;
+    let destination = database_path.clone();
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        chat_hub::archive::prepare_restore(&source, &destination).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "restore_failed")??;
+    let conversation_count = prepared.receipt().conversation_count;
+
+    let runtime = s
+        .runtime
+        .lock()
+        .map_err(|_| "library_unavailable".to_string())?
+        .take()
+        .ok_or_else(|| "library_unavailable".to_string())?;
+    runtime.shutdown_for_restore().await?;
+    let commit = tauri::async_runtime::spawn_blocking(move || prepared.commit())
+        .await
+        .map_err(|_| "restore_interrupted".to_string())?;
+    if let Err(chat_hub::error::Error::RestoreRecovery { details }) = &commit {
+        return Err(format!("restore_recovery_required:{details}"));
+    }
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        handle.request_restart();
+    });
+    commit.map_err(|_| "restore_failed".to_string())?;
+    Ok(DesktopRestoreReceipt {
+        cancelled: false,
+        conversation_count,
+    })
 }
 
 async fn save_library_archive(
@@ -558,7 +655,7 @@ async fn save_library_archive(
 
 #[tauri::command]
 async fn service_health(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     s: State<'_, AppState>,
 ) -> Result<ServiceHealth, String> {
     authorize_local_main(&window)?;
@@ -580,30 +677,31 @@ async fn service_health(
     if !healthy_response(status, &body) {
         return Err("health check unavailable".into());
     }
-    Ok(ServiceHealth { healthy: true })
+    Ok(ServiceHealth {
+        healthy: true,
+        capture: body.get("capture").cloned(),
+    })
 }
 #[derive(Serialize)]
 struct ServiceHealth {
     healthy: bool,
+    capture: Option<serde_json::Value>,
 }
 
 #[tauri::command]
-fn update_status(
-    window: tauri::WebviewWindow,
-    s: State<'_, AppState>,
-) -> Result<UpdateStatus, String> {
+fn update_status(window: tauri::Webview, s: State<'_, AppState>) -> Result<UpdateStatus, String> {
     authorize_local_main(&window)?;
     Ok(s.updater.lock().map_err(|e| e.to_string())?.clone())
 }
 #[cfg(feature = "native-smoke")]
 #[tauri::command]
-fn e2e_result(window: tauri::WebviewWindow, id: String, value: String) -> Result<(), String> {
+fn e2e_result(window: tauri::Webview, id: String, value: String) -> Result<(), String> {
     authorize_local_main(&window)?;
     e2e::e2e_result(id, value)
 }
 #[tauri::command]
 fn service_info(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     s: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     authorize_local_main(&window)?;
@@ -611,9 +709,66 @@ fn service_info(
         serde_json::json!({"service":APP_NAME,"version":env!("CARGO_PKG_VERSION"),"api":s.api,"proxy":s.proxy,"process_id":std::process::id(),"executable":std::env::current_exe().ok()}),
     )
 }
+
+#[tauri::command]
+fn set_provider_view(
+    window: tauri::Webview,
+    state: State<'_, ProviderViewState>,
+    visible: bool,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    reload: bool,
+) -> Result<provider_view::ProviderViewStatus, String> {
+    authorize_local_main(&window)?;
+    state.set_view(visible, x, y, width, height, reload)
+}
+
+#[tauri::command]
+fn open_provider_conversation(
+    window: tauri::Webview,
+    state: State<'_, ProviderViewState>,
+    conversation_id: Option<String>,
+) -> Result<(), String> {
+    authorize_local_main(&window)?;
+    state.open_conversation(conversation_id.as_deref())
+}
+
+#[tauri::command]
+fn sync_paseo_history(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    history: State<'_, paseo_history::PaseoHistoryState>,
+) -> Result<paseo_history::PaseoHistoryStatus, String> {
+    authorize_local_main(&window)?;
+    if state.shutdown_started.load(Ordering::Acquire)
+        || state.shutdown_finished.load(Ordering::Acquire)
+        || state
+            .runtime
+            .lock()
+            .map_err(|_| "service_unavailable")?
+            .is_none()
+    {
+        return Err("service_unavailable".into());
+    }
+    let permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    history.start(app, state.api.clone(), state.token.clone(), permit)
+}
+
+#[tauri::command]
+fn paseo_history_status(
+    window: tauri::Webview,
+    history: State<'_, paseo_history::PaseoHistoryState>,
+) -> Result<paseo_history::PaseoHistoryStatus, String> {
+    authorize_local_main(&window)?;
+    history.snapshot()
+}
+
 #[tauri::command]
 async fn check_for_updates(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UpdateStatus, String> {
@@ -700,7 +855,7 @@ fn updater_builder(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updat
 }
 #[tauri::command]
 async fn install_update(
-    window: tauri::WebviewWindow,
+    window: tauri::Webview,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -755,6 +910,10 @@ async fn install_update(
     app.restart();
 }
 fn main() {
+    if let Err(error) = chat_hub::proxy::install_crypto_provider() {
+        eprintln!("desktop TLS provider initialization failed: {error}");
+        return;
+    }
     crash_diagnostics::install();
     let updater_builder = tauri_plugin_updater::Builder::new();
     let builder = tauri::Builder::default()
@@ -784,6 +943,8 @@ fn main() {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
         let ca = dir.join("ca");
+        let (capture_enabled, _) =
+            Config::capture_settings_from_env().map_err(std::io::Error::other)?;
         let mut cfg = ProxyConfig::loopback(&ca);
         #[cfg(feature = "native-smoke")]
         if smoke() {
@@ -794,6 +955,13 @@ fn main() {
                 cfg.test_roots = Some(PathBuf::from(roots));
             }
         }
+        // The isolated smoke may route its provider view through its local fixture
+        // without enabling message retention. Production only proxies when the
+        // user explicitly enabled capture.
+        let provider_proxy_enabled = capture_enabled || (smoke() && cfg.test_upstream.is_some());
+        let provider_direct_smoke_enabled = cfg!(feature = "native-smoke")
+            && smoke()
+            && std::env::var("MUNINN_PROVIDER_DIRECT_SMOKE").as_deref() == Ok("1");
         let runtime = tauri::async_runtime::block_on(desktop_runtime::start(&dir, cfg))
             .map_err(std::io::Error::other)?;
         let api = runtime.api.clone();
@@ -826,6 +994,7 @@ fn main() {
             #[cfg(all(feature = "native-smoke", debug_assertions))]
             smoke_data_dir: dir.clone(),
         });
+        app.manage(paseo_history::PaseoHistoryState::new(dir.clone()));
         #[cfg(feature = "native-smoke")]
         e2e::start(app.handle().clone());
         // Disable Tauri's automatic window creation: the configured main window
@@ -870,27 +1039,25 @@ fn main() {
         // Registration follows successful construction only; JS cannot create or
         // impersonate this native process-local ownership token.
         main_ownership.register_after_build();
+        let proxy_url = format!("http://{proxy}");
+        let ca_der = chat_hub::ca::Ca::load_or_create(&ca_dir)
+            .and_then(|ca| ca.cert_der())
+            .map_err(std::io::Error::other)?;
+        let provider_webview = ProviderViewState::attach(
+            app.handle(),
+            &main,
+            &proxy_url,
+            provider_proxy_enabled,
+            provider_direct_smoke_enabled,
+        )
+        .map_err(std::io::Error::other)?;
         #[cfg(target_os = "macos")]
-        {
-            let proxy_addr = proxy.clone();
-            let proxy_url = format!("http://{proxy_addr}");
-            let ca_der = chat_hub::ca::Ca::load_or_create(&ca_dir)
-                .and_then(|ca| ca.cert_der())
-                .map_err(std::io::Error::other)?;
-            let provider = tauri::WebviewWindowBuilder::new(
-                app,
-                "provider",
-                tauri::WebviewUrl::External(
-                    "https://chatgpt.com"
-                        .parse()
-                        .map_err(std::io::Error::other)?,
-                ),
-            )
-            .title("Provider")
-            .proxy_url(proxy_url.parse().map_err(std::io::Error::other)?)
-            .build()?;
-            crate::trust_mac::prepare(&ca_der, &provider);
+        if provider_proxy_enabled {
+            // Install the app-scoped certificate trust callback before any
+            // provider navigation can begin.
+            crate::trust_mac::prepare(&ca_der, &provider_webview);
         }
+        let _ = provider_webview;
         Ok(())
     });
     #[cfg(feature = "native-smoke")]
@@ -902,8 +1069,13 @@ fn main() {
             import_chatgpt_export,
             backup_library,
             export_library_json,
+            restore_library_backup,
             service_health,
             service_info,
+            set_provider_view,
+            open_provider_conversation,
+            sync_paseo_history,
+            paseo_history_status,
             check_for_updates,
             install_update,
             e2e_result
@@ -912,6 +1084,7 @@ fn main() {
         .map(|app| {
             app.run(|app, event| {
                 if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                    app.state::<paseo_history::PaseoHistoryState>().cancel();
                     let state = app.state::<AppState>();
                     if state.shutdown_finished.load(Ordering::Acquire) {
                         return;
@@ -942,8 +1115,13 @@ fn main() {
             import_chatgpt_export,
             backup_library,
             export_library_json,
+            restore_library_backup,
             service_health,
             service_info,
+            set_provider_view,
+            open_provider_conversation,
+            sync_paseo_history,
+            paseo_history_status,
             check_for_updates,
             install_update
         ])
@@ -951,6 +1129,7 @@ fn main() {
         .map(|app| {
             app.run(|app, event| {
                 if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                    app.state::<paseo_history::PaseoHistoryState>().cancel();
                     let state = app.state::<AppState>();
                     if state.shutdown_finished.load(Ordering::Acquire) {
                         return;

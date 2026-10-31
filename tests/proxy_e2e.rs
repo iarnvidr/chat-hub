@@ -38,6 +38,21 @@ async fn connect_mitm_forwards_tls_response_and_emits_capture() {
 }
 
 async fn exercise_connect_mitm() {
+    proxy::install_crypto_provider().expect("select Ring before any Rustls use");
+    let installed = rustls::crypto::CryptoProvider::get_default().expect("Ring is installed");
+    let expected = rustls::crypto::ring::default_provider();
+    assert_eq!(
+        installed
+            .cipher_suites
+            .iter()
+            .map(|suite| suite.suite())
+            .collect::<Vec<_>>(),
+        expected
+            .cipher_suites
+            .iter()
+            .map(|suite| suite.suite())
+            .collect::<Vec<_>>()
+    );
     let dir = common::temp_dir("chat-hub-e2e");
     let upstream_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let upstream_params = CertificateParams::new(vec!["chatgpt.com".into()]).unwrap();
