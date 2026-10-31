@@ -359,8 +359,11 @@ func (u *uploader) upload(ctx context.Context, name string, retention int, archi
 		return errors.New("artifact service rejected creation")
 	}
 	blobURL, err := url.Parse(created.SignedUploadURL)
-	if err != nil || blobURL.Scheme != "https" || blobURL.Host == "" || blobURL.User != nil {
-		return errors.New("artifact service returned an invalid storage URL")
+	if err != nil {
+		return errors.New("artifact service returned a malformed storage URL")
+	}
+	if blobURL.Scheme != "https" || blobURL.Host == "" || blobURL.User != nil {
+		return fmt.Errorf("artifact service returned an invalid storage URL (scheme=%q host-present=%t userinfo-present=%t length=%d)", blobURL.Scheme, blobURL.Host != "", blobURL.User != nil, len(created.SignedUploadURL))
 	}
 	hash, err := u.uploadBlocks(ctx, blobURL, archive, size)
 	if err != nil {
