@@ -7,6 +7,7 @@ const providerButton = document.getElementById('show-chatgpt');
 let showing = false, sequence = 0, queue = Promise.resolve(), poll, resize, connectionPoll, locationPoll, connectDeadline = 0;
 let activeTarget, current = {conversationId: null, title: 'New conversation', localId: null};
 let reportedConversationId = null;
+let settingsOpen = false;
 
 function native() {
   const invoke = window.ChatHub?.invoke;
@@ -20,7 +21,7 @@ async function update(reload = false) {
   const rect = host.getBoundingClientRect();
   const token = sequence;
   const result = await native()('set_provider_view', {
-    visible: showing,
+    visible: showing && !settingsOpen,
     x: Math.max(0, rect.x), y: Math.max(0, rect.y),
     width: Math.max(1, rect.width), height: Math.max(1, rect.height), reload,
   });
@@ -189,3 +190,7 @@ new ResizeObserver(() => {
   clearTimeout(resize);
   if (showing) resize = setTimeout(() => update().catch(() => {}), 80);
 }).observe(host);
+window.addEventListener('chat-hub:workspace-settings', event => {
+  settingsOpen = !!event.detail?.open;
+  if (showing) queue = queue.catch(() => {}).then(() => update()).catch(() => {});
+});

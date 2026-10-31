@@ -92,6 +92,19 @@ test('failed provider creation offers recovery and keeps the library reachable',
   assert.equal(ui.element('library-reader').hidden, false);
 });
 
+test('Settings hides the native chat and restores it without navigating or losing the draft', async () => {
+  const calls = [], ui = boot(async (command, args) => {
+    calls.push({command, args});
+    return {state: args?.visible ? 'ready' : 'hidden'};
+  });
+  ui.element('show-chatgpt').click(); await ui.flush();
+  ui.dispatch('chat-hub:workspace-settings', {open: true}); await ui.flush();
+  assert.equal(calls.filter(c => c.command === 'set_provider_view').at(-1).args.visible, false);
+  ui.dispatch('chat-hub:workspace-settings', {open: false}); await ui.flush();
+  assert.equal(calls.filter(c => c.command === 'set_provider_view').at(-1).args.visible, true);
+  assert.equal(calls.filter(c => c.command === 'open_provider_conversation').length, 1);
+});
+
 test('Connect ChatGPT opens account sign-in without creating a conversation tab', async () => {
   const calls = [], ui = boot(async (command, args) => {
     calls.push({command, args});

@@ -5,7 +5,7 @@ import {createConversationTabs, findCapturedChatRecord} from './conversation-tab
 import {chatgptConversationId} from './continuation.js';
 const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';const adapter=fixture?fixtureAdapter():{async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value});},async getConversation(id,leafNodeId){return invoke('get_conversation',leafNodeId!==undefined?{id,leafNodeId}:{id});},async importChatgptExport(){return invoke('import_chatgpt_export');}};$('fixture-banner').hidden=!fixture;let selected=null,conversation=null,items=[],timer,queryToken=0,readerToken=0,cursor=null,revision=null,queryValue='',cursorRetry=false,lastConversationButton=null,liveDraftSequence=0;const errText=e=>String(e?.message||e);const safeError=code=>({invalid_request:'The request was invalid.',invalid_cursor:'The page cursor is invalid.',stale_cursor:'The library changed; restart the search.',library_changed:'The library changed; restart the search.',unauthorized:'Sign in to the desktop service.',not_found:'The requested conversation was not found.',service_unavailable:'The desktop service is unavailable.',busy:'The desktop service is busy.',response_too_large:'This conversation is too large to display (8 MiB response limit). No content has been truncated.'}[code]||'The desktop service returned an error.');function showError(s){$('list-state').textContent=s;}
 function providerLabel(provider) {
-  return {'paseo-chatgpt':'ChatGPT · saved in Paseo', 'paseo-codex_local':'Codex local · saved in Paseo', 'paseo-codex_cloud':'Codex cloud · saved in Paseo'}[provider] || provider || 'Unknown provider';
+  return {'chatgpt':'ChatGPT', 'paseo-chatgpt':'ChatGPT · imported', 'paseo-codex_local':'Codex local · imported', 'paseo-codex_cloud':'Codex cloud · imported'}[provider] || provider || 'Unknown provider';
 }
 function drawList() {
   const box = $('conversation-list');
@@ -19,6 +19,7 @@ function drawList() {
     const title = document.createElement('strong'), metadata = document.createElement('span');
     title.textContent = c.title ?? 'Untitled conversation';
     metadata.textContent = providerLabel(c.provider);
+    metadata.hidden = $('history-source').value === 'chatgpt' && !c.search_hit;
     if (!c.provider?.startsWith('paseo-') && Number.isFinite(c.message_count)) metadata.textContent += ` · ${c.message_count} messages`;
     button.append(title, metadata);
     if (c.search_hit) {
