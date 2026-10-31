@@ -86,6 +86,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chat-hub"
           ditto -x -k artifacts/Chat_Hub_*.zip "$RUNNER_TEMP/chat-hub"
           cp artifacts/Chat_Hub_*.dmg artifacts/release-input.json "$RUNNER_TEMP/chat-hub/"
+      - name: Verify accepted app signature and retain evidence
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/chat-hub/verify-macos.txt"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/chat-hub/Chat Hub.app" > "$evidence" 2>&1
+          printf 'PASS: accepted app signature verified for version %s at %s.\n' "$INPUT_VERSION" "$GITHUB_SHA" >> "$evidence"
       - name: Create updater archive, sign and verify
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
