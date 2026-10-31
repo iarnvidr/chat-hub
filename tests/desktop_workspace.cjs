@@ -83,6 +83,10 @@ const server = http.createServer((request, response) => {
     await page.waitForFunction(() => window.__calls.filter(([name]) => name === 'set_provider_view').at(-1)?.[1]?.visible === true);
     await page.locator('#show-library').click();
     await page.waitForFunction(() => window.__calls.filter(([name]) => name === 'set_provider_view').at(-1)?.[1]?.visible === false);
+    await page.locator('#workspace-sync-state').click();
+    await page.locator('#settings-page').waitFor({state: 'visible'});
+    await page.keyboard.press('Escape');
+    await page.locator('#settings-page').waitFor({state: 'hidden'});
     assert.deepEqual(pageErrors, []);
     console.log('PASS compact workspace geometry, settings back/Escape/focus, native provider show/hide');
   } finally {
