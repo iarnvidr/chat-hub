@@ -4,7 +4,15 @@
   const message = document.querySelector('[data-testid="update-message"]');
   const version = document.querySelector('[data-testid="app-version"]');
   if (!button || !message || !version) throw new Error('native UI test selectors missing');
-  if (!version.textContent.includes('Version')) throw new Error('version was not rendered');
+  const versionDeadline = Date.now() + 15000;
+  while (!version.textContent.includes('Version') && Date.now() < versionDeadline) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  if (!version.textContent.includes('Version')) throw new Error(`version was not rendered: ${JSON.stringify({
+    versionText: version.textContent, bridge: typeof window.ChatHub?.invoke,
+    health: document.getElementById('health')?.textContent,
+    status: document.getElementById('app-status')?.textContent,
+  })}`);
   button.click();
   const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {

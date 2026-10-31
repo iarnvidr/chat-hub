@@ -1,7 +1,90 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Chat Hub</title><link rel="stylesheet" href="./styles.css"></head>
-<body><header class="topbar"><a class="brand" href="#"><span class="mark">C</span> Chat Hub</a><span id="version" data-testid="app-version">Loading…</span></header>
-<div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
-<div class="workspace"><aside class="sidebar"><div class="section-title">WORKSPACE</div><div class="nav-item active">◫ <span>Conversations</span></div><div class="nav-item muted">◇ <span>Providers</span><small>Coming later</small></div><section class="health-card"><div class="section-title">LOCAL SERVICE</div><div id="health" aria-live="polite">Starting local service…</div><button id="retry-health" class="quiet" hidden>Retry connection</button></section><section class="update-card"><h2>Software updates</h2><p>Channel: Stable. Prerelease updates are unsupported; install previews manually.</p><div class="actions"><button id="check" data-testid="check-updates">Check for updates</button><button id="install" hidden>Update &amp; relaunch</button></div><div id="message" data-testid="update-message" role="status" aria-live="polite">Checking version…</div></section></aside>
-<main class="content"><section class="list-pane"><div class="pane-heading"><div><div class="eyebrow">YOUR LIBRARY</div><h1>Conversations</h1></div><button id="import" class="primary">Import export</button><button id="backup-library" type="button">Save library backup</button><button id="export-library-json" type="button">Export library as JSON</button></div><label class="search"><span aria-hidden="true">⌕</span><span class="sr-only">Search conversations</span><input id="search" type="search" placeholder="Search conversations…" autocomplete="off"></label><div id="list-state" class="subtle" role="status" aria-live="polite"></div><div id="conversation-list" class="conversation-list"></div><button id="load-more" type="button">Load more</button></section><section class="reader-pane"><div id="reader-empty" class="reader-empty"><div class="empty-icon">✳</div><h2>Choose a conversation</h2><p>Select an item to read its messages and branches.</p></div><div id="reader" hidden><div class="reader-head"><button id="back-to-library" type="button" aria-label="Back to library">Back to library</button><div><div id="provider" class="eyebrow"></div><h2 id="title"></h2></div><label class="branch-label">Branch<select id="branch"></select></label></div><div id="messages" class="messages"></div></div></section></main></div><div id="app-status" class="app-status" role="status" aria-live="polite"></div>
-<script type="module" src="./app.js"></script></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Chat Hub</title>
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./update-menu.css">
+  <link rel="stylesheet" href="./library-layout.css">
+  <link rel="stylesheet" href="./markdown.css">
+  <link rel="stylesheet" href="./overview.css">
+  <link rel="stylesheet" href="./library-items.css">
+  <link rel="stylesheet" href="./classified-terminal.css">
+</head>
+<body>
+  <div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
+  <div class="workspace">
+    <aside class="list-pane" aria-label="Conversation library">
+      <div class="sidebar-heading"><a class="brand" href="#">Chat Hub</a><button id="show-chatgpt" class="primary" type="button">New chat</button></div>
+      <label class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Search conversations</span><input id="search" type="search" placeholder="Search chats" autocomplete="off"></label>
+      <div class="source-toggle" role="group" aria-label="Conversation source"><button id="source-chat" type="button" aria-pressed="true" data-source="chatgpt">Chat</button><button id="source-codex" type="button" aria-pressed="false" data-source="codex">Codex</button></div>
+      <select id="history-source" aria-label="History source" hidden><option value="chatgpt" selected>Chat</option><option value="codex">Codex</option></select>
+      <div class="project-filter"><details id="project-disclosure" class="project-disclosure"><summary><span>Projects</span><span id="project-selection">All projects</span></summary><div id="project-options" role="group" aria-label="Filter by project"></div></details><select id="project-filter" aria-label="Filter by project" hidden><option value="">All projects</option></select><button id="edit-project-name" type="button" title="Rename selected project" aria-label="Rename selected project" disabled>…</button></div>
+      <label class="tag-filter"><span class="sr-only">Filter by tag</span><select id="tag-filter" aria-label="Filter by tag"><option value="">All tags</option></select></label>
+      <div id="list-state" class="subtle" role="status" aria-live="polite"></div>
+      <div class="list-scroll"><div id="conversation-list" class="conversation-list"></div><button id="load-more" type="button" hidden>Load more</button></div>
+      <footer class="sidebar-footer"><button id="show-settings" type="button"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 3-.5 2-2 1-2-.5-2 3 1.5 1.5v3L2.5 15l2 3 2-.5 2 1L9 21h4l.5-2.5 2-1 2 .5 2-3-1.5-2v-3L19.5 8l-2-3-2 .5-2-1L13 3Z"/><circle cx="11" cy="12" r="3"/></svg>Settings</button><button id="workspace-sync-state" type="button" aria-label="History sync details" aria-live="polite">Saved on this Mac</button></footer>
+    </aside>
+    <div id="library-shell" class="library-shell">
+      <div class="workspace-bar" data-workspace-content><button id="show-library" type="button" title="Show local library" aria-label="Show local library"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></button><button id="show-overview" type="button" aria-pressed="false">Overview</button><div id="conversation-tabs" role="tablist" aria-label="Open conversations" hidden></div></div>
+      <main class="content" data-workspace-content>
+        <section id="library-overview" tabindex="-1" hidden aria-labelledby="overview-title">
+          <header class="overview-heading"><div><h1 id="overview-title">Chat overview</h1><p id="overview-scope"></p></div><div class="actions"><button id="overview-back" type="button" hidden>← Overview</button><button id="overview-read-chat" type="button" hidden>Read chat</button></div></header>
+          <div id="overview-state" role="status" aria-live="polite"></div>
+          <div id="overview-stats" class="overview-stats"></div>
+          <input id="catalog-search" type="search" placeholder="Search indexed items…" aria-label="Search indexed items" maxlength="256" autocomplete="off" hidden>
+          <div class="overview-graph-toolbar"><select id="overview-kind" aria-label="Overview items"><option value="chats">Chats</option><option value="repository">Repositories</option><option value="pull_request">Pull requests</option><option value="issue">Issues</option><option value="domain">Domains</option><option value="link">Links</option><option value="file_artifact">Files</option></select><div class="map-search-wrap"><label class="sr-only" for="map-search">Find a saved chat</label><input id="map-search" type="search" placeholder="Find a chat…" autocomplete="off"><div id="map-search-results" hidden></div></div><div class="graph-legend"><span class="legend-project">Project</span><span class="legend-keyword">Topics</span></div><div id="graph-controls" class="actions"><button id="graph-zoom-out" type="button" aria-label="Zoom graph out">−</button><button id="graph-zoom-in" type="button" aria-label="Zoom graph in">+</button><button id="graph-reset" type="button">Fit</button></div><select id="artifact-state-filter" aria-label="File availability" hidden><option value="">All files</option><option value="saved_locally">Saved locally</option><option value="metadata_present">Metadata available</option><option value="link_only">Link only</option></select></div>
+          <section id="catalog-items-panel" hidden aria-label="Indexed items"><div id="catalog-items-state" role="status" aria-live="polite"></div><div id="catalog-items-list"></div><button id="catalog-items-more" type="button" hidden>Load more</button></section>
+          <div id="overview-map" class="overview-map"><div id="graph-canvas" aria-label="Conversation graph"></div><aside id="graph-inspector" aria-label="Graph details"><button id="graph-inspector-close" type="button" aria-label="Close graph details">×</button><div id="graph-selection"><h2>Follow a connection</h2><p>Select a chat to inspect its connections.</p></div></aside></div>
+          <p id="graph-caption" class="graph-caption"></p>
+          <details id="overview-recent-section"><summary id="overview-recent-title">Chats in this map</summary><div id="overview-recent" class="overview-recent"></div></details>
+        </section>
+        <section id="library-reader" class="reader-pane" aria-label="Saved conversation">
+          <div id="reader-empty" class="reader-empty"><h1>Pick up a conversation</h1><p>Open a chat from your history, or start something new.</p><button class="primary" type="button" data-library-action="show-chatgpt">New chat</button></div>
+          <div id="reader" hidden>
+            <div class="reader-head"><button id="back-to-library" type="button" aria-label="Back to library">Back</button><div class="reader-heading"><div id="provider" class="eyebrow"></div><h1 id="title"></h1><p id="account-attribution" class="subtle"></p><span id="reader-project" class="project-label" hidden></span></div><button id="continue-chatgpt" class="primary" type="button" hidden>Continue chat</button><label class="branch-label">Branch<select id="branch"></select></label></div>
+            <div class="reader-tools" role="search" aria-label="Find in this branch"><input id="branch-find" type="search" placeholder="Find in this chat…" aria-label="Find in this branch"><span id="branch-find-count" role="status" aria-live="polite"></span><button id="branch-find-prev" type="button" aria-label="Previous match" disabled>↑</button><button id="branch-find-next" type="button" aria-label="Next match" disabled>↓</button><button id="copy-branch" type="button">Copy branch</button><button id="show-chat-connections" type="button">Related chats</button><button id="show-message-graph" type="button">Message graph</button><button id="set-chat-project" type="button" hidden>Set project</button></div>
+            <div class="reader-labels"><div id="reader-tags" class="tag-chips"></div><button id="edit-chat-tags" type="button" disabled>Tags</button><button id="show-chat-files" type="button" disabled>Files</button></div>
+            <div id="messages" class="messages"></div>
+          </div>
+        </section>
+        <section id="provider-shell" hidden aria-label="ChatGPT"><div class="provider-toolbar"><span id="provider-title" class="sr-only">New conversation</span><p id="provider-view-status" role="status" aria-live="polite">Loading ChatGPT…</p><div class="actions"><button id="provider-reload" type="button">Reload</button><button id="provider-back" type="button">Read saved copy</button></div></div><div id="provider-host" aria-label="ChatGPT browser area"></div></section>
+      </main>
+      <main id="settings-page" tabindex="-1" hidden aria-labelledby="settings-title">
+        <header class="settings-header"><button id="settings-back" type="button">← Back to chat</button><h1 id="settings-title">Settings</h1></header>
+        <div class="settings-body">
+          <section class="settings-section" aria-labelledby="appearance-title"><h2 id="appearance-title">Appearance</h2><p>Color scheme</p><div id="color-schemes" class="color-schemes" role="group" aria-label="Color scheme"></div><p id="color-scheme-status" role="status" aria-live="polite"></p></section>
+          <section class="settings-section" aria-labelledby="connection-title"><h2 id="connection-title">ChatGPT</h2><p>History syncs in the background when ChatGPT is connected. Saved conversations stay available offline.</p><div class="actions"><button id="connect-chatgpt" type="button">Connect ChatGPT</button><button id="sync-history" type="button">Sync history</button></div><p id="history-sync-status" role="status" aria-live="polite"></p></section>
+          <section class="settings-section" aria-labelledby="capture-title"><h2 id="capture-title">Save live conversations</h2><div class="capture-preferences"><label for="capture-enabled-toggle"><input id="capture-enabled-toggle" type="checkbox" disabled> Save live chats on this Mac</label><p>Keep a local copy of conversations and replies captured in Chat Hub. Changes apply after restart.</p><div class="actions"><button id="save-capture-setting" type="button" disabled>Save setting</button><button id="restart-capture-settings" type="button" hidden>Restart to apply</button></div><p id="capture-preferences-status" role="status" aria-live="polite">Loading capture settings…</p></div></section>
+          <section class="settings-section" aria-labelledby="library-title"><h2 id="library-title">Library</h2><p>Import a ChatGPT export, or keep a portable copy of your local library.</p><details class="library-tools"><summary>Library tools</summary><div class="library-tools-menu"><button id="import" type="button">Import export</button><button id="backup-library" type="button">Save library backup</button><button id="restore-library" type="button">Restore backup</button><button id="export-library-json" type="button">Export library as JSON</button></div></details></section>
+          <section class="settings-section" aria-labelledby="catalog-title"><h2 id="catalog-title">Chat index</h2><p>Saved chats are indexed locally for the overview, shared keywords and message graphs. Rebuilding does not change the original conversations.</p><button id="rebuild-catalog" type="button">Rebuild index</button><p id="catalog-status" role="status" aria-live="polite"></p></section>
+          <section class="settings-section" aria-labelledby="software-title"><h2 id="software-title">Software</h2><p id="version" data-testid="app-version">Loading…</p><details class="update-menu"><summary>Software updates</summary><section class="update-card"><h3>Software updates</h3><p>Stable channel</p><div class="actions"><button id="check" data-testid="check-updates">Check for updates</button><button id="install" hidden>Update &amp; relaunch</button></div><div id="message" data-testid="update-message" role="status" aria-live="polite">Checking version…</div></section></details></section>
+          <details class="settings-section diagnostics"><summary>Service details</summary><div id="health" aria-live="polite">Starting local service…</div><div id="capture-health" aria-live="polite"></div><button id="retry-health" class="quiet" hidden>Retry connection</button></details>
+        </div>
+      </main>
+    </div>
+  </div>
+  <div id="app-status" class="app-status" role="status" aria-live="polite"></div>
+  <dialog id="tags-editor"><form id="tags-editor-form"><h2>Tags</h2><p id="tags-editor-target"></p><div id="tags-editor-chips" class="tag-chips"></div><label for="tag-name-input">Add a tag</label><div class="tag-add-row"><input id="tag-name-input" maxlength="80" list="tag-suggestions" autocomplete="off" placeholder="e.g. research"><button id="add-tag" type="button">Add</button></div><datalist id="tag-suggestions"></datalist><p id="tags-editor-status" role="status" aria-live="polite"></p><div class="actions"><button id="tags-editor-cancel" type="button">Cancel</button><button id="tags-editor-save" class="primary" type="submit">Save tags</button></div></form></dialog>
+  <dialog id="project-editor"><form id="project-editor-form"><h2 id="project-editor-title">Rename project</h2><label for="project-name-input">Project name</label><input id="project-name-input" name="name" maxlength="120" autocomplete="off"><label for="project-edit-scope">Apply to</label><select id="project-edit-scope"><option value="upstream" selected>ChatGPT</option><option value="local">Local label only</option></select><p id="project-editor-description">Updates the project name in your connected ChatGPT account.</p><p id="project-editor-status" role="status" aria-live="polite"></p><div class="actions"><button id="project-editor-cancel" type="button">Cancel</button><button id="project-editor-save" class="primary" type="submit">Rename in ChatGPT</button></div></form></dialog>
+  <dialog id="chat-project-editor"><form id="chat-project-form"><h2>Set project</h2><p id="chat-project-title"></p><label for="chat-project-choice">Project</label><select id="chat-project-choice"><option value="">No project</option></select><label for="chat-project-scope">Apply to</label><select id="chat-project-scope"><option value="upstream" selected>ChatGPT</option><option value="local">Local library only</option></select><p id="chat-project-status" role="status" aria-live="polite"></p><div class="actions"><button id="chat-project-cancel" type="button">Cancel</button><button id="chat-project-save" class="primary" type="submit">Update in ChatGPT</button></div></form></dialog>
+  <script type="module" src="./disclosure-menus.js"></script>
+  <script type="module" src="./app.js"></script>
+  <script type="module" src="./restore.js"></script>
+  <script type="module" src="./capture-status.js"></script>
+  <script type="module" src="./live-refresh.js"></script>
+  <script type="module" src="./library-home.js"></script>
+  <script type="module" src="./reader-tools.js"></script>
+  <script type="module" src="./provider-view.js"></script>
+  <script type="module" src="./history-sync.js"></script>
+  <script type="module" src="./workspace.js"></script>
+  <script type="module" src="./overview.js"></script>
+  <script type="module" src="./catalog-items.js"></script>
+  <script type="module" src="./tags.js"></script>
+  <script type="module" src="./projects.js"></script>
+  <script type="module" src="./project-filter.js"></script>
+  <script type="module" src="./appearance.js"></script>
+</body>
+</html>

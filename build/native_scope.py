@@ -8,7 +8,7 @@ import subprocess
 
 NATIVE_PATTERNS = (
     'src-tauri/**', 'build/**', 'tests/native/**', 'src/**', 'frontend/**',
-    'desktop-ui/**', 'package.json', 'package-lock.json', 'Cargo.toml',
+    'desktop-ui/**', 'ci/actions/**', 'Cargo.toml',
     'Cargo.lock', 'rust-toolchain.toml', 'tauri.conf.json',
     '.github/workflows/macos.yml', '.github/workflows/check.yml',
     '.github/workflows/accept-native.yml',

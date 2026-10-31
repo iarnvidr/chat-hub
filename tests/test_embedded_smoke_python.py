@@ -26,7 +26,6 @@ class EmbeddedPythonSmokeTest(unittest.TestCase):
             (root / "source/Cargo.toml").write_text('[package]\nversion = "0.1.0"\n')
             (root / "source/src-tauri/Cargo.toml").write_text('[package]\nversion = "0.1.0"\n')
             (root / "source/src-tauri/tauri.conf.json").write_text('{"version":"0.1.0"}')
-            (root / "source/package.json").write_text('{"version":"0.1.0"}')
             (root / "app/Contents").mkdir(parents=True)
             (root / "app/Contents/Info.plist").write_bytes(__import__('plistlib').dumps({'CFBundleShortVersionString': '0.2.0'}))
             (root / "feed").mkdir()

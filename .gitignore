@@ -1,9 +1,9 @@
 /target/
 /src-tauri/target/
+/src-tauri/gen/schemas/
 **/__pycache__/
 *.py[cod]
 /dist/
-/node_modules/
 .env
 .env.*
 !.env.example

@@ -59,7 +59,7 @@ root=pathlib.Path(sys.argv[1]); expected=sys.argv[2]
 assert (root/'Cargo.toml').read_text().split('version = "',1)[1].split('"',1)[0] == expected
 assert (root/'src-tauri/Cargo.toml').read_text().split('version = "',1)[1].split('"',1)[0] == expected
 assert json.loads((root/'src-tauri/tauri.conf.json').read_text())['version'] == expected
-assert json.loads((root/'package.json').read_text())['version'] == expected
+assert json.loads((root/'src-tauri/tauri.conf.json').read_text())['version'] == expected
 PY
   CARGO_TARGET_DIR="$target" cargo build --locked --offline --manifest-path "$source/src-tauri/Cargo.toml" --target aarch64-apple-darwin --features native-smoke
   local app="$TMP/build-$version/Chat Hub-$version.app" exe
@@ -97,7 +97,7 @@ for bundle in "$TMP/healthy/Chat Hub.app" "$TMP/tampered/Chat Hub.app"; do
 done
 
 # Isolated ephemeral minisign key; no key material is printed.
-npx --yes @tauri-apps/cli@2.10.1 signer generate --ci --write-keys "$TMP/test.key" >"$TMP/keygen.log" 2>&1
+cargo tauri signer generate --ci --write-keys "$TMP/test.key" >"$TMP/keygen.log" 2>&1
 PUB="$(find "$TMP" -maxdepth 1 -type f -name '*.key.pub' -print -quit)"
 [[ -s "$PUB" ]] || { echo 'FAIL: signer did not produce public key' >&2; exit 2; }
 export MUNINN_UPDATER_SMOKE_PUBKEY="$(cat "$PUB")"
@@ -109,7 +109,7 @@ make_archive() {
   mkdir -p "$out"
   tar -czf "$out/Chat-Hub.app.tar.gz" -C "$TMP" "Chat Hub.app"
   # CLI emits signature in the requested output file; never scrape stdout.
-  npx --yes @tauri-apps/cli@2.10.1 signer sign --private-key-path "$TMP/test.key" --password '' "$out/Chat-Hub.app.tar.gz" >"$TMP/sign.log" 2>&1
+  cargo tauri signer sign --private-key-path "$TMP/test.key" --password '' "$out/Chat-Hub.app.tar.gz" >"$TMP/sign.log" 2>&1
   [[ -s "$out/Chat-Hub.app.tar.gz.sig" ]] || { echo 'FAIL: signer did not emit detached .sig file' >&2; exit 2; }
   cp "$out/Chat-Hub.app.tar.gz.sig" "$out/signature"
 }

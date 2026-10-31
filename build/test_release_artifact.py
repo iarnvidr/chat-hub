@@ -70,14 +70,14 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.mapping_run = {
             'id': 789, 'run_attempt': 1, 'path': release.MAPPING_WORKFLOW,
             'repository': {'full_name': release.REPOSITORY}, 'event': 'push',
-            'head_branch': 'main', 'head_sha': self.commit, 'conclusion': 'success',
+            'head_branch': 'main', 'head_sha': self.commit, 'status': 'in_progress',
         }
         self.manual_run = {
             'id': 321, 'run_attempt': 1, 'path': release.NATIVE_WORKFLOW,
             'repository': {'full_name': release.REPOSITORY}, 'event': 'workflow_dispatch',
             'head_branch': 'main', 'head_sha': self.commit, 'conclusion': 'success',
         }
-        self.native_artifact = {'id': 456, 'name': f'{release.NATIVE_ARTIFACT_PREFIX}-pr-123-2', 'expired': False}
+        self.native_artifact = {'id': 456, 'name': f'{release.NATIVE_ARTIFACT_PREFIX}-main-789-1', 'expired': False}
         self.check_artifact = {'id': 457, 'name': f'{release.CHECK_ARTIFACT_PREFIX}-124-1', 'expired': False}
         self.mapping_artifact = {'id': 987, 'name': f'{release.MAPPING_ARTIFACT_PREFIX}-{self.commit}-789-1', 'expired': False}
         self.manual_artifact = {'id': 654, 'name': f'{release.NATIVE_ARTIFACT_PREFIX}-main-321-1', 'expired': False}
@@ -89,29 +89,26 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.include_check = True
         self.policy_drift = False
         self.native_tree = self.tree
-        self.build_native()
+        self.build_native(event='push', run=self.mapping_run, artifact=self.native_artifact)
         self.build_check()
 
     def git(self, root, *args):
         return self.tree if 'HEAD^{tree}' in args else self.commit
 
-    def build_native(self, event='pull_request', run=None, artifact=None, tree=None, workflow_sha=None):
-        run = run or self.native_run
+    def build_native(self, event='push', run=None, artifact=None, tree=None, workflow_sha=None):
+        run = run or self.mapping_run
         artifact = artifact or self.native_artifact
         record = {
             'schema': 2, 'repository': release.REPOSITORY,
-            'workflow_path': release.NATIVE_WORKFLOW,
+            'workflow_path': release.MAPPING_WORKFLOW if event == 'push' else release.NATIVE_WORKFLOW,
             'run_id': run['id'], 'run_attempt': run['run_attempt'], 'event': event,
-            'head': self.pr_head if event == 'pull_request' else self.commit,
+            'head': self.commit,
             'tree': tree or self.tree, 'workflow_sha': workflow_sha or self.commit,
             'helper_sha': 'e' * 40,
-            'toolchain': {'rustc': 'rustc fixture', 'node': 'v22 fixture', 'macos': '15', 'sdk': 'fixture'},
+            'toolchain': {'rustc': 'rustc fixture', 'tauri-cli': 'tauri-cli fixture', 'macos': '15', 'sdk': 'fixture'},
             'platform': release.PLATFORM, 'version': '1.2.3',
             'files': {name: digest(data) for name, data in self.files.items()},
         }
-        if event == 'pull_request':
-            record.update({'pr_number': 42, 'pr_head_sha': self.pr_head,
-                           'tested_base': self.base, 'head_repository': release.REPOSITORY})
         self.native_blob = zip_data({**self.files, 'native-receipt.json': json.dumps(record, sort_keys=True).encode()})
         artifact['digest'] = 'sha256:' + digest(self.native_blob)
 
@@ -132,20 +129,14 @@ class ReleaseArtifactTests(unittest.TestCase):
             return [{'number': 42, 'base': {'ref': 'main'}}]
         if path.endswith('/pulls/42'):
             return self.pr
-        if '/workflows/macos.yml/runs?' in path:
-            return {'workflow_runs': [self.native_run]}
         if '/workflows/check.yml/runs?' in path:
             return {'workflow_runs': [self.check_run] if self.include_check else []}
-        if '/actions/runs/123/artifacts?per_page=100' in path:
-            return {'artifacts': [self.native_artifact]}
+        if '/actions/runs/789/artifacts?per_page=100' in path:
+            return {'artifacts': [self.native_artifact, self.mapping_artifact]}
         if '/actions/runs/124/artifacts?per_page=100' in path:
             return {'artifacts': [self.check_artifact]}
         if '/actions/runs/321/artifacts?per_page=100' in path:
             return {'artifacts': [self.manual_artifact]}
-        if '/actions/runs/789/artifacts?per_page=100' in path:
-            return {'artifacts': [self.mapping_artifact]}
-        if path.endswith('/actions/runs/123'):
-            return self.native_run
         if path.endswith('/actions/runs/124'):
             return self.check_run
         if path.endswith('/actions/runs/321'):
@@ -168,13 +159,15 @@ class ReleaseArtifactTests(unittest.TestCase):
 
     def promote(self):
         with mock.patch.object(release, 'git', side_effect=self.git):
-            return release.promote(self.root, self.commit, self.api)
+            return release.promote(self.root, self.commit, '789', self.api)
 
     def retrieve(self, **kwargs):
         with mock.patch.object(release, 'git', side_effect=self.git):
             return release.retrieve(self.root, 'v1.2.3', api_fn=self.api, **kwargs)
 
     def install_mapping(self, mapping):
+        self.mapping_run['status'] = 'completed'
+        self.mapping_run['conclusion'] = 'success'
         name = f'chat-hub-accepted-native-{self.commit}-{self.mapping_run["id"]}-{self.mapping_run["run_attempt"]}'
         self.mapping_artifact['name'] = name
         self.mapping_blob = zip_data({'accepted-native.json': json.dumps(mapping, sort_keys=True).encode()})
@@ -184,7 +177,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         mapping = self.promote()
         self.assertEqual(mapping['accepted_commit'], self.commit)
         self.assertEqual(mapping['accepted_tree'], self.tree)
-        self.assertEqual(mapping['source_run_id'], 123)
+        self.assertEqual(mapping['source_run_id'], 789)
         self.assertEqual(mapping['source_artifact_id'], 456)
         self.assertEqual(mapping['source_artifact_digest'], self.native_artifact['digest'])
         self.assertEqual(mapping['check_receipt']['run_id'], 124)
@@ -200,18 +193,72 @@ class ReleaseArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Linux check receipt unavailable'):
             self.promote()
 
-    def test_promoter_and_retriever_accept_successful_runs_after_github_drops_pr_associations(self):
-        self.native_run['pull_requests'] = []
+    def test_promoter_requires_exact_trusted_main_run_and_transferred_main_artifact(self):
+        for key, value in [('event', 'pull_request'), ('head_sha', 'f' * 40),
+                           ('head_branch', 'feature')]:
+            with self.subTest(key=key):
+                self.mapping_run[key] = value
+                with self.assertRaisesRegex(ValueError, 'exact in-progress trusted-main acceptance'):
+                    self.promote()
+                self.mapping_run[key] = {'event': 'push', 'head_sha': self.commit,
+                                         'head_branch': 'main'}[key]
+        self.mapping_run['repository']['full_name'] = 'fork/chat-hub'
+        with self.assertRaisesRegex(ValueError, 'exact in-progress trusted-main acceptance'):
+            self.promote()
+        self.mapping_run['repository']['full_name'] = release.REPOSITORY
+        self.native_artifact['name'] = f'{release.NATIVE_ARTIFACT_PREFIX}-pr-123-2'
+        with self.assertRaisesRegex(ValueError, 'exact trusted-main native artifact'):
+            self.promote()
+
+    def test_retriever_rejects_pr_source_other_sha_or_other_attempt(self):
+        for key, value in [('event', 'pull_request'), ('head_sha', 'f' * 40), ('run_attempt', 2)]:
+            with self.subTest(key=key):
+                self.mapping_run['event'] = 'push'
+                self.mapping_run['head_sha'] = self.commit
+                self.mapping_run['run_attempt'] = 1
+                self.mapping_run['head_branch'] = 'main'
+                self.mapping_run['status'] = 'in_progress'
+                self.mapping_run.pop('conclusion', None)
+                self.native_artifact['name'] = f'{release.NATIVE_ARTIFACT_PREFIX}-main-789-1'
+                mapping = self.promote()
+                self.install_mapping(mapping)
+                if key == 'run_attempt':
+                    mapping['source_run_attempt'] = value
+                    self.install_mapping(mapping)
+                    with self.assertRaisesRegex(ValueError, 'does not match the release commit'):
+                        self.retrieve(mapping_run_id=789)
+                else:
+                    self.mapping_run[key] = value
+                    with self.assertRaisesRegex(ValueError, 'trusted-main acceptance'):
+                        self.retrieve(mapping_run_id=789)
+                self.mapping_run['event'] = 'push'
+                self.mapping_run['head_sha'] = self.commit
+                self.mapping_run['run_attempt'] = 1
+                self.mapping_run['head_branch'] = 'main'
+
+    def test_mapping_rejects_forked_or_other_attempt_main_run(self):
+        mapping = self.promote()
+        self.install_mapping(mapping)
+        self.mapping_run['repository']['full_name'] = 'fork/chat-hub'
+        with self.assertRaisesRegex(ValueError, 'trusted-main acceptance'):
+            self.retrieve(mapping_run_id=789)
+        self.mapping_run['repository']['full_name'] = release.REPOSITORY
+        self.mapping_run['run_attempt'] = 2
+        with self.assertRaisesRegex(ValueError, 'mapping artifact is missing'):
+            self.retrieve(mapping_run_id=789)
+
+    def test_promoter_and_retriever_bind_the_same_trusted_main_run_and_preserve_pr_check(self):
         self.check_run['pull_requests'] = []
         mapping = self.promote()
+        self.assertEqual(mapping['acceptance'], 'trusted-main-build')
         self.assertEqual(mapping['pr_number'], 42)
         self.install_mapping(mapping)
         retrieved = self.retrieve(mapping_run_id=789)
-        self.assertEqual(retrieved['source_run_id'], 123)
+        self.assertEqual(retrieved['source_run_id'], 789)
 
     def test_promoter_rejects_wrong_tree_policy_or_base(self):
         self.build_native(tree='f' * 40)
-        with self.assertRaisesRegex(ValueError, 'accepted PR tree'):
+        with self.assertRaisesRegex(ValueError, 'exact trusted-main commit'):
             self.promote()
         self.build_native()
         self.policy_drift = True
@@ -219,15 +266,15 @@ class ReleaseArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'workflow differs'):
             self.promote()
         self.policy_drift = False
-        self.native_run['pull_requests'][0]['base']['sha'] = 'f' * 40
-        with self.assertRaisesRegex(ValueError, 'accepted native artifact unavailable'):
+        self.mapping_run['head_sha'] = 'f' * 40
+        with self.assertRaisesRegex(ValueError, 'exact in-progress trusted-main acceptance'):
             self.promote()
 
     def test_retrieval_uses_explicit_mapping_and_preserves_native_archive_and_dmg(self):
         mapping = self.promote()
         self.install_mapping(mapping)
         result = self.retrieve(mapping_run_id=789)
-        self.assertEqual(result['acceptance'], 'merged-pr')
+        self.assertEqual(result['acceptance'], 'trusted-main-build')
         self.assertEqual(result['source_artifact_id'], 456)
         self.assertEqual((self.root / 'artifacts' / self.archive_name).read_bytes(), self.app_archive)
         self.assertEqual((self.root / 'artifacts' / self.dmg_name).read_bytes(), self.dmg)

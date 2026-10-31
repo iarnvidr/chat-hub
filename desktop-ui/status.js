@@ -10,7 +10,11 @@ export async function updateStatus({ invoke, setVersion, setMessage, setHealth, 
   for (let i = 0; i < maxPolls; i++) {
     try {
       const health = await invoke('service_health');
-      if (health.healthy === true) { setHealth('Local service READY.'); setRetryVisible(false); return; }
+      if (health.healthy === true) {
+        setHealth('Local service READY.');
+        setRetryVisible(false);
+        return;
+      }
     } catch (_) {}
     if (i + 1 < maxPolls) await delay(500);
   }

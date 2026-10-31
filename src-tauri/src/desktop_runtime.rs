@@ -25,6 +25,21 @@ impl DesktopRuntime {
     }
 
     pub async fn shutdown(self) -> serde_json::Value {
+        self.shutdown_outcome().await.0
+    }
+
+    // The packaged desktop command calls this; isolated startup tests compile
+    // this module without that command in their crate graph.
+    #[allow(dead_code)]
+    pub async fn shutdown_for_restore(self) -> Result<(), String> {
+        if self.shutdown_outcome().await.1 {
+            Ok(())
+        } else {
+            Err("restore_shutdown_incomplete".into())
+        }
+    }
+
+    async fn shutdown_outcome(self) -> (serde_json::Value, bool) {
         let Self {
             handle,
             capture,
@@ -32,14 +47,32 @@ impl DesktopRuntime {
             ..
         } = self;
         drop(capture);
-        let legacy = handle.shutdown_timeout(Duration::from_secs(5)).await;
-        service::shutdown_report(&legacy, capture_status.snapshot())
+        let (legacy, stopped) = handle
+            .shutdown_timeout_outcome(Duration::from_secs(5))
+            .await;
+        (
+            service::shutdown_report(&legacy, capture_status.snapshot()),
+            stopped,
+        )
     }
 }
 
-pub async fn start(
+pub async fn start(data_dir: &Path, proxy_config: ProxyConfig) -> Result<DesktopRuntime, String> {
+    let (capture_enabled, capture_profile_scope) = Config::capture_settings_from_env()?;
+    start_with_capture_config(
+        data_dir,
+        proxy_config,
+        capture_enabled,
+        capture_profile_scope,
+    )
+    .await
+}
+
+pub async fn start_with_capture_config(
     data_dir: &Path,
     mut proxy_config: ProxyConfig,
+    capture_enabled: bool,
+    capture_profile_scope: String,
 ) -> Result<DesktopRuntime, String> {
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -61,7 +94,8 @@ pub async fn start(
             .ok_or_else(|| "database path is not valid UTF-8".to_string())?
             .to_owned(),
         ca_dir: ca_dir.clone(),
-        capture_enabled: false,
+        capture_enabled,
+        capture_profile_scope,
         proxy_addr: "127.0.0.1:0".parse().expect("valid loopback address"),
     };
     let (handle, capture) = service::start_with_proxy(config, 64, proxy_config).await?;

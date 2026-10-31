@@ -13,6 +13,8 @@ class NativeScopeTests(unittest.TestCase):
     def test_native_source_and_policy_changes_require_macos_validation(self):
         for path in ('src-tauri/src/main.rs', 'desktop-ui/app.tsx', 'build/native_scope.py',
                      '.github/workflows/check.yml', '.github/workflows/accept-native.yml',
+                     'ci/actions/macos-native-build/action.yml',
+                     'ci/actions/gha-artifact-upload/main.go',
                      'Cargo.lock', 'tests/native/launch.sh'):
             with self.subTest(path=path):
                 self.assertTrue(native_scope.requires_native([path]))

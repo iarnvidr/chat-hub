@@ -48,7 +48,7 @@ fn fk_ok(path: &str) {
 fn empty_file_opens_at_v4() {
     let p = temp("empty");
     let s = Store::open(&p).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 8);
+    assert_eq!(s.schema_version().unwrap(), 12);
     drop(s);
     fk_ok(&p);
     std::fs::remove_file(p).unwrap();
@@ -66,7 +66,7 @@ fn historical_v1_and_v2_fixtures_migrate_and_reopen_without_changes() {
         .unwrap();
         drop(c);
         let s = Store::open(&p).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 8);
+        assert_eq!(s.schema_version().unwrap(), 12);
         if version == 1 {
             // Historical v1 has no messages; migration 2 creates the table.
             let c = Connection::open(&p).unwrap();
@@ -114,7 +114,7 @@ fn historical_v1_and_v2_fixtures_migrate_and_reopen_without_changes() {
         }
         drop(c);
         let s = Store::open(&p).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 8);
+        assert_eq!(s.schema_version().unwrap(), 12);
         drop(s);
         let c = Connection::open(&p).unwrap();
         let after_conversation: (String, String, String) = c
@@ -176,7 +176,7 @@ fn v3_failure_rolls_back_alter_and_retry_succeeds() {
     c.execute_batch("DROP TABLE graph_nodes").unwrap();
     drop(c);
     let s = Store::open(&p).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 8);
+    assert_eq!(s.schema_version().unwrap(), 12);
     assert_eq!(s.search("searchable", 10).unwrap().len(), 1);
     drop(s);
     fk_ok(&p);
@@ -186,7 +186,7 @@ fn v3_failure_rolls_back_alter_and_retry_succeeds() {
 fn migrated_schema_is_idempotent_and_fts_tracks_insert_update_delete_rebuild() {
     let p = temp("fts");
     let mut s = Store::open(&p).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 8);
+    assert_eq!(s.schema_version().unwrap(), 12);
     let id = s.ingest_observation(&obs("a", "alphaunique")).unwrap();
     assert_eq!(s.search("alphaunique", 10).unwrap(), vec![id.clone()]);
     s.ingest_observation(&obs("a", "betaunique")).unwrap();
@@ -208,7 +208,7 @@ fn migrated_schema_is_idempotent_and_fts_tracks_insert_update_delete_rebuild() {
         .unwrap();
     drop(c);
     let s = Store::open(&p).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 8);
+    assert_eq!(s.schema_version().unwrap(), 12);
     assert!(s.search("betaunique", 10).unwrap().is_empty());
     drop(s);
     fk_ok(&p);

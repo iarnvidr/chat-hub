@@ -98,6 +98,7 @@ impl ReadAdapter for FixtureReader {
         items.truncate(limit);
         Ok(ListPageSnapshot {
             library_revision: revision,
+            tag_revision: None,
             items,
         })
     }
@@ -114,6 +115,7 @@ impl ReadAdapter for FixtureReader {
         if expected.is_some_and(|r| r != revision) {
             return Ok(SearchPageSnapshot {
                 library_revision: revision,
+                tag_revision: None,
                 hits: vec![],
             });
         }
@@ -148,6 +150,7 @@ impl ReadAdapter for FixtureReader {
         hits.truncate(limit);
         Ok(SearchPageSnapshot {
             library_revision: revision,
+            tag_revision: None,
             hits,
         })
     }

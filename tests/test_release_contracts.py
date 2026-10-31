@@ -1,6 +1,9 @@
 """Static and source-bundle contracts for protected release tooling."""
 import hashlib
 import json
+import os
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -31,6 +34,17 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("name: chat-hub-release", self.workflow)
         self.assertNotIn("contents: write", self.workflow.split("publish:", 1)[0])
 
+    def test_release_review_transport_binds_the_tag_in_its_own_step(self):
+        step = self.workflow.split("- name: Stage protected release review artifacts\n", 1)[1].split("      - id:", 1)[0]
+        self.assertIn("INPUT_TAG: ${{ inputs.tag }}", step.split("run: |", 1)[0])
+        script = re.search(r"<<'PY'\n(.*?)\n          PY", step, re.S).group(1)
+        script = "\n".join(line[10:] for line in script.splitlines())
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "transport.json"
+            env = {**os.environ, "GITHUB_REPOSITORY": "iarnvidr/chat-hub", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "a" * 40, "INPUT_TAG": "v0.2.1"}
+            subprocess.run([sys.executable, "-c", script, str(output)], env=env, check=True, capture_output=True)
+            self.assertEqual(json.loads(output.read_text()), {"repository": "iarnvidr/chat-hub", "run_id": "123", "run_attempt": "1", "sha": "a" * 40, "tag": "v0.2.1"})
+
     def test_signing_and_dmg_evidence_are_required(self):
         self.assertIn("TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}", self.workflow)
         self.assertIn("TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}", self.workflow)
@@ -40,7 +54,8 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("updater_release.py generate", self.workflow)
         self.assertIn("updater_release.py validate", self.workflow)
         self.assertIn('cp artifacts/Chat_Hub_*.dmg', self.workflow)
-        self.assertIn('Build and mount-verify the DMG', (ROOT / '.github/workflows/macos.yml').read_text())
+        native = (ROOT / 'ci/actions/macos-native-build/action.yml').read_text()
+        self.assertIn('Build and mount-verify the DMG', native)
         self.assertIn("hdiutil verify", self.dmg)
         self.assertIn("hdiutil attach", self.dmg)
         self.assertIn("codesign --verify", self.dmg)
@@ -53,17 +68,18 @@ class ReleaseContracts(unittest.TestCase):
 
     def test_native_smoke_compilation_is_blocking_but_runtime_diagnostics_are_nonblocking(self):
         workflow = (ROOT / ".github/workflows/macos.yml").read_text()
-        compile_step = workflow.index("Compile native-smoke feature (required)")
-        build_step = workflow.index("Build debug binary for native UI interactions")
+        native = (ROOT / "ci/actions/macos-native-build/action.yml").read_text()
+        compile_step = native.index("Compile native-smoke feature (required)")
+        build_step = native.index("Build debug binary for native UI interactions")
         self.assertLess(compile_step, build_step)
-        self.assertNotIn("continue-on-error", workflow[compile_step:workflow.index("Prepare isolated debug bundle")])
-        self.assertGreaterEqual(workflow.count("continue-on-error: true"), 2)
+        self.assertNotIn("continue-on-error", native[compile_step:native.index("Prepare isolated debug bundle")])
+        self.assertGreaterEqual(native.count("continue-on-error: true"), 2)
         release = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("release_artifact.py retrieve", release)
         self.assertNotIn('cargo check', release)
         self.assertNotIn('cargo build', release)
-        self.assertIn("Build real Tauri app, ad-hoc signed", workflow)
-        self.assertIn("Build and mount-verify the DMG", workflow)
+        self.assertIn("Build real Tauri app, ad-hoc signed", native)
+        self.assertIn("Build and mount-verify the DMG", native)
 
     def test_dmg_packager_reports_missing_bundle_path(self):
         self.assertIn('app_input="$1"', self.dmg)
@@ -74,17 +90,20 @@ class ReleaseContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "root"
             root.mkdir()
-            for name in ("LICENSE", "NOTICE", "README.md", "Cargo.toml", "Cargo.lock", "package.json", "rust-toolchain.toml"):
+            for name in ("LICENSE", "NOTICE", "README.md", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
                 (root / name).write_text(name)
             for directory, files in {
                 "src": ["main.rs"], "src-tauri": ["Cargo.toml", "Cargo.lock", "tauri.conf.json", "Info.plist", "src/main.rs", "icons/icon.png"],
                 "desktop-ui": ["index.html"], "build": ["build-native-macos.sh"],
+                "ci/actions/macos-native-build": ["action.yml"],
+                "ci/actions/gha-artifact-upload": ["action.yml", "main.go"],
+                ".github/workflows": ["macos.yml", "accept-native.yml"],
             }.items():
                 for name in files:
                     path = root / directory / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(name)
-            for directory in ("target", "node_modules", ".tools", ".git"):
+            for directory in ("target", ".tools", ".git"):
                 path = root / directory
                 path.mkdir()
                 (path / "secret.tmp").write_text("exclude")
@@ -99,10 +118,14 @@ class ReleaseContracts(unittest.TestCase):
                 "src-tauri/tauri.conf.json", "src-tauri/Info.plist",
                 "src-tauri/src/main.rs", "src-tauri/icons/icon.png",
                 "desktop-ui/index.html", "build/build-native-macos.sh",
-                "Cargo.toml", "Cargo.lock", "package.json", "rust-toolchain.toml",
+                "ci/actions/macos-native-build/action.yml",
+                "ci/actions/gha-artifact-upload/action.yml",
+                "ci/actions/gha-artifact-upload/main.go",
+                ".github/workflows/macos.yml", ".github/workflows/accept-native.yml",
+                "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
                 "LICENSE", "NOTICE",
             }.issubset(paths))
-            self.assertFalse(any(path.startswith((".git/", "target/", "node_modules/", ".tools/")) for path in paths))
+            self.assertFalse(any(path.startswith((".git/", "target/", ".tools/")) for path in paths))
             self.assertNotIn("src/escape", paths)
             for item in manifest["files"]:
                 self.assertEqual(hashlib.sha256((out / item["path"]).read_bytes()).hexdigest(), item["sha256"])

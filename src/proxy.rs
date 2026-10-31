@@ -1,8 +1,9 @@
 //! Selective loopback CONNECT TLS interception proxy.
 use crate::ca::{allowed_capture_host, Ca};
 use crate::capture_lane::{
-    Accumulator, CaptureContext, CaptureLane, CaptureLimits, CaptureMetadata,
+    Accumulator, CaptureContext, CaptureLane, CaptureLimits, CaptureMetadata, RequestBodyCapture,
 };
+use crate::store::operation_learner::{self, OperationSink};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -11,7 +12,11 @@ use hyper::{
     Request, Response,
 };
 use hyper_util::rt::TokioIo;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -20,12 +25,30 @@ use std::{
 fn rustls_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
+
+/// Select Ring before other Rustls users in this process can rely on an implicit default.
+/// The proxy configs also carry Ring explicitly; this protects reqwest and future users.
+pub fn install_crypto_provider() -> Result<(), &'static str> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    match rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+    {
+        Ok(()) => Ok(()),
+        Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => Ok(()),
+        Err(_) => Err("a Rustls crypto provider was installed concurrently"),
+    }
+}
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
+    sync::Semaphore,
 };
 pub const MAX_CAPTURE_BODY: usize = 2 * 1024 * 1024;
+const MAX_REQUEST_CAPTURE_BODY: usize = 512 * 1024;
+const OPERATION_BODY_LIMIT: usize = 64 * 1024;
+const REQUEST_CAPTURE_SLOTS: usize = 8;
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
     pub ca_dir: PathBuf,
@@ -56,6 +79,7 @@ pub struct CaptureEvent {
 pub enum ProxyError {
     Io(std::io::Error),
     Ca(crate::ca::CaError),
+    CryptoProvider,
     NonLoopback,
 }
 impl std::fmt::Display for ProxyError {
@@ -107,11 +131,13 @@ pub async fn run_with_capture_context(
 pub(crate) async fn run_live(
     config: ProxyConfig,
     sink: crate::live_capture::LiveSink,
+    operations: OperationSink,
+    profile_scope: String,
 ) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
     run_source(
         config,
-        CaptureSource::Live(sink),
-        "provisional:default".into(),
+        CaptureSource::Live { sink, operations },
+        profile_scope,
     )
     .await
 }
@@ -119,17 +145,36 @@ pub(crate) async fn run_live(
 #[derive(Clone)]
 enum CaptureSource {
     Legacy(CaptureLane),
-    Live(crate::live_capture::LiveSink),
+    Live {
+        sink: crate::live_capture::LiveSink,
+        operations: OperationSink,
+    },
 }
 enum BodyCapture {
     Legacy(Accumulator),
     Live(crate::live_capture::Accumulator),
+    Operation(operation_learner::Accumulator),
 }
 impl CaptureSource {
+    fn request_capture_enabled(&self) -> bool {
+        matches!(self, Self::Live { sink, .. } if sink.request_capture_enabled())
+    }
+
     fn begin(&self, context: CaptureContext, metadata: CaptureMetadata) -> Option<BodyCapture> {
         match self {
             Self::Legacy(lane) => Some(BodyCapture::Legacy(lane.begin(context, metadata))),
-            Self::Live(sink) => sink.begin(context, metadata).map(BodyCapture::Live),
+            Self::Live { sink, operations } => sink
+                .begin(context.clone(), metadata.clone())
+                .map(BodyCapture::Live)
+                .or_else(|| {
+                    if sink.request_capture_enabled() {
+                        operations
+                            .begin(context, metadata)
+                            .map(BodyCapture::Operation)
+                    } else {
+                        None
+                    }
+                }),
         }
     }
 }
@@ -138,18 +183,21 @@ impl BodyCapture {
         match self {
             Self::Legacy(c) => c.observe(bytes),
             Self::Live(c) => c.observe(bytes),
+            Self::Operation(c) => c.observe(bytes),
         }
     }
     fn finish(self) {
         match self {
             Self::Legacy(c) => c.finish(),
             Self::Live(c) => c.finish(),
+            Self::Operation(c) => c.finish(),
         }
     }
     fn interrupt(self) {
         match self {
             Self::Legacy(c) => c.interrupt(),
             Self::Live(c) => c.interrupt(),
+            Self::Operation(c) => c.interrupt(),
         }
     }
 }
@@ -158,6 +206,7 @@ async fn run_source(
     lane: CaptureSource,
     profile_scope: String,
 ) -> Result<(RunningProxy, tokio::task::JoinHandle<()>), ProxyError> {
+    install_crypto_provider().map_err(|_| ProxyError::CryptoProvider)?;
     if !config.bind.ip().is_loopback() {
         return Err(ProxyError::NonLoopback);
     }
@@ -167,6 +216,8 @@ async fn run_source(
     let c = ca.clone();
     let test = config.test_upstream;
     let roots = config.test_roots;
+    let request_capture_slots = Arc::new(Semaphore::new(REQUEST_CAPTURE_SLOTS));
+    let request_identity = Arc::new(crate::request_identity::RequestIdentity::new()?);
     let profile_scope = CaptureContext::at_entry(profile_scope, "", "").profile_scope;
     let task = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
@@ -175,8 +226,22 @@ async fn run_source(
             let lane = lane.clone();
             let roots = roots.clone();
             let profile_scope = profile_scope.clone();
+            let request_capture_slots = request_capture_slots.clone();
+            let request_identity = request_identity.clone();
             connections.spawn(async move {
-                let _ = client(s, ca, lane, test, roots, profile_scope).await;
+                let _ = client(
+                    s,
+                    ClientContext {
+                        ca,
+                        lane,
+                        test,
+                        roots,
+                        profile_scope,
+                        request_capture_slots,
+                        request_identity,
+                    },
+                )
+                .await;
             });
             while connections.try_join_next().is_some() {}
         }
@@ -197,6 +262,92 @@ struct TeeBody {
     inner: Incoming,
     capture: Option<BodyCapture>,
     finished: bool,
+}
+
+/// Taps a bounded JSON request body while forwarding each frame unchanged.
+struct TeeRequestBody {
+    inner: Incoming,
+    capture: Option<Arc<Mutex<RequestBodyCapture>>>,
+    finished: bool,
+}
+
+impl TeeRequestBody {
+    fn new(inner: Incoming, capture: Option<Arc<Mutex<RequestBodyCapture>>>) -> Self {
+        let mut body = Self {
+            inner,
+            capture,
+            finished: false,
+        };
+        if body.inner.is_end_stream() {
+            body.finish(true);
+        }
+        body
+    }
+
+    fn finish(&mut self, complete: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(capture) = self.capture.take() {
+            let mut capture = capture.lock().unwrap_or_else(|p| p.into_inner());
+            if complete {
+                capture.complete();
+            } else {
+                capture.interrupt();
+            }
+        }
+    }
+}
+
+impl Drop for TeeRequestBody {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(false);
+        }
+    }
+}
+
+impl hyper::body::Body for TeeRequestBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let (Some(capture), Some(data)) = (&self.capture, frame.data_ref()) {
+                    capture
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .observe(data);
+                }
+                if self.inner.is_end_stream() {
+                    self.finish(true);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => {
+                self.finish(true);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finish(false);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 impl TeeBody {
     fn new(inner: Incoming, capture: BodyCapture) -> Self {
@@ -268,14 +419,26 @@ fn empty_body() -> UnsyncBoxBody<Bytes, hyper::Error> {
         .boxed_unsync()
 }
 
-async fn client(
-    mut s: TcpStream,
+struct ClientContext {
     ca: Arc<Ca>,
     lane: CaptureSource,
     test: Option<SocketAddr>,
     roots: Option<PathBuf>,
     profile_scope: String,
-) -> std::io::Result<()> {
+    request_capture_slots: Arc<Semaphore>,
+    request_identity: Arc<crate::request_identity::RequestIdentity>,
+}
+
+async fn client(mut s: TcpStream, context: ClientContext) -> std::io::Result<()> {
+    let ClientContext {
+        ca,
+        lane,
+        test,
+        roots,
+        profile_scope,
+        request_capture_slots,
+        request_identity,
+    } = context;
     let mut buf = Vec::new();
     let mut b = [0; 1];
     while buf.len() < 16384 {
@@ -373,19 +536,61 @@ async fn client(
                     .map(|u| u.as_str())
                     .unwrap_or("/")
                     .to_owned();
-                let context = CaptureContext::at_entry(
-                    profile_scope.clone(),
-                    if matches!(&lane, CaptureSource::Live(_)) && path.len() > 4096 {
+                let content_type = req
+                    .headers()
+                    .get(hyper::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.split(';').next())
+                    .map(str::trim)
+                    .unwrap_or("");
+                let create_chat_request = req.method().as_str() == "POST"
+                    && path.split('?').next() == Some("/backend-api/conversation")
+                    && content_type.eq_ignore_ascii_case("application/json");
+                let learn_operation_request = operation_learner::OperationSink::is_candidate_request(
+                    req.method().as_str(), &path,
+                ) && content_type.eq_ignore_ascii_case("application/json");
+                let request_capture = if lane.request_capture_enabled()
+                    && (create_chat_request || learn_operation_request)
+                {
+                    let limit = if learn_operation_request && !create_chat_request {
+                        OPERATION_BODY_LIMIT
+                    } else {
+                        MAX_REQUEST_CAPTURE_BODY
+                    };
+                    request_capture_slots
+                        .clone()
+                        .try_acquire_owned()
+                        .ok()
+                        .map(|permit| {
+                            Arc::new(Mutex::new(RequestBodyCapture::new(
+                                permit,
+                                limit,
+                            )))
+                        })
+                } else {
+                    None
+                };
+                let mut context = CaptureContext::at_entry(
+                    if matches!(&lane, CaptureSource::Live { .. }) && lane.request_capture_enabled() {
+                        request_identity
+                            .resolve(&profile_scope, req.headers())
+                            .unwrap_or_default()
+                    } else {
+                        profile_scope.clone()
+                    },
+                    if matches!(&lane, CaptureSource::Live { .. }) && path.len() > 4096 {
                         ""
                     } else {
                         req.method().as_str()
                     },
                     path.clone(),
                 );
+                context.request_body = request_capture.clone();
                 let sender = sender.clone();
                 let lane = lane.clone();
                 async move {
                     let (parts, body) = req.into_parts();
+                    let body = TeeRequestBody::new(body, request_capture).boxed_unsync();
                     let upstream_req = Request::from_parts(parts, body);
                     let result = sender.lock().await.send_request(upstream_req).await;
                     match result {

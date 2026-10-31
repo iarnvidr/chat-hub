@@ -126,7 +126,8 @@ def receipt(root):
     pr_head = pr.get('head') or {}
     record = {
         'schema': 2, 'repository': os.environ['GITHUB_REPOSITORY'],
-        'workflow_path': NATIVE_WORKFLOW,
+        'workflow_path': (MAPPING_WORKFLOW if os.environ['GITHUB_EVENT_NAME'] == 'push'
+                          else NATIVE_WORKFLOW),
         'run_id': int(os.environ['GITHUB_RUN_ID']),
         'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
         'event': os.environ['GITHUB_EVENT_NAME'],
@@ -135,7 +136,7 @@ def receipt(root):
         'workflow_sha': os.environ['GITHUB_WORKFLOW_SHA'],
         'helper_sha': git(root, 'rev-parse', f'HEAD:{HELPER_PATH}'),
         'toolchain': {name: subprocess.run(command, capture_output=True, text=True, check=True).stdout.strip()
-                      for name, command in {'rustc': ['rustc', '--version'], 'node': ['node', '--version'],
+                      for name, command in {'rustc': ['rustc', '--version'], 'tauri-cli': ['cargo', 'tauri', '--version'],
                                             'macos': ['sw_vers', '-productVersion'],
                                             'sdk': ['xcrun', '--show-sdk-version']}.items()},
         'platform': PLATFORM, 'version': version(root),
@@ -283,7 +284,7 @@ def validate_pr_candidate(data, artifact, run, pr, merge_sha, merge_tree, build_
     if any(record.get(key) != value for key, value in expected.items()):
         raise ValueError('native receipt does not match the accepted PR tree, base, or run')
     tools = record.get('toolchain', {})
-    if set(tools) != {'rustc', 'node', 'macos', 'sdk'} or any(not isinstance(value, str) or not value for value in tools.values()):
+    if set(tools) != {'rustc', 'tauri-cli', 'macos', 'sdk'} or any(not isinstance(value, str) or not value for value in tools.values()):
         raise ValueError('native toolchain identity is incomplete')
     files = validate_files(record, members, build_version)
     workflow_blob = verify_workflow(NATIVE_WORKFLOW, record.get('workflow_sha'), merge_sha, api_fn)
@@ -297,6 +298,52 @@ def validate_pr_candidate(data, artifact, run, pr, merge_sha, merge_tree, build_
         'source_artifact_name': artifact['name'], 'workflow_path': NATIVE_WORKFLOW,
         'workflow_sha': record['workflow_sha'], 'workflow_blob': workflow_blob,
         'helper_sha': helper_blob, 'toolchain': tools, 'files': files,
+    }
+
+
+def validate_main_candidate(data, artifact, run, pr, merge_sha, merge_tree, build_version, api_fn,
+                            allow_in_progress=False):
+    if (run.get('path') != MAPPING_WORKFLOW or run.get('event') != 'push'
+            or run.get('head_sha') != merge_sha
+            or (run.get('conclusion') != 'success'
+                and not (allow_in_progress and run.get('status') == 'in_progress'))
+            or run.get('repository', {}).get('full_name') != REPOSITORY
+            or artifact.get('expired') or not isinstance(artifact.get('id'), int)
+            or artifact.get('name') != artifact_name(run, 'main')
+            or not isinstance(artifact.get('digest'), str)
+            or not re.fullmatch(r'sha256:[0-9a-f]{64}', artifact['digest'])
+            or run.get('head_branch') != 'main'):
+        raise ValueError('native producer is not the exact trusted-main acceptance run')
+    expected_files = {f'Chat_Hub_{build_version}_macos-arm64.zip',
+                      f'Chat_Hub_{build_version}_macos-arm64.zip.sha256',
+                      f'Chat_Hub_{build_version}_macos-arm64.dmg', 'native-receipt.json'}
+    members = zip_members(data, expected_files)
+    record = json.loads(members['native-receipt.json'])
+    expected = {
+        'schema': 2, 'repository': REPOSITORY, 'workflow_path': MAPPING_WORKFLOW,
+        'run_id': run['id'], 'run_attempt': run['run_attempt'], 'event': 'push',
+        'head': merge_sha, 'tree': merge_tree, 'version': build_version, 'platform': PLATFORM,
+    }
+    if any(record.get(key) != value for key, value in expected.items()):
+        raise ValueError('native receipt does not match the exact trusted-main commit, tree, or run')
+    if any(key in record for key in ('pr_number', 'pr_head_sha', 'head_repository', 'tested_base')):
+        raise ValueError('trusted-main native receipt unexpectedly identifies a PR build')
+    tools = record.get('toolchain', {})
+    if set(tools) != {'rustc', 'tauri-cli', 'macos', 'sdk'} or any(not isinstance(value, str) or not value for value in tools.values()):
+        raise ValueError('native toolchain identity is incomplete')
+    files = validate_files(record, members, build_version)
+    workflow_blob = verify_workflow(MAPPING_WORKFLOW, record.get('workflow_sha'), merge_sha, api_fn)
+    helper_blob = verify_helper(record.get('helper_sha'), merge_sha, api_fn)
+    return {
+        'schema': 1, 'repository': REPOSITORY, 'accepted_commit': merge_sha,
+        'accepted_tree': merge_tree, 'version': build_version, 'platform': PLATFORM,
+        'pr_number': pr['number'], 'pr_head_sha': pr['head']['sha'],
+        'source_run_id': run['id'],
+        'source_run_attempt': run['run_attempt'], 'source_artifact_id': artifact['id'],
+        'source_artifact_digest': artifact['digest'], 'source_artifact_name': artifact['name'],
+        'workflow_path': MAPPING_WORKFLOW, 'workflow_sha': record['workflow_sha'],
+        'workflow_blob': workflow_blob, 'helper_sha': helper_blob,
+        'toolchain': tools, 'files': files, 'acceptance': 'trusted-main-build',
     }
 
 
@@ -369,7 +416,7 @@ def require_check_receipt(pr, tested_base, merge_sha, merge_tree, api_fn):
     return max(accepted, key=lambda item: (item[0], item[1]))[2]
 
 
-def promote(root, merge_sha, api_fn=request):
+def promote(root, merge_sha, mapping_run_id, api_fn=request):
     if git(root, 'rev-parse', 'HEAD^{commit}') != merge_sha:
         raise ValueError('promotion checkout does not match the actual main merge commit')
     merge_tree = git(root, 'rev-parse', 'HEAD^{tree}')
@@ -385,36 +432,27 @@ def promote(root, merge_sha, api_fn=request):
     if ((pr.get('head') or {}).get('repo', {}).get('full_name') != REPOSITORY
             or (pr.get('base') or {}).get('repo', {}).get('full_name') != REPOSITORY):
         raise ValueError('fork-produced artifacts cannot be promoted')
-    head = pr['head']['sha']
-    runs = workflow_runs(NATIVE_WORKFLOW, head, 'pull_request', api_fn)
-    candidates = [run for run in runs if run.get('path') == NATIVE_WORKFLOW
-                 and run.get('event') == 'pull_request' and run.get('head_sha') == head
-                 and run.get('conclusion') == 'success'
-                  and run.get('repository', {}).get('full_name') == REPOSITORY
-                  and run.get('head_repository', {}).get('full_name') == REPOSITORY]
-    accepted = []
-    errors = []
-    for run in candidates:
-        artifacts = api_fn(f"repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts?per_page=100").get('artifacts', [])
-        name = artifact_name(run, 'pr')
-        found = [item for item in artifacts if item.get('name') == name and not item.get('expired')]
-        if len(found) != 1:
-            continue
-        artifact = found[0]
-        try:
-            data = artifact_bytes(artifact, api_fn)
-            record = validate_pr_candidate(data, artifact, run, pr, merge_sha,
-                                            merge_tree, build_version, api_fn)
-            check = require_check_receipt(pr, record['source_base_sha'], merge_sha, merge_tree, api_fn)
-            accepted.append((run['id'], run['run_attempt'], record, check))
-        except (ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as error:
-            errors.append(str(error))
-    if not accepted:
-        reason = errors[-1] if errors else 'no successful native PR artifact for the exact merged head and tree'
-        raise ValueError(f'accepted native artifact unavailable: {reason}')
-    _, _, record, check = max(accepted, key=lambda item: (item[0], item[1]))
+    if not str(mapping_run_id).isdigit():
+        raise ValueError('trusted-main acceptance run ID must be numeric')
+    run = api_fn(f'repos/{REPOSITORY}/actions/runs/{mapping_run_id}')
+    if (run.get('id') != int(mapping_run_id) or run.get('path') != MAPPING_WORKFLOW
+            or run.get('event') != 'push' or run.get('head_branch') != 'main'
+            or run.get('head_sha') != merge_sha
+            or run.get('repository', {}).get('full_name') != REPOSITORY
+            or run.get('status') != 'in_progress'):
+        raise ValueError('promotion must run inside the exact in-progress trusted-main acceptance for this commit')
+    artifacts = api_fn(f"repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts?per_page=100").get('artifacts', [])
+    name = artifact_name(run, 'main')
+    found = [item for item in artifacts if item.get('name') == name and not item.get('expired')]
+    if len(found) != 1:
+        raise ValueError('exact trusted-main native artifact is missing, expired, or ambiguous')
+    artifact = found[0]
+    data = artifact_bytes(artifact, api_fn)
+    record = validate_main_candidate(data, artifact, run, pr, merge_sha, merge_tree, build_version, api_fn,
+                                     allow_in_progress=True)
+    check = require_check_receipt(pr, None, merge_sha, merge_tree, api_fn)
+    record['source_base_sha'] = check['base_sha']
     record['check_receipt'] = check
-    record['acceptance'] = 'merged-pr'
     (root / 'accepted-native.json').write_text(json.dumps(record, sort_keys=True) + '\n')
     return record
 
@@ -441,7 +479,11 @@ def read_mapping(api_fn, run, commit, tree, build_version):
     accepted = json.loads(members['accepted-native.json'])
     if (accepted.get('repository') != REPOSITORY or accepted.get('accepted_commit') != commit
             or accepted.get('accepted_tree') != tree or accepted.get('version') != build_version
-            or accepted.get('platform') != PLATFORM):
+            or accepted.get('platform') != PLATFORM
+            or accepted.get('source_run_id') != run.get('id')
+            or accepted.get('source_run_attempt') != run.get('run_attempt')
+            or accepted.get('workflow_path') != MAPPING_WORKFLOW
+            or accepted.get('acceptance') != 'trusted-main-build'):
         raise ValueError('accepted mapping does not match the release commit, tree, version, or platform')
     return accepted
 
@@ -452,11 +494,13 @@ def source_artifact(accepted, api_fn):
         raise ValueError('accepted native run identity is malformed')
     run = api_fn(f'repos/{REPOSITORY}/actions/runs/{run_id}')
     if (run.get('id') != run_id or run.get('run_attempt') != attempt
-            or run.get('path') != NATIVE_WORKFLOW or run.get('event') != 'pull_request'
-            or run.get('conclusion') != 'success' or run.get('head_sha') != accepted.get('pr_head_sha')
+            or run.get('path') != MAPPING_WORKFLOW or run.get('event') != 'push'
+            or run.get('head_branch') != 'main' or run.get('head_sha') != accepted.get('accepted_commit')
+            or run.get('conclusion') != 'success'
             or run.get('repository', {}).get('full_name') != REPOSITORY
-            or run.get('head_repository', {}).get('full_name') != REPOSITORY):
-        raise ValueError('source native run is not the accepted successful same-repository PR run')
+            or accepted.get('workflow_path') != MAPPING_WORKFLOW
+            or accepted.get('acceptance') != 'trusted-main-build'):
+        raise ValueError('source native run is not the exact successful trusted-main build run')
     artifacts = api_fn(f'repos/{REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=100').get('artifacts', [])
     found = [item for item in artifacts if item.get('id') == accepted.get('source_artifact_id')
              and item.get('name') == accepted.get('source_artifact_name')
@@ -464,6 +508,8 @@ def source_artifact(accepted, api_fn):
              and not item.get('expired')]
     if len(found) != 1:
         raise ValueError('source native artifact ID or immutable digest changed after acceptance')
+    if accepted.get('source_artifact_name') != artifact_name(run, 'main'):
+        raise ValueError('source native artifact is not the run-attempt-specific trusted-main artifact')
     pr = api_fn(f"repos/{REPOSITORY}/pulls/{accepted['pr_number']}")
     if (not pr.get('merged') or pr.get('merge_commit_sha') != accepted.get('accepted_commit')
             or (pr.get('base') or {}).get('repo', {}).get('full_name') != REPOSITORY
@@ -543,7 +589,7 @@ def manual_main_candidate(run_id, merge_sha, merge_tree, build_version, api_fn):
     if any(key in record for key in ('pr_number', 'pr_head_sha', 'head_repository')):
         raise ValueError('manual native receipt unexpectedly identifies a PR build')
     tools = record.get('toolchain', {})
-    if set(tools) != {'rustc', 'node', 'macos', 'sdk'} or any(not isinstance(v, str) or not v for v in tools.values()):
+    if set(tools) != {'rustc', 'tauri-cli', 'macos', 'sdk'} or any(not isinstance(v, str) or not v for v in tools.values()):
         raise ValueError('manual native toolchain identity is incomplete')
     files = validate_files(record, members, build_version)
     workflow_blob = verify_workflow(NATIVE_WORKFLOW, record.get('workflow_sha'), merge_sha, api_fn)
@@ -576,8 +622,8 @@ def retrieve(root, tag, api_fn=request, mapping_run_id=None, trusted_main_run_id
         verify_check_receipt(accepted, merge_sha, merge_tree, api_fn)
         run, pr, artifact = source_artifact(accepted, api_fn)
         data = artifact_bytes(artifact, api_fn)
-        verified = validate_pr_candidate(data, artifact, run, pr, merge_sha,
-                                         merge_tree, build_version, api_fn)
+        verified = validate_main_candidate(data, artifact, run, pr, merge_sha,
+                                           merge_tree, build_version, api_fn)
         for key, value in verified.items():
             if accepted.get(key) != value:
                 raise ValueError('source PR artifact no longer matches its accepted main mapping')
@@ -609,6 +655,7 @@ if __name__ == '__main__':
     promote_parser = sub.add_parser('promote')
     promote_parser.add_argument('--root', type=Path, default=Path.cwd())
     promote_parser.add_argument('--merge-sha', required=True)
+    promote_parser.add_argument('--mapping-run-id', required=True)
     retrieve_parser = sub.add_parser('retrieve')
     retrieve_parser.add_argument('--root', type=Path, default=Path.cwd())
     retrieve_parser.add_argument('--tag', required=True)
@@ -621,7 +668,7 @@ if __name__ == '__main__':
         elif args.operation == 'check-receipt':
             check_receipt(args.root)
         elif args.operation == 'promote':
-            promote(args.root, args.merge_sha)
+            promote(args.root, args.merge_sha, args.mapping_run_id)
         else:
             retrieve(args.root, args.tag, mapping_run_id=args.mapping_run_id,
                      trusted_main_run_id=args.trusted_main_run_id)

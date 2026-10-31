@@ -1,15 +1,15 @@
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
-workflow = (ROOT / '.github/workflows/macos.yml').read_text()
+workflow = (ROOT / 'ci/actions/macos-native-build/action.yml').read_text()
 release = (ROOT / '.github/workflows/release.yml').read_text()
 smoke = (ROOT / 'build/smoke-native-macos.sh').read_text()
 handler = (ROOT / 'src-tauri/src/crash_diagnostics.rs').read_text()
-startup_step = workflow.split('      - name: Required release app launch and localhost health smoke\n', 1)[1].split('\n      - ', 1)[0]
+startup_step = workflow.split('    - name: Required release app launch and localhost health smoke\n', 1)[1].split('\n    - ', 1)[0]
 assert 'continue-on-error:' not in startup_step
 assert 'run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"' in startup_step
 assert 'Verify transformed archive and launch without signing or publication credentials' in release
 assert 'bash build/smoke-native-macos.sh "$target/Chat Hub.app"' in release
-assert 'needs: [prepare, qualify]' in release
+assert 'needs: [prepare, qualify, artifact-transfer]' in release
 for needle in ('open', 'osascript', 'service PID changed', 'for _ in range(15):', "health_path='/api/health'", 'OBJC_DEBUG_MISSING_POOLS=NO', 'RUST_BACKTRACE=1', 'NSUnbufferedIO=YES', 'chat-hub-desktop*.ips'):
     assert needle in smoke, needle
 for needle in ('NSSetUncaughtExceptionHandler', 'callStackSymbols', 'reason', 'name'):

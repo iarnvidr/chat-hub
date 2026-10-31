@@ -4,6 +4,27 @@ use chat_hub::{
     service,
 };
 use std::{env, time::Duration};
+
+const HELP: &str = "Chat Hub — local conversation library
+
+Usage: chat-hub <command> [arguments]
+
+Commands:
+  status                       Check the desktop app or standalone service and library
+  search <words...>            Search saved messages; print matching chat IDs
+  read <id>                   Print a saved conversation as JSON
+  import <export.json>        Import a ChatGPT export into the local library
+  backup <destination>        Save a SQLite library backup
+  export-json <destination>   Export the local library as JSON
+  restore <backup.sqlite3>    Restore into an empty library
+  serve                       Run the standalone local service (CHAT_HUB_TOKEN required)
+
+Options:
+  -h, --help                  Show this help
+  -V, --version               Show the version
+
+Uses the desktop app's library by default. CHAT_HUB_DATABASE selects another library.
+Local library commands do not require a token. ChatGPT sign-in and live chat use the app.";
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -14,6 +35,14 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
+        None | Some("-h" | "--help" | "help") => {
+            println!("{HELP}");
+            Ok(())
+        }
+        Some("-V" | "--version" | "version") => {
+            println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("import") => {
             let path = args.next().ok_or("usage: chat-hub import <path>")?;
             if args.next().is_some() {
@@ -23,7 +52,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let bytes = chat_hub::importer::read_input(file)?;
             // Validate before opening the database or creating its data directory.
             chat_hub::importer::parse_export(&bytes)?;
-            let c = Config::from_env()?;
+            let c = Config::for_local_cli()?;
             if c.database_path != ":memory:" {
                 if let Some(parent) = std::path::Path::new(&c.database_path)
                     .parent()
@@ -39,6 +68,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(())
         }
+        Some("restore") => {
+            let source = args
+                .next()
+                .ok_or("usage: chat-hub restore <backup.sqlite3>")?;
+            if args.next().is_some() {
+                return Err("usage: chat-hub restore <backup.sqlite3>".into());
+            }
+            let c = Config::for_local_cli()?;
+            if c.database_path == ":memory:" {
+                return Err("restore requires a file-backed library".into());
+            }
+            if let Some(parent) = std::path::Path::new(&c.database_path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| "unable to create library directory")?;
+            }
+            let mut store = chat_hub::store::Store::open(&c.database_path)
+                .map_err(|_| "unable to open restore destination")?;
+            let receipt = store.restore_from(source)?;
+            println!("{{\"operation\":\"restore\",\"schema_version\":{},\"library_revision\":{},\"conversation_count\":{}}}", receipt.schema_version, receipt.library_revision, receipt.conversation_count);
+            Ok(())
+        }
         Some(command @ ("backup" | "export-json")) => {
             let usage = if command == "backup" {
                 "usage: chat-hub backup <destination>"
@@ -49,7 +102,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.next().is_some() {
                 return Err(usage.into());
             }
-            let c = Config::from_env()?;
+            let c = Config::for_local_cli()?;
             if c.database_path == ":memory:" {
                 return Err("archive commands require an existing file-backed library".into());
             }
@@ -66,23 +119,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some("status") => {
-            let c = Config::from_env()?;
+            if args.next().is_some() {
+                return Err("usage: chat-hub status".into());
+            }
+            let c = Config::for_local_cli()?;
             let s = chat_hub::runtime::status(&c).await?;
             println!("{}", serde_json::to_string(&s)?);
             Ok(())
         }
         Some("search") => {
             let q = args.collect::<Vec<_>>().join(" ");
-            let c = Config::from_env()?;
-            for id in chat_hub::store::Store::open(&c.database_path)?.search(&q, 50)? {
+            if q.trim().is_empty() {
+                return Err("usage: chat-hub search <words...>".into());
+            }
+            let c = Config::for_local_cli()?;
+            for id in chat_hub::store::Store::open_existing(&c.database_path)?.search(&q, 50)? {
                 println!("{id}")
             }
             Ok(())
         }
         Some("read") => {
             let id = args.next().ok_or("usage: chat-hub read <id>")?;
-            let c = Config::from_env()?;
-            if let Some(v) = chat_hub::store::Store::open(&c.database_path)?.read(&id)? {
+            if args.next().is_some() {
+                return Err("usage: chat-hub read <id>".into());
+            }
+            let c = Config::for_local_cli()?;
+            if let Some(v) = chat_hub::store::Store::open_existing(&c.database_path)?.read(&id)? {
                 println!("{}", serde_json::to_string_pretty(&v)?);
                 Ok(())
             } else {
@@ -108,6 +170,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{}", service::shutdown_report(&stats, capture.snapshot()));
             Ok(())
         }
-        _ => Err("usage: chat-hub <status|search|read|serve|import|backup|export-json>".into()),
+        _ => Err("unknown command; run chat-hub --help".into()),
     }
 }

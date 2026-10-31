@@ -1,6 +1,7 @@
 """Execute production authorization policy and panic hook without desktop dependencies."""
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -50,7 +51,10 @@ class WindowPolicyTests(unittest.TestCase):
 fn main() {{ crash_diagnostics::install(); panic!("{{}}", format!("UNICODE-λ-{{}}", "x".repeat(50000))); }}
 ''')
             binary = temp / "panic"
-            subprocess.run(["rustc", "--edition=2021", str(harness), "-o", str(binary)], check=True, timeout=60)
+            command = ["rustc", "--edition=2021", str(harness), "-o", str(binary)]
+            if sys.platform == "darwin":
+                command.extend(["-l", "framework=Foundation", "-l", "objc"])
+            subprocess.run(command, check=True, timeout=60)
             binary.chmod(0o700)
             env = dict(__import__("os").environ, RUST_BACKTRACE="1", CHAT_HUB_CRASH_EVIDENCE=str(temp / "evidence"))
             result = subprocess.run(["bash", "-c", '"$1"', "runner", str(binary)], capture_output=True, env=env, timeout=15)

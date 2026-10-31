@@ -1,7 +1,7 @@
 mod common;
 
 use chat_hub::{
-    archive::BackupReceipt,
+    archive::{prepare_restore, BackupReceipt},
     store::{GraphNode, Observation, Store},
 };
 use rusqlite::Connection;
@@ -64,6 +64,100 @@ fn check_database(path: &std::path::Path) -> Connection {
 }
 
 #[test]
+fn observations_without_a_title_do_not_erase_a_known_conversation_title() {
+    let dir = common::temp_dir("chat-hub-preserve-title");
+    let mut store = Store::open(dir.join("db.sqlite").to_str().unwrap()).unwrap();
+    let mut first = observation(
+        "title-source",
+        "Known title",
+        vec![node("root", None, vec![json!("first message")])],
+        Some("root"),
+    );
+    first.observed_ms = 10;
+    let id = store.ingest_observation(&first).unwrap();
+    let mut later = observation(
+        "title-source",
+        "",
+        vec![node("reply", Some("root"), vec![json!("second message")])],
+        Some("reply"),
+    );
+    later.observed_ms = 11;
+    store.ingest_observation(&later).unwrap();
+    let detail = store.read_normalized(&id).unwrap().unwrap();
+    assert_eq!(detail["title"], "Known title");
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn prepared_restore_keeps_current_library_until_atomic_commit() {
+    let dir = common::temp_dir("chat-hub-backup-replace");
+    let source = dir.join("source.db");
+    let backup = dir.join("portable-backup.db");
+    let destination = dir.join("library.db");
+    let mut exported = Store::open(source.to_str().unwrap()).unwrap();
+    exported
+        .ingest_observation(&observation(
+            "backup-item",
+            "Restored conversation",
+            vec![node(
+                "root",
+                None,
+                vec![json!("restored searchable phrase")],
+            )],
+            Some("root"),
+        ))
+        .unwrap();
+    exported.backup_to(&backup).unwrap();
+
+    let mut current = Store::open(destination.to_str().unwrap()).unwrap();
+    current
+        .ingest_observation(&observation(
+            "existing-item",
+            "Current conversation",
+            vec![node("root", None, vec![json!("current searchable phrase")])],
+            Some("root"),
+        ))
+        .unwrap();
+    drop(current);
+    drop(exported);
+
+    let invalid_backup = dir.join("invalid.sqlite3");
+    std::fs::write(&invalid_backup, b"not sqlite").unwrap();
+    assert!(prepare_restore(&invalid_backup, &destination).is_err());
+    let current = Store::open_existing(destination.to_str().unwrap()).unwrap();
+    assert_eq!(current.search("current searchable", 10).unwrap().len(), 1);
+    drop(current);
+
+    let prepared = prepare_restore(&backup, &destination).unwrap();
+    assert_eq!(prepared.receipt().conversation_count, 1);
+    let before_commit = Store::open_existing(destination.to_str().unwrap()).unwrap();
+    assert_eq!(
+        before_commit
+            .search("current searchable", 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(before_commit
+        .search("restored searchable", 10)
+        .unwrap()
+        .is_empty());
+    drop(before_commit);
+
+    prepared.commit().unwrap();
+    let restored = Store::open_existing(destination.to_str().unwrap()).unwrap();
+    assert!(restored
+        .search("current searchable", 10)
+        .unwrap()
+        .is_empty());
+    assert_eq!(restored.search("restored searchable", 10).unwrap().len(), 1);
+    drop(restored);
+    drop(check_database(&destination));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn backup_is_independent_valid_and_never_overwrites() {
     let dir = common::temp_dir("chat-hub-backup-basic");
     let source = dir.join("source.db");
@@ -108,6 +202,12 @@ fn backup_is_independent_valid_and_never_overwrites() {
             None,
         ))
         .unwrap();
+    store
+        .set_target_tags("conversation", &id1, &["reference".into()])
+        .unwrap();
+    store
+        .set_target_tags("entity", "entity:repository-opaque", &["reference".into()])
+        .unwrap();
     let receipt: BackupReceipt = store.backup_to(&dest).unwrap();
     assert_eq!(receipt.schema_version, store.schema_version().unwrap());
     assert_eq!(receipt.library_revision, store.library_revision().unwrap());
@@ -119,6 +219,15 @@ fn backup_is_independent_valid_and_never_overwrites() {
         receipt.conversation_count
     );
     assert_eq!(receipt.conversation_count, 2);
+    assert_eq!(
+        copy.query_row(
+            "SELECT count(*) FROM target_tags WHERE name_key='reference'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -141,6 +250,10 @@ fn backup_is_independent_valid_and_never_overwrites() {
         receipt.library_revision
     );
     assert_eq!(
+        reopened.target_tags("conversation", &id1).unwrap(),
+        ["reference"]
+    );
+    assert_eq!(
         reopened.search("branch searchable", 10).unwrap(),
         vec![id1.clone()]
     );
@@ -156,6 +269,67 @@ fn backup_is_independent_valid_and_never_overwrites() {
     let missing = dir.join("absent").join("backup.db");
     assert!(store.backup_to(&missing).is_err());
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn restore_into_empty_library_preserves_records_and_search() {
+    let dir = common::temp_dir("chat-hub-restore-empty");
+    let source = dir.join("source.db");
+    let backup = dir.join("backup.db");
+    let destination = dir.join("restored.db");
+    let mut original = Store::open(source.to_str().unwrap()).unwrap();
+    let id = original
+        .ingest_observation(&observation(
+            "restore-conversation",
+            "Restored library title",
+            vec![node(
+                "root",
+                None,
+                vec![json!("restore-only-message-phrase")],
+            )],
+            Some("root"),
+        ))
+        .unwrap();
+    original.backup_to(&backup).unwrap();
+    drop(original);
+    Connection::open(&backup)
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM message_fts; DELETE FROM title_fts; DELETE FROM normalized_fts;",
+        )
+        .unwrap();
+
+    let mut restored = Store::open(destination.to_str().unwrap()).unwrap();
+    let receipt = restored.restore_from(&backup).unwrap();
+    assert_eq!(receipt.conversation_count, 1);
+    assert_eq!(
+        restored.search("restore-only-message-phrase", 10).unwrap(),
+        vec![id.clone()]
+    );
+    assert_eq!(
+        restored
+            .search_page_snapshot("restore-only-message-phrase", 10, None, None)
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    assert_eq!(
+        restored.read_normalized(&id).unwrap().unwrap()["title"],
+        "Restored library title"
+    );
+    assert!(
+        restored.restore_from(&backup).is_err(),
+        "non-empty destination must not be overwritten"
+    );
+    drop(restored);
+
+    let reopened = Store::open(destination.to_str().unwrap()).unwrap();
+    assert_eq!(
+        reopened.search("restore-only-message-phrase", 10).unwrap(),
+        vec![id]
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
