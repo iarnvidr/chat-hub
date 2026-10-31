@@ -848,6 +848,15 @@ async fn get_chatgpt_connection(
 }
 
 #[tauri::command]
+fn prepare_chatgpt_session(
+    window: tauri::Webview,
+    state: State<'_, ProviderViewState>,
+) -> Result<bool, String> {
+    authorize_local_main(&window)?;
+    state.prepare_session()
+}
+
+#[tauri::command]
 fn sync_chatgpt_history(
     window: tauri::Webview,
     app: tauri::AppHandle,
@@ -1209,6 +1218,7 @@ fn main() {
             set_provider_view,
             open_provider_conversation,
             get_chatgpt_connection,
+            prepare_chatgpt_session,
             sync_chatgpt_history,
             chatgpt_history_status,
             check_for_updates,
@@ -1260,6 +1270,7 @@ fn main() {
             set_provider_view,
             open_provider_conversation,
             get_chatgpt_connection,
+            prepare_chatgpt_session,
             sync_chatgpt_history,
             chatgpt_history_status,
             check_for_updates,

@@ -5,6 +5,7 @@ const workspaceStatus = document.getElementById('workspace-sync-state');
 let pollTimer, cooldownTimer, lastChanges = 0, lastExports = 0, running = false, pendingConnection = false;
 let startPromise = null, interactiveSync = false, cooldownUntil = 0, automaticSyncUntil = 0, lastConnectionStart = 0;
 let configured = true;
+let sessionTimer;
 const hasNative = typeof window.__TAURI_INTERNALS__?.invoke === 'function';
 const AUTO_EVENT_DEBOUNCE_MS = 5000;
 const AUTO_SYNC_COALESCE_MS = 5 * 60 * 1000;
@@ -28,6 +29,7 @@ function updateButton() {
 }
 
 function setCooldown(seconds, _message, manual = false) {
+  clearTimeout(sessionTimer);
   const delay = Math.max(0, Math.min(1800, Number(seconds) || 0));
   if (delay <= 0) return;
   cooldownUntil = Math.max(cooldownUntil, Date.now() + delay * 1000);
@@ -155,6 +157,7 @@ async function runStart(automatic) {
 
 function start({automatic = false} = {}) {
   if (startPromise || running || cooldownUntil > Date.now() || !configured) return startPromise || Promise.resolve();
+  clearTimeout(sessionTimer);
   if (automatic && automaticSyncUntil > Date.now()) return Promise.resolve();
   startPromise = runStart(automatic).finally(() => { startPromise = null; });
   return startPromise;
@@ -167,7 +170,27 @@ async function startup() {
   try {
     const connection = await window.ChatHub.invoke('get_chatgpt_connection');
     if (connection?.state === 'connected') await start({automatic: true});
-  } catch { /* Startup probing never navigates or interrupts the current view. */ }
+    else if (connection?.state === 'not_open' || connection?.state === 'loading') {
+      // Initialize only an untouched hidden session. Native code refuses to
+      // navigate a page that already hosts a live chat or an unsent draft.
+      await window.ChatHub.invoke('prepare_chatgpt_session');
+      const deadline = Date.now() + 60000;
+      const probe = async () => {
+        if (running || cooldownUntil > Date.now()) return;
+        try {
+          const session = await window.ChatHub.invoke('get_chatgpt_connection');
+          if (session?.state === 'connected') { await start({automatic: true}); return; }
+          if (session?.state === 'signed_out') {
+            footer('Connect ChatGPT in Settings');
+            say('Connect ChatGPT in Settings to sync history. Your saved chats are available offline.');
+            return;
+          }
+          if (Date.now() < deadline) sessionTimer = setTimeout(probe, 2000);
+        } catch { /* Startup remains bounded and never opens a sign-in window. */ }
+      };
+      sessionTimer = setTimeout(probe, 2000);
+    }
+  } catch { /* Startup never interrupts the active conversation. */ }
 }
 
 if (button) button.addEventListener('click', () => start({automatic: false}));

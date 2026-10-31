@@ -123,7 +123,7 @@ class UiBridgeContract(unittest.TestCase):
         sensitive = (
             "update_status", "service_info", "check_for_updates", "install_update",
             "e2e_result", "set_provider_view", "open_provider_conversation",
-            "get_chatgpt_connection",
+            "get_chatgpt_connection", "prepare_chatgpt_session",
             "get_capture_preferences", "set_capture_preferences", "restart_capture_settings",
             "sync_chatgpt_history", "chatgpt_history_status",
         )

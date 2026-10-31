@@ -32,7 +32,7 @@ function boot(invoke, {buttonPresent = true} = {}) {
   };
 }
 
-test('startup checks the provider session without opening ChatGPT or starting a sync when it is not open', async () => {
+test('startup prepares a hidden session without opening the live view or starting an unready sync', async () => {
   const calls = [], ui = boot(async command => {
     calls.push(command);
     if (command === 'chatgpt_history_status') return {state: 'idle', configured: true, auto_sync: false};
@@ -40,9 +40,27 @@ test('startup checks the provider session without opening ChatGPT or starting a 
     return {};
   });
   await ui.flush();
-  assert.deepEqual(calls, ['chatgpt_history_status', 'get_chatgpt_connection']);
+  assert.deepEqual(calls, ['chatgpt_history_status', 'get_chatgpt_connection', 'prepare_chatgpt_session']);
   assert.equal(calls.includes('sync_chatgpt_history'), false);
   assert.deepEqual(ui.events, []);
+});
+
+test('a hidden startup session becomes connected and syncs without opening a tab', async () => {
+  let probes = 0, starts = 0;
+  const ui = boot(async command => {
+    if (command === 'chatgpt_history_status') return {state: starts ? 'completed' : 'idle'};
+    if (command === 'get_chatgpt_connection') return {state: probes++ ? 'connected' : 'not_open'};
+    if (command === 'prepare_chatgpt_session') return true;
+    if (command === 'sync_chatgpt_history') starts++;
+    return {};
+  });
+  await ui.flush();
+  const pending = [...ui.timers.values()].find(timer => timer.ms === 2000);
+  assert.ok(pending);
+  await pending.fn(); await ui.flush();
+  assert.equal(starts, 1);
+  assert.equal(ui.events.includes('chat-hub:show-live'), false);
+  assert.equal(ui.events.includes('chat-hub:connect'), false);
 });
 
 test('a signed-in session found at startup starts a background history sync', async () => {

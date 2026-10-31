@@ -259,6 +259,10 @@ fn cleanup_probe(webview: &Webview<Wry>, key_json: &str) {
     let _ = webview.eval(&format!("delete window[{key_json}]"));
 }
 
+fn should_prepare_session(navigated: bool) -> bool {
+    !navigated
+}
+
 struct Inner {
     webview: Webview<Wry>,
     navigated: bool,
@@ -274,6 +278,22 @@ pub struct ProviderViewState {
 }
 
 impl ProviderViewState {
+    /// Initialize the provider's own signed-in browser session in the hidden
+    /// child webview. This never reveals the view or replaces a live page.
+    pub fn prepare_session(&self) -> Result<bool, String> {
+        let mut inner = self.inner.lock().map_err(|_| "provider_unavailable".to_string())?;
+        if !should_prepare_session(inner.navigated) {
+            return Ok(false);
+        }
+        inner
+            .webview
+            .navigate(tauri::Url::parse("https://chatgpt.com/").map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        inner.loaded = false;
+        inner.navigated = true;
+        Ok(true)
+    }
+
     pub(crate) fn history_webview(&self) -> Result<Webview<Wry>, String> {
         let (webview, loaded) = {
             let inner = self
@@ -604,7 +624,7 @@ mod target_url_tests {
     use super::{
         allowed_provider_navigation, current_chatgpt_conversation_id, exact_chatgpt_origin,
         page_metadata_script, parse_page_metadata_callback, parse_probe_callback, target_url,
-        valid_observed_scope, ChatGptConnectionState, ProbePoll,
+        should_prepare_session, valid_observed_scope, ChatGptConnectionState, ProbePoll,
     };
 
     #[test]
@@ -618,6 +638,13 @@ mod target_url_tests {
         for bad in ["not-a-uuid", "https://example.com", "../settings", ""] {
             assert!(target_url(Some(bad)).is_err());
         }
+    }
+
+    #[test]
+    fn background_session_preparation_only_navigates_an_unopened_provider() {
+        assert!(should_prepare_session(false));
+        assert!(!should_prepare_session(true));
+        assert_eq!(target_url(None).unwrap().as_str(), "https://chatgpt.com/");
     }
 
     #[test]
