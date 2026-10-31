@@ -1,6 +1,9 @@
 """Static and source-bundle contracts for protected release tooling."""
 import hashlib
 import json
+import os
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,6 +33,17 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("needs: prepare", self.workflow)
         self.assertIn("name: chat-hub-release", self.workflow)
         self.assertNotIn("contents: write", self.workflow.split("publish:", 1)[0])
+
+    def test_release_review_transport_binds_the_tag_in_its_own_step(self):
+        step = self.workflow.split("- name: Stage protected release review artifacts\n", 1)[1].split("      - id:", 1)[0]
+        self.assertIn("INPUT_TAG: ${{ inputs.tag }}", step.split("run: |", 1)[0])
+        script = re.search(r"<<'PY'\n(.*?)\n          PY", step, re.S).group(1)
+        script = "\n".join(line[10:] for line in script.splitlines())
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "transport.json"
+            env = {**os.environ, "GITHUB_REPOSITORY": "iarnvidr/chat-hub", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_SHA": "a" * 40, "INPUT_TAG": "v0.2.1"}
+            subprocess.run([sys.executable, "-c", script, str(output)], env=env, check=True, capture_output=True)
+            self.assertEqual(json.loads(output.read_text()), {"repository": "iarnvidr/chat-hub", "run_id": "123", "run_attempt": "1", "sha": "a" * 40, "tag": "v0.2.1"})
 
     def test_signing_and_dmg_evidence_are_required(self):
         self.assertIn("TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}", self.workflow)

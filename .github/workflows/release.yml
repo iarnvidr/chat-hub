@@ -126,6 +126,8 @@ jobs:
           python3 build/updater_release.py generate "$INPUT_VERSION" "$url" "$(cat "$RUNNER_TEMP/chat-hub/Chat-Hub.app.tar.gz.sig")" "$RUNNER_TEMP/chat-hub/latest.json" --repo "$GITHUB_REPOSITORY" --tag "$INPUT_TAG"
           python3 build/updater_release.py validate "$RUNNER_TEMP/chat-hub/latest.json"
       - name: Stage protected release review artifacts
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/release-review-transport"
