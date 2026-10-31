@@ -10,6 +10,14 @@ on:
         description: Existing tag (for example v0.1.0); workflow never creates tags
         required: true
         type: string
+      mapping_run_id:
+        description: Successful main acceptance-mapping run for this exact merged tree
+        required: false
+        type: string
+      trusted_main_run_id:
+        description: Explicit successful workflow_dispatch macOS run on main; use only when no accepted PR mapping exists
+        required: false
+        type: string
       publish:
         description: Publish reviewed assets to the existing GitHub Release
         required: true
@@ -56,8 +64,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_MAPPING_RUN_ID: ${{ inputs.mapping_run_id }}
+          INPUT_TRUSTED_MAIN_RUN_ID: ${{ inputs.trusted_main_run_id }}
         run: |
-          python3 build/release_artifact.py retrieve --tag "$INPUT_TAG"
+          set -euo pipefail
+          if [[ -n "$INPUT_MAPPING_RUN_ID" && -n "$INPUT_TRUSTED_MAIN_RUN_ID" ]] || [[ -z "$INPUT_MAPPING_RUN_ID" && -z "$INPUT_TRUSTED_MAIN_RUN_ID" ]]; then
+            echo "Provide exactly one acceptance mapping run ID or trusted-main manual native run ID." >&2
+            exit 2
+          fi
+          python3 build/release_artifact.py retrieve --tag "$INPUT_TAG" \
+            --mapping-run-id "$INPUT_MAPPING_RUN_ID" --trusted-main-run-id "$INPUT_TRUSTED_MAIN_RUN_ID"
           mkdir -p "$RUNNER_TEMP/chat-hub"
           ditto -x -k artifacts/Chat_Hub_*.zip "$RUNNER_TEMP/chat-hub"
           cp artifacts/Chat_Hub_*.dmg artifacts/release-input.json "$RUNNER_TEMP/chat-hub/"

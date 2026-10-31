@@ -19,3 +19,13 @@ jobs:
           verb: call
           module: ./ci/dagger/check
           args: checks --source .
+      - name: Record the exact successful PR check receipt
+        if: github.event_name == 'pull_request'
+        run: python3 build/release_artifact.py check-receipt --root "$GITHUB_WORKSPACE"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          name: chat-hub-check-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/check-receipt.json
+          if-no-files-found: error
+          retention-days: 90

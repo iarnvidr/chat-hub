@@ -15,6 +15,8 @@ on:
       - "rust-toolchain.toml"
       - "tauri.conf.json"
       - ".github/workflows/macos.yml"
+      - ".github/workflows/check.yml"
+      - ".github/workflows/accept-native.yml"
   workflow_dispatch:
 permissions:
   contents: read
@@ -23,6 +25,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   package:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -197,10 +200,10 @@ jobs:
       - name: Upload accepted native release input
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: chat-hub-native-release
+          name: chat-hub-native-release-${{ github.event_name == 'pull_request' && 'pr' || 'main' }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/*
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
       - name: Show where to download this build
         env:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
