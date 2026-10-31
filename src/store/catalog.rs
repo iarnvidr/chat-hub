@@ -5,15 +5,19 @@ use crate::catalog::{
 use crate::error::{Error, Result};
 use crate::store::Store;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_SAMPLE_BYTES: usize = 64 * 1024;
 const SAMPLE_CHUNK_BYTES: usize = 4 * 1024;
 const MAX_SAMPLE_ROWS: usize = MAX_SAMPLE_BYTES / SAMPLE_CHUNK_BYTES;
 const REBUILD_BATCH_CHATS: usize = 64;
 const MAX_TERMS_PER_CHAT: usize = 10;
-const MAX_CHATS_IN_GRAPH: usize = 12;
-const MAX_NEIGHBOR_DEGREE: usize = 5;
+const MAX_CHATS_IN_GRAPH: usize = 100;
+const MAX_GLOBAL_GRAPH_CANDIDATES: usize = 20_000;
+const MAX_GLOBAL_GRAPH_EDGES: usize = 30_000;
+const MAX_KEYWORD_POSTING: usize = 256;
+const PROJECT_CANDIDATE_NEIGHBORS: usize = 3;
+const MAX_NEIGHBOR_DEGREE: usize = 4;
 const KEYWORD_CANDIDATE_SCAN: usize = 100;
 const MAX_EDGES_IN_GRAPH: usize = MAX_CHATS_IN_GRAPH * MAX_NEIGHBOR_DEGREE / 2;
 
@@ -248,34 +252,15 @@ impl Store {
             });
         }
         let stats = read_stats(&tx, source_filter, project_key)?;
-        let chats = read_chat_rows(&tx, source_filter, project_key, limit)?;
-        let nodes = chats.iter().map(chat_node).collect::<Vec<_>>();
-        let mut edges = Vec::new();
-        let mut truncated = stats.chats > chats.len() as i64;
-        let mut degrees = vec![0_usize; chats.len()];
-        for left in 0..chats.len() {
-            for right in (left + 1)..chats.len() {
-                let first = &chats[left];
-                let second = &chats[right];
-                if same_account(first, second)
-                    && first.project_key.is_some()
-                    && first.project_key == second.project_key
-                {
-                    if degrees[left] < MAX_NEIGHBOR_DEGREE && degrees[right] < MAX_NEIGHBOR_DEGREE {
-                        edges.push(project_relationship(first, second));
-                        degrees[left] += 1;
-                        degrees[right] += 1;
-                    } else {
-                        truncated = true;
-                    }
-                }
-            }
-        }
+        let (nodes, edges, truncated) =
+            read_global_relationship_map(&tx, source_filter, project_key, limit)?;
+        let unmapped_count = (stats.chats - nodes.len() as i64).max(0);
         tx.commit()?;
         Ok(CatalogGraph {
             index,
             stats,
             truncated,
+            unmapped_count,
             focus_id: None,
             nodes,
             edges,
@@ -366,15 +351,333 @@ impl Store {
             nodes.push(chat_node(&neighbor));
             edges.push(edge);
         }
+        let unmapped_count = (stats.chats - nodes.len() as i64).max(0);
         tx.commit()?;
         Ok(CatalogGraph {
             index,
             stats,
             truncated,
+            unmapped_count,
             focus_id: Some(focus.catalog_id),
             nodes,
             edges,
         })
+    }
+}
+
+#[derive(Debug)]
+struct CandidateRelationship {
+    left: usize,
+    right: usize,
+    edge: CatalogEdge,
+}
+
+fn read_global_relationship_map(
+    conn: &Connection,
+    source_filter: &str,
+    project_filter: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<CatalogNode>, Vec<CatalogEdge>, bool)> {
+    let mut chats = read_chat_rows(
+        conn,
+        source_filter,
+        project_filter,
+        MAX_GLOBAL_GRAPH_CANDIDATES + 1,
+    )?;
+    let candidate_truncated = chats.len() > MAX_GLOBAL_GRAPH_CANDIDATES;
+    chats.truncate(MAX_GLOBAL_GRAPH_CANDIDATES);
+    if chats.is_empty() {
+        return Ok((Vec::new(), Vec::new(), candidate_truncated));
+    }
+
+    let mut by_catalog_id = HashMap::with_capacity(chats.len());
+    for (index, chat) in chats.iter().enumerate() {
+        by_catalog_id.insert(chat.catalog_id.as_str(), index);
+    }
+    let mut candidate_edges = Vec::new();
+    let mut pairs = HashSet::new();
+    let mut truncated = candidate_truncated;
+
+    // Project memberships are explicit. Link each chat to the next few recent
+    // chats in that project/account, making a bounded chain instead of a clique.
+    let mut project_groups = BTreeMap::<(String, String, String), Vec<usize>>::new();
+    for (index, chat) in chats.iter().enumerate() {
+        if let Some(project_key) = chat.project_key.as_deref() {
+            project_groups
+                .entry((
+                    chat.provider.clone(),
+                    chat.account_scope.clone(),
+                    project_key.to_owned(),
+                ))
+                .or_default()
+                .push(index);
+        }
+    }
+    for members in project_groups.values() {
+        for left_position in 0..members.len() {
+            for offset in 1..=PROJECT_CANDIDATE_NEIGHBORS {
+                let Some(&right) = members.get(left_position + offset) else {
+                    break;
+                };
+                let left = members[left_position];
+                let pair = (left.min(right), left.max(right));
+                if pairs.insert(pair) {
+                    push_candidate_edge(
+                        &mut candidate_edges,
+                        CandidateRelationship {
+                            left,
+                            right,
+                            edge: project_relationship(&chats[left], &chats[right]),
+                        },
+                        &mut truncated,
+                    );
+                }
+            }
+        }
+    }
+
+    // Read bounded lexical metadata from the persisted index. A keyword link is
+    // considered only within the exact provider/account and requires two terms.
+    type TermKey = (String, String, String);
+    let sql = format!(
+        "SELECT c.catalog_id,c.provider,c.account_scope,t.term,t.chat_count
+         FROM catalog_chats c
+         JOIN catalog_edges e ON e.source_id=c.catalog_id AND e.basis='shared_keyword'
+         JOIN catalog_terms t ON t.term_id=e.target_id
+         WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1)
+         ORDER BY c.catalog_id,t.term"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([project_filter], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    let mut postings = BTreeMap::<TermKey, Vec<(usize, i64)>>::new();
+    let mut chat_terms = vec![Vec::<(TermKey, i64)>::new(); chats.len()];
+    let mut chat_count_by_scope = HashMap::<(String, String), i64>::new();
+    let mut scope_counts = conn.prepare(
+        "SELECT provider,account_scope,count(*) FROM catalog_chats GROUP BY provider,account_scope",
+    )?;
+    for row in scope_counts.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (provider, account_scope, count) = row?;
+        chat_count_by_scope.insert((provider, account_scope), count);
+    }
+    for row in rows {
+        let (catalog_id, provider, account_scope, term, document_frequency) = row?;
+        if document_frequency > MAX_KEYWORD_POSTING as i64 {
+            truncated = true;
+            continue;
+        }
+        let Some(&index) = by_catalog_id.get(catalog_id.as_str()) else {
+            continue;
+        };
+        let key = (provider, account_scope, term);
+        postings
+            .entry(key.clone())
+            .or_default()
+            .push((index, document_frequency));
+        chat_terms[index].push((key, document_frequency));
+    }
+
+    for (left, terms) in chat_terms.iter().enumerate() {
+        let mut neighbors = BTreeMap::<usize, Vec<(String, i64)>>::new();
+        for (key, document_frequency) in terms {
+            if let Some(members) = postings.get(key) {
+                for &(right, _) in members {
+                    if right > left {
+                        neighbors
+                            .entry(right)
+                            .or_default()
+                            .push((key.2.clone(), *document_frequency));
+                    }
+                }
+            }
+        }
+        for (right, mut evidence) in neighbors {
+            evidence.sort_by(|a, b| a.0.cmp(&b.0));
+            evidence.dedup_by(|a, b| a.0 == b.0);
+            if evidence.len() < 2 {
+                continue;
+            }
+            let pair = (left, right);
+            if !pairs.insert(pair) {
+                continue;
+            }
+            let scope_count = chat_count_by_scope
+                .get(&(
+                    chats[left].provider.clone(),
+                    chats[left].account_scope.clone(),
+                ))
+                .copied()
+                .unwrap_or(chats.len() as i64);
+            let mut candidate = KeywordCandidate {
+                catalog_id: chats[right].catalog_id.clone(),
+                updated_at_ms: chats[right].updated_at_ms,
+                evidence: evidence.iter().map(|(term, _)| term.clone()).collect(),
+                score: 0,
+            };
+            candidate.score = evidence
+                .iter()
+                .map(|(_, document_frequency)| {
+                    let inverse_frequency =
+                        ((scope_count + 1) as f64 / (document_frequency + 1) as f64).ln() + 1.0;
+                    (inverse_frequency * 1000.0).round() as i64
+                })
+                .sum();
+            let edge = keyword_relationship(&chats[left], &candidate);
+            push_candidate_edge(
+                &mut candidate_edges,
+                CandidateRelationship { left, right, edge },
+                &mut truncated,
+            );
+        }
+    }
+
+    let candidate_edge_count = candidate_edges.len();
+    let mut components = relationship_components(chats.len(), &candidate_edges);
+    components.sort_by(|left, right| {
+        right
+            .max_score
+            .cmp(&left.max_score)
+            .then_with(|| right.node_count.cmp(&left.node_count))
+            .then_with(|| left.root.cmp(&right.root))
+    });
+
+    let mut selected_edges = Vec::new();
+    let mut selected_nodes = Vec::new();
+    let mut selected = HashSet::new();
+    let mut degrees = vec![0_usize; chats.len()];
+    let mut cursors = vec![0_usize; components.len()];
+    loop {
+        let mut made_progress = false;
+        for (component_index, component) in components.iter().enumerate() {
+            while let Some(&edge_index) = component.edges.get(cursors[component_index]) {
+                cursors[component_index] += 1;
+                let edge = &candidate_edges[edge_index];
+                let new_nodes = usize::from(!selected.contains(&edge.left))
+                    + usize::from(!selected.contains(&edge.right));
+                if selected_nodes.len() + new_nodes > limit
+                    || degrees[edge.left] >= MAX_NEIGHBOR_DEGREE
+                    || degrees[edge.right] >= MAX_NEIGHBOR_DEGREE
+                    || selected_edges.len() >= MAX_EDGES_IN_GRAPH
+                {
+                    truncated = true;
+                    continue;
+                }
+                for index in [edge.left, edge.right] {
+                    if selected.insert(index) {
+                        selected_nodes.push(index);
+                    }
+                    degrees[index] += 1;
+                }
+                selected_edges.push(edge.edge.clone());
+                made_progress = true;
+                break;
+            }
+        }
+        if !made_progress {
+            break;
+        }
+    }
+    if selected_edges.len() < candidate_edge_count || selected_nodes.len() < chats.len() {
+        truncated = true;
+    }
+    let nodes = selected_nodes
+        .into_iter()
+        .map(|index| chat_node(&chats[index]))
+        .collect();
+    Ok((nodes, selected_edges, truncated))
+}
+
+fn push_candidate_edge(
+    edges: &mut Vec<CandidateRelationship>,
+    edge: CandidateRelationship,
+    truncated: &mut bool,
+) {
+    if edges.len() >= MAX_GLOBAL_GRAPH_EDGES {
+        *truncated = true;
+    } else {
+        edges.push(edge);
+    }
+}
+
+#[derive(Debug)]
+struct RelationshipComponent {
+    root: usize,
+    edges: Vec<usize>,
+    max_score: i64,
+    node_count: usize,
+}
+
+fn relationship_components(
+    node_count: usize,
+    edges: &[CandidateRelationship],
+) -> Vec<RelationshipComponent> {
+    let mut parent = (0..node_count).collect::<Vec<_>>();
+    for edge in edges {
+        union_roots(&mut parent, edge.left, edge.right);
+    }
+    let mut components = BTreeMap::<usize, Vec<usize>>::new();
+    for (index, edge) in edges.iter().enumerate() {
+        let root = find_root(&mut parent, edge.left);
+        components.entry(root).or_default().push(index);
+    }
+    components
+        .into_iter()
+        .map(|(root, mut edge_indices)| {
+            edge_indices.sort_by(|left, right| {
+                edges[*right]
+                    .edge
+                    .score
+                    .cmp(&edges[*left].edge.score)
+                    .then_with(|| edges[*left].left.cmp(&edges[*right].left))
+                    .then_with(|| edges[*left].right.cmp(&edges[*right].right))
+            });
+            let mut members = HashSet::new();
+            for index in &edge_indices {
+                members.insert(edges[*index].left);
+                members.insert(edges[*index].right);
+            }
+            let max_score = edge_indices
+                .first()
+                .and_then(|index| edges[*index].edge.score)
+                .unwrap_or_default();
+            RelationshipComponent {
+                root,
+                edges: edge_indices,
+                max_score,
+                node_count: members.len(),
+            }
+        })
+        .collect()
+}
+
+fn find_root(parent: &mut [usize], node: usize) -> usize {
+    if parent[node] != node {
+        let root = find_root(parent, parent[node]);
+        parent[node] = root;
+    }
+    parent[node]
+}
+
+fn union_roots(parent: &mut [usize], left: usize, right: usize) {
+    let left_root = find_root(parent, left);
+    let right_root = find_root(parent, right);
+    if left_root != right_root {
+        let root = left_root.min(right_root);
+        let child = left_root.max(right_root);
+        parent[child] = root;
     }
 }
 
@@ -573,10 +876,6 @@ fn indexed_chat_from_row(row: &Row<'_>) -> rusqlite::Result<IndexedChat> {
     })
 }
 
-fn same_account(left: &IndexedChat, right: &IndexedChat) -> bool {
-    left.provider == right.provider && left.account_scope == right.account_scope
-}
-
 fn chat_node(chat: &IndexedChat) -> CatalogNode {
     CatalogNode {
         id: chat.catalog_id.clone(),
@@ -767,6 +1066,20 @@ fn index_status(conn: &Connection) -> Result<CatalogIndexStatus> {
     })
 }
 
+type RawCatalogStatsRow = (
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+);
+
 fn read_stats(
     conn: &Connection,
     source_filter: &str,
@@ -794,19 +1107,7 @@ fn read_stats(
         cached_archives,
         full_graphs,
         projects,
-    ): (
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<i64>,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = conn.query_row(&sql, params![project_key], |row| {
+    ): RawCatalogStatsRow = conn.query_row(&sql, params![project_key], |row| {
         Ok((
             row.get(0)?,
             row.get(1)?,
@@ -941,8 +1242,7 @@ fn score_text(text: &str, weight: u16, scores: &mut BTreeMap<String, u16>) {
         let digit_count = term.chars().filter(|ch| ch.is_ascii_digit()).count();
         let looks_like_camel_case = raw.chars().next().is_some_and(char::is_lowercase)
             && raw.chars().skip(1).any(char::is_uppercase);
-        if char_count < 3
-            || char_count > 48
+        if !(3..=48).contains(&char_count)
             || alphabetic_count < 2
             || alphabetic_count * 2 < char_count
             || digit_count > alphabetic_count
@@ -1364,19 +1664,23 @@ mod tests {
         assert_eq!(overview.stats.provenance.full_graphs, 3);
 
         let graph = store.catalog_graph("chatgpt", None, 100).unwrap();
-        assert!(!graph.truncated);
+        assert!(
+            graph.truncated,
+            "the bounded map reports omitted isolated chats"
+        );
         let chat_ids = graph
             .nodes
             .iter()
             .filter(|node| node.kind == "chat")
             .map(|node| node.conversation_id.as_deref().unwrap())
             .collect::<HashSet<_>>();
-        assert_eq!(chat_ids.len(), 4);
+        assert_eq!(chat_ids.len(), 2, "isolated chats do not become map cards");
         assert_eq!(
             graph.nodes.len(),
-            4,
-            "the default overview has chat nodes only"
+            2,
+            "the global map contains connected chat nodes only"
         );
+        assert_eq!(graph.unmapped_count, 2);
         let project_edges = graph
             .edges
             .iter()
@@ -1391,7 +1695,12 @@ mod tests {
             .iter()
             .filter(|edge| edge.basis == "shared_keyword")
             .collect::<Vec<_>>();
-        assert!(keyword_edges.is_empty(), "the overview omits keyword hubs");
+        assert_eq!(
+            keyword_edges.len(),
+            1,
+            "shared terms connect chats directly"
+        );
+        assert!(keyword_edges[0].evidence.len() >= 2);
         assert!(graph
             .nodes
             .iter()
@@ -1413,7 +1722,11 @@ mod tests {
             .iter()
             .filter(|node| node.kind == "chat")
             .count();
-        assert_eq!(filtered_chats, 1);
+        assert_eq!(
+            filtered_chats, 0,
+            "single isolated project member is omitted"
+        );
+        assert_eq!(filtered.unmapped_count, 1);
         assert!(filtered.nodes.iter().all(|node| node.kind == "chat"));
 
         let chat_a_id: String = store
@@ -1451,16 +1764,27 @@ mod tests {
         let mut store = seeded_store();
         store.rebuild_catalog_index().unwrap();
         let graph = store.catalog_graph("chatgpt", None, 100).unwrap();
-        let archived = graph
+        assert!(graph
             .nodes
             .iter()
-            .find(|node| node.completeness.as_deref() == Some("cached_transcript"))
+            .all(|node| node.completeness.as_deref() != Some("cached_transcript")));
+        assert_eq!(
+            graph.unmapped_count, 2,
+            "isolated archive/account chats stay out of the map"
+        );
+        let archived: (i64, i64, i64, String, i64) = store
+            .connection
+            .query_row(
+                "SELECT graph_node_count,message_count,branch_count,completeness,sample_bytes FROM catalog_chats WHERE source_id='archive-chat'",
+                [],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            )
             .unwrap();
-        assert_eq!(archived.graph_node_count, Some(1));
-        assert_eq!(archived.message_count, Some(0));
-        assert_eq!(archived.branch_count, Some(0));
-        assert_eq!(archived.cached_archive, Some(true));
-        assert!(archived.sample_bytes.unwrap() <= MAX_SAMPLE_BYTES as i64);
+        assert_eq!(archived.0, 1);
+        assert_eq!(archived.1, 0);
+        assert_eq!(archived.2, 0);
+        assert_eq!(archived.3, "cached_transcript");
+        assert!(archived.4 <= MAX_SAMPLE_BYTES as i64);
         assert_eq!(
             store.catalog_overview("chatgpt", None).unwrap().stats.chats,
             4
@@ -1652,6 +1976,74 @@ mod tests {
             graph.truncated,
             "some same-project links are omitted at the degree cap"
         );
+    }
+
+    #[test]
+    fn global_map_finds_older_connected_clusters_with_bounded_degree() {
+        let mut store = Store::in_memory().unwrap();
+        let clusters = [
+            ("quartz", "migration"),
+            ("cedar", "lantern"),
+            ("orbital", "meadow"),
+            ("harbor", "prism"),
+        ];
+        for (cluster_index, (first, second)) in clusters.iter().enumerate() {
+            for item in 0..25 {
+                let source_id = format!("cluster-{cluster_index}-{item:02}");
+                ingest(
+                    &mut store,
+                    "chatgpt",
+                    "scope-a",
+                    &source_id,
+                    &format!("{first} {second} case{item}"),
+                    vec![graph_node(
+                        "n",
+                        None,
+                        "user",
+                        &format!("{first} {second} notes case{item}"),
+                    )],
+                    "complete",
+                );
+                store
+                    .connection
+                    .execute(
+                        "UPDATE conversations SET updated_at_ms=?1 WHERE source_id=?2",
+                        params![
+                            1_700_000_000_000_i64 + cluster_index as i64 * 1_000 + item,
+                            source_id
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        store.rebuild_catalog_index().unwrap();
+
+        let graph = store.catalog_graph("chatgpt", None, 100).unwrap();
+        assert_eq!(graph.stats.chats, 100);
+        assert_eq!(graph.nodes.len(), 100);
+        assert_eq!(graph.unmapped_count, 0);
+        let source_ids = graph
+            .nodes
+            .iter()
+            .filter_map(|node| node.source_id.as_deref())
+            .collect::<HashSet<_>>();
+        assert!(
+            source_ids.contains("cluster-0-00"),
+            "old clusters are indexed beyond the latest 40 chats"
+        );
+        assert!(source_ids.contains("cluster-3-24"));
+        assert!(graph.edges.len() > 80);
+        assert!(graph.edges.iter().all(|edge| {
+            edge.basis == "shared_keyword" && edge.evidence.len() >= 2 && edge.reason.is_some()
+        }));
+        for node in &graph.nodes {
+            let degree = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.source == node.id || edge.target == node.id)
+                .count();
+            assert!((1..=MAX_NEIGHBOR_DEGREE).contains(&degree));
+        }
     }
 
     #[test]

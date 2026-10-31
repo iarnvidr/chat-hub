@@ -13,7 +13,6 @@ const element = (tag, text, cls) => {
 };
 const view = createGraphView($('graph-canvas'), (node, open) => {
   if (open) return openNode(node);
-  if (node.kind === 'chat' && node.conversation_id !== focusId) return focusChat(node.conversation_id);
   showSelection(node);
 }, showEdge);
 function state(text) { $('overview-state').textContent = text; $('catalog-status').textContent = text; }
@@ -34,11 +33,11 @@ function enter() {
   $('show-overview').setAttribute('aria-pressed', 'true');
 }
 function showOverview(focus = true) {
-  focusId = null; messageDetail = null; panel.classList.remove('message-mode', 'connections-mode');
-  $('overview-title').textContent = 'Chat overview';
+  focusId = null; messageDetail = null; panel.classList.remove('message-mode', 'connections-mode', 'selection-open');
+  $('overview-title').textContent = 'Library map';
   $('overview-back').hidden = $('overview-read-chat').hidden = true;
   $('overview-stats').hidden = false;
-  $('overview-recent-title').textContent = 'Recent chats · select one to explore its connections';
+  $('overview-recent-title').textContent = 'Chats in this map';
   enter(); refresh(true); if (focus) panel.focus();
 }
 async function focusChat(id) {
@@ -50,14 +49,7 @@ async function focusChat(id) {
 }
 function renderStats(stats) {
   const root = $('overview-stats'); root.replaceChildren();
-  const metrics = [[stats.chats, 'Chats'], [stats.projects, 'Projects']];
-  if (stats.messages) metrics.push([stats.messages, 'Stored messages']);
-  if (stats.branch_points) metrics.push([stats.branch_points, 'Branch points']);
-  if (stats.provenance?.cached_archives) metrics.push([stats.provenance.cached_archives, 'Saved transcripts']);
-  for (const [value, label] of metrics) {
-    const item = element('div', undefined, 'overview-stat');
-    item.append(element('strong', Number(value || 0).toLocaleString()), element('span', label)); root.append(item);
-  }
+  root.textContent = `${Number(stats.chats || 0).toLocaleString()} chats · ${Number(stats.projects || 0).toLocaleString()} projects`;
 }
 async function rebuild(manual = false) {
   if (rebuilding) return rebuilding;
@@ -87,19 +79,20 @@ async function refresh(allowRebuild = false) {
       if (token !== request || messageDetail) return;
       overview = await invoke('catalog_overview', args);
     }
-    const data = await invoke('catalog_graph', {...args, focusId:requestedFocus, limit:12});
+    const data = await invoke('catalog_graph', {...args, focusId:requestedFocus, limit:100});
     if (token !== request || messageDetail) return;
     if (!Array.isArray(data?.nodes) || !Array.isArray(data?.edges)) throw Error('invalid_catalog_graph');
     graph = prepareConnections(data); renderStats(overview.stats); renderGraph();
-    $('overview-recent-title').textContent = requestedFocus ? 'Connected chats · select one to explore further' : 'Recent chats · select one to explore its connections';
+    $('overview-recent-title').textContent = `${graph.nodes.length} chats in this map`;
     renderList(graph.nodes.filter(node => node.kind === 'chat'));
     const focused = graph.nodes.find(node => node.id === graph.focus_id);
     if (focused) showSelection(focused);
     $('graph-caption').textContent = requestedFocus
-      ? `${Math.max(0, graph.nodes.length - 1)} related chats from your indexed library. Select a connection to see why it appears. Topic matches use shared terms from saved text, so they can be imperfect.`
-      : `Your ${graph.nodes.length} most recent chats. Select a chat to find up to five related conversations across the full library. Lines here show a shared project.`;
-    state(overview.index.stale ? 'Index needs refreshing. Rebuild it in Settings.' : 'Indexed on this Mac · available offline');
-  } catch {
+      ? `${Math.max(0, graph.nodes.length - 1)} related chats · Select a line for its evidence. Back returns to the library map.`
+      : `${graph.nodes.length} chats · ${graph.edges.length} connections · ${graph.clusters} clusters${graph.unmapped_count ? ` · ${graph.unmapped_count} other chats in the sidebar` : ''}. Select to inspect; double-click to open.`;
+    state(overview.index.stale ? 'Index needs refreshing. Rebuild it in Settings.' : '');
+  } catch (error) {
+    console.error('Chat map could not render:', String(error?.message || error).slice(0,180));
     if (token === request) state('Connections could not load. Your saved chats remain available in the sidebar.');
   }
 }
@@ -108,11 +101,13 @@ function renderList(nodes) {
   for (const node of nodes) {
     const button = element('button', undefined, 'overview-chat'); button.type = 'button';
     button.append(element('span', node.kind === 'message' ? `${node.label}: ${node.excerpt || 'Context'}` : node.label),
-      element('small', node.kind === 'message' ? 'Inspect' : node.id === graph.focus_id ? 'Selected' : 'Explore →'));
-    button.addEventListener('click', () => node.kind === 'message' ? showSelection(node) : focusChat(node.conversation_id)); root.append(button);
+      element('small', 'Inspect'));
+    button.addEventListener('click', () => view.select(node.id)); root.append(button);
   }
 }
 function renderGraph() {
+  panel.classList.remove('selection-open');
+  $('map-search').value='';$('map-search-results').hidden=true;
   $('graph-selection').replaceChildren(element('h2', messageDetail ? 'Explore a message' : 'Explore a chat'),
     element('p', messageDetail ? 'Select a message to read it on its original branch.' : 'Select a chat to find related conversations. Select a line to see the connection.'));
   view.render(graph, Boolean(messageDetail));
@@ -121,6 +116,7 @@ function appendAction(root, text, action) {
   const button = element('button', text); button.type = 'button'; button.addEventListener('click', action); root.append(button);
 }
 function showEdge(edge) {
+  panel.classList.add('selection-open');
   const root = $('graph-selection'); root.replaceChildren(element('h2', edge.basis === 'project' ? 'Same project' : edge.basis === 'parent' ? 'Message sequence' : 'Shared topics'));
   const names = [edge.source, edge.target].map(id => graph.nodes.find(node => node.id === id)?.label || 'Chat');
   root.append(element('p', names.join(' ↔ ')), element('p', edge.reason || 'Original stored parent relationship.'));
@@ -131,10 +127,12 @@ function showEdge(edge) {
   }
 }
 function showSelection(node) {
+  panel.classList.add('selection-open');
   const root = $('graph-selection'); root.replaceChildren(element('h2', node.label));
   if (node.kind === 'chat') {
     root.append(element('p', node.cached_archive ? 'Saved transcript. Original message boundaries and branches are unavailable.' : `${node.message_count || 0} stored messages · ${node.branch_count || 0} branch points`));
     appendAction(root, 'Open chat', () => openNode(node));
+    if (node.conversation_id !== focusId) appendAction(root, 'Explore all connections', () => focusChat(node.conversation_id));
     appendAction(root, 'Message graph', async () => {
       try { showMessages(await invoke('get_conversation', {id:node.conversation_id})); }
       catch { state('This message graph could not open. Try reading the saved conversation.'); }
@@ -145,7 +143,7 @@ function showSelection(node) {
       const other = graph.nodes.find(item => item.id === (edge.source === node.id ? edge.target : edge.source));
       if (!other) continue;
       const entry = element('div', undefined, 'connection-evidence');
-      appendAction(entry, other.label, () => other.kind === 'chat' ? focusChat(other.conversation_id) : showSelection(other));
+      appendAction(entry, other.label, () => view.select(other.id));
       entry.append(element('p', edge.reason || 'Same project'));
       if (edge.basis === 'shared_keyword' && edge.evidence?.length) entry.append(element('p', edge.evidence.join(' · ')));
       root.append(entry);
@@ -179,6 +177,17 @@ $('rebuild-catalog').addEventListener('click', () => rebuild(true));
 $('graph-zoom-in').addEventListener('click', () => view.zoom(1.25));
 $('graph-zoom-out').addEventListener('click', () => view.zoom(.8));
 $('graph-reset').addEventListener('click', () => view.fit());
+$('graph-inspector-close').addEventListener('click', () => panel.classList.remove('selection-open'));
+$('map-search').addEventListener('input', () => {
+  const results=$('map-search-results');results.replaceChildren();
+  const query=$('map-search').value.trim();const hits=view.search(query);results.hidden=!query;
+  for(const node of hits) appendAction(results,node.label,()=>{view.select(node.id);results.hidden=true;});
+  if(query&&!hits.length)results.append(element('p','No match in this map. Search all chats in the sidebar.'));
+});
+$('map-search').addEventListener('keydown',event=>{
+  if(event.key==='Escape'){$('map-search-results').hidden=true;event.target.value='';view.search('');}
+  if(event.key==='Enter'){const first=$('map-search-results').querySelector('button');if(first){event.preventDefault();first.click();}}
+});
 for (const event of ['chat-hub:show-local','chat-hub:show-live','chat-hub:live-open','chat-hub:connect']) window.addEventListener(event, leave);
 window.addEventListener('chat-hub:show-message-graph', event => showMessages(event.detail));
 window.addEventListener('chat-hub:show-chat-connections', event => focusChat(event.detail.id));

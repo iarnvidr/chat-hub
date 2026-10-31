@@ -167,6 +167,10 @@ fn validate_chunk(value: &Value) -> Result<ChunkMeta, String> {
             && value
                 .get("conversation_projects")
                 .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            && value
+                .get("project_catalog")
+                .and_then(Value::as_array)
                 .is_none_or(Vec::is_empty))
         || conversations.len() > 1000
         || conversations
@@ -218,6 +222,8 @@ fn validate_status_shape(value: &Value) -> bool {
         "conversations",
         "error_code",
         "retry_after",
+        "http_status",
+        "project_count",
         "chunk",
     ];
     if !value.as_object().is_some_and(|object| {
@@ -248,6 +254,14 @@ fn validate_status_shape(value: &Value) -> bool {
             .get("retry_after")
             .and_then(Value::as_u64)
             .is_some_and(|seconds| seconds <= 1800)
+        && value
+            .get("http_status")
+            .and_then(Value::as_u64)
+            .is_some_and(|status| status <= 599)
+        && value
+            .get("project_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count <= 1000)
         && value
             .get("chunk")
             .is_some_and(|chunk| chunk.is_null() || chunk.is_object())
@@ -364,6 +378,7 @@ pub fn run(
     let mut last_acked: Option<AckedChunk> = None;
     let mut chunk_owner: Option<String> = None;
     let mut account_scope: Option<String> = None;
+    let mut last_debug_state: Option<(String, String, String, u64, u64, u64)> = None;
     let key_json_for_poll = key_json.clone();
 
     loop {
@@ -392,7 +407,7 @@ pub fn run(
         let (tx, rx) = mpsc::sync_channel(1);
         let tx_for_callback = tx.clone();
         let poll = format!(
-            r#"(()=>{{const s=window[{key_json_for_poll}];if(!s)return "null";const c=s.chunk;return JSON.stringify({{status:s.status,stage:s.stage,complete:s.complete,sequence:s.sequence,conversations:s.conversations,error_code:s.error_code,retry_after:s.retry_after,chunk:c?{{sequence:c.sequence,owner:c.owner,account_scope:c.account_scope,format:c.format,conversations:c.conversations}}:null}})}})()"#
+            r#"(()=>{{const s=window[{key_json_for_poll}];if(!s)return "null";const c=s.chunk;return JSON.stringify({{status:s.status,stage:s.stage,complete:s.complete,sequence:s.sequence,conversations:s.conversations,error_code:s.error_code,retry_after:s.retry_after,http_status:s.http_status,project_count:c&&Array.isArray(c.project_catalog)?c.project_catalog.length:0,chunk:c?{{sequence:c.sequence,owner:c.owner,account_scope:c.account_scope,format:c.format,conversations:c.conversations,project_catalog:c.project_catalog,conversation_projects:c.conversation_projects}}:null}})}})()"#
         );
         if view
             .eval_with_callback(poll, move |result| {
@@ -435,6 +450,39 @@ pub fn run(
             set_cancelled(&view, &key_json);
             cleanup(&view, &key_json);
             return Err("browser_history_invalid_result".into());
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let status = status_str(&state, "status").unwrap_or("unknown");
+            let stage = status_str(&state, "stage").unwrap_or("unknown");
+            let code = status_str(&state, "error_code")
+                .filter(|code| !code.is_empty())
+                .map(safe_error_code)
+                .unwrap_or_else(|| "none".into());
+            let http_status = status_u64(&state, "http_status").min(599);
+            let retry_after = status_u64(&state, "retry_after").min(1800);
+            let project_count = status_u64(&state, "project_count").min(1000);
+            let diagnostic = (
+                status.to_owned(),
+                stage.to_owned(),
+                code,
+                http_status,
+                retry_after,
+                project_count,
+            );
+            if last_debug_state.as_ref() != Some(&diagnostic) {
+                eprintln!(
+                    "[chatgpt-history] status={} stage={} code={} http_status={} retry_after={} project_count={}",
+                    diagnostic.0,
+                    diagnostic.1,
+                    diagnostic.2,
+                    diagnostic.3,
+                    diagnostic.4,
+                    diagnostic.5
+                );
+                last_debug_state = Some(diagnostic);
+            }
         }
 
         let stage = status_str(&state, "stage").unwrap_or("syncing");
@@ -613,6 +661,7 @@ mod tests {
         empty["conversations"] = json!([]);
         assert!(validate_chunk(&empty).is_err());
         empty["project_catalog"] = json!([{"id":"project-a","title":"Research"}]);
+        assert_eq!(validate_chunk(&empty).unwrap().conversations, 0);
         empty["conversation_projects"] =
             json!([{"conversation_id":"chat-a","project_id":"project-a"}]);
         assert_eq!(validate_chunk(&empty).unwrap().conversations, 0);
@@ -652,9 +701,15 @@ mod tests {
         let valid = json!({
             "status": "running", "stage": "list", "complete": false,
             "sequence": 0, "conversations": 0, "error_code": "",
-            "retry_after": 0, "chunk": null
+            "retry_after": 0, "http_status": 0, "project_count": 0, "chunk": null
         });
         assert!(validate_status_shape(&valid));
+        let mut bad_http_status = valid.clone();
+        bad_http_status["http_status"] = json!(600);
+        assert!(!validate_status_shape(&bad_http_status));
+        let mut excessive_project_count = valid.clone();
+        excessive_project_count["project_count"] = json!(1001);
+        assert!(!validate_status_shape(&excessive_project_count));
         let mut with_secret = valid.clone();
         with_secret["accessToken"] = json!("must-not-cross-boundary");
         assert!(!validate_status_shape(&with_secret));

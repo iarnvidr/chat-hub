@@ -1,10 +1,33 @@
 export function prepareConnections(graph) {
-  const nodes = (graph.nodes || []).filter(node => ['chat','project'].includes(node.kind)).slice(0, 30)
+  const nodes = (graph.nodes || []).filter(node => ['chat','project'].includes(node.kind)).slice(0, 100)
     .map(node => ({...node}));
   const ids = new Set(nodes.map(node => node.id));
   const edges = (graph.edges || []).filter(edge => ids.has(edge.source) && ids.has(edge.target)
-    && ['project','shared_keyword'].includes(edge.basis)).slice(0, 60).map(edge => ({...edge}));
-  return {nodes, edges, focus_id:graph.focus_id || null};
+    && ['project','shared_keyword'].includes(edge.basis)).slice(0, 240).map(edge => ({...edge}));
+  const adjacency = new Map(nodes.map(node => [node.id, new Set()]));
+  for (const edge of edges) {adjacency.get(edge.source).add(edge.target);adjacency.get(edge.target).add(edge.source);}
+  let cluster = 0; const visited = new Set();
+  for (const root of nodes) {
+    if (visited.has(root.id)) continue;
+    const queue = [root.id], members = [];
+    for (let i=0;i<queue.length;i++) {
+      const id=queue[i];if(visited.has(id))continue;visited.add(id);members.push(id);
+      queue.push(...adjacency.get(id));
+    }
+    const hub = [...members].sort((a,b)=>adjacency.get(b).size-adjacency.get(a).size || a.localeCompare(b))[0];
+    const landmarks=new Set([hub]),nearLabel=new Set();
+    const reserve=id=>{nearLabel.add(id);for(const n of adjacency.get(id)){nearLabel.add(n);for(const k of adjacency.get(n))nearLabel.add(k);}};
+    reserve(hub);
+    for(const id of [...members].sort((a,b)=>adjacency.get(b).size-adjacency.get(a).size)){
+      if(landmarks.size>=8)break;
+      if(!nearLabel.has(id)&&adjacency.get(id).size>=2){landmarks.add(id);reserve(id);}
+    }
+    for (const node of nodes) if (members.includes(node.id)) {
+      node.cluster=cluster;node.degree=adjacency.get(node.id).size;node.hub=node.id===hub;node.landmark=landmarks.has(node.id);
+    }
+    cluster++;
+  }
+  return {nodes, edges, focus_id:graph.focus_id || null, clusters:cluster, unmapped_count:graph.unmapped_count || 0};
 }
 
 export function messageGraph(detail, limit = 240) {

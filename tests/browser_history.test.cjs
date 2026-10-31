@@ -27,14 +27,15 @@ function response(status, value, headers = {}) {
   };
 }
 
-function setup(handler) {
-  const window = {};
+function setup(handler, anchors = []) {
+  const window = {getComputedStyle: () => ({display: 'block', visibility: 'visible', opacity: '1'})};
   const calls = [];
   const fetch = async (url, options) => {
     calls.push({url: String(url), options});
     return handler(String(url), options, calls);
   };
-  const context = vm.createContext({window, fetch, location: {origin: 'https://chatgpt.com'},
+  const document = {querySelectorAll: selector => selector === 'a[href]' ? anchors : []};
+  const context = vm.createContext({window, document, fetch, location: {origin: 'https://chatgpt.com'},
     crypto: webcrypto, TextEncoder, TextDecoder, AbortController, URL,
     atob: value => Buffer.from(value, 'base64').toString('binary'),
     setTimeout, clearTimeout, Date, Number, String, Array, Object, JSON, Math, Map, Set,
@@ -42,6 +43,11 @@ function setup(handler) {
   const factory = vm.runInContext(source, context);
   const state = factory(KEY);
   return {state, calls, window};
+}
+
+function projectAnchor(id, title, {url = `https://chatgpt.com/g/${id}/project`, visible = true, hidden = false} = {}) {
+  return {href: url, innerText: title, getClientRects: () => visible ? [{}] : [],
+    getAttribute: name => name === 'aria-hidden' && hidden ? 'true' : null};
 }
 
 const graph = (id, marker = 'leaf') => ({id, mapping: {
@@ -145,13 +151,17 @@ test('project labels and membership travel separately without refetching or chan
     return normal(url, options);
   });
   await until(() => job.state.chunk !== null);
-  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversations[0])), original);
+  assert.equal(job.state.chunk.conversations.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.project_catalog)), [{id: 'project-a', title: 'Research'}]);
   job.state.ackSequence = 1;
   await until(() => job.state.chunk?.sequence === 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversations[0])), original);
+  job.state.ackSequence = 2;
+  await until(() => job.state.chunk?.sequence === 3);
   assert.equal(job.state.chunk.conversations.length, 0);
   assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.project_catalog)), [{id: 'project-a', title: 'Research'}]);
   assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversation_projects)), [{conversation_id: 'chat-1', project_id: 'project-a'}]);
-  job.state.ackSequence = 2;
+  job.state.ackSequence = 3;
   await job.state.ready;
   assert.equal(job.state.complete, true);
   assert.equal(job.calls.filter(call => new URL(call.url).pathname === '/backend-api/conversations/batch').length, 1);
@@ -166,15 +176,74 @@ test('429 stops immediately and publishes bounded retry timing', async () => {
   await job.state.ready;
   assert.equal(job.state.status, 'waiting');
   assert.equal(job.state.error_code, 'rate_limited');
-  assert.equal(job.state.stage, 'list');
+  assert.equal(job.state.stage, 'project');
+  assert.equal(job.state.http_status, 429);
   assert.equal(job.state.retry_after, 29);
   assert.equal(job.calls.length, 2);
+});
+
+test('visible sidebar titles are committed before the sidebar API can be rate limited', async () => {
+  const job = setup((url) => {
+    const path = new URL(url).pathname;
+    if (path === '/api/auth/session') return response(200, {accessToken: token});
+    if (path === '/backend-api/gizmos/snorlax/sidebar') return response(429, {}, {'retry-after': '31'});
+    throw new Error(`unexpected URL ${path}`);
+  }, [
+    projectAnchor('g-p-real-project', 'Visible project name'),
+    projectAnchor('g-p-hidden-project', 'Hidden name', {visible: false}),
+    projectAnchor('g-p-aria-hidden', 'Hidden aria name', {hidden: true}),
+    projectAnchor('g-p-generic', 'Projects'),
+    projectAnchor('g-p-empty', '  '),
+    projectAnchor('g-p-external', 'External name', {url: 'https://example.com/g/g-p-external/project'}),
+    projectAnchor('g-p-chat', 'Chat title', {url: 'https://chatgpt.com/c/g-p-chat/project'}),
+  ]);
+  await until(() => job.state.chunk !== null);
+  assert.equal(job.state.chunk.sequence, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.project_catalog)), [
+    {id: 'g-p-real-project', title: 'Visible project name'},
+  ]);
+  assert.deepEqual(job.calls.map(call => new URL(call.url).pathname), ['/api/auth/session'],
+    'visible DOM names are acknowledged before any ChatGPT API request');
+  job.state.ackSequence = 1;
+  await job.state.ready;
+  assert.equal(job.state.status, 'waiting');
+  assert.equal(job.state.stage, 'project');
+  assert.equal(job.state.http_status, 429);
+  assert.deepEqual(job.calls.map(call => new URL(call.url).pathname), [
+    '/api/auth/session', '/backend-api/gizmos/snorlax/sidebar',
+  ]);
+});
+
+test('authenticated sidebar API title supersedes the rendered fallback', async () => {
+  const id = 'g-p-real-project';
+  const job = setup((url) => {
+    const path = new URL(url).pathname;
+    if (path === '/api/auth/session') return response(200, {accessToken: token});
+    if (path === '/backend-api/gizmos/snorlax/sidebar') return response(200, {
+      items: [{gizmo: {id, display: {name: 'Canonical API name'}}}], cursor: null});
+    if (path === `/backend-api/gizmos/${id}/conversations`) return response(200, {items: [], cursor: null});
+    if (path === '/backend-api/conversations') return response(200, {items: [], total: 0});
+    throw new Error(`unexpected URL ${path}`);
+  }, [projectAnchor(id, 'Rendered fallback name')]);
+  await until(() => job.state.chunk !== null);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.project_catalog)), [
+    {id, title: 'Rendered fallback name'},
+  ]);
+  job.state.ackSequence = 1;
+  await until(() => job.state.chunk?.sequence === 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.project_catalog)), [
+    {id, title: 'Canonical API name'},
+  ]);
+  job.state.ackSequence = 2;
+  await job.state.ready;
+  assert.equal(job.state.complete, true);
 });
 
 test('malformed graph is rejected before it can be acknowledged', async () => {
   const job = setup((url, options) => {
     const path = new URL(url).pathname;
     if (path === '/api/auth/session') return response(200, {accessToken: token});
+    if (path === '/backend-api/gizmos/snorlax/sidebar') return response(200, {items: []});
     if (path === '/backend-api/conversations') return response(200, {items: [{id: 'chat-1'}], total: 1});
     if (path === '/backend-api/conversations/batch') return response(200, [{id: 'chat-1', title: 'bad'}]);
     throw new Error(path);

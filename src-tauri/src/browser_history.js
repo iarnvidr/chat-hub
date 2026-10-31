@@ -3,7 +3,7 @@
   const state = {
     status: 'starting', stage: 'auth', complete: false, cancelled: false,
     sequence: 0, ackSequence: 0, chunk: null, conversations: 0,
-    listed: 0, exports: 0, error_code: '', retry_after: 0,
+    listed: 0, exports: 0, error_code: '', retry_after: 0, http_status: 0,
   };
   window[key] = state;
   const API = 'https://chatgpt.com/backend-api/';
@@ -29,11 +29,40 @@
   function validId(value) {
     return typeof value === 'string' && value.length > 0 && value.length <= 256 && /^[A-Za-z0-9_:-]+$/.test(value);
   }
-  function safeFail(code, stage, retryAfter) {
+  function visibleSidebarProjectTitles() {
+    const found = new Map();
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return found;
+    let anchors;
+    try { anchors = document.querySelectorAll('a[href]'); } catch (_) { return found; }
+    let inspected = 0;
+    for (const anchor of anchors) {
+      if (++inspected > 2000) break;
+      try {
+        const url = new URL(anchor.href, ORIGIN);
+        const match = url.origin === ORIGIN
+          ? url.pathname.match(/^\/g\/(g-p-[A-Za-z0-9-]{1,240})\/project\/?$/)
+          : null;
+        if (!match || !anchor.getClientRects || anchor.getClientRects().length === 0 ||
+            anchor.getAttribute?.('aria-hidden') === 'true') continue;
+        const style = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(anchor) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) continue;
+        const title = typeof anchor.innerText === 'string'
+          ? anchor.innerText.replace(/\s+/g, ' ').trim()
+          : '';
+        const lowerTitle = title.toLocaleLowerCase();
+        if (!title || enc.encode(title).byteLength > 4096 ||
+            ['project', 'projects', 'all projects', 'new project', 'create project'].includes(lowerTitle)) continue;
+        if (!found.has(match[1])) found.set(match[1], title);
+      } catch (_) {}
+    }
+    return found;
+  }
+  function safeFail(code, stage, retryAfter, httpStatus) {
     state.status = code === 'rate_limited' ? 'waiting' : 'failed';
     state.stage = stage;
     state.error_code = code;
     state.retry_after = Number.isFinite(retryAfter) ? Math.max(0, Math.min(1800, retryAfter)) : 0;
+    state.http_status = Number.isInteger(httpStatus) ? Math.max(0, Math.min(599, httpStatus)) : 0;
     state.complete = false;
   }
   function checkCancelled() {
@@ -110,10 +139,10 @@
       if (response.status === 429) {
         const raw = Number(response.headers.get('retry-after') || 60);
         try { await response.body?.cancel(); } catch (_) {}
-        throw Object.assign(new Error(), {code: 'rate_limited', retryAfter: Number.isFinite(raw) ? Math.max(1, Math.min(1800, raw)) : 60, stage});
+        throw Object.assign(new Error(), {code: 'rate_limited', retryAfter: Number.isFinite(raw) ? Math.max(1, Math.min(1800, raw)) : 60, httpStatus: response.status, stage});
       }
-      if (response.status === 401) throw Object.assign(new Error(), {code: 'login_required', stage});
-      if (response.status !== 200) throw Object.assign(new Error(), {code: 'http_error', stage});
+      if (response.status === 401) throw Object.assign(new Error(), {code: 'login_required', httpStatus: response.status, stage});
+      if (response.status !== 200) throw Object.assign(new Error(), {code: 'http_error', httpStatus: response.status, stage});
       const text = await readBounded(response, maximum);
       try { return JSON.parse(text); }
       catch (_) { throw Object.assign(new Error(), {code: 'invalid_response', stage}); }
@@ -205,6 +234,20 @@
     }
     if (state.chunk && state.chunk.sequence === sequence) state.chunk = null;
   }
+  async function sendProjectCatalog() {
+    if (!projectCatalog.size) return;
+    checkCancelled();
+    const sequence = ++state.sequence;
+    state.chunk = {sequence, owner, account_scope: accountScope,
+      format: 'chat-hub-history-v1', conversations: [],
+      project_catalog: [...projectCatalog].map(([id, title]) => ({id, title}))};
+    state.exports++;
+    while (state.ackSequence < sequence && state.chunk && state.chunk.sequence === sequence) {
+      checkCancelled();
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    if (state.chunk && state.chunk.sequence === sequence) state.chunk = null;
+  }
   async function deliverGraphs(rows, projectForId) {
     let pending = [];
     let pendingBytes = 0;
@@ -269,6 +312,24 @@
       accountScope = 'chatgpt:observed:' + await sha256(JSON.stringify([
         'chatgpt-request-identity-v1', accountId, userId]));
       owner = (await sha256(accountId + ':' + claims.sub)).slice(0, 24);
+      // Use only visible same-origin project links already rendered by ChatGPT.
+      // This read-only fallback is acknowledged before any history API request;
+      // the authenticated sidebar response below remains canonical when present.
+      for (const [id, title] of visibleSidebarProjectTitles()) projectCatalog.set(id, title);
+      await sendProjectCatalog();
+      // Project names are useful even when conversation listing is throttled.
+      // Read the authenticated sidebar first, persist only its bounded names,
+      // then continue with conversations and project membership enrichment.
+      state.stage = 'project';
+      const projects = await pages('gizmos/snorlax/sidebar', {
+        conversations_per_gizmo: 0, limit: 20, owned_only: 'false'}, true, 'project');
+      const catalogBeforeApi = JSON.stringify([...projectCatalog]);
+      for (const item of projects) {
+        const gizmo = item.gizmo || {};
+        if (!gizmo || !validId(gizmo.id)) continue;
+        if (gizmo.title) projectCatalog.set(gizmo.id, gizmo.title);
+      }
+      if (JSON.stringify([...projectCatalog]) !== catalogBeforeApi) await sendProjectCatalog();
       state.stage = 'list';
       const rows = new Map();
       for (const archived of [false, true]) {
@@ -281,10 +342,9 @@
       }
       state.listed = rows.size;
       await deliverGraphs(rows, new Map());
-      // Projects are supplemental. Their failure leaves already acknowledged chats intact.
+      // Membership is supplemental. Sidebar titles were already acknowledged;
+      // a later project-conversation 429 must not discard those names.
       state.stage = 'project';
-      const projects = await pages('gizmos/snorlax/sidebar', {
-        conversations_per_gizmo: 0, limit: 20, owned_only: 'false'}, true, 'project');
       const projectRows = new Map();
       let memberships = new Map();
       const newProjectForId = new Map();
@@ -292,7 +352,6 @@
         const wrapper = item.gizmo || {};
         const gizmo = wrapper.gizmo || wrapper;
         if (!gizmo || !validId(gizmo.id)) continue;
-        projectCatalog.set(gizmo.id, gizmo.title || null);
         const chats = await pages('gizmos/' + encodeURIComponent(gizmo.id) + '/conversations',
           {cursor: '0'}, true, 'project');
         for (const row of chats) {
@@ -313,7 +372,7 @@
         state.status = 'cancelled'; state.stage = 'cancelled'; state.complete = false;
       } else {
         safeFail(error && error.code || 'sync_failed', error && error.stage || state.stage,
-          error && error.retryAfter);
+          error && error.retryAfter, error && error.httpStatus);
       }
     } finally {
       bearer = '';

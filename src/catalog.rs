@@ -93,6 +93,8 @@ pub struct CatalogGraph {
     pub index: CatalogIndexStatus,
     pub stats: CatalogStats,
     pub truncated: bool,
+    /// Chats omitted from this bounded connected map, out of the filtered index.
+    pub unmapped_count: i64,
     pub focus_id: Option<String>,
     pub nodes: Vec<CatalogNode>,
     pub edges: Vec<CatalogEdge>,

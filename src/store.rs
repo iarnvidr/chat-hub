@@ -58,6 +58,12 @@ pub struct ProjectMembership {
     pub title: Option<String>,
 }
 #[derive(Clone, Debug)]
+pub struct ProjectTitle {
+    pub source_id: String,
+    pub title: Option<String>,
+}
+type ProjectRecord = (String, String, String, Option<String>, Option<String>);
+#[derive(Clone, Debug)]
 pub struct DetailSnapshot {
     pub library_revision: i64,
     pub conversation: Option<Value>,
@@ -351,6 +357,59 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// Refresh titles from the authenticated ChatGPT sidebar without requiring
+    /// conversation-list or per-project conversation requests to succeed.
+    /// Only projects already attributed to this exact provider/account scope
+    /// are updated; the sidebar cannot create memberships or claim other rows.
+    pub fn apply_project_titles(
+        &mut self,
+        provider: &str,
+        account_scope: &str,
+        projects: &[ProjectTitle],
+    ) -> Result<()> {
+        if provider != "chatgpt"
+            || !account_scope
+                .strip_prefix("chatgpt:observed:")
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                })
+        {
+            return Err(Error::Configuration(
+                "invalid observed ChatGPT scope".into(),
+            ));
+        }
+        let tx = self.connection.transaction()?;
+        let mut changed = false;
+        for project in projects {
+            if project.source_id.is_empty() || project.source_id.len() > 256 {
+                return Err(Error::Configuration("invalid project id".into()));
+            }
+            let title = project
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            if title.is_some_and(|name| name.len() > 4096) {
+                return Err(Error::Configuration("invalid project title".into()));
+            }
+            let Some(title) = title else { continue };
+            changed |= tx.execute(
+                "UPDATE projects SET title=?1 WHERE source_id=?2 AND title IS NOT ?1 AND ((provider='chatgpt' AND account_scope=?3) OR (provider='chatgpt' AND account_scope LIKE 'provisional:%') OR (provider='chatgpt' AND account_scope LIKE 'paseo-cache:%') OR (provider='paseo-chatgpt' AND account_scope LIKE 'paseo-cache:%'))",
+                params![title, project.source_id, account_scope],
+            )? > 0;
+        }
+        if changed {
+            tx.execute(
+                "UPDATE library_state SET revision=revision+1 WHERE singleton=1",
+                [],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn projects_snapshot(&self, source: &str) -> Result<ProjectSnapshot> {
         let tx = self.connection.unchecked_transaction()?;
         let revision: i64 = tx.query_row(
@@ -459,7 +518,7 @@ impl Store {
             if key.is_empty() || key.len() > 1024 {
                 return Err(Error::Configuration("invalid project key".into()));
             }
-            let value: Option<(String, String, String, Option<String>, Option<String>)> = self
+            let value: Option<ProjectRecord> = self
                 .connection
                 .query_row(
                     "SELECT provider,account_scope,source_id,title,local_name FROM projects WHERE project_key=?1",
@@ -549,7 +608,7 @@ impl Store {
         }
         let mut changed = false;
         let result_project = if let Some(project_key) = project_key {
-            let project: Option<(String, String, String, Option<String>, Option<String>)> = tx
+            let project: Option<ProjectRecord> = tx
                 .query_row(
                     "SELECT provider,source_id,account_scope,title,local_name FROM projects WHERE project_key=?1",
                     [project_key],
@@ -2112,6 +2171,134 @@ mod project_and_search_tests {
             store.projects_snapshot("chatgpt").unwrap().projects.len(),
             0
         );
+    }
+
+    #[test]
+    fn verified_sidebar_titles_update_matching_provisional_ids_only() {
+        let mut store = Store::in_memory().unwrap();
+        let current_scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        let other_scope = format!("chatgpt:observed:{}", "b".repeat(64));
+        for (key, scope, source_id, title) in [
+            (
+                "legacy",
+                "provisional:default",
+                "gizmo-shared",
+                None::<String>,
+            ),
+            (
+                "cached-legacy",
+                "paseo-cache:owner-legacy",
+                "gizmo-shared",
+                None::<String>,
+            ),
+            (
+                "current",
+                current_scope.as_str(),
+                "gizmo-shared",
+                None::<String>,
+            ),
+            (
+                "other",
+                other_scope.as_str(),
+                "gizmo-shared",
+                None::<String>,
+            ),
+            (
+                "unrelated",
+                "provisional:default",
+                "gizmo-other",
+                None::<String>,
+            ),
+        ] {
+            store.connection.execute(
+                "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES(?1,'chatgpt',?2,?3,?4)",
+                params![key, scope, source_id, title],
+            ).unwrap();
+        }
+        store
+            .apply_project_titles(
+                "chatgpt",
+                &current_scope,
+                &[ProjectTitle {
+                    source_id: "gizmo-shared".into(),
+                    title: Some("Design work".into()),
+                }],
+            )
+            .unwrap();
+        let titles = ["legacy", "cached-legacy", "current", "other", "unrelated"]
+            .into_iter()
+            .map(|key| {
+                let title: Option<String> = store
+                    .connection
+                    .query_row(
+                        "SELECT title FROM projects WHERE project_key=?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                (key, title)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(titles["legacy"].as_deref(), Some("Design work"));
+        assert_eq!(titles["cached-legacy"].as_deref(), Some("Design work"));
+        assert_eq!(titles["current"].as_deref(), Some("Design work"));
+        assert_eq!(titles["other"], None);
+        assert_eq!(titles["unrelated"], None);
+    }
+
+    #[test]
+    fn verified_sidebar_titles_update_legacy_paseo_provider_without_relabeling_it() {
+        let mut store = Store::in_memory().unwrap();
+        let current_scope = format!("chatgpt:observed:{}", "c".repeat(64));
+        store.connection.execute(
+            "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES('legacy-paseo-project','paseo-chatgpt','paseo-cache:legacy-owner','g-p-legacy-project',NULL)",
+            [],
+        ).unwrap();
+        store.apply_project_titles(
+            "chatgpt",
+            &current_scope,
+            &[ProjectTitle { source_id: "g-p-legacy-project".into(), title: Some("Verified sidebar name".into()) }],
+        ).unwrap();
+        let record: (String, String, Option<String>) = store.connection.query_row(
+            "SELECT provider,account_scope,title FROM projects WHERE project_key='legacy-paseo-project'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(record, ("paseo-chatgpt".into(), "paseo-cache:legacy-owner".into(), Some("Verified sidebar name".into())));
+    }
+
+    #[test]
+    fn verified_sidebar_title_updates_project_created_by_legacy_migration() {
+        let mut store = Store::in_memory().unwrap();
+        let source_id = "g-p-migrated-project";
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES('legacy-chat','Legacy chat','paseo-chatgpt','paseo-cache:legacy-owner','legacy-chat',1)",
+            [],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO observations(conversation_id,observed_ms,parser,completeness,raw_payload) VALUES('legacy-chat',1,'legacy-fixture','complete',?1)",
+            [serde_json::json!({"paseo_cache":{"project":source_id}}).to_string()],
+        ).unwrap();
+        store.connection.execute_batch(
+            "DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;",
+        ).unwrap();
+        store.migrate().unwrap();
+
+        store.apply_project_titles(
+            "chatgpt",
+            &format!("chatgpt:observed:{}", "d".repeat(64)),
+            &[ProjectTitle { source_id: source_id.into(), title: Some("Migrated project name".into()) }],
+        ).unwrap();
+        let projects = store.projects_snapshot("chatgpt").unwrap();
+        assert_eq!(projects.projects.len(), 1);
+        assert_eq!(projects.projects[0]["title"], "Migrated project name");
+        assert_eq!(projects.projects[0]["project_id"], source_id);
+        assert_eq!(projects.projects[0]["conversation_count"], 1);
+        let identity: (String, String) = store.connection.query_row(
+            "SELECT provider,account_scope FROM projects WHERE source_id=?1", [source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(identity, ("paseo-chatgpt".into(), "paseo-cache:legacy-owner".into()));
     }
 
     #[test]

@@ -235,6 +235,10 @@ pub fn import_chatgpt_history(
             .and_then(|id| titles.get(id))
             .and_then(Clone::clone);
     }
+    let project_titles = titles
+        .into_iter()
+        .map(|(source_id, title)| crate::store::ProjectTitle { source_id, title })
+        .collect::<Vec<_>>();
     let receipt = if envelope
         .get("conversations")
         .and_then(Value::as_array)
@@ -244,6 +248,9 @@ pub fn import_chatgpt_history(
     } else {
         import_scoped(store, bytes, scope, "chatgpt-history-v1", false)?
     };
+    store
+        .apply_project_titles("chatgpt", scope, &project_titles)
+        .map_err(|_| invalid())?;
     store
         .apply_project_memberships("chatgpt", scope, &mappings)
         .map_err(|_| invalid())?;
@@ -432,6 +439,38 @@ mod project_metadata_import_tests {
         assert!(store.library_revision().unwrap() > before);
         let projects = store.projects_snapshot("chatgpt").unwrap();
         assert_eq!(projects.projects[0]["title"], "Project title");
+        assert_eq!(projects.projects[0]["conversation_count"], 1);
+    }
+
+    #[test]
+    fn sidebar_only_envelope_updates_preexisting_project_title_without_membership_fetch() {
+        let mut store = crate::store::Store::in_memory().unwrap();
+        seed(&mut store, "existing");
+        store
+            .apply_project_memberships(
+                "chatgpt",
+                &format!("chatgpt:observed:{}", "a".repeat(64)),
+                &[crate::store::ProjectMembership {
+                    source_id: "existing".into(),
+                    project_id: Some("project-1".into()),
+                    title: None,
+                }],
+            )
+            .unwrap();
+        let scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        let body = serde_json::json!({
+            "format":"chat-hub-history-v1", "account_scope":scope, "conversations":[],
+            "project_catalog":[{"id":"project-1","title":"Current sidebar name"}],
+            "conversation_projects":[]
+        });
+        let receipt =
+            import_chatgpt_history(&mut store, &serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(
+            receipt.imported + receipt.updated + receipt.unchanged + receipt.failed,
+            0
+        );
+        let projects = store.projects_snapshot("chatgpt").unwrap();
+        assert_eq!(projects.projects[0]["title"], "Current sidebar name");
         assert_eq!(projects.projects[0]["conversation_count"], 1);
     }
 

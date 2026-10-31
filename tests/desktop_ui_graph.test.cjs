@@ -28,7 +28,7 @@ test('connections keeps only named chat/project nodes and declared reasons', asy
 
 test('overview never materializes generic keyword hubs and caps graph size', async () => {
   const {prepareConnections} = await load();
-  const chats = Array.from({length:35},(_,i)=>({id:`chat:${i}`,kind:'chat',label:`Chat ${i}`}));
+  const chats = Array.from({length:130},(_,i)=>({id:`chat:${i}`,kind:'chat',label:`Chat ${i}`}));
   const projects = [{id:'project:p',kind:'project',label:'Project'}];
   const terms = Array.from({length:40},(_,i)=>({id:`term:${i}`,kind:'keyword',label:`generic ${i}`}));
   const edges = [
@@ -36,10 +36,20 @@ test('overview never materializes generic keyword hubs and caps graph size', asy
     ...terms.flatMap(term=>chats.slice(0,2).map(chat=>({source:chat.id,target:term.id,basis:'shared_keyword'}))),
   ];
   const graph = prepareConnections({nodes:[...chats,...projects,...terms],edges});
-  assert.equal(graph.nodes.length, 30);
+  assert.equal(graph.nodes.length, 100);
   assert.ok(graph.nodes.every(node=>['chat','project'].includes(node.kind)));
-  assert.ok(graph.edges.length <= 60);
+  assert.ok(graph.edges.length <= 240);
   assert.ok(graph.edges.every(edge=>['project','shared_keyword'].includes(edge.basis)));
+});
+
+test('map clusters and node degrees reflect declared connections only', async () => {
+  const {prepareConnections}=await load();
+  const graph=prepareConnections({unmapped_count:9,nodes:['a','b','c','d'].map(id=>({id,kind:'chat',label:id})),
+    edges:[{source:'a',target:'b',basis:'shared_keyword'},{source:'c',target:'d',basis:'project'}]});
+  assert.equal(graph.clusters,2);assert.equal(graph.unmapped_count,9);
+  assert.equal(graph.nodes.find(n=>n.id==='a').cluster,graph.nodes.find(n=>n.id==='b').cluster);
+  assert.notEqual(graph.nodes.find(n=>n.id==='a').cluster,graph.nodes.find(n=>n.id==='c').cluster);
+  assert.ok(graph.nodes.every(n=>n.degree===1));assert.equal(graph.nodes.filter(n=>n.hub).length,2);
 });
 
 test('message graph preserves null context, branches and exact navigation anchors', async () => {
