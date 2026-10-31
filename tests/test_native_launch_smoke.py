@@ -3,12 +3,15 @@ import pathlib, unittest
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 class NativeLaunchSmoke(unittest.TestCase):
  def test_required_steps_are_blocking_in_both_workflows(self):
-  for name in ('macos.yml','release.yml'):
+  for name in ('macos.yml',):
    text=(ROOT/'.github/workflows'/name).read_text()
    self.assertIn('Required native',text)
    self.assertIn('build/native-launch-smoke.sh',text)
-  self.assertIn('cargo build --locked', (ROOT/'.github/workflows/release.yml').read_text())
-  for name in ('macos.yml','release.yml'):
+  release=(ROOT/'.github/workflows/release.yml').read_text()
+  self.assertNotIn('cargo build', release)
+  self.assertIn('release_artifact.py retrieve', release)
+  self.assertIn('needs: [prepare, qualify]', release)
+  for name in ('macos.yml',):
    text=(ROOT/'.github/workflows'/name).read_text()
    self.assertIn('basic',text)
    self.assertIn('Advisory provider proxy capture',text)
@@ -33,11 +36,9 @@ class NativeLaunchSmoke(unittest.TestCase):
   self.assertIn('exit "$final_rc"',basic)
   self.assertNotIn('continue-on-error',basic)
   release=(ROOT/'.github/workflows/release.yml').read_text()
-  required=release.split('Required native UI, health, update status, relaunch, and shutdown smoke',1)[1].split('      - name:',1)[0]
-  self.assertIn('for attempt in 1 2',required)
-  self.assertIn('attempt-$attempt',required)
-  self.assertIn('exit "$final_rc"',required)
-  for text in (workflow,release):
+  self.assertIn('Verify transformed archive and launch without signing or publication credentials',release)
+  self.assertIn('bash build/smoke-native-macos.sh "$target/Chat Hub.app"',release)
+  for text in (workflow,):
    self.assertIn('prepare-native-evidence.py',text)
    self.assertIn('chat-hub-safe-evidence/**',text)
    self.assertNotIn('chat-hub-native-launch-evidence/**',text)
