@@ -79,20 +79,27 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
-    pub fn capture_settings_from_env() -> Result<(bool, String), String> {
-        let enabled = match env::var("CHAT_HUB_CAPTURE_ENABLED").as_deref() {
-            Err(env::VarError::NotPresent) | Ok("false" | "0") => false,
-            Ok("true" | "1") => true,
-            _ => {
-                return Err("invalid CHAT_HUB_CAPTURE_ENABLED; expected true, false, 1 or 0".into())
-            }
-        };
+    pub fn capture_enabled_override_from_env() -> Result<Option<bool>, String> {
+        match env::var("CHAT_HUB_CAPTURE_ENABLED").as_deref() {
+            Err(env::VarError::NotPresent) => Ok(None),
+            Ok("false" | "0") => Ok(Some(false)),
+            Ok("true" | "1") => Ok(Some(true)),
+            _ => Err("invalid CHAT_HUB_CAPTURE_ENABLED; expected true, false, 1 or 0".into()),
+        }
+    }
+
+    pub fn capture_profile_scope_from_env() -> Result<String, String> {
         let scope = env::var("CHAT_HUB_CAPTURE_PROFILE_SCOPE")
             .unwrap_or_else(|_| "provisional:default".into());
         if !valid_capture_profile_scope(&scope) {
             return Err("invalid CHAT_HUB_CAPTURE_PROFILE_SCOPE".into());
         }
-        Ok((enabled, scope))
+        Ok(scope)
+    }
+
+    pub fn capture_settings_from_env() -> Result<(bool, String), String> {
+        let enabled = Self::capture_enabled_override_from_env()?.unwrap_or(false);
+        Ok((enabled, Self::capture_profile_scope_from_env()?))
     }
 
     pub fn from_env() -> Result<Self, String> {

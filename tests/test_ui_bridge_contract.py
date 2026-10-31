@@ -1,5 +1,6 @@
 import json
 import pathlib
+import plistlib
 import re
 import unittest
 
@@ -81,6 +82,11 @@ class UiBridgeContract(unittest.TestCase):
         self.assertIn("await invoke('service_info')", status)
         self.assertIn("invoke('service_health')", status)
         self.assertIn("window.ChatHub={invoke}", app)
+        capture_ui = (ROOT / "desktop-ui/capture-status.js").read_text()
+        self.assertIn("get_capture_preferences", capture_ui)
+        self.assertIn("set_capture_preferences", capture_ui)
+        self.assertIn("restart_capture_settings", capture_ui)
+        self.assertIn("New ChatGPT conversations and replies are saved in your local library", html)
         tauri = (ROOT / "src-tauri/src/main.rs").read_text()
         self.assertIn("service_info,", tauri)
         signature, body = rust_function(tauri, "service_info")
@@ -98,12 +104,25 @@ class UiBridgeContract(unittest.TestCase):
         config = json.loads((ROOT / "src-tauri/tauri.conf.json").read_text())
         self.assertEqual(config["app"]["windows"][0]["title"], "Chat Hub")
 
+    def test_macos_transport_exception_is_scoped_to_chatgpt(self):
+        plist = plistlib.loads((ROOT / "src-tauri/Info.plist").read_bytes())
+        transport = plist["NSAppTransportSecurity"]
+        self.assertTrue(transport["NSAllowsLocalNetworking"])
+        self.assertNotIn("NSAllowsArbitraryLoads", transport)
+        self.assertNotIn("NSAllowsArbitraryLoadsInWebContent", transport)
+        exceptions = transport["NSExceptionDomains"]
+        self.assertEqual(set(exceptions), {"chatgpt.com"})
+        self.assertFalse(exceptions["chatgpt.com"]["NSIncludesSubdomains"])
+        self.assertTrue(exceptions["chatgpt.com"]["NSExceptionAllowsInsecureHTTPLoads"])
+
     def test_sensitive_commands_are_bound_to_authorized_main_webview(self):
         source = (ROOT / "src-tauri/src/main.rs").read_text()
         sensitive = (
             "update_status", "service_info", "check_for_updates", "install_update",
             "e2e_result", "set_provider_view", "open_provider_conversation",
-            "sync_paseo_history", "paseo_history_status",
+            "get_chatgpt_connection",
+            "get_capture_preferences", "set_capture_preferences", "restart_capture_settings",
+            "sync_chatgpt_history", "chatgpt_history_status",
         )
         for command in sensitive:
             with self.subTest(command=command):
@@ -142,6 +161,8 @@ class UiBridgeContract(unittest.TestCase):
         handlers = source.split(".invoke_handler", 1)[-1]
         self.assertRegex(handlers, r"e2e_result\s*,?")
         production_handlers = handlers.split('#[cfg(not(feature = "native-smoke"))]', 1)[-1]
+        for command in ("get_capture_preferences", "set_capture_preferences", "restart_capture_settings"):
+            self.assertIn(command, production_handlers)
         self.assertNotIn("e2e_result", production_handlers)
         self.assertNotIn("e2e_provider_result", production_handlers)
 

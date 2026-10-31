@@ -57,9 +57,22 @@ impl DesktopRuntime {
     }
 }
 
-pub async fn start(
+pub async fn start(data_dir: &Path, proxy_config: ProxyConfig) -> Result<DesktopRuntime, String> {
+    let (capture_enabled, capture_profile_scope) = Config::capture_settings_from_env()?;
+    start_with_capture_config(
+        data_dir,
+        proxy_config,
+        capture_enabled,
+        capture_profile_scope,
+    )
+    .await
+}
+
+pub async fn start_with_capture_config(
     data_dir: &Path,
     mut proxy_config: ProxyConfig,
+    capture_enabled: bool,
+    capture_profile_scope: String,
 ) -> Result<DesktopRuntime, String> {
     std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -70,7 +83,6 @@ pub async fn start(
     }
     let token = persistent_token(data_dir)?;
     let ca_dir = data_dir.join("ca");
-    let (capture_enabled, capture_profile_scope) = Config::capture_settings_from_env()?;
     proxy_config.ca_dir = ca_dir.clone();
     proxy_config.bind = "127.0.0.1:0".parse().expect("valid loopback address");
     let database_path = data_dir.join("chat-hub.sqlite3");

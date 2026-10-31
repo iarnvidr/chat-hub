@@ -137,6 +137,36 @@ pub fn import_paseo_history(
     import_scoped(store, bytes, &scope, "chatgpt-paseo-history-v1", cached)
 }
 
+/// App-owned direct history fetching uses the same stable account attribution
+/// as live requests when those claims are present. Generic export import must
+/// never honor a file's claimed account scope.
+pub fn import_chatgpt_history(
+    store: &mut crate::store::Store,
+    bytes: &[u8],
+) -> Result<ImportReceipt, ImportError> {
+    check_size(bytes)?;
+    let envelope: Value = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    if envelope.get("format").and_then(Value::as_str) != Some("chat-hub-history-v1") {
+        return Err(invalid());
+    }
+    let scope = envelope
+        .get("account_scope")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let hash = scope
+        .strip_prefix("chatgpt:observed:")
+        .or_else(|| scope.strip_prefix("chatgpt:oauth:"))
+        .ok_or_else(invalid)?;
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid());
+    }
+    import_scoped(store, bytes, scope, "chatgpt-history-v1", false)
+}
+
 fn import_scoped(
     store: &mut crate::store::Store,
     bytes: &[u8],

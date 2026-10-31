@@ -1,3 +1,14 @@
+export function findCapturedChatRecord(items, sourceConversationId, accountScope) {
+  if (typeof sourceConversationId !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sourceConversationId)) return null;
+  if (typeof accountScope !== 'string' ||
+      !/^chatgpt:observed:[0-9a-f]{64}$/.test(accountScope)) return null;
+  let matches = (Array.isArray(items) ? items : []).filter(item =>
+    item?.provider === 'chatgpt' && item.source_id === sourceConversationId &&
+    item.account_scope === accountScope);
+  return matches.length === 1 ? {...matches[0]} : null;
+}
+
 export function createConversationTabs({container, onSelect, onEmpty}) {
   const tabs = new Map();
   let selected = null;
@@ -40,5 +51,22 @@ export function createConversationTabs({container, onSelect, onEmpty}) {
   return {
     open(tab) { const existing = tabs.get(tab.id); tabs.set(tab.id, {...existing, ...tab}); selected = tab.id; render(); },
     update(id, changes) { if (tabs.has(id)) { tabs.set(id, {...tabs.get(id), ...changes}); render(); } },
+    get(id) { const tab = tabs.get(id); return tab ? {...tab} : null; },
+    selected() { const tab = tabs.get(selected); return tab ? {...tab} : null; },
+    all() { return [...tabs.values()].map(tab => ({...tab})); },
+    rekey(oldId, newId, changes = {}) {
+      if (!tabs.has(oldId) || (oldId !== newId && tabs.has(newId))) return false;
+      const entries = [...tabs.entries()];
+      const updated = new Map();
+      for (const [id, tab] of entries) {
+        if (id === oldId) updated.set(newId, {...tab, ...changes, id: newId});
+        else updated.set(id, tab);
+      }
+      tabs.clear();
+      for (const [id, tab] of updated) tabs.set(id, tab);
+      if (selected === oldId) selected = newId;
+      render();
+      return true;
+    },
   };
 }

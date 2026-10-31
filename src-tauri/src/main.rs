@@ -3,7 +3,6 @@ use chat_hub::{
     proxy::ProxyConfig,
 };
 use serde::Serialize;
-#[cfg(feature = "native-smoke")]
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -11,13 +10,15 @@ use std::sync::{
 };
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
+mod browser_history;
+mod chatgpt_history;
 mod crash_diagnostics;
 mod desktop_api;
 mod desktop_archive;
 mod desktop_runtime;
 #[cfg(feature = "native-smoke")]
 mod e2e_protocol;
-mod paseo_history;
+mod newcapture_settings;
 mod service_health;
 use service_health::healthy_response;
 mod provider_view;
@@ -37,6 +38,9 @@ struct AppState {
     runtime: Arc<Mutex<Option<desktop_runtime::DesktopRuntime>>>,
     shutdown_started: Arc<AtomicBool>,
     shutdown_finished: Arc<AtomicBool>,
+    capture_settings_dir: PathBuf,
+    capture_enabled_at_start: bool,
+    capture_environment_override: Option<bool>,
     #[cfg(all(feature = "native-smoke", debug_assertions))]
     smoke_data_dir: PathBuf,
 }
@@ -46,6 +50,25 @@ struct UpdateStatus {
     channel: String,
     status: String,
     message: String,
+}
+
+#[derive(Serialize)]
+struct CapturePreferencesReceipt {
+    enabled: bool,
+    active: bool,
+    restart_required: bool,
+    environment_managed: bool,
+}
+
+fn capture_preferences_receipt(state: &AppState) -> Result<CapturePreferencesReceipt, String> {
+    let saved = newcapture_settings::load(&state.capture_settings_dir)?;
+    let enabled = state.capture_environment_override.unwrap_or(saved);
+    Ok(CapturePreferencesReceipt {
+        enabled,
+        active: state.capture_enabled_at_start,
+        restart_required: enabled != state.capture_enabled_at_start,
+        environment_managed: state.capture_environment_override.is_some(),
+    })
 }
 #[allow(dead_code)] // Used only when the native-smoke feature is enabled.
 fn smoke() -> bool {
@@ -71,6 +94,22 @@ mod e2e {
         let t = d.join(format!("{id}.diag.json.tmp"));
         if std::fs::write(&t, value.to_string()).is_ok() {
             let _ = std::fs::rename(t, p);
+        }
+    }
+    fn trust_diagnostics() -> Value {
+        #[cfg(target_os = "macos")]
+        {
+            super::trust_mac::diagnostics()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            json!({
+                "install_state": "unsupported",
+                "challenge_reached": 0,
+                "allowed_host_challenges": 0,
+                "anchor_accepted_challenges": 0,
+                "credentials_used": 0
+            })
         }
     }
     pub fn start(app: tauri::AppHandle) {
@@ -167,18 +206,18 @@ mod e2e {
             }
             "provider_denial" => {
                 let Some(main) = app.get_webview("main") else {
-                    return json!({"ok":false,"error":"main window missing"});
+                    return json!({"ok":false,"error":"main window missing","trust_diagnostics":trust_diagnostics()});
                 };
                 let provider_state = app.state::<crate::ProviderViewState>();
                 if let Err(error) = provider_state.set_smoke_view(&main) {
-                    return json!({"ok":false,"error":format!("provider fixture view unavailable: {error}")});
+                    return json!({"ok":false,"error":format!("provider fixture view unavailable: {error}"),"trust_diagnostics":trust_diagnostics()});
                 }
                 let w = app.get_webview("provider");
                 let Some(w) = w else {
-                    return json!({"ok":false,"error":"provider webview missing"});
+                    return json!({"ok":false,"error":"provider webview missing","trust_diagnostics":trust_diagnostics()});
                 };
                 if !super::smoke() {
-                    return json!({"ok":false,"error":"native smoke automation disabled"});
+                    return json!({"ok":false,"error":"native smoke automation disabled","trust_diagnostics":trust_diagnostics()});
                 }
                 // The provider webview is created during setup and may not yet
                 // have committed its initial navigation when the driver asks.
@@ -211,7 +250,7 @@ mod e2e {
                         }
                     }
                     if std::time::Instant::now() >= ready_deadline {
-                        return json!({"ok":false,"error":"provider webview readiness timed out","readiness":readiness,"polls":readiness_polls,"deadline_ms":28000});
+                        return json!({"ok":false,"error":"provider webview readiness timed out","readiness":readiness,"polls":readiness_polls,"deadline_ms":28000,"trust_diagnostics":trust_diagnostics()});
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
@@ -234,7 +273,7 @@ mod e2e {
                     serde_json::to_string(&key).unwrap_or_else(|_| "\"invalid\"".into());
                 let start = format!("(()=>{{const k={escaped_key};const invoke=window.__TAURI_INTERNALS__?.invoke;if(typeof invoke!==\"function\"){{window[k]={{nonce:{escaped_key},attempted:false,error:\"invoke unavailable\"}};return}};window[k]={{nonce:{escaped_key},pending:true}};Promise.resolve().then(()=>invoke(\"service_info\")).then(()=>{{window[k]={{nonce:{escaped_key},attempted:true,denied:false}}}},e=>{{window[k]={{nonce:{escaped_key},attempted:true,denied:true,error:String(e).slice(0,120)}}}})}})()");
                 if let Err(e) = w.eval(start) {
-                    return json!({"ok":false,"error":format!("provider probe start failed: {e}")});
+                    return json!({"ok":false,"error":format!("provider probe start failed: {e}"),"trust_diagnostics":trust_diagnostics()});
                 }
                 let deadline = operation_deadline;
                 let mut probe_polls = 0u64;
@@ -251,7 +290,7 @@ mod e2e {
                     if let Err(e) = w.eval_with_callback(poll, move |value| {
                         let _ = tx.send(value);
                     }) {
-                        return json!({"ok":false,"error":format!("provider probe poll failed: {e}")});
+                        return json!({"ok":false,"error":format!("provider probe poll failed: {e}"),"trust_diagnostics":trust_diagnostics()});
                     }
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     match rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
@@ -267,21 +306,21 @@ mod e2e {
                                     continue;
                                 }
                                 if result["attempted"].as_bool() == Some(false) {
-                                    return json!({"ok":false,"error":result["error"].as_str().unwrap_or("invoke unavailable")});
+                                    return json!({"ok":false,"error":result["error"].as_str().unwrap_or("invoke unavailable"),"trust_diagnostics":trust_diagnostics()});
                                 }
                                 if result["attempted"].as_bool() == Some(true) {
                                     let denied = result["denied"].as_bool() == Some(true);
-                                    return json!({"ok":denied,"denied":denied,"category":result["error"].as_str().unwrap_or(""),"readiness":readiness});
+                                    return json!({"ok":denied,"denied":denied,"category":result["error"].as_str().unwrap_or(""),"readiness":readiness,"trust_diagnostics":trust_diagnostics()});
                                 }
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(_) => {
-                            return json!({"ok":false,"error":"provider probe callback disconnected"})
+                            return json!({"ok":false,"error":"provider probe callback disconnected","trust_diagnostics":trust_diagnostics()})
                         }
                     }
                     if std::time::Instant::now() >= deadline {
-                        return json!({"ok":false,"error":"timed out waiting for provider service_info result","href":readiness["href"],"readyState":readiness["readyState"],"polls":probe_polls});
+                        return json!({"ok":false,"error":"timed out waiting for provider service_info result","href":readiness["href"],"readyState":readiness["readyState"],"polls":probe_polls,"trust_diagnostics":trust_diagnostics()});
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -700,6 +739,58 @@ fn e2e_result(window: tauri::Webview, id: String, value: String) -> Result<(), S
     e2e::e2e_result(id, value)
 }
 #[tauri::command]
+fn get_capture_preferences(
+    window: tauri::Webview,
+    state: State<'_, AppState>,
+) -> Result<CapturePreferencesReceipt, String> {
+    authorize_local_main(&window)?;
+    capture_preferences_receipt(&state)
+}
+
+#[tauri::command]
+fn set_capture_preferences(
+    window: tauri::Webview,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<CapturePreferencesReceipt, String> {
+    authorize_local_main(&window)?;
+    if state.capture_environment_override.is_some() {
+        return Err("capture_managed_by_environment".into());
+    }
+    let _permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    newcapture_settings::save(&state.capture_settings_dir, enabled)?;
+    capture_preferences_receipt(&state)
+}
+
+#[tauri::command]
+async fn restart_capture_settings(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    authorize_local_main(&window)?;
+    let _permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    let preferences = capture_preferences_receipt(&state)?;
+    if preferences.environment_managed {
+        return Err("capture_managed_by_environment".into());
+    }
+    if !preferences.restart_required {
+        return Err("capture_settings_already_active".into());
+    }
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "service_unavailable".to_string())?
+        .take()
+        .ok_or_else(|| "service_unavailable".to_string())?;
+    runtime
+        .shutdown_for_restore()
+        .await
+        .map_err(|_| "capture_restart_shutdown_incomplete".to_string())?;
+    app.restart();
+}
+
+#[tauri::command]
 fn service_info(
     window: tauri::Webview,
     s: State<'_, AppState>,
@@ -736,12 +827,21 @@ fn open_provider_conversation(
 }
 
 #[tauri::command]
-fn sync_paseo_history(
+async fn get_chatgpt_connection(
+    window: tauri::Webview,
+    state: State<'_, ProviderViewState>,
+) -> Result<provider_view::ChatGptConnectionStatus, String> {
+    authorize_local_main(&window)?;
+    Ok(state.chatgpt_connection().await)
+}
+
+#[tauri::command]
+fn sync_chatgpt_history(
     window: tauri::Webview,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    history: State<'_, paseo_history::PaseoHistoryState>,
-) -> Result<paseo_history::PaseoHistoryStatus, String> {
+    history: State<'_, chatgpt_history::ChatgptHistoryState>,
+) -> Result<chatgpt_history::ChatgptHistoryStatus, String> {
     authorize_local_main(&window)?;
     if state.shutdown_started.load(Ordering::Acquire)
         || state.shutdown_finished.load(Ordering::Acquire)
@@ -758,10 +858,10 @@ fn sync_paseo_history(
 }
 
 #[tauri::command]
-fn paseo_history_status(
+fn chatgpt_history_status(
     window: tauri::Webview,
-    history: State<'_, paseo_history::PaseoHistoryState>,
-) -> Result<paseo_history::PaseoHistoryStatus, String> {
+    history: State<'_, chatgpt_history::ChatgptHistoryState>,
+) -> Result<chatgpt_history::ChatgptHistoryStatus, String> {
     authorize_local_main(&window)?;
     history.snapshot()
 }
@@ -943,8 +1043,14 @@ fn main() {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
         let ca = dir.join("ca");
-        let (capture_enabled, _) =
-            Config::capture_settings_from_env().map_err(std::io::Error::other)?;
+        let capture_environment_override =
+            Config::capture_enabled_override_from_env().map_err(std::io::Error::other)?;
+        let capture_profile_scope =
+            Config::capture_profile_scope_from_env().map_err(std::io::Error::other)?;
+        let capture_preferences = newcapture_settings::resolve(&dir, capture_environment_override)
+            .map_err(std::io::Error::other)?;
+        let capture_enabled = capture_preferences.enabled;
+        #[allow(unused_mut)]
         let mut cfg = ProxyConfig::loopback(&ca);
         #[cfg(feature = "native-smoke")]
         if smoke() {
@@ -962,8 +1068,13 @@ fn main() {
         let provider_direct_smoke_enabled = cfg!(feature = "native-smoke")
             && smoke()
             && std::env::var("MUNINN_PROVIDER_DIRECT_SMOKE").as_deref() == Ok("1");
-        let runtime = tauri::async_runtime::block_on(desktop_runtime::start(&dir, cfg))
-            .map_err(std::io::Error::other)?;
+        let runtime = tauri::async_runtime::block_on(desktop_runtime::start_with_capture_config(
+            &dir,
+            cfg,
+            capture_enabled,
+            capture_profile_scope,
+        ))
+        .map_err(std::io::Error::other)?;
         let api = runtime.api.clone();
         let token = runtime.token.clone();
         let proxy = runtime.proxy.clone();
@@ -991,10 +1102,13 @@ fn main() {
             runtime: Arc::new(Mutex::new(Some(runtime))),
             shutdown_started: Arc::new(AtomicBool::new(false)),
             shutdown_finished: Arc::new(AtomicBool::new(false)),
+            capture_settings_dir: dir.clone(),
+            capture_enabled_at_start: capture_enabled,
+            capture_environment_override,
             #[cfg(all(feature = "native-smoke", debug_assertions))]
             smoke_data_dir: dir.clone(),
         });
-        app.manage(paseo_history::PaseoHistoryState::new(dir.clone()));
+        app.manage(chatgpt_history::ChatgptHistoryState::new(dir.clone()));
         #[cfg(feature = "native-smoke")]
         e2e::start(app.handle().clone());
         // Disable Tauri's automatic window creation: the configured main window
@@ -1028,6 +1142,10 @@ fn main() {
                 eprintln!("main webview setup failed: {error}");
                 error
             })?;
+        #[cfg(feature = "native-smoke")]
+        if smoke() {
+            main.set_title("Chat Hub — isolated validation")?;
+        }
         main.on_window_event({
             let ownership = main_ownership.clone();
             move |event| {
@@ -1055,7 +1173,7 @@ fn main() {
         if provider_proxy_enabled {
             // Install the app-scoped certificate trust callback before any
             // provider navigation can begin.
-            crate::trust_mac::prepare(&ca_der, &provider_webview);
+            crate::trust_mac::prepare(&ca_der, &provider_webview).map_err(std::io::Error::other)?;
         }
         let _ = provider_webview;
         Ok(())
@@ -1069,13 +1187,17 @@ fn main() {
             import_chatgpt_export,
             backup_library,
             export_library_json,
+            get_capture_preferences,
+            set_capture_preferences,
+            restart_capture_settings,
             restore_library_backup,
             service_health,
             service_info,
             set_provider_view,
             open_provider_conversation,
-            sync_paseo_history,
-            paseo_history_status,
+            get_chatgpt_connection,
+            sync_chatgpt_history,
+            chatgpt_history_status,
             check_for_updates,
             install_update,
             e2e_result
@@ -1084,7 +1206,7 @@ fn main() {
         .map(|app| {
             app.run(|app, event| {
                 if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
-                    app.state::<paseo_history::PaseoHistoryState>().cancel();
+                    app.state::<chatgpt_history::ChatgptHistoryState>().cancel();
                     let state = app.state::<AppState>();
                     if state.shutdown_finished.load(Ordering::Acquire) {
                         return;
@@ -1115,13 +1237,17 @@ fn main() {
             import_chatgpt_export,
             backup_library,
             export_library_json,
+            get_capture_preferences,
+            set_capture_preferences,
+            restart_capture_settings,
             restore_library_backup,
             service_health,
             service_info,
             set_provider_view,
             open_provider_conversation,
-            sync_paseo_history,
-            paseo_history_status,
+            get_chatgpt_connection,
+            sync_chatgpt_history,
+            chatgpt_history_status,
             check_for_updates,
             install_update
         ])
@@ -1129,7 +1255,7 @@ fn main() {
         .map(|app| {
             app.run(|app, event| {
                 if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
-                    app.state::<paseo_history::PaseoHistoryState>().cancel();
+                    app.state::<chatgpt_history::ChatgptHistoryState>().cancel();
                     let state = app.state::<AppState>();
                     if state.shutdown_finished.load(Ordering::Acquire) {
                         return;

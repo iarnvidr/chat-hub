@@ -45,6 +45,12 @@ body.provider-open{overflow:hidden}
 .list-caption{font-size:12px;color:#8ea0b3;margin:5px 0 18px}
 .sidebar-note{padding:5px 10px;color:#8b9eb1;font-size:12px;line-height:1.7}
 .sidebar .health-card{margin-top:auto}
+.capture-preferences{margin-top:13px;padding-top:12px;border-top:1px solid #283544}
+.capture-preferences label{display:flex;align-items:flex-start;gap:8px;color:#dce7f2;font-size:12px;font-weight:600;cursor:pointer}
+.capture-preferences input{margin:3px 0 0;accent-color:#55c7d0}
+.capture-preferences p{margin:8px 0;color:#91a2b4;font-size:11px;line-height:1.55}
+.capture-preferences button{margin:0 5px 4px 0;padding:6px 8px;font-size:11px}
+.capture-preferences button:disabled{opacity:.5;cursor:default}
 .reader-empty{min-height:calc(100vh - 270px);align-content:center;justify-items:start;text-align:left;max-width:820px;margin:auto}
 .welcome-kicker{font-size:10px;letter-spacing:.17em;font-weight:700;color:#6ed0ce;margin-bottom:16px}
 .reader-empty h2{font-size:clamp(28px,3.3vw,44px);line-height:1.15;letter-spacing:-.035em;margin:0 0 18px;color:#edf3f8}

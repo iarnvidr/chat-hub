@@ -18,6 +18,7 @@ function boot(invoke) {
     return elements.get(id);
   };
   const listeners = new Map();
+  const timers = new Map(); let nextTimer = 0;
   const context = vm.createContext({
     document: {getElementById: element, body: element('body')},
     window: {ChatHub: {invoke}, __TAURI_INTERNALS__: {invoke},
@@ -26,11 +27,14 @@ function boot(invoke) {
     },
     Event: class { constructor(type) { this.type = type; } },
     CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options?.detail; } },
-    ResizeObserver: class { observe() {} }, setTimeout: () => 1, clearTimeout() {}, Date,
+    ResizeObserver: class { observe() {} },
+    setTimeout: (fn, delay) => { const id = ++nextTimer; timers.set(id, {fn, delay}); return id; },
+    clearTimeout: id => timers.delete(id), Date,
   });
   vm.runInContext(fs.readFileSync(require.resolve('../desktop-ui/provider-view.js'), 'utf8'), context);
   return {element, dispatch: (type, detail) => listeners.get(type)?.({type, detail}),
     listen: (type, callback) => listeners.set(type, callback),
+    async runTimer(delay) { const item = [...timers].find(([, timer]) => timer.delay === delay); if (!item) return false; timers.delete(item[0]); await item[1].fn(); return true; },
     flush: () => new Promise(resolve => setImmediate(resolve))};
 }
 
@@ -49,7 +53,7 @@ test('ChatGPT opens on demand within the main layout and hides before returning 
   assert.equal(ui.element('provider-shell').hidden, false);
   assert.match(ui.element('provider-view-status').textContent, /ChatGPT is open/);
   ui.element('provider-back').click(); await ui.flush();
-  assert.equal(calls[2].args.visible, false);
+  assert.equal(calls.filter(c => c.command === 'set_provider_view').at(-1).args.visible, false);
   assert.equal(ui.element('library-reader').hidden, false);
   assert.equal(ui.element('provider-shell').hidden, true);
 });
@@ -86,4 +90,35 @@ test('failed provider creation offers recovery and keeps the library reachable',
   assert.match(ui.element('provider-view-status').textContent, /could not open.*Reload ChatGPT/);
   ui.element('provider-back').click(); await ui.flush();
   assert.equal(ui.element('library-reader').hidden, false);
+});
+
+test('Connect ChatGPT opens account sign-in without creating a conversation tab', async () => {
+  const calls = [], ui = boot(async (command, args) => {
+    calls.push({command, args});
+    if (command === 'get_chatgpt_connection') return {state: 'signed_out'};
+    return {state: args.visible ? 'ready' : 'hidden'};
+  });
+  let drafts = 0;
+  ui.listen('chat-hub:live-open', () => { drafts++; });
+  ui.element('connect-chatgpt').click(); await ui.flush();
+  assert.equal(drafts, 0);
+  assert.equal(ui.element('provider-title').textContent, 'Connect ChatGPT');
+  assert.match(ui.element('provider-view-status').textContent, /Sign in.*fetch your history/);
+  assert.equal(calls.filter(c => c.command === 'open_provider_conversation').length, 1);
+});
+
+test('visible ChatGPT view polls its guarded native URL status and dispatches a conversation UUID once', async () => {
+  let currentId = null; const received = [];
+  const ui = boot(async (command, args) => {
+    if (command === 'get_chatgpt_connection') return {state: 'connected'};
+    if (command === 'set_provider_view') return {state: args.visible ? 'ready' : 'hidden', conversation_id: currentId};
+    return {};
+  });
+  ui.listen('chat-hub:provider-conversation', event => received.push(event.detail.conversationId));
+  ui.element('show-chatgpt').click(); await ui.flush();
+  currentId = '123e4567-e89b-12d3-a456-426614174000';
+  assert.equal(await ui.runTimer(3000), true);
+  assert.deepEqual(received, [currentId]);
+  assert.equal(await ui.runTimer(3000), true);
+  assert.deepEqual(received, [currentId], 'unchanged location is reported only once');
 });

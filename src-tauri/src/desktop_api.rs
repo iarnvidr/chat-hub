@@ -75,6 +75,15 @@ pub async fn import_paseo_history(
     import_from(base, token, data, count, "paseo-history").await
 }
 
+pub async fn import_chatgpt_history(
+    base: &str,
+    token: &str,
+    data: Vec<u8>,
+    count: u64,
+) -> Result<ImportReceipt, String> {
+    import_from(base, token, data, count, "chatgpt-history").await
+}
+
 async fn import_from(
     base: &str,
     token: &str,
@@ -86,11 +95,13 @@ async fn import_from(
         return Err("file_too_large".into());
     }
     let c = Client::builder()
-        .timeout(Duration::from_secs(if source == "paseo-history" {
-            300
-        } else {
-            60
-        }))
+        .timeout(Duration::from_secs(
+            if matches!(source, "paseo-history" | "chatgpt-history") {
+                300
+            } else {
+                60
+            },
+        ))
         .build()
         .map_err(|_| "Desktop API unavailable")?;
     let u = url(base, &["api", "v1", "imports", source], &[])?;

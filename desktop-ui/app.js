@@ -1,9 +1,9 @@
 import {fixtureAdapter, normalizeList, normalizeSearch} from './data.js';
 import {branchChoices,orderedMessages,messageText,hasUnsupportedContent,renderMarkdown} from './render.js';
 import {updateStatus} from './status.js';
-import {createConversationTabs} from './conversation-tabs.js';
+import {createConversationTabs, findCapturedChatRecord} from './conversation-tabs.js';
 import {chatgptConversationId} from './continuation.js';
-const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';const adapter=fixture?fixtureAdapter():{async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value});},async getConversation(id,leafNodeId){return invoke('get_conversation',leafNodeId!==undefined?{id,leafNodeId}:{id});},async importChatgptExport(){return invoke('import_chatgpt_export');}};$('fixture-banner').hidden=!fixture;let selected=null,conversation=null,items=[],timer,queryToken=0,readerToken=0,cursor=null,revision=null,queryValue='',cursorRetry=false,lastConversationButton=null;const errText=e=>String(e?.message||e);const safeError=code=>({invalid_request:'The request was invalid.',invalid_cursor:'The page cursor is invalid.',stale_cursor:'The library changed; restart the search.',library_changed:'The library changed; restart the search.',unauthorized:'Sign in to the desktop service.',not_found:'The requested conversation was not found.',service_unavailable:'The desktop service is unavailable.',busy:'The desktop service is busy.',response_too_large:'This conversation is too large to display (8 MiB response limit). No content has been truncated.'}[code]||'The desktop service returned an error.');function showError(s){$('list-state').textContent=s;}
+const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';const adapter=fixture?fixtureAdapter():{async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value});},async getConversation(id,leafNodeId){return invoke('get_conversation',leafNodeId!==undefined?{id,leafNodeId}:{id});},async importChatgptExport(){return invoke('import_chatgpt_export');}};$('fixture-banner').hidden=!fixture;let selected=null,conversation=null,items=[],timer,queryToken=0,readerToken=0,cursor=null,revision=null,queryValue='',cursorRetry=false,lastConversationButton=null,liveDraftSequence=0;const errText=e=>String(e?.message||e);const safeError=code=>({invalid_request:'The request was invalid.',invalid_cursor:'The page cursor is invalid.',stale_cursor:'The library changed; restart the search.',library_changed:'The library changed; restart the search.',unauthorized:'Sign in to the desktop service.',not_found:'The requested conversation was not found.',service_unavailable:'The desktop service is unavailable.',busy:'The desktop service is busy.',response_too_large:'This conversation is too large to display (8 MiB response limit). No content has been truncated.'}[code]||'The desktop service returned an error.');function showError(s){$('list-state').textContent=s;}
 function providerLabel(provider) {
   return {'paseo-chatgpt':'ChatGPT · saved in Paseo', 'paseo-codex_local':'Codex local · saved in Paseo', 'paseo-codex_cloud':'Codex cloud · saved in Paseo'}[provider] || provider || 'Unknown provider';
 }
@@ -36,7 +36,7 @@ const conversationTabs = createConversationTabs({
   onSelect: tab => {
     if (tab.mode === 'live') window.dispatchEvent(new CustomEvent('chat-hub:show-live', {detail: {
       conversationId: tab.sourceConversationId ?? null, title: tab.title, localId: tab.localId,
-      leafNodeId: tab.leafNodeId,
+      leafNodeId: tab.leafNodeId, accountScope: tab.accountScope,
     }}));
     else openConversation(tab.id, tab.leafNodeId, tab.anchorNodeId);
   },
@@ -49,7 +49,8 @@ const conversationTabs = createConversationTabs({
 });
 window.addEventListener('chat-hub:live-open', () => {
   ++readerToken;
-  conversationTabs.open({id: 'draft:chatgpt', title: 'New conversation', mode: 'live'});
+  conversationTabs.open({id: `draft:chatgpt:${Date.now()}-${++liveDraftSequence}`,
+    title: 'New conversation', mode: 'live', sourceConversationId: null});
 });
 window.addEventListener('chat-hub:read-saved', event => {
   if (event.detail?.localId) openConversation(event.detail.localId, event.detail.leafNodeId);
@@ -60,17 +61,106 @@ $('continue-chatgpt').addEventListener('click', () => {
   const title = conversation.conversation.title || 'Conversation';
   const leafNodeId = $('branch').value || conversation.selected_node_id;
   ++readerToken;
-  conversationTabs.update(selected, {mode: 'live', sourceConversationId, localId: selected, title, leafNodeId});
+  conversationTabs.update(selected, {mode: 'live', sourceConversationId, localId: selected, title, leafNodeId,
+    accountScope: conversation.conversation.account_scope});
   window.dispatchEvent(new CustomEvent('chat-hub:show-live', {detail: {
-    conversationId: sourceConversationId, title, localId: selected, leafNodeId, freshNavigation: true,
+    conversationId: sourceConversationId, title, localId: selected, leafNodeId,
+    accountScope: conversation.conversation.account_scope, freshNavigation: true,
   }}));
 });
-window.addEventListener('chat-hub:history-updated', () => loadList($('search').value, true));
+function reconcileLiveTab(tab) {
+  if (!tab?.sourceConversationId) return false;
+  const record = findCapturedChatRecord(items, tab.sourceConversationId, tab.accountScope);
+  if (!record) return false;
+  const prior = items.find(item => item.id === tab.localId);
+  const changes = {mode: 'live', sourceConversationId: tab.sourceConversationId,
+    localId: record.id, accountScope: record.account_scope,
+    title: record.title || tab.title || 'ChatGPT conversation'};
+  if (prior?.provider === 'paseo-chatgpt') {
+    changes.leafNodeId = null;
+    changes.anchorNodeId = null;
+    changes.branchReset = true;
+  }
+  if (tab.id === record.id) { conversationTabs.update(tab.id, changes); return true; }
+  return conversationTabs.rekey(tab.id, record.id, changes);
+}
+function providerConversationChanged(event) {
+  const sourceConversationId = event.detail?.conversationId;
+  if (typeof sourceConversationId !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sourceConversationId)) return;
+  let tab = conversationTabs.selected();
+  if (tab?.mode !== 'live') tab = null;
+  const accountScope = typeof event.detail?.accountScope === 'string' &&
+    /^chatgpt:observed:[0-9a-f]{64}$/.test(event.detail.accountScope)
+    ? event.detail.accountScope : null;
+  if (!tab) {
+    const canonical = `live:chatgpt:${sourceConversationId}`;
+    const id = conversationTabs.get(canonical) ? `${canonical}:pending:${++liveDraftSequence}` : canonical;
+    conversationTabs.open({id, title: 'ChatGPT conversation', mode: 'live', sourceConversationId, accountScope, localId: null, leafNodeId: null});
+    tab = conversationTabs.get(id);
+  } else if (tab.sourceConversationId === sourceConversationId &&
+      (tab.accountScope !== accountScope && (tab.accountScope !== null || accountScope !== null))) {
+    // A matching URL cannot prove that the provider account stayed the same.
+    // Keep the old tab scoped to its original account and start a separate live placeholder.
+    const canonical = `live:chatgpt:${sourceConversationId}`;
+    const id = conversationTabs.get(canonical) ? `${canonical}:pending:${++liveDraftSequence}` : canonical;
+    const prior = items.find(item => item.id === tab.localId);
+    const cachedTranscript = prior?.provider === 'paseo-chatgpt';
+    conversationTabs.open({id, title: tab.title || 'ChatGPT conversation', mode: 'live', sourceConversationId, accountScope,
+      localId: cachedTranscript ? tab.localId : null,
+      leafNodeId: cachedTranscript ? tab.leafNodeId : null,
+      anchorNodeId: cachedTranscript ? tab.anchorNodeId : null});
+    tab = conversationTabs.get(id);
+  } else if (tab.sourceConversationId !== sourceConversationId) {
+    const changes = {sourceConversationId, title: 'ChatGPT conversation', localId: null,
+      accountScope, leafNodeId: null, anchorNodeId: null};
+    if (tab.id.startsWith('draft:chatgpt:')) {
+      const canonical = `live:chatgpt:${sourceConversationId}`;
+      if (conversationTabs.rekey(tab.id, canonical, changes)) tab = conversationTabs.get(canonical);
+      else {
+        const id = `${canonical}:pending:${++liveDraftSequence}`;
+        conversationTabs.open({id, ...changes, mode: 'live'}); tab = conversationTabs.get(id);
+      }
+    } else {
+      const canonical = `live:chatgpt:${sourceConversationId}`;
+      const id = conversationTabs.get(canonical) ? `${canonical}:pending:${++liveDraftSequence}` : canonical;
+      conversationTabs.open({id, ...changes, mode: 'live'}); tab = conversationTabs.get(id);
+    }
+  }
+  reconcileLiveTab(tab);
+}
+window.addEventListener('chat-hub:provider-conversation', providerConversationChanged);
+async function rereadSelected() {
+  const tab = conversationTabs.selected();
+  if (tab?.mode === 'live') {
+    const id = tab.localId;
+    if (!id) return;
+    try {
+      const detail = await adapter.getConversation(id, tab.leafNodeId);
+      if (detail?.conversation?.id !== id || conversationTabs.selected()?.id !== tab.id) return;
+      const title = detail.conversation.title || tab.title;
+      conversationTabs.update(tab.id, {title, leafNodeId: tab.branchReset ? null : (tab.leafNodeId ?? detail.selection?.selected_node_id)});
+      if (conversation?.id === id) conversation = {...detail.conversation, ...detail,
+        selected_node_id: detail.selection?.selected_node_id};
+    } catch { /* A background refresh must not take focus away from the live ChatGPT view. */ }
+    return;
+  }
+  if (!selected) return;
+  openConversation(selected, $('branch').value || conversation?.selected_node_id,
+    undefined, {focus: false, selectTab: false});
+}
+window.addEventListener('chat-hub:history-updated', async () => {
+  await loadList($('search').value, true);
+  const tab = conversationTabs.selected();
+  if (tab?.mode === 'live') reconcileLiveTab(tab);
+  await rereadSelected();
+});
 $('history-source').addEventListener('change', () => loadList($('search').value, true));
-function openConversation(id, leafNodeId, anchorNodeId) {
-  window.dispatchEvent(new Event('chat-hub:show-local'));
+function openConversation(id, leafNodeId, anchorNodeId, options={}) {
+  const focus = options.focus !== false;
+  if (focus) window.dispatchEvent(new Event('chat-hub:show-local'));
   const title = items.find(item => item.id === id)?.title || 'Conversation';
-  conversationTabs.open({id, title, leafNodeId, anchorNodeId, mode: 'local'});
+  if (options.selectTab !== false) conversationTabs.open({id, title, leafNodeId, anchorNodeId, mode: 'local'});
   const token = ++readerToken;
   lastConversationButton = [...document.querySelectorAll('.conversation-item')].find(b => b.classList.contains('selected')) || document.activeElement;
   selected = id;
@@ -87,7 +177,7 @@ function openConversation(id, leafNodeId, anchorNodeId) {
     conversation = {...c.conversation, ...c, selected_node_id: c.selection?.selected_node_id};
     $('continue-chatgpt').hidden = !chatgptConversationId(c.conversation);
     $('title').textContent = c.conversation?.title ?? 'Untitled conversation';
-    conversationTabs.update(id, {title: $('title').textContent});
+    conversationTabs.update(options.tabId || id, {title: $('title').textContent});
     $('provider').textContent = providerLabel(c.conversation?.provider);
     const scope = c.conversation?.account_scope;
     $('account-attribution').textContent = typeof scope !== 'string' || scope.startsWith('provisional:')

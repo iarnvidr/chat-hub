@@ -12,6 +12,8 @@ The native library actions save a consistent SQLite backup, export a one-way JSO
 
 The desktop opens saved conversations in individual tabs and defaults to ChatGPT history. Existing Paseo cached transcripts retain their exact text with a provenance notice; the cache does not contain alternate branches. For a recognized ChatGPT conversation ID, **Continue in ChatGPT** opens that specific live chat within the reader; **Read saved copy** returns to its local tab. Sign-in, sending and live reconciliation still require acceptance. Large-transcript reading now budgets JSON escaping and normalized parts accurately; search uses graph topology without loading complete message bodies. Conversations whose full detail exceeds the 8 MiB response limit still need paged reading.
 
+**Connect ChatGPT** uses the desktop app's own provider session. **Sync history** fetches conversation lists and full conversation graphs directly from ChatGPT through that session, then passes bounded chunks to the shared local importer. Credentials remain inside the provider webview; that webview cannot invoke privileged native commands. Each chunk is committed before fetching continues. This replaces the native dependency on the Paseo plugin and its deployed cache. A future plugin can connect to Chat Hub's service; no Paseo infrastructure is required for this flow. Signed-in history fetching and new-chat capture remain acceptance items until tested with a real session.
+
 The CLI restore command remains available for restoring into an empty library: set `CHAT_HUB_DATABASE` to the destination path and run `cargo run -- restore /path/to/library.sqlite3`. It validates the backup, applies compatible migrations, rebuilds all search indexes, and prints a receipt. JSON exports cannot be restored.
 
 ## Build and run
@@ -24,7 +26,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
 ```
 
-For an explicit development capture run, start the native app with `CHAT_HUB_CAPTURE_ENABLED=true CHAT_HUB_CAPTURE_PROFILE_SCOPE=provisional:default npm run tauri -- dev`. Capture defaults off. The scope must remain tied to one provider account for the lifetime of the library; account switching is not detected or safe yet. Captured snapshots include conversation content in the local library.
+Capture defaults off. The desktop offers **Save live chats on this Mac**, with an explicit save and restart action. It stores a private preference in the app data directory and waits for the local writer to stop before restarting. For an explicit development override, use `CHAT_HUB_CAPTURE_ENABLED=true CHAT_HUB_CAPTURE_PROFILE_SCOPE=provisional:default npm run tauri -- dev`. An environment value overrides the saved preference. Request-local account claims are attributed to opaque scopes; real account-switch and restart acceptance remains pending. Captured snapshots include conversation content in the local library.
 
 Set the following environment variables for the Rust CLI/service; the native desktop app shares only the capture opt-in and profile-scope settings above, and uses Tauri's platform app-data directory and explicit database/CA paths instead of the CLI/service path overrides:
 

@@ -36,6 +36,13 @@
         <div class="section-title">LOCAL SERVICE</div>
         <div id="health" aria-live="polite">Starting local service…</div>
         <div id="capture-health" aria-live="polite"></div>
+        <section class="capture-preferences" aria-label="Live capture settings">
+          <label for="capture-enabled-toggle"><input id="capture-enabled-toggle" type="checkbox" disabled> Save live chats on this Mac</label>
+          <p>New ChatGPT conversations and replies are saved in your local library. The setting applies after restart.</p>
+          <button id="save-capture-setting" type="button" disabled>Save setting</button>
+          <button id="restart-capture-settings" type="button" hidden>Restart to apply</button>
+          <p id="capture-preferences-status" role="status" aria-live="polite">Loading capture settings…</p>
+        </section>
         <button id="retry-health" class="quiet" hidden>Retry connection</button>
       </section>
     </aside>
@@ -45,6 +52,7 @@
         <div><div class="eyebrow">YOUR CONVERSATIONS</div><h1>Chats</h1><p>Pick up a conversation. Find something you said. Keep a few chats open.</p></div>
         <div class="library-actions">
           <button id="show-chatgpt" class="primary" type="button">New conversation</button>
+          <button id="connect-chatgpt" type="button">Connect ChatGPT</button>
           <button id="sync-history" type="button">Sync history</button>
           <details class="library-tools"><summary>Library tools</summary><div class="library-tools-menu">
           <button id="import">Import export</button>

@@ -389,6 +389,10 @@ pub(super) fn routes(
         .route("/api/v1/conversations/:id", get(detail))
         .route("/api/v1/imports/chatgpt", post(imports::import_chatgpt))
         .route(
+            "/api/v1/imports/chatgpt-history",
+            post(imports::import_chatgpt_history),
+        )
+        .route(
             "/api/v1/imports/paseo-history",
             post(imports::import_paseo_history),
         )

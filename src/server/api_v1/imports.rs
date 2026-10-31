@@ -35,20 +35,33 @@ pub(super) async fn import_chatgpt(
     State(s): State<ApiState>,
     request: Request,
 ) -> Result<Json<ImportReceipt>, ApiError> {
-    import(State(s), request, false).await
+    import(State(s), request, ImportSource::Export).await
 }
 
 pub(super) async fn import_paseo_history(
     State(s): State<ApiState>,
     request: Request,
 ) -> Result<Json<ImportReceipt>, ApiError> {
-    import(State(s), request, true).await
+    import(State(s), request, ImportSource::Paseo).await
+}
+
+pub(super) async fn import_chatgpt_history(
+    State(s): State<ApiState>,
+    request: Request,
+) -> Result<Json<ImportReceipt>, ApiError> {
+    import(State(s), request, ImportSource::History).await
+}
+
+enum ImportSource {
+    Export,
+    Paseo,
+    History,
 }
 
 async fn import(
     State(s): State<ApiState>,
     request: Request,
-    paseo: bool,
+    source: ImportSource,
 ) -> Result<Json<ImportReceipt>, ApiError> {
     let content_type = request
         .headers()
@@ -95,10 +108,10 @@ async fn import(
         let _import_permit = import_permit;
         let _db_permit = db_permit;
         let mut store = store.lock().map_err(|_| unavailable())?;
-        (if paseo {
-            importer::import_paseo_history(&mut store, &bytes)
-        } else {
-            importer::import_chatgpt(&mut store, &bytes)
+        (match source {
+            ImportSource::Paseo => importer::import_paseo_history(&mut store, &bytes),
+            ImportSource::Export => importer::import_chatgpt(&mut store, &bytes),
+            ImportSource::History => importer::import_chatgpt_history(&mut store, &bytes),
         })
         .map(Json)
         .map_err(|e| match e.code {
