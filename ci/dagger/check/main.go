@@ -63,9 +63,11 @@ func (m *ChatHubCi) BrowserChecks(ctx context.Context, source *dagger.Directory)
 
 func (m *ChatHubCi) Contracts(ctx context.Context, source *dagger.Directory) (string, error) {
 	python := dag.Container().From(pythonImage)
+	bun := dag.Container().From(bunImage)
 	rust := dag.Container().From(rustImage)
 	return python.
 		WithExec([]string{"sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends bash build-essential git && rm -rf /var/lib/apt/lists/*"}).
+		WithFile("/usr/local/bin/bun", bun.File("/usr/local/bin/bun")).
 		WithDirectory("/usr/local/cargo", rust.Directory("/usr/local/cargo")).
 		WithDirectory("/usr/local/rustup", rust.Directory("/usr/local/rustup")).
 		WithEnvVariable("CARGO_HOME", "/usr/local/cargo").
