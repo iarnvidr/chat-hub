@@ -31,6 +31,16 @@ pub trait ReadAdapter: Send {
         after: Option<&ListKey>,
         expected_revision: Option<i64>,
     ) -> Result<ListPageSnapshot, ReadError>;
+    /// Provider-filtered chat-side listing. Existing adapters without this
+    /// capability remain valid and fail closed as unavailable.
+    fn chat_list_page_snapshot(
+        &mut self,
+        _limit: usize,
+        _after: Option<&ListKey>,
+        _expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        Err(ReadError::Unavailable)
+    }
     /// RAW text, not FTS grammar. The store literalizes whitespace-separated
     /// Unicode terms and ANDs them. Do not prequote or resolve summaries later.
     fn search_page_snapshot(
@@ -40,6 +50,16 @@ pub trait ReadAdapter: Send {
         after: Option<&SearchKey>,
         expected_revision: Option<i64>,
     ) -> Result<SearchPageSnapshot, ReadError>;
+    /// Provider-filtered chat-side search, using the same raw query semantics.
+    fn chat_search_page_snapshot(
+        &mut self,
+        _query: &str,
+        _limit: usize,
+        _after: Option<&SearchKey>,
+        _expected_revision: Option<i64>,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        Err(ReadError::Unavailable)
+    }
     fn detail_snapshot(&mut self, canonical_id: &str) -> Result<DetailSnapshot, ReadError>;
     /// Service readiness must be known independently of the database probe.
     fn diagnostics(&mut self) -> Result<Diagnostics, ReadError>;
@@ -207,6 +227,60 @@ impl ReadAdapter for StoreReader {
                 .map_err(|_| ReadError::InvalidData)?,
         })
     }
+    fn chat_list_page_snapshot(
+        &mut self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        let after = after.map(|key| crate::store::ListKey {
+            updated_at_ms: key.updated_at_ms,
+            id: key.id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .chat_list_page_snapshot(limit, after.as_ref(), expected_revision)
+            .map_err(store_read_error)?;
+        Ok(ListPageSnapshot {
+            library_revision: snapshot.library_revision,
+            items: snapshot
+                .items
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
+    }
+    fn chat_search_page_snapshot(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        let after = after.map(|key| crate::store::SearchKey {
+            score: key.score,
+            conversation_id: key.conversation_id.clone(),
+            node_id: key.node_id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .chat_search_page_snapshot(query, limit, after.as_ref(), expected_revision)
+            .map_err(store_read_error)?;
+        Ok(SearchPageSnapshot {
+            library_revision: snapshot.library_revision,
+            hits: snapshot
+                .hits
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
+    }
     fn detail_snapshot(&mut self, canonical_id: &str) -> Result<DetailSnapshot, ReadError> {
         let snapshot = self
             .store
@@ -310,8 +384,14 @@ pub(super) fn routes(
         .route("/api/v1/version", get(version))
         .route("/api/v1/conversations", get(list))
         .route("/api/v1/search", get(search))
+        .route("/api/v1/chat/conversations", get(chat_list))
+        .route("/api/v1/chat/search", get(chat_search))
         .route("/api/v1/conversations/:id", get(detail))
         .route("/api/v1/imports/chatgpt", post(imports::import_chatgpt))
+        .route(
+            "/api/v1/imports/paseo-history",
+            post(imports::import_paseo_history),
+        )
         // Auth runs before parameter extraction, including malformed queries.
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
@@ -559,14 +639,14 @@ fn decode_cursor(
         return Err(invalid_cursor());
     }
     match (&cursor.after, route) {
-        (Key::List { id, .. }, "list") if !id.is_empty() => {}
+        (Key::List { id, .. }, "list" | "chat-list") if !id.is_empty() => {}
         (
             Key::Search {
                 score,
                 conversation_id,
                 ..
             },
-            "search",
+            "search" | "chat-search",
         ) if score.is_finite() && !conversation_id.is_empty() => {}
         _ => return Err(invalid_cursor()),
     }
@@ -621,9 +701,23 @@ fn after_list(item: &Summary, key: &Key) -> bool {
         == Ordering::Greater
 }
 async fn list(State(s): State<ApiState>, q: Result<Query<PageQuery>, QueryRejection>) -> ApiResult {
+    list_route(State(s), q, "list", false).await
+}
+async fn chat_list(
+    State(s): State<ApiState>,
+    q: Result<Query<PageQuery>, QueryRejection>,
+) -> ApiResult {
+    list_route(State(s), q, "chat-list", true).await
+}
+async fn list_route(
+    State(s): State<ApiState>,
+    q: Result<Query<PageQuery>, QueryRejection>,
+    route: &'static str,
+    chat_only: bool,
+) -> ApiResult {
     let q = query(q)?;
     let limit = limit(q.limit)?;
-    let cursor = decode_cursor(q.cursor.as_deref(), "list", None)?;
+    let cursor = decode_cursor(q.cursor.as_deref(), route, None)?;
     let after = cursor.as_ref().and_then(|c| match &c.after {
         Key::List { updated_at_ms, id } => Some(ListKey {
             updated_at_ms: *updated_at_ms,
@@ -633,7 +727,11 @@ async fn list(State(s): State<ApiState>, q: Result<Query<PageQuery>, QueryReject
     });
     let expected = cursor.as_ref().map(|c| c.revision);
     let snapshot = run_read(&s, move |r| {
-        r.list_page_snapshot(limit + 1, after.as_ref(), expected)
+        if chat_only {
+            r.chat_list_page_snapshot(limit + 1, after.as_ref(), expected)
+        } else {
+            r.list_page_snapshot(limit + 1, after.as_ref(), expected)
+        }
     })
     .await?;
     revision(&cursor, snapshot.library_revision)?;
@@ -653,7 +751,7 @@ async fn list(State(s): State<ApiState>, q: Result<Query<PageQuery>, QueryReject
     let next_cursor = if more {
         let last = items.last().ok_or_else(invalid_data)?;
         Some(encode_cursor(
-            "list",
+            route,
             None,
             snapshot.library_revision,
             Key::List {
@@ -695,13 +793,27 @@ async fn search(
     State(s): State<ApiState>,
     q: Result<Query<SearchQuery>, QueryRejection>,
 ) -> ApiResult {
+    search_route(State(s), q, "search", false).await
+}
+async fn chat_search(
+    State(s): State<ApiState>,
+    q: Result<Query<SearchQuery>, QueryRejection>,
+) -> ApiResult {
+    search_route(State(s), q, "chat-search", true).await
+}
+async fn search_route(
+    State(s): State<ApiState>,
+    q: Result<Query<SearchQuery>, QueryRejection>,
+    route: &'static str,
+    chat_only: bool,
+) -> ApiResult {
     let q = query(q)?;
     let limit = limit(q.limit)?;
     let normalized = q.q.split_whitespace().collect::<Vec<_>>().join(" ");
     if !normalized.chars().any(char::is_alphanumeric) {
         return Err(invalid_request());
     }
-    let cursor = decode_cursor(q.cursor.as_deref(), "search", Some(&normalized))?;
+    let cursor = decode_cursor(q.cursor.as_deref(), route, Some(&normalized))?;
     let raw_query = normalized.clone();
     let after = cursor.as_ref().and_then(|c| match &c.after {
         Key::Search {
@@ -717,7 +829,11 @@ async fn search(
     });
     let expected = cursor.as_ref().map(|c| c.revision);
     let snapshot = run_read(&s, move |r| {
-        r.search_page_snapshot(&raw_query, limit + 1, after.as_ref(), expected)
+        if chat_only {
+            r.chat_search_page_snapshot(&raw_query, limit + 1, after.as_ref(), expected)
+        } else {
+            r.search_page_snapshot(&raw_query, limit + 1, after.as_ref(), expected)
+        }
     })
     .await?;
     revision(&cursor, snapshot.library_revision)?;
@@ -749,7 +865,7 @@ async fn search(
     let next_cursor = if more {
         let h = items.last().ok_or_else(invalid_data)?;
         Some(encode_cursor(
-            "search",
+            route,
             Some(&normalized),
             snapshot.library_revision,
             Key::Search {

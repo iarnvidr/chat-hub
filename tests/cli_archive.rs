@@ -28,7 +28,10 @@ fn populate(path: &std::path::Path) {
             role: Some("user".into()),
             author: None,
             create_time: None,
-            parts: vec![Value::String("x".repeat(96 * 1024))],
+            parts: vec![Value::String(format!(
+                "large body marker {}",
+                "x".repeat(96 * 1024)
+            ))],
         }],
         raw_payload: json!({"private":"not-in-receipt"}),
         source_time: None,
@@ -125,4 +128,41 @@ fn cli_backup_and_export_json_use_store_and_emit_only_receipts() {
         );
     }
     fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn cli_restore_populates_an_empty_library_and_rejects_replacement() {
+    let d = common::temp_dir("chat-hub-cli-restore");
+    let source = d.join("source.sqlite");
+    let backup = d.join("backup.sqlite");
+    let destination = d.join("restored.sqlite");
+    populate(&source);
+    let backup_output = invoke("backup", &[backup.to_str().unwrap()], &source);
+    assert!(backup_output.status.success());
+
+    let restored = invoke("restore", &[backup.to_str().unwrap()], &destination);
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(receipt["operation"], "restore");
+    assert_eq!(receipt["conversation_count"], 1);
+    let library = Store::open(destination.to_str().unwrap()).unwrap();
+    assert_eq!(library.search("large body marker", 10).unwrap().len(), 1);
+    drop(library);
+
+    let second = invoke("restore", &[backup.to_str().unwrap()], &destination);
+    assert!(
+        !second.status.success(),
+        "restore must not overwrite existing records"
+    );
+    let wrong_usage = invoke(
+        "restore",
+        &[backup.to_str().unwrap(), "extra"],
+        &d.join("unused.sqlite"),
+    );
+    assert!(!wrong_usage.status.success());
+    std::fs::remove_dir_all(d).unwrap();
 }

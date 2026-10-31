@@ -63,11 +63,37 @@ pub async fn import(
     data: Vec<u8>,
     count: u64,
 ) -> Result<ImportReceipt, String> {
+    import_from(base, token, data, count, "chatgpt").await
+}
+
+pub async fn import_paseo_history(
+    base: &str,
+    token: &str,
+    data: Vec<u8>,
+    count: u64,
+) -> Result<ImportReceipt, String> {
+    import_from(base, token, data, count, "paseo-history").await
+}
+
+async fn import_from(
+    base: &str,
+    token: &str,
+    data: Vec<u8>,
+    count: u64,
+    source: &str,
+) -> Result<ImportReceipt, String> {
+    if data.len() > MAX_IMPORT_BYTES {
+        return Err("file_too_large".into());
+    }
     let c = Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(if source == "paseo-history" {
+            300
+        } else {
+            60
+        }))
         .build()
         .map_err(|_| "Desktop API unavailable")?;
-    let u = url(base, &["api", "v1", "imports", "chatgpt"], &[])?;
+    let u = url(base, &["api", "v1", "imports", source], &[])?;
     let r = c
         .post(u)
         .bearer_auth(token)
@@ -127,6 +153,15 @@ fn url(base: &str, segments: &[&str], query: &[(&str, &str)]) -> Result<Url, Str
     Ok(u)
 }
 pub fn list_url(base: &str, query: &str, cursor: Option<&str>) -> Result<Url, String> {
+    list_url_for_source(base, query, cursor, None)
+}
+
+pub fn list_url_for_source(
+    base: &str,
+    query: &str,
+    cursor: Option<&str>,
+    source: Option<&str>,
+) -> Result<Url, String> {
     let mut q = vec![("limit", "50")];
     if !query.trim().is_empty() {
         q.push(("q", query.trim()));
@@ -134,19 +169,23 @@ pub fn list_url(base: &str, query: &str, cursor: Option<&str>) -> Result<Url, St
     if let Some(c) = cursor {
         q.push(("cursor", c));
     }
-    url(
-        base,
-        &[
-            "api",
-            "v1",
-            if query.trim().is_empty() {
-                "conversations"
-            } else {
-                "search"
-            },
-        ],
-        &q,
-    )
+    let filtered = match source {
+        None | Some("all") => false,
+        Some("chatgpt") => true,
+        _ => return Err("invalid_source".into()),
+    };
+    let endpoint = match (filtered, query.trim().is_empty()) {
+        (false, true) => "conversations",
+        (false, false) => "search",
+        (true, true) => "conversations",
+        (true, false) => "search",
+    };
+    let segments: &[&str] = if filtered {
+        &["api", "v1", "chat", endpoint]
+    } else {
+        &["api", "v1", endpoint]
+    };
+    url(base, segments, &q)
 }
 pub fn detail_url(base: &str, id: &str, leaf: Option<&str>) -> Result<Url, String> {
     let mut u = url(base, &["api", "v1", "conversations", id], &[])?;
@@ -215,11 +254,21 @@ async fn get<T: for<'de> Deserialize<'de>>(c: &Client, u: Url, token: &str) -> R
     serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
 }
 pub async fn list(base: &str, token: &str, q: &str, cursor: Option<&str>) -> Result<Page, String> {
+    list_in_source(base, token, q, cursor, None).await
+}
+
+pub async fn list_in_source(
+    base: &str,
+    token: &str,
+    q: &str,
+    cursor: Option<&str>,
+    source: Option<&str>,
+) -> Result<Page, String> {
     let c = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| "Desktop API unavailable")?;
-    let u = list_url(base, q, cursor)?;
+    let u = list_url_for_source(base, q, cursor, source)?;
     get(&c, u, token).await
 }
 pub async fn detail(
@@ -234,4 +283,40 @@ pub async fn detail(
         .map_err(|_| "Desktop API unavailable")?;
     let u = detail_url(base, id, leaf)?;
     get(&c, u, token).await
+}
+
+#[cfg(test)]
+mod source_list_tests {
+    use super::list_url_for_source;
+
+    #[test]
+    fn source_selects_server_side_list_and_search_routes() {
+        let base = "http://127.0.0.1:8000";
+        assert_eq!(
+            list_url_for_source(base, "", None, None).unwrap().path(),
+            "/api/v1/conversations"
+        );
+        assert_eq!(
+            list_url_for_source(base, "", None, Some("all"))
+                .unwrap()
+                .path(),
+            "/api/v1/conversations"
+        );
+        assert_eq!(
+            list_url_for_source(base, " term ", None, Some("chatgpt"))
+                .unwrap()
+                .path(),
+            "/api/v1/chat/search"
+        );
+        assert_eq!(
+            list_url_for_source(base, "", Some("cursor"), Some("chatgpt"))
+                .unwrap()
+                .path(),
+            "/api/v1/chat/conversations"
+        );
+        assert_eq!(
+            list_url_for_source(base, "", None, Some("codex")).unwrap_err(),
+            "invalid_source"
+        );
+    }
 }

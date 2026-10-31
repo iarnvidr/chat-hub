@@ -15,6 +15,7 @@ use tokio::{
 fn config(db: String, ca: PathBuf) -> Config {
     Config {
         capture_enabled: true,
+        capture_profile_scope: "provisional:default".into(),
         bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         bearer_token: "test".into(),
         database_path: db,
@@ -297,7 +298,16 @@ async fn live_tls_malformed_oversize_encoding_and_store_failure_preserve_traffic
     }
 }
 
+#[tokio::test]
+async fn live_tls_gzip_and_deflate_snapshots_persist_without_changing_wire_response() {
+    exercise_live_tls(true, Some("gzip")).await;
+    exercise_live_tls(true, Some("deflate")).await;
+    exercise_live_tls(true, Some("bad_gzip")).await;
+    exercise_live_tls(true, Some("sse")).await;
+}
+
 async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
+    let is_sse = case == Some("sse");
     let root = tmp("tls");
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = CertificateParams::new(vec!["chatgpt.com".into()])
@@ -345,10 +355,39 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         Some("null_empty") => doc["conversation_id"] = serde_json::Value::Null,
         _ => {}
     }
-    let body = match case {
-        Some("invalid_snapshot") => b"not-json PRIVATE_BODY_SENTINEL".to_vec(),
-        Some("oversized") => vec![b'x'; chat_hub::live_capture::ITEM_BYTES + 1],
-        _ => serde_json::to_vec(&doc).unwrap(),
+    let request_payload = if case == Some("sse") {
+        serde_json::json!({
+            "conversation_id": null,
+            "parent_message_id": "root-node",
+            "messages": [{
+                "id": "user-node",
+                "author": {"role":"user"},
+                "content": {"content_type":"text","parts":["streamed question"]}
+            }]
+        })
+        .to_string()
+        .into_bytes()
+    } else {
+        b"request".to_vec()
+    };
+    let body = if case == Some("sse") {
+        let mut stream = String::new();
+        for value in [
+            serde_json::json!({"conversation_id":"sse-conversation","title":"SSE Test"}),
+            serde_json::json!({"conversation_id":"sse-conversation","message":{"id":"assistant-node","parent_id":"user-node","author":{"role":"assistant"},"content":{"content_type":"text","parts":["live answer"]}}}),
+        ] {
+            stream.push_str("data: ");
+            stream.push_str(&value.to_string());
+            stream.push_str("\r\n\r\n");
+        }
+        stream.push_str("data: [DONE]\r\n\r\n");
+        stream.into_bytes()
+    } else {
+        match case {
+            Some("invalid_snapshot") => b"not-json PRIVATE_BODY_SENTINEL".to_vec(),
+            Some("oversized") => vec![b'x'; chat_hub::live_capture::ITEM_BYTES + 1],
+            _ => serde_json::to_vec(&doc).unwrap(),
+        }
     };
     let terminal = match case {
         Some(
@@ -360,16 +399,45 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         ) => "invalid_snapshot",
         Some("oversized") => "oversized",
         Some("unsupported_encoding") => "unsupported_encoding",
+        Some("bad_gzip") => "decode_failed",
         Some("store_failed") => "store_failed",
         _ => "committed_imported",
     };
     let successful = enabled && terminal == "committed_imported";
     let encoding_header = if case == Some("unsupported_encoding") {
+        "Content-Encoding: br\r\n"
+    } else if case == Some("gzip") || case == Some("bad_gzip") {
         "Content-Encoding: gzip\r\n"
+    } else if case == Some("deflate") {
+        "Content-Encoding: deflate\r\n"
     } else {
         ""
     };
-    let response_body = body.clone();
+    let response_body = match case {
+        Some("gzip") => {
+            use flate2::{write::GzEncoder, Compression};
+            use std::io::Write;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&body).unwrap();
+            encoder.finish().unwrap()
+        }
+        Some("bad_gzip") => b"not a gzip stream".to_vec(),
+        Some("deflate") => {
+            use flate2::{write::ZlibEncoder, Compression};
+            use std::io::Write;
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&body).unwrap();
+            encoder.finish().unwrap()
+        }
+        _ => body.clone(),
+    };
+    let response_content_type = if case == Some("sse") {
+        "Content-Type: text/event-stream\r\n"
+    } else {
+        "Content-Type: application/json\r\n"
+    };
+    let expected_request_payload = request_payload.clone();
+    let expected_response_body = response_body.clone();
     let upstream_task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(upstream_cfg))
@@ -383,6 +451,9 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
             request.push(byte[0]);
         }
         let text = String::from_utf8_lossy(&request);
+        if is_sse {
+            assert!(text.starts_with("POST /backend-api/conversation HTTP/1.1"));
+        }
         let length: usize = text
             .lines()
             .find_map(|l| {
@@ -397,12 +468,14 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         let mut payload = vec![0; length];
         tls.read_exact(&mut payload).await.unwrap();
         assert!(end > 0);
+        assert_eq!(payload, expected_request_payload);
         let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{encoding_header}\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{response_content_type}{encoding_header}\r\n",
             response_body.len()
         );
         tls.write_all(head.as_bytes()).await.unwrap();
         tls.write_all(&response_body).await.unwrap();
+        tls.shutdown().await.unwrap();
     });
     let mut proxy = ProxyConfig::loopback(root.join("unused"));
     proxy.test_upstream = Some(upstream_addr);
@@ -412,6 +485,7 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         root.join("ca"),
     );
     service_config.capture_enabled = enabled;
+    service_config.capture_profile_scope = "profile:tls-test".into();
     let (handle, tx) = service::start_with_proxy(service_config, 1, proxy)
         .await
         .unwrap();
@@ -428,14 +502,27 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap();
-    let response = client
-        .get("https://chatgpt.com/backend-api/conversation/synthetic-export-one")
-        .body("request")
-        .send()
-        .await
-        .unwrap();
+    let response = if case == Some("sse") {
+        client
+            .post("https://chatgpt.com/backend-api/conversation")
+            .header("content-type", "application/json")
+            .body(request_payload)
+            .send()
+            .await
+            .unwrap()
+    } else {
+        client
+            .get("https://chatgpt.com/backend-api/conversation/synthetic-export-one")
+            .body("request")
+            .send()
+            .await
+            .unwrap()
+    };
     assert_eq!(response.status(), 200);
-    assert_eq!(response.bytes().await.unwrap().as_ref(), body.as_slice());
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        expected_response_body.as_slice()
+    );
     upstream_task.await.unwrap();
     if !enabled {
         tx.send(event(
@@ -502,9 +589,18 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
             .await
             .unwrap();
         let graph: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(graph["nodes"].as_array().unwrap().len(), 3);
-        assert_eq!(graph["selection"]["selected_node_id"], "right");
-        assert!(graph["messages"].to_string().contains("future_part"));
+        if case == Some("sse") {
+            assert_eq!(graph["conversation"]["title"], "SSE Test");
+            assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+            assert_eq!(graph["selection"]["selected_node_id"], "assistant-node");
+            assert!(graph["messages"].to_string().contains("streamed question"));
+            assert!(graph["messages"].to_string().contains("live answer"));
+            assert_eq!(graph["conversation"]["account_scope"], "profile:tls-test");
+        } else {
+            assert_eq!(graph["nodes"].as_array().unwrap().len(), 3);
+            assert_eq!(graph["selection"]["selected_node_id"], "right");
+            assert!(graph["messages"].to_string().contains("future_part"));
+        }
     }
     let stats = tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
         .await
@@ -522,20 +618,37 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
     );
     if successful {
         let snapshot = store.library_snapshot().unwrap();
+        assert_eq!(
+            snapshot.conversations[0]["account_scope"],
+            "profile:tls-test"
+        );
         let saved = store
             .read_normalized(snapshot.conversations[0]["id"].as_str().unwrap())
             .unwrap()
             .unwrap();
         assert_eq!(saved["messages"].as_array().unwrap().len(), 2);
-        assert!(saved.to_string().contains("Selected synthetic answer"));
+        if case == Some("sse") {
+            assert!(saved.to_string().contains("streamed question"));
+            assert!(saved.to_string().contains("live answer"));
+        } else {
+            assert!(saved.to_string().contains("Selected synthetic answer"));
+        }
         let inspector = rusqlite::Connection::open(root.join("db.sqlite")).unwrap();
         let raw: String = inspector
             .query_row("SELECT raw_payload FROM observations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
-            doc
-        );
+        if case == Some("sse") {
+            assert!(serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("[DONE]"));
+        } else {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+                doc
+            );
+        }
     }
     let counters = serde_json::to_value(capture.snapshot()).unwrap();
     assert_eq!(counters["counters"]["active"], 0);

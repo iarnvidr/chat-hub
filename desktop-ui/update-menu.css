@@ -1,0 +1,8 @@
+.topbar{position:relative;z-index:20}
+.update-menu{position:relative;margin-left:auto}
+.update-menu>summary{display:flex;align-items:center;list-style:none;border:1px solid #344558;border-radius:7px;padding:7px 10px;background:#202c39;color:#e7f4fa;font-size:12px;cursor:pointer}
+.update-menu>summary::-webkit-details-marker{display:none}
+.update-menu>summary::after{content:"▾";margin-left:8px;color:#91a0b2}
+.update-menu[open]>summary{border-color:#57c6d5}
+.update-menu .update-card{position:absolute;top:calc(100% + 8px);right:0;width:min(340px,calc(100vw - 24px));margin:0;z-index:30;box-shadow:0 12px 32px #0008}
+@media(max-width:650px){.topbar{padding:0 12px}.update-menu>summary{padding:7px 8px;font-size:11px}}

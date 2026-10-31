@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 fn actual_disabled_capture_snapshot_satisfies_smoke_contract() {
     let snapshot = serde_json::to_value(CaptureStatus::new(false).snapshot()).unwrap();
     let counters = snapshot["counters"].as_object().unwrap();
-    assert_eq!(counters.len(), 19);
+    assert_eq!(counters.len(), 20);
     assert_eq!(counters["last_error_code"], Value::Null);
     for (name, value) in counters {
         if name != "last_error_code" {

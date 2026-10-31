@@ -1,6 +1,6 @@
 mod common;
 
-use chat_hub::store::{GraphNode, ListKey, Observation, Store};
+use chat_hub::store::{GraphNode, ListKey, Observation, SearchKey, Store};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -36,6 +36,86 @@ fn node(id: &str, parent: Option<&str>, text: &str) -> GraphNode {
         parts: vec![json!(text)],
     }
 }
+
+fn provider_observation(
+    provider: &str,
+    source_id: &str,
+    title: &str,
+    observed_ms: i64,
+    text: &str,
+) -> Observation {
+    let mut observation = observation(
+        source_id,
+        title,
+        observed_ms,
+        vec![node("message", None, text)],
+    );
+    observation.provider = provider.into();
+    observation.current_node = Some("message".into());
+    observation
+}
+
+#[test]
+fn chat_page_snapshots_filter_sources_before_keyset_pagination_and_search() {
+    let mut store = Store::in_memory().unwrap();
+    for (provider, source, title, time) in [
+        ("chatgpt", "chat-old", "ChatGPT older", 10),
+        ("paseo-chatgpt", "chat-new", "Paseo ChatGPT newer", 30),
+        ("paseo-codex_local", "codex-mid", "Codex in between", 20),
+    ] {
+        store
+            .ingest_observation(&provider_observation(
+                provider,
+                source,
+                title,
+                time,
+                "chatneedle shared text",
+            ))
+            .unwrap();
+    }
+
+    let all = store.list_page_snapshot(10, None, None).unwrap();
+    let first = store.chat_list_page_snapshot(1, None, None).unwrap();
+    assert_eq!(all.items.len(), 3);
+    assert_eq!(first.items[0]["provider"], "paseo-chatgpt");
+    let key = ListKey {
+        updated_at_ms: first.items[0]["updated_at_ms"].as_i64(),
+        id: first.items[0]["id"].as_str().unwrap().into(),
+    };
+    let next = store.chat_list_page_snapshot(10, Some(&key), None).unwrap();
+    assert_eq!(next.items.len(), 1);
+    assert_eq!(next.items[0]["provider"], "chatgpt");
+
+    let all_hits = store
+        .search_page_snapshot("chatneedle", 10, None, None)
+        .unwrap();
+    let first_hits = store
+        .chat_search_page_snapshot("chatneedle", 1, None, None)
+        .unwrap();
+    assert_eq!(all_hits.hits.len(), 3);
+    assert_eq!(first_hits.hits.len(), 1);
+    assert!(matches!(
+        first_hits.hits[0]["conversation"]["provider"].as_str(),
+        Some("chatgpt" | "paseo-chatgpt")
+    ));
+    let hit = &first_hits.hits[0];
+    let key = SearchKey {
+        score: hit["score"].as_f64().unwrap(),
+        conversation_id: hit["conversation"]["id"].as_str().unwrap().into(),
+        node_id: hit["node_id"].as_str().map(str::to_owned),
+    };
+    let next_hits = store
+        .chat_search_page_snapshot("chatneedle", 10, Some(&key), None)
+        .unwrap();
+    assert_eq!(next_hits.hits.len(), 1);
+    assert!(next_hits.hits.iter().all(|hit| {
+        matches!(
+            hit["conversation"]["provider"].as_str(),
+            Some("chatgpt" | "paseo-chatgpt")
+        )
+    }));
+}
+
 #[test]
 fn list_keyset_nulls_and_ties_and_limits() {
     let mut s = Store::in_memory().unwrap();

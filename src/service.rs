@@ -272,7 +272,12 @@ impl ServiceHandle {
         let d = self.deadline;
         self.shutdown_timeout(d).await
     }
-    pub async fn shutdown_timeout(mut self, budget: Duration) -> IngestStats {
+    pub async fn shutdown_timeout(self, budget: Duration) -> IngestStats {
+        self.shutdown_timeout_outcome(budget).await.0
+    }
+    /// The boolean proves the SQLite writer was joined, rather than detached
+    /// after its shutdown deadline. Replacement operations must require it.
+    pub async fn shutdown_timeout_outcome(mut self, budget: Duration) -> (IngestStats, bool) {
         self.capture.stop();
         {
             let mut state = lock_status(&self.status);
@@ -326,7 +331,7 @@ impl ServiceHandle {
                         .accepted
                         .saturating_sub(s.ingest.stored + s.ingest.ignored + s.ingest.failed),
                 );
-                return s.ingest.clone();
+                return (s.ingest.clone(), false);
             }
         }
         let mut s = lock_status(&self.status);
@@ -338,7 +343,7 @@ impl ServiceHandle {
                 .accepted
                 .saturating_sub(s.ingest.stored + s.ingest.ignored + s.ingest.failed),
         );
-        s.ingest.clone()
+        (s.ingest.clone(), true)
     }
 }
 impl Drop for ServiceHandle {
@@ -418,6 +423,17 @@ async fn start_internal(
     }
     let api_store = tokio::task::spawn_blocking(move || {
         Store::open(&path).and_then(|s| {
+            // Readers stay responsive during history imports. Keep FULL
+            // durability while avoiding a rollback journal rewrite per item.
+            let journal: String = s
+                .connection()
+                .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+            if journal != "wal" && journal != "memory" {
+                return Err(crate::error::Error::Configuration(
+                    "SQLite WAL mode is unavailable".into(),
+                ));
+            }
+            s.connection().execute_batch("PRAGMA synchronous=FULL;")?;
             s.health()?;
             Ok(s)
         })
@@ -609,7 +625,13 @@ async fn start_internal(
     proxy_config.bind = config.proxy_addr;
     #[cfg(test)]
     let test_live_sink = live_sink.clone();
-    let (proxy, pt) = match proxy::run_live(proxy_config, live_sink).await {
+    let (proxy, pt) = match proxy::run_live(
+        proxy_config,
+        live_sink,
+        config.capture_profile_scope.clone(),
+    )
+    .await
+    {
         Ok(x) => x,
         Err(e) => {
             flag.store(true, Ordering::Release);
@@ -728,6 +750,7 @@ mod deadline_tests {
         ));
         let config = Config {
             capture_enabled: true,
+            capture_profile_scope: "provisional:default".into(),
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             bearer_token: "synthetic".into(),
@@ -821,6 +844,7 @@ mod deadline_tests {
         ));
         let config = Config {
             capture_enabled: true,
+            capture_profile_scope: "provisional:default".into(),
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             proxy_addr: "127.0.0.1:0".parse().unwrap(),
             bearer_token: "synthetic".into(),
@@ -878,7 +902,10 @@ mod deadline_tests {
         })
         .await
         .unwrap();
-        let legacy = handle.shutdown_timeout(Duration::from_millis(1)).await;
+        let (legacy, writer_stopped) = handle
+            .shutdown_timeout_outcome(Duration::from_millis(1))
+            .await;
+        assert!(!writer_stopped, "an in-flight writer must prevent restore");
         let report = shutdown_report(&legacy, capture.snapshot());
         let pending = report["capture"].clone();
         drop(release);
@@ -926,6 +953,7 @@ mod deadline_tests {
         let db = root.join("db.sqlite");
         let config = Config {
             capture_enabled: false,
+            capture_profile_scope: "provisional:default".into(),
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             bearer_token: "test".into(),
             database_path: db.display().to_string(),
@@ -974,7 +1002,10 @@ mod deadline_tests {
         tx.try_send(capture("/backend-api/conversation/queued"))
             .unwrap();
         drop(tx);
-        let stats = handle.shutdown_timeout(Duration::from_millis(1)).await;
+        let (stats, writer_stopped) = handle
+            .shutdown_timeout_outcome(Duration::from_millis(1))
+            .await;
+        assert!(!writer_stopped, "a detached writer must prevent restore");
         assert!(
             matches!(lock_status(&status).state, ServiceState::Failed(ref reason) if reason.contains("shutdown deadline exceeded")),
             "unexpected service state: {:?}",

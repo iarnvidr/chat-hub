@@ -65,10 +65,36 @@ try:
     if not isinstance(result,dict) or result.get('clicked') is not True or not result.get('version') or not result.get('message'):
         raise RuntimeError(f'update UI assertion failed: {result!r}')
     record['interaction']=result
+    # Exercise the visible ChatGPT tab, not only a native helper-created view.
+    record['provider_click']=bridge('eval', js='document.getElementById("show-chatgpt").click(); await new Promise(r=>setTimeout(r,150)); return {visible:!document.getElementById("provider-shell").hidden, libraryHidden:document.getElementById("library-reader").hidden, status:document.getElementById("provider-view-status").textContent, url:location.href};')
+    provider_deadline=time.monotonic()+30
+    while time.monotonic()<provider_deadline:
+        provider_ui=bridge('eval', js='return {visible:!document.getElementById("provider-shell").hidden, libraryHidden:document.getElementById("library-reader").hidden, status:document.getElementById("provider-view-status").textContent};')
+        if provider_ui.get('visible') and provider_ui.get('libraryHidden') and 'ChatGPT is open' in provider_ui.get('status',''):
+            break
+        time.sleep(.2)
+    else:
+        raise RuntimeError(f'embedded ChatGPT did not become ready: {provider_ui!r}')
+    record['provider_tab']=provider_ui
+    provider_shot=evidence/'native-provider-tab.png'
+    subprocess.run(['screencapture','-x',str(provider_shot)],check=True,timeout=20)
+    record['provider_screenshot']=str(provider_shot)
     # Native callback returns only after the actual provider invoke rejects.
     denial=bridge('provider_denial')
     if denial.get('denied') is not True: raise RuntimeError(f'provider service_info was not denied: {denial!r}')
     record['provider_denial']=denial
+    if os.environ.get('MUNINN_PROVIDER_DIRECT_SMOKE') == '1':
+        readiness=denial.get('readiness',{})
+        if 'chatgpt' not in readiness.get('title','').lower() or readiness.get('bodyTextLength',0)<40:
+            raise RuntimeError(f'public ChatGPT page was not usable: {readiness!r}')
+    bridge('eval', js='document.getElementById("provider-back").click(); return true;')
+    library_deadline=time.monotonic()+5
+    while time.monotonic()<library_deadline:
+        library_ui=bridge('eval', js='return {visible:!document.getElementById("library-reader").hidden, providerHidden:document.getElementById("provider-shell").hidden};')
+        if library_ui.get('visible') and library_ui.get('providerHidden'): break
+        time.sleep(.1)
+    else: raise RuntimeError(f'could not return from ChatGPT to library: {library_ui!r}')
+    record['returned_to_library']=library_ui
     record['passed']=True
 except Exception as exc:
     record.update(passed=False,error=f'{type(exc).__name__}: {exc}',traceback=traceback.format_exc())

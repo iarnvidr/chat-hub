@@ -2,7 +2,7 @@
 
 COUNTERS = (
     "started", "active", "committed_imported", "committed_updated",
-    "committed_unchanged", "invalid_snapshot", "unsupported_encoding",
+    "committed_unchanged", "invalid_snapshot", "unsupported_encoding", "decode_failed",
     "oversized", "dropped", "interrupted", "store_failed",
     "shutdown_unprocessed", "admitted", "completed_responses", "queued",
     "writer_in_flight", "retained_bytes", "lost_observations",

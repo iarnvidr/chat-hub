@@ -1,7 +1,125 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Chat Hub</title><link rel="stylesheet" href="./styles.css"></head>
-<body><header class="topbar"><a class="brand" href="#"><span class="mark">C</span> Chat Hub</a><span id="version" data-testid="app-version">Loading…</span></header>
-<div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
-<div class="workspace"><aside class="sidebar"><div class="section-title">WORKSPACE</div><div class="nav-item active">◫ <span>Conversations</span></div><div class="nav-item muted">◇ <span>Providers</span><small>Coming later</small></div><section class="health-card"><div class="section-title">LOCAL SERVICE</div><div id="health" aria-live="polite">Starting local service…</div><button id="retry-health" class="quiet" hidden>Retry connection</button></section><section class="update-card"><h2>Software updates</h2><p>Channel: Stable. Prerelease updates are unsupported; install previews manually.</p><div class="actions"><button id="check" data-testid="check-updates">Check for updates</button><button id="install" hidden>Update &amp; relaunch</button></div><div id="message" data-testid="update-message" role="status" aria-live="polite">Checking version…</div></section></aside>
-<main class="content"><section class="list-pane"><div class="pane-heading"><div><div class="eyebrow">YOUR LIBRARY</div><h1>Conversations</h1></div><button id="import" class="primary">Import export</button><button id="backup-library" type="button">Save library backup</button><button id="export-library-json" type="button">Export library as JSON</button></div><label class="search"><span aria-hidden="true">⌕</span><span class="sr-only">Search conversations</span><input id="search" type="search" placeholder="Search conversations…" autocomplete="off"></label><div id="list-state" class="subtle" role="status" aria-live="polite"></div><div id="conversation-list" class="conversation-list"></div><button id="load-more" type="button">Load more</button></section><section class="reader-pane"><div id="reader-empty" class="reader-empty"><div class="empty-icon">✳</div><h2>Choose a conversation</h2><p>Select an item to read its messages and branches.</p></div><div id="reader" hidden><div class="reader-head"><button id="back-to-library" type="button" aria-label="Back to library">Back to library</button><div><div id="provider" class="eyebrow"></div><h2 id="title"></h2></div><label class="branch-label">Branch<select id="branch"></select></label></div><div id="messages" class="messages"></div></div></section></main></div><div id="app-status" class="app-status" role="status" aria-live="polite"></div>
-<script type="module" src="./app.js"></script></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Chat Hub</title>
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./update-menu.css">
+  <link rel="stylesheet" href="./library-layout.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#"><span class="mark">C</span> Chat Hub</a>
+    <details class="update-menu">
+      <summary>Software updates</summary>
+      <section class="update-card">
+        <h2>Software updates</h2>
+        <p>Channel: Stable. Prerelease updates are unsupported; install previews manually.</p>
+        <div class="actions">
+          <button id="check" data-testid="check-updates">Check for updates</button>
+          <button id="install" hidden>Update &amp; relaunch</button>
+        </div>
+        <div id="message" data-testid="update-message" role="status" aria-live="polite">Checking version…</div>
+      </section>
+    </details>
+    <span id="version" data-testid="app-version">Loading…</span>
+  </header>
+  <div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
+  <div class="workspace">
+    <aside class="sidebar">
+      <div class="section-title">WORKSPACE</div>
+      <button id="show-library" class="nav-item active" type="button" aria-current="page">◫ <span>Conversations</span></button>
+      <p class="sidebar-note">Your ChatGPT history, saved on this Mac. Open chats in tabs, search, and read offline.</p>
+      <section class="health-card">
+        <div class="section-title">LOCAL SERVICE</div>
+        <div id="health" aria-live="polite">Starting local service…</div>
+        <div id="capture-health" aria-live="polite"></div>
+        <button id="retry-health" class="quiet" hidden>Retry connection</button>
+      </section>
+    </aside>
+    <div id="library-shell" class="library-shell">
+      <div id="conversation-tabs" role="tablist" aria-label="Open conversations" hidden></div>
+      <section class="library-toolbar" aria-label="Library actions">
+        <div><div class="eyebrow">YOUR CONVERSATIONS</div><h1>Chats</h1><p>Pick up a conversation. Find something you said. Keep a few chats open.</p></div>
+        <div class="library-actions">
+          <button id="show-chatgpt" class="primary" type="button">New conversation</button>
+          <button id="sync-history" type="button">Sync history</button>
+          <details class="library-tools"><summary>Library tools</summary><div class="library-tools-menu">
+          <button id="import">Import export</button>
+          <button id="backup-library" type="button">Save library backup</button>
+          <button id="restore-library" type="button">Restore backup</button>
+          <button id="export-library-json" type="button">Export library as JSON</button>
+          </div></details>
+        </div>
+      </section>
+    <main class="content">
+      <section class="list-pane">
+        <div class="pane-heading">
+          <div><h2>Conversations</h2><p class="list-caption">Search titles and message text.</p></div>
+        </div>
+        <label class="search">
+          <span aria-hidden="true">⌕</span><span class="sr-only">Search conversations</span>
+          <input id="search" type="search" placeholder="Search your messages…" autocomplete="off">
+        </label>
+        <label class="history-source"><span>Show</span><select id="history-source" aria-label="History source"><option value="chatgpt" selected>ChatGPT</option><option value="all">All saved conversations</option></select></label>
+        <div id="list-state" class="subtle" role="status" aria-live="polite"></div>
+        <div id="conversation-list" class="conversation-list"></div>
+        <button id="load-more" type="button" hidden>Load more</button>
+      </section>
+      <section id="library-reader" class="reader-pane">
+        <div id="reader-empty" class="reader-empty">
+          <div class="welcome-kicker">PICK UP WHERE YOU LEFT OFF</div>
+          <h2>Your chats. <br>Room to think.</h2>
+          <p>Choose a saved chat on the left to read it locally. Open more conversations in tabs as you go.</p>
+          <div class="welcome-actions">
+            <button class="primary" type="button" data-library-action="show-chatgpt">New conversation <span aria-hidden="true">↗</span></button>
+            <button type="button" data-library-action="sync-history">Sync history</button>
+          </div>
+          <div class="library-guide">
+            <div><span>01</span><h3>Open a chat</h3><p>Read a saved conversation from your local history.</p></div>
+            <div><span>02</span><h3>Keep a few open</h3><p>Switch between individual conversation tabs.</p></div>
+            <div><span>03</span><h3>Find the detail</h3><p>Search message text to get back to the right chat.</p></div>
+          </div>
+        </div>
+        <div id="reader" hidden>
+          <div class="reader-head">
+            <button id="back-to-library" type="button" aria-label="Back to library">Back to library</button>
+            <div><div id="provider" class="eyebrow"></div><h2 id="title"></h2><p id="account-attribution" class="subtle"></p></div>
+            <label class="branch-label">Branch<select id="branch"></select></label>
+          </div>
+          <div class="reader-tools" role="search" aria-label="Find in this branch">
+            <input id="branch-find" type="search" placeholder="Find in this branch…" aria-label="Find in this branch">
+            <span id="branch-find-count" role="status" aria-live="polite"></span>
+            <button id="branch-find-prev" type="button" aria-label="Previous match" disabled>↑</button>
+            <button id="branch-find-next" type="button" aria-label="Next match" disabled>↓</button>
+            <button id="copy-branch" type="button">Copy branch</button>
+          </div>
+          <div id="messages" class="messages"></div>
+        </div>
+      </section>
+    <section id="provider-shell" hidden aria-label="ChatGPT">
+      <div class="provider-toolbar">
+        <div><h1>New conversation</h1><p id="provider-view-status" role="status" aria-live="polite">Open ChatGPT and sign in to your account.</p></div>
+        <div class="actions">
+          <button id="provider-reload" type="button">Reload ChatGPT</button>
+          <button id="provider-back" type="button">Back to library</button>
+        </div>
+      </div>
+      <div id="provider-host" aria-label="ChatGPT browser area"></div>
+    </section>
+    </main>
+    </div>
+  </div>
+  <div id="app-status" class="app-status" role="status" aria-live="polite"></div>
+  <script type="module" src="./app.js"></script>
+  <script type="module" src="./restore.js"></script>
+  <script type="module" src="./capture-status.js"></script>
+  <script type="module" src="./live-refresh.js"></script>
+  <script type="module" src="./library-home.js"></script>
+  <script type="module" src="./reader-tools.js"></script>
+  <script type="module" src="./provider-view.js"></script>
+  <script type="module" src="./history-sync.js"></script>
+</body>
+</html>

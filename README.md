@@ -8,7 +8,9 @@ Provider capture is disabled by default. No real provider account, provider traf
 
 The desktop library supports export import, conversation/message browsing, selected-branch and alternate-branch navigation, and body full-text search. A hosted debug-native smoke on Apple Silicon verified the official fixture import, library UI body, full-text search, selection, and alternate-branch detail and persistence in the same default OS-account app-data directory across same-process use, restart, and closure. The accepted run is [41110436605](https://github.com/iarnvidr/chat-hub/actions/runs/41110436605) for source `6b7f1f9a41daf4e9894e4ab946acb1639fa48c9d`. It did not test an alternate home/data-directory override, production DMG installation, real provider traffic, or native Save dialog/file acceptance. Raw native IPC health status was not retained as a separate artifact.
 
-The native library Save implementation reuses the store's consistent SQLite backup and streamed JSON export APIs; JSON export is not a restore format. Existing destinations are refused, cancellation creates no file, and a normal success receipt confirms durability after sync. `Error::ArchivePublished` means the archive was published but durability could not be confirmed; the UI warns that the file exists and must not automatically overwrite or retry it. Native OS Save dialog/file acceptance remains unverified.
+The native library actions save a consistent SQLite backup, export a one-way JSON interchange file, and restore a SQLite backup. Restore asks before replacing the current library, validates and stages the backup before stopping the service, then restarts Chat Hub with the restored library. Native file-dialog and restart acceptance still needs a manual desktop run.
+
+The CLI restore command remains available for restoring into an empty library: set `CHAT_HUB_DATABASE` to the destination path and run `cargo run -- restore /path/to/library.sqlite3`. It validates the backup, applies compatible migrations, rebuilds all search indexes, and prints a receipt. JSON exports cannot be restored.
 
 ## Build and run
 
@@ -20,7 +22,9 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
 ```
 
-Set the following environment variables for the Rust CLI/service only; the production native desktop app uses Tauri's platform app-data directory and explicit database/CA paths, not these CLI/service overrides:
+For an explicit development capture run, start the native app with `CHAT_HUB_CAPTURE_ENABLED=true CHAT_HUB_CAPTURE_PROFILE_SCOPE=provisional:default npm run tauri -- dev`. Capture defaults off. The scope must remain tied to one provider account for the lifetime of the library; account switching is not detected or safe yet. Captured snapshots include conversation content in the local library.
+
+Set the following environment variables for the Rust CLI/service; the native desktop app shares only the capture opt-in and profile-scope settings above, and uses Tauri's platform app-data directory and explicit database/CA paths instead of the CLI/service path overrides:
 
 - `CHAT_HUB_TOKEN` — required non-empty bearer token.
 - `CHAT_HUB_DATA_DIR` — optional data-directory override; by default macOS uses `~/Library/Application Support/io.github.iarnvidr.chat-hub`, Linux uses `$XDG_DATA_HOME/io.github.iarnvidr.chat-hub` or `~/.local/share/io.github.iarnvidr.chat-hub`, and Windows uses `%APPDATA%/io.github.iarnvidr.chat-hub`.

@@ -25,6 +25,18 @@ impl DesktopRuntime {
     }
 
     pub async fn shutdown(self) -> serde_json::Value {
+        self.shutdown_outcome().await.0
+    }
+
+    pub async fn shutdown_for_restore(self) -> Result<(), String> {
+        if self.shutdown_outcome().await.1 {
+            Ok(())
+        } else {
+            Err("restore_shutdown_incomplete".into())
+        }
+    }
+
+    async fn shutdown_outcome(self) -> (serde_json::Value, bool) {
         let Self {
             handle,
             capture,
@@ -32,8 +44,13 @@ impl DesktopRuntime {
             ..
         } = self;
         drop(capture);
-        let legacy = handle.shutdown_timeout(Duration::from_secs(5)).await;
-        service::shutdown_report(&legacy, capture_status.snapshot())
+        let (legacy, stopped) = handle
+            .shutdown_timeout_outcome(Duration::from_secs(5))
+            .await;
+        (
+            service::shutdown_report(&legacy, capture_status.snapshot()),
+            stopped,
+        )
     }
 }
 
@@ -50,6 +67,7 @@ pub async fn start(
     }
     let token = persistent_token(data_dir)?;
     let ca_dir = data_dir.join("ca");
+    let (capture_enabled, capture_profile_scope) = Config::capture_settings_from_env()?;
     proxy_config.ca_dir = ca_dir.clone();
     proxy_config.bind = "127.0.0.1:0".parse().expect("valid loopback address");
     let database_path = data_dir.join("chat-hub.sqlite3");
@@ -61,7 +79,8 @@ pub async fn start(
             .ok_or_else(|| "database path is not valid UTF-8".to_string())?
             .to_owned(),
         ca_dir: ca_dir.clone(),
-        capture_enabled: false,
+        capture_enabled,
+        capture_profile_scope,
         proxy_addr: "127.0.0.1:0".parse().expect("valid loopback address"),
     };
     let (handle, capture) = service::start_with_proxy(config, 64, proxy_config).await?;

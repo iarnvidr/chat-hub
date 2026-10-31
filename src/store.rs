@@ -105,8 +105,21 @@ impl Store {
         s.migrate()?;
         Ok(s)
     }
+    /// Read-only connection to an already migrated service-owned database.
+    /// It has its own transaction/mutex so imports do not block library reads.
+    pub(crate) fn open_reader(path: &str) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON;")?;
+        Ok(Self { connection })
+    }
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
+    }
+    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
     }
     fn migrate(&mut self) -> Result<()> {
         self.connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);")?;
@@ -207,8 +220,11 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(8)", [])?;
             tx.commit()?;
         }
-        self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id);")?;
+        self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id); CREATE INDEX IF NOT EXISTS observations_conversation_order ON observations(conversation_id,id DESC);")?;
         Ok(())
+    }
+    pub(crate) fn migrate_for_restore(&mut self) -> Result<()> {
+        self.migrate()
     }
     pub fn health(&self) -> Result<bool> {
         Ok(self
@@ -368,6 +384,25 @@ impl Store {
         after: Option<&ListKey>,
         expected_revision: Option<i64>,
     ) -> Result<ListPageSnapshot> {
+        self.list_page_snapshot_filtered(limit, after, expected_revision, false)
+    }
+    /// Chat-side listing keeps the existing keyset, revision, and response-budget
+    /// contract while restricting candidates to ChatGPT conversation providers.
+    pub fn chat_list_page_snapshot(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot> {
+        self.list_page_snapshot_filtered(limit, after, expected_revision, true)
+    }
+    fn list_page_snapshot_filtered(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+        chat_only: bool,
+    ) -> Result<ListPageSnapshot> {
         let tx = self.connection.unchecked_transaction()?;
         let revision: i64 = tx.query_row(
             "SELECT revision FROM library_state WHERE singleton=1",
@@ -380,7 +415,13 @@ impl Store {
         }
         if expected_revision.is_none_or(|v| v == revision) {
             let lim = limit.min(101) as i64;
-            let mut pre=tx.prepare("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE (?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)")?;
+            let chat_filter = if chat_only {
+                "provider IN ('chatgpt','paseo-chatgpt') AND "
+            } else {
+                ""
+            };
+            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {chat_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
+            let mut pre = tx.prepare(&budget_sql)?;
             let source_bytes: i64 = pre.query_row(
                 params![
                     after.is_none() as i64,
@@ -401,7 +442,8 @@ impl Store {
                     limit: 8 * 1024 * 1024 - 64 * 1024,
                 });
             }
-            let mut st=tx.prepare("SELECT id,provider,account_scope,source_id,title,updated_at_ms FROM conversations WHERE (?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5")?;
+            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms FROM conversations WHERE {chat_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
+            let mut st = tx.prepare(&page_sql)?;
             let ids = st
                 .query_map(
                     params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim],
@@ -473,6 +515,27 @@ impl Store {
         after: Option<&SearchKey>,
         expected_revision: Option<i64>,
     ) -> Result<SearchPageSnapshot> {
+        self.search_page_snapshot_filtered(raw_query, limit, after, expected_revision, false)
+    }
+    /// Chat-side search uses the same FTS ranking and bounded keyset walk as the
+    /// all-source search, with the provider predicate applied inside FTS results.
+    pub fn chat_search_page_snapshot(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<SearchPageSnapshot> {
+        self.search_page_snapshot_filtered(raw_query, limit, after, expected_revision, true)
+    }
+    fn search_page_snapshot_filtered(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        chat_only: bool,
+    ) -> Result<SearchPageSnapshot> {
         let terms: Vec<String> = raw_query
             .split_whitespace()
             .filter(|t| t.chars().any(char::is_alphanumeric))
@@ -505,7 +568,18 @@ impl Store {
             let mut total_bytes = 0usize;
             while hits.len() < limit.min(101) && scanned < 1024 {
                 let lim = (limit.min(101) - hits.len()).min(1024 - scanned) as i64;
-                let mut st=tx.prepare("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,snippet(message_fts,3,'','','…',12) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1 UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5")?;
+                let chat_message_filter = if chat_only {
+                    " AND f.conversation_id IN (SELECT id FROM conversations WHERE provider IN ('chatgpt','paseo-chatgpt'))"
+                } else {
+                    ""
+                };
+                let chat_title_filter = if chat_only {
+                    " AND c.provider IN ('chatgpt','paseo-chatgpt')"
+                } else {
+                    ""
+                };
+                let sql = format!("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,snippet(message_fts,3,'','','…',12) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1{chat_message_filter} UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1{chat_title_filter}) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5");
+                let mut st = tx.prepare(&sql)?;
                 let mut prospective_bytes = total_bytes;
                 let rows = st
                     .query_map(
@@ -692,6 +766,13 @@ impl Store {
     }
     pub fn rebuild_search_index(&self) -> Result<()> {
         let tx = self.connection.unchecked_transaction()?;
+        tx.execute("DELETE FROM message_fts", [])?;
+        tx.execute("INSERT INTO message_fts SELECT g.conversation_id,g.source_node_id,g.message_id,g.content FROM graph_nodes g WHERE g.role IS NOT NULL OR g.source_message_id IS NOT NULL", [])?;
+        tx.execute("DELETE FROM title_fts", [])?;
+        tx.execute(
+            "INSERT INTO title_fts SELECT id,title FROM conversations",
+            [],
+        )?;
         tx.execute("DELETE FROM normalized_fts", [])?;
         tx.execute("INSERT INTO normalized_fts(id,title,body) SELECT c.id,c.title,coalesce((SELECT group_concat(content,' ') FROM graph_nodes g WHERE g.conversation_id=c.id),'') FROM conversations c", [])?;
         tx.commit()?;
@@ -1119,7 +1200,7 @@ fn ingest_tx(tx: &Transaction<'_>, o: &Observation) -> Result<()> {
         rows
     };
     if accept {
-        tx.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id,url,current_node,last_source_updated_ms,ordering_payload,ordering_observed_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(provider,account_scope,source_id) DO UPDATE SET title=excluded.title,url=coalesce(excluded.url,conversations.url),current_node=excluded.current_node,last_source_updated_ms=coalesce(excluded.last_source_updated_ms,conversations.last_source_updated_ms),ordering_payload=excluded.ordering_payload,ordering_observed_ms=excluded.ordering_observed_ms",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node,source_ms,incoming_key,o.observed_ms])?;
+        tx.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id,url,current_node,last_source_updated_ms,ordering_payload,ordering_observed_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(provider,account_scope,source_id) DO UPDATE SET title=CASE WHEN excluded.title='' THEN conversations.title ELSE excluded.title END,url=coalesce(excluded.url,conversations.url),current_node=excluded.current_node,last_source_updated_ms=coalesce(excluded.last_source_updated_ms,conversations.last_source_updated_ms),ordering_payload=excluded.ordering_payload,ordering_observed_ms=excluded.ordering_observed_ms",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node,source_ms,incoming_key,o.observed_ms])?;
     } else {
         tx.execute("INSERT OR IGNORE INTO conversations(id,title,provider,account_scope,source_id,url,current_node) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id,o.title,o.provider,o.account_scope,o.source_id,o.url,o.current_node])?;
     }
