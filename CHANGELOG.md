@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — release candidate
+
+- Compact tabbed chat workspace, Chat/Codex separation, inline expandable projects, five saved color schemes, distinct speaker styling and native tab shortcuts. Cmd/Ctrl+W leaves the app open when there are no tabs.
+- Local catalog for chat connections, message branches, repositories, pull requests, issues, domains, links and file references. Full-index search and source/project/tag filters keep original source references.
+- Persistent local tags and explicit file attachment, verified local storage, Open/Reveal and Save copy. File references distinguish produced files, attachments and mentions; automatic ChatGPT file downloading is not included. SQLite backups include saved bytes; JSON exports include metadata only.
+- Chat Hub owns its ChatGPT session and fetching/capture implementation without depending on Paseo infrastructure. Authenticated sidebar metadata restores project names. Upstream project assignment/rename commits locally only after verified readback.
+- Rust CLI installation, shared desktop-library status/search/read, and a Node-free development and CI pipeline using Cargo, Bun, Python and Go.
+- Known limitations: fresh history listing currently encounters HTTP 429 in the connected test account. Fresh-history success, generated/interrupted live capture, account switching, upstream project mutations and automatic generated-file retrieval remain unverified. Existing imported transcripts do not contain original branches. This release does not claim full live-chat MVP acceptance.
+- macOS builds are ad-hoc signed, not notarized; downloaded-app Gatekeeper behavior and the genuine stable-feed upgrade remain manual acceptance items. Release assets must pass the exact-source protected packaging, launch, updater-signature and DMG gates before publication.
+
 ## 0.2.0 candidate — unreleased draft
 
 - Adds the local conversation library: normalized storage, export import, conversation graph and selected-branch browsing, body full-text search, and desktop library UI.

@@ -1,6 +1,6 @@
 # Chat Hub
 
-Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.0; a version bump is not a release or release acceptance.
+Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.1; a version bump is not a release or release acceptance.
 
 Provider capture is disabled by default. No real provider account, provider traffic capture, or production ingestion path has been accepted. The selective CONNECT proxy intercepts only the exact host `chatgpt.com`; subdomains, authentication/sign-in hosts and other hosts tunnel without TLS decryption. The per-install CA is not automatically added to system trust. Linux proxy checks use synthetic traffic and do not establish real-provider behavior.
 
