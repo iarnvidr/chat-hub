@@ -95,13 +95,14 @@
             <button id="branch-find-prev" type="button" aria-label="Previous match" disabled>↑</button>
             <button id="branch-find-next" type="button" aria-label="Next match" disabled>↓</button>
             <button id="copy-branch" type="button">Copy branch</button>
+            <button id="continue-chatgpt" type="button" hidden>Continue in ChatGPT</button>
           </div>
           <div id="messages" class="messages"></div>
         </div>
       </section>
     <section id="provider-shell" hidden aria-label="ChatGPT">
       <div class="provider-toolbar">
-        <div><h1>New conversation</h1><p id="provider-view-status" role="status" aria-live="polite">Open ChatGPT and sign in to your account.</p></div>
+        <div><h1 id="provider-title">New conversation</h1><p id="provider-view-status" role="status" aria-live="polite">Open ChatGPT and sign in to your account.</p></div>
         <div class="actions">
           <button id="provider-reload" type="button">Reload ChatGPT</button>
           <button id="provider-back" type="button">Back to library</button>

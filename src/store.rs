@@ -476,16 +476,36 @@ impl Store {
                 limit: 100_000,
             });
         }
-        // Bound source material before constructing the normalized DTO. The 6x allowance
-        // covers JSON escaping plus normalized wrappers; serialized output is checked too.
+        // Bound raw material before asking SQLite to inspect JSON or constructing a
+        // DTO. Then budget the actual JSON string escaping and normalized part
+        // duplication. Multiplying all source bytes by six incorrectly rejects
+        // ordinary cached transcripts that fit comfortably in the response limit.
         const RESPONSE_LIMIT: usize = 8 * 1024 * 1024 - 64 * 1024;
         let bytes: i64 = tx.query_row("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))+coalesce(length(CAST(url AS BLOB)),0)+coalesce(length(CAST(current_node AS BLOB)),0)),0) FROM conversations WHERE id=?1", [canonical_id], |r| r.get(0))?;
         let bytes = bytes.saturating_add(tx.query_row("SELECT coalesce(sum(length(CAST(source_node_id AS BLOB))+coalesce(length(CAST(source_message_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+coalesce(length(CAST(parent_id AS BLOB)),0)+coalesce(length(CAST(role AS BLOB)),0)+coalesce(length(CAST(author_json AS BLOB)),0)+coalesce(length(CAST(create_time_json AS BLOB)),0)+length(CAST(parts_json AS BLOB))+length(CAST(content AS BLOB))),0) FROM graph_nodes WHERE conversation_id=?1", [canonical_id], |r| r.get::<_,i64>(0))?);
-        if (bytes.max(0) as usize)
-            .saturating_mul(6)
-            .saturating_add((count.max(0) as usize).saturating_mul(512))
-            > RESPONSE_LIMIT
-        {
+        if bytes.max(0) as usize > RESPONSE_LIMIT {
+            return Err(Error::ReadBudgetExceeded {
+                kind: "detail source bytes",
+                limit: RESPONSE_LIMIT,
+            });
+        }
+        // json_quote counts UTF-8 bytes after escaping, without transferring the
+        // text to Rust. A node ID occurs in the node twice, its message and the
+        // selected ancestry. Message IDs occur in the node and message. Text
+        // parts occur twice (text/raw); unknown parts occur once. Doubling the
+        // original parts JSON and allowing 48 bytes per part covers both forms.
+        // Fixed wrapper/number/null fields fit within 512 bytes per node and
+        // another 512 bytes for the conversation. The selected fallback node
+        // gets a separate allowance because it need not equal current_node.
+        let encoded: i64 = tx.query_row(
+            "SELECT coalesce(sum(length(CAST(json_quote(id) AS BLOB))+length(CAST(json_quote(provider) AS BLOB))+2*length(CAST(json_quote(account_scope) AS BLOB))+length(CAST(json_quote(source_id) AS BLOB))+length(CAST(json_quote(title) AS BLOB))+length(CAST(json_quote(url) AS BLOB))+length(CAST(json_quote(current_node) AS BLOB))),0) FROM conversations WHERE id=?1",
+            [canonical_id], |r| r.get(0),
+        )?;
+        let encoded = encoded.saturating_add(tx.query_row(
+            "SELECT coalesce(sum(4*length(CAST(json_quote(source_node_id) AS BLOB))+length(CAST(json_quote(source_message_id) AS BLOB))+2*length(CAST(json_quote(message_id) AS BLOB))+length(CAST(json_quote(parent_id) AS BLOB))+length(CAST(json_quote(role) AS BLOB))+coalesce(length(CAST(author_json AS BLOB)),4)+coalesce(length(CAST(create_time_json AS BLOB)),4)+2*length(CAST(parts_json AS BLOB))+48*json_array_length(parts_json)+length(CAST(json_quote(content) AS BLOB))+512),0)+coalesce(max(length(CAST(json_quote(source_node_id) AS BLOB))),0) FROM graph_nodes WHERE conversation_id=?1",
+            [canonical_id], |r| r.get::<_, i64>(0),
+        )?).saturating_add(512);
+        if encoded.max(0) as usize > RESPONSE_LIMIT {
             return Err(Error::ReadBudgetExceeded {
                 kind: "detail encoded bytes",
                 limit: RESPONSE_LIMIT,
@@ -563,7 +583,7 @@ impl Store {
                 after.map(|k| k.conversation_id.clone()).unwrap_or_default();
             let mut cursor_node = after.and_then(|k| k.node_id.clone());
             let mut scanned = 0usize;
-            let mut cache = std::collections::HashMap::<String, Value>::new();
+            let mut cache = std::collections::HashMap::<String, SearchTopology>::new();
             let mut total = 0usize;
             let mut total_bytes = 0usize;
             while hits.len() < limit.min(101) && scanned < 1024 {
@@ -578,7 +598,10 @@ impl Store {
                 } else {
                     ""
                 };
-                let sql = format!("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,snippet(message_fts,3,'','','…',12) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1{chat_message_filter} UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1{chat_title_filter}) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5");
+                // FTS counts tokens, not bytes: a single token may contain an
+                // entire long URL or pasted blob. Bound the excerpt separately
+                // while keeping the complete text in the authoritative store.
+                let sql = format!("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,substr(snippet(message_fts,3,'','','…',12),1,2048) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1{chat_message_filter} UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1{chat_title_filter}) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5");
                 let mut st = tx.prepare(&sql)?;
                 let mut prospective_bytes = total_bytes;
                 let rows = st
@@ -645,8 +668,10 @@ impl Store {
                                 limit: 100_000,
                             });
                         }
+                        // Search only needs graph identity and parent edges. Do not
+                        // hydrate or budget transcript parts/content/author payloads.
                         let bytes:i64=tx.query_row("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))+coalesce(length(CAST(url AS BLOB)),0)+coalesce(length(CAST(current_node AS BLOB)),0)),0) FROM conversations WHERE id=?1",[&id],|r|r.get(0))?;
-                        let bytes=bytes.saturating_add(tx.query_row("SELECT coalesce(sum(length(CAST(source_node_id AS BLOB))+coalesce(length(CAST(source_message_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+coalesce(length(CAST(parent_id AS BLOB)),0)+coalesce(length(CAST(role AS BLOB)),0)+coalesce(length(CAST(author_json AS BLOB)),0)+coalesce(length(CAST(create_time_json AS BLOB)),0)+length(CAST(parts_json AS BLOB))+length(CAST(content AS BLOB))),0) FROM graph_nodes WHERE conversation_id=?1",[&id],|r|r.get::<_,i64>(0))?);
+                        let bytes=bytes.saturating_add(tx.query_row("SELECT coalesce(sum(length(CAST(source_node_id AS BLOB))+coalesce(length(CAST(parent_id AS BLOB)),0)),0) FROM graph_nodes WHERE conversation_id=?1",[&id],|r|r.get::<_,i64>(0))?);
                         let graph_bytes = (bytes.max(0) as usize)
                             .saturating_mul(6)
                             .saturating_add((count.max(0) as usize).saturating_mul(512));
@@ -657,12 +682,11 @@ impl Store {
                                 limit: 8 * 1024 * 1024 - 64 * 1024,
                             });
                         }
-                        let g = read_normalized_conn(&tx, &id)?.unwrap_or(Value::Null);
+                        let g = read_search_topology_conn(&tx, &id)?.unwrap_or_default();
                         cache.insert(id.clone(), g.clone());
                         g
                     };
                     let leaf = if let Some(ref n) = node {
-                        let nodes = graph["nodes"].as_array().cloned().unwrap_or_default();
                         let mut frontier = vec![n.clone()];
                         let mut visited = std::collections::HashSet::new();
                         let mut leaves = Vec::new();
@@ -670,42 +694,30 @@ impl Store {
                             if !visited.insert(c.clone()) {
                                 continue;
                             }
-                            let children: Vec<String> = nodes
-                                .iter()
-                                .filter(|x| x["parent_id"].as_str() == Some(c.as_str()))
-                                .filter_map(|x| x["id"].as_str().map(str::to_owned))
-                                .collect();
+                            let children = graph.children.get(&c).cloned().unwrap_or_default();
                             if children.is_empty() {
                                 leaves.push(c)
                             } else {
                                 frontier.extend(children)
                             }
                         }
-                        let selected_leaf = graph["selected_node_id"].as_str().filter(|selected| {
-                            !nodes
-                                .iter()
-                                .any(|x| x["parent_id"].as_str() == Some(*selected))
-                                && {
-                                    let mut cur = Some(selected.to_string());
-                                    let mut seen = std::collections::HashSet::new();
-                                    let mut found = false;
-                                    while let Some(c) = cur {
-                                        if !seen.insert(c.clone()) {
-                                            break;
-                                        }
-                                        if c == *n {
-                                            found = true;
-                                            break;
-                                        }
-                                        cur = nodes
-                                            .iter()
-                                            .find(|x| x["id"].as_str() == Some(c.as_str()))
-                                            .and_then(|x| {
-                                                x["parent_id"].as_str().map(str::to_owned)
-                                            });
+                        let selected_leaf = graph.selected_node_id.as_deref().filter(|selected| {
+                            !graph.children.contains_key(*selected) && {
+                                let mut cur = Some(selected.to_string());
+                                let mut seen = std::collections::HashSet::new();
+                                let mut found = false;
+                                while let Some(c) = cur {
+                                    if !seen.insert(c.clone()) {
+                                        break;
                                     }
-                                    found
+                                    if c == *n {
+                                        found = true;
+                                        break;
+                                    }
+                                    cur = graph.parents.get(&c).cloned().flatten();
                                 }
+                                found
+                            }
                         });
                         selected_leaf
                             .map(str::to_owned)
@@ -716,10 +728,9 @@ impl Store {
                     if node.is_some() && leaf.is_none() {
                         continue;
                     }
-                    let selected = graph["thread_node_ids"].as_array().is_some_and(|xs| {
-                        node.as_ref()
-                            .is_some_and(|n| xs.iter().any(|x| x.as_str() == Some(n)))
-                    });
+                    let selected = node
+                        .as_ref()
+                        .is_some_and(|n| graph.selected_thread.contains(n));
                     let summary: Value=tx.query_row("SELECT json_object('id',id,'provider',provider,'account_scope',account_scope,'source_id',source_id,'title',title,'updated_at_ms',updated_at_ms) FROM conversations WHERE id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
                     hits.push(serde_json::json!({"conversation":summary,"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
                     if serde_json::to_vec(&hits)
@@ -877,6 +888,76 @@ impl Store {
         })
     }
 }
+#[derive(Clone, Debug, Default)]
+struct SearchTopology {
+    parents: std::collections::HashMap<String, Option<String>>,
+    children: std::collections::HashMap<String, Vec<String>>,
+    selected_node_id: Option<String>,
+    selected_thread: std::collections::HashSet<String>,
+}
+
+/// Minimal graph projection used by search. This intentionally excludes all
+/// transcript and presentation fields so large local messages do not block hits.
+fn read_search_topology_conn(conn: &Connection, id: &str) -> Result<Option<SearchTopology>> {
+    let Some(current) = conn
+        .query_row(
+            "SELECT current_node FROM conversations WHERE id=?1",
+            [id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+
+    let mut topology = SearchTopology::default();
+    let mut statement = conn.prepare(
+        "SELECT source_node_id,parent_id FROM graph_nodes WHERE conversation_id=?1 ORDER BY source_node_id",
+    )?;
+    let rows = statement.query_map([id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (node, parent) = row?;
+        if let Some(parent_id) = &parent {
+            topology
+                .children
+                .entry(parent_id.clone())
+                .or_default()
+                .push(node.clone());
+        }
+        topology.parents.insert(node, parent);
+    }
+
+    topology.selected_node_id = current
+        .filter(|selected| topology.parents.contains_key(selected))
+        .or_else(|| {
+            topology
+                .parents
+                .keys()
+                .filter(|node| !topology.children.contains_key(*node))
+                .min()
+                .cloned()
+        });
+    let mut ancestry = Vec::new();
+    let mut cursor = topology.selected_node_id.clone();
+    while let Some(node) = cursor {
+        if ancestry.contains(&node) {
+            ancestry.clear();
+            break;
+        }
+        ancestry.push(node.clone());
+        cursor = topology
+            .parents
+            .get(&node)
+            .cloned()
+            .flatten()
+            .filter(|parent| topology.parents.contains_key(parent));
+    }
+    topology.selected_thread.extend(ancestry);
+    Ok(Some(topology))
+}
+
 fn read_normalized_conn(conn: &Connection, id: &str) -> Result<Option<Value>> {
     let row = conn.query_row("SELECT id,title,provider,account_scope,source_id,url,current_node,updated_at_ms FROM conversations WHERE id=?1", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<i64>>(7)?))).optional()?;
     let Some((id, title, provider, scope, source, url, current, updated)) = row else {

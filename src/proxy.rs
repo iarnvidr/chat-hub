@@ -205,13 +205,15 @@ async fn run_source(
             connections.spawn(async move {
                 let _ = client(
                     s,
-                    ca,
-                    lane,
-                    test,
-                    roots,
-                    profile_scope,
-                    request_capture_slots,
-                    request_identity,
+                    ClientContext {
+                        ca,
+                        lane,
+                        test,
+                        roots,
+                        profile_scope,
+                        request_capture_slots,
+                        request_identity,
+                    },
                 )
                 .await;
             });
@@ -391,8 +393,7 @@ fn empty_body() -> UnsyncBoxBody<Bytes, hyper::Error> {
         .boxed_unsync()
 }
 
-async fn client(
-    mut s: TcpStream,
+struct ClientContext {
     ca: Arc<Ca>,
     lane: CaptureSource,
     test: Option<SocketAddr>,
@@ -400,7 +401,18 @@ async fn client(
     profile_scope: String,
     request_capture_slots: Arc<Semaphore>,
     request_identity: Arc<crate::request_identity::RequestIdentity>,
-) -> std::io::Result<()> {
+}
+
+async fn client(mut s: TcpStream, context: ClientContext) -> std::io::Result<()> {
+    let ClientContext {
+        ca,
+        lane,
+        test,
+        roots,
+        profile_scope,
+        request_capture_slots,
+        request_identity,
+    } = context;
     let mut buf = Vec::new();
     let mut b = [0; 1];
     while buf.len() < 16384 {

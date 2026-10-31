@@ -2,6 +2,7 @@ import {fixtureAdapter, normalizeList, normalizeSearch} from './data.js';
 import {branchChoices,orderedMessages,messageText,hasUnsupportedContent,renderMarkdown} from './render.js';
 import {updateStatus} from './status.js';
 import {createConversationTabs} from './conversation-tabs.js';
+import {chatgptConversationId} from './continuation.js';
 const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';const adapter=fixture?fixtureAdapter():{async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value});},async getConversation(id,leafNodeId){return invoke('get_conversation',leafNodeId!==undefined?{id,leafNodeId}:{id});},async importChatgptExport(){return invoke('import_chatgpt_export');}};$('fixture-banner').hidden=!fixture;let selected=null,conversation=null,items=[],timer,queryToken=0,readerToken=0,cursor=null,revision=null,queryValue='',cursorRetry=false,lastConversationButton=null;const errText=e=>String(e?.message||e);const safeError=code=>({invalid_request:'The request was invalid.',invalid_cursor:'The page cursor is invalid.',stale_cursor:'The library changed; restart the search.',library_changed:'The library changed; restart the search.',unauthorized:'Sign in to the desktop service.',not_found:'The requested conversation was not found.',service_unavailable:'The desktop service is unavailable.',busy:'The desktop service is busy.',response_too_large:'This conversation is too large to display (8 MiB response limit). No content has been truncated.'}[code]||'The desktop service returned an error.');function showError(s){$('list-state').textContent=s;}
 function providerLabel(provider) {
   return {'paseo-chatgpt':'ChatGPT · saved in Paseo', 'paseo-codex_local':'Codex local · saved in Paseo', 'paseo-codex_cloud':'Codex cloud · saved in Paseo'}[provider] || provider || 'Unknown provider';
@@ -33,7 +34,10 @@ async function loadList(query=$('search').value,reset=true){const token=++queryT
 const conversationTabs = createConversationTabs({
   container: $('conversation-tabs'),
   onSelect: tab => {
-    if (tab.mode === 'live') window.dispatchEvent(new Event('chat-hub:show-live'));
+    if (tab.mode === 'live') window.dispatchEvent(new CustomEvent('chat-hub:show-live', {detail: {
+      conversationId: tab.sourceConversationId ?? null, title: tab.title, localId: tab.localId,
+      leafNodeId: tab.leafNodeId,
+    }}));
     else openConversation(tab.id, tab.leafNodeId, tab.anchorNodeId);
   },
   onEmpty: () => {
@@ -44,14 +48,29 @@ const conversationTabs = createConversationTabs({
   },
 });
 window.addEventListener('chat-hub:live-open', () => {
+  ++readerToken;
   conversationTabs.open({id: 'draft:chatgpt', title: 'New conversation', mode: 'live'});
+});
+window.addEventListener('chat-hub:read-saved', event => {
+  if (event.detail?.localId) openConversation(event.detail.localId, event.detail.leafNodeId);
+});
+$('continue-chatgpt').addEventListener('click', () => {
+  const sourceConversationId = chatgptConversationId(conversation?.conversation);
+  if (!sourceConversationId || !selected) return;
+  const title = conversation.conversation.title || 'Conversation';
+  const leafNodeId = $('branch').value || conversation.selected_node_id;
+  ++readerToken;
+  conversationTabs.update(selected, {mode: 'live', sourceConversationId, localId: selected, title, leafNodeId});
+  window.dispatchEvent(new CustomEvent('chat-hub:show-live', {detail: {
+    conversationId: sourceConversationId, title, localId: selected, leafNodeId, freshNavigation: true,
+  }}));
 });
 window.addEventListener('chat-hub:history-updated', () => loadList($('search').value, true));
 $('history-source').addEventListener('change', () => loadList($('search').value, true));
 function openConversation(id, leafNodeId, anchorNodeId) {
   window.dispatchEvent(new Event('chat-hub:show-local'));
   const title = items.find(item => item.id === id)?.title || 'Conversation';
-  conversationTabs.open({id, title, leafNodeId, anchorNodeId});
+  conversationTabs.open({id, title, leafNodeId, anchorNodeId, mode: 'local'});
   const token = ++readerToken;
   lastConversationButton = [...document.querySelectorAll('.conversation-item')].find(b => b.classList.contains('selected')) || document.activeElement;
   selected = id;
@@ -61,10 +80,12 @@ function openConversation(id, leafNodeId, anchorNodeId) {
   $('title').textContent = 'Loading…';
   $('account-attribution').textContent = '';
   $('messages').replaceChildren();
+  $('continue-chatgpt').hidden = true;
   adapter.getConversation(id, leafNodeId).then(c => {
     if(token!==readerToken)return;
     if (c?.conversation?.id !== id) throw Error('not_found');
     conversation = {...c.conversation, ...c, selected_node_id: c.selection?.selected_node_id};
+    $('continue-chatgpt').hidden = !chatgptConversationId(c.conversation);
     $('title').textContent = c.conversation?.title ?? 'Untitled conversation';
     conversationTabs.update(id, {title: $('title').textContent});
     $('provider').textContent = providerLabel(c.conversation?.provider);

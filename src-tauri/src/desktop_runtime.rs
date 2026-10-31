@@ -28,6 +28,9 @@ impl DesktopRuntime {
         self.shutdown_outcome().await.0
     }
 
+    // The packaged desktop command calls this; isolated startup tests compile
+    // this module without that command in their crate graph.
+    #[allow(dead_code)]
     pub async fn shutdown_for_restore(self) -> Result<(), String> {
         if self.shutdown_outcome().await.1 {
             Ok(())

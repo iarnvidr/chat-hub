@@ -86,6 +86,28 @@ async fn import(app: &Router, docs: Value) -> Value {
 }
 
 #[tokio::test]
+async fn large_local_transcript_detail_and_search_preserve_exact_text() {
+    let mut store = Store::in_memory().unwrap();
+    let text = "archivebodyneedle café 🧭 \"quotation\"\n".repeat(25_000);
+    let mut o = source_observation("paseo-chatgpt", "large-cache", "Large saved chat", 1);
+    o.graph[0].role = Some("archive".into());
+    o.graph[0].parts = vec![json!(text)];
+    o.completeness = "cached_transcript".into();
+    let id = store.ingest_observation(&o).unwrap();
+    let app = server::router(store, "secret".into());
+    let (status, detail) = request(&app, &format!("/api/v1/conversations/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["messages"][0]["role"], "archive");
+    assert_eq!(detail["messages"][0]["content"], text);
+    assert_eq!(detail["messages"][0]["parts"][0]["text"], text);
+    assert_eq!(detail["messages"][0]["parts"][0]["raw"], text);
+    let (status, search) = request(&app, "/api/v1/chat/search?q=archivebodyneedle", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search["items"].as_array().unwrap().len(), 1);
+    assert_eq!(search["items"][0]["node_id"], o.current_node.unwrap());
+}
+
+#[tokio::test]
 async fn import_list_search_anchor_and_view_only_branch_use_real_store() {
     let app = app();
     assert_eq!(

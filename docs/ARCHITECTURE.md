@@ -9,7 +9,7 @@ Chat Hub is a local-first conversation library, not a replacement chat frontend.
 - Local Axum JSON endpoints with bearer-protected health, search, and conversation-read routes.
 - Tauri desktop application using the Rust service bridge and platform app-data directory by default.
 - Native library backup/export commands that reuse consistent SQLite backup and streamed JSON export APIs. The CLI can restore a SQLite backup into an empty database and rebuild search indexes; JSON export is not a restore format. Restore is currently a developer/operator CLI workflow, and native OS Save dialog/file acceptance is not verified.
-- Selective CONNECT TLS proxy for `chatgpt.com` and subdomains, excluding recognized authentication/sign-in hosts; other hosts tunnel without decryption. A per-install CA is created/persisted but is not installed as trusted automatically.
+- Selective CONNECT TLS proxy for the exact `chatgpt.com` host. Subdomains, authentication/sign-in hosts and all other hosts tunnel without decryption. A per-install CA is created/persisted but is not installed as trusted automatically.
 - Snapshot capture exists as a disabled-by-default path. It does not establish provider traffic compatibility, real account capture, or accepted provider ingestion.
 
 ## Verification and boundaries

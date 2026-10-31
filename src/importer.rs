@@ -207,7 +207,7 @@ fn ingest_cached_if_changed(
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).optional()?;
     if let Some((conversation_id, payload)) = previous {
-        if payload == observation.raw_payload.to_string() {
+        if payload == observation.raw_payload {
             return Ok(crate::store::IngestOutcome::Unchanged { conversation_id });
         }
     }

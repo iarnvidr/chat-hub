@@ -726,6 +726,16 @@ fn set_provider_view(
 }
 
 #[tauri::command]
+fn open_provider_conversation(
+    window: tauri::Webview,
+    state: State<'_, ProviderViewState>,
+    conversation_id: Option<String>,
+) -> Result<(), String> {
+    authorize_local_main(&window)?;
+    state.open_conversation(conversation_id.as_deref())
+}
+
+#[tauri::command]
 fn sync_paseo_history(
     window: tauri::Webview,
     app: tauri::AppHandle,
@@ -1063,6 +1073,7 @@ fn main() {
             service_health,
             service_info,
             set_provider_view,
+            open_provider_conversation,
             sync_paseo_history,
             paseo_history_status,
             check_for_updates,
@@ -1108,6 +1119,7 @@ fn main() {
             service_health,
             service_info,
             set_provider_view,
+            open_provider_conversation,
             sync_paseo_history,
             paseo_history_status,
             check_for_updates,

@@ -209,7 +209,10 @@ fn detail_rejects_large_parts_without_truncating_database() {
             "big",
             1,
             vec![GraphNode {
-                parts: vec![json!({"opaque": "x".repeat(2 * 1024 * 1024)})],
+                parts: vec![
+                    json!("searchable"),
+                    json!({"opaque": "x".repeat(9 * 1024 * 1024)}),
+                ],
                 ..node("n", None, "small searchable text")
             }],
         ))
@@ -218,6 +221,11 @@ fn detail_rejects_large_parts_without_truncating_database() {
         s.detail_snapshot(&id),
         Err(chat_hub::error::Error::ReadBudgetExceeded { .. })
     ));
+    let search = s
+        .search_page_snapshot("searchable", 10, None, None)
+        .unwrap();
+    assert_eq!(search.hits.len(), 1);
+    assert_eq!(search.hits[0]["conversation"]["id"], id);
     assert!(matches!(
         s.detail_snapshot(&id),
         Err(chat_hub::error::Error::ReadBudgetExceeded { .. })
@@ -227,6 +235,78 @@ fn detail_rejects_large_parts_without_truncating_database() {
 fn bounded_graph_node_count() {
     let s = Store::in_memory().unwrap();
     assert!(s.detail_snapshot("missing").unwrap().conversation.is_none());
+}
+
+#[test]
+fn detail_reads_large_utf8_cached_text_without_losing_parts_or_escapes() {
+    let mut store = Store::in_memory().unwrap();
+    // A saved transcript larger than the previous 6x preflight allowed, with
+    // multibyte text and JSON escaping representative of real imported chats.
+    let text = "Saved café 🧭 \\\"quoted\\\"\n\t".repeat(35_000);
+    let mut o = observation(
+        "large-cached",
+        "Saved chat",
+        1,
+        vec![node("n", None, &text)],
+    );
+    o.provider = "paseo-chatgpt".into();
+    o.completeness = "cached_transcript".into();
+    o.graph[0].role = Some("archive".into());
+    let id = store.ingest_observation(&o).unwrap();
+    let c = store.detail_snapshot(&id).unwrap().conversation.unwrap();
+    assert_eq!(c["messages"][0]["content"], text);
+    assert_eq!(c["messages"][0]["parts"][0]["text"], text);
+    assert_eq!(c["messages"][0]["parts"][0]["raw"], text);
+    assert_eq!(c["thread_node_ids"], json!(["n"]));
+    assert!(serde_json::to_vec(&c).unwrap().len() < 8 * 1024 * 1024 - 64 * 1024);
+}
+
+#[test]
+fn detail_budget_counts_escape_expansion_and_normalized_part_wrappers() {
+    let mut store = Store::in_memory().unwrap();
+    // The source is below the raw budget but three copies of escaped text do
+    // not fit in the encoded response. Rejection must never truncate storage.
+    let text = "\u{0001}".repeat(700_000);
+    let id = store
+        .ingest_observation(&observation(
+            "escaped",
+            "Escaped",
+            1,
+            vec![node("n", None, &text)],
+        ))
+        .unwrap();
+    assert!(matches!(
+        store.detail_snapshot(&id),
+        Err(chat_hub::error::Error::ReadBudgetExceeded { .. })
+    ));
+    assert_eq!(
+        store.read_normalized(&id).unwrap().unwrap()["messages"][0]["content"],
+        text
+    );
+
+    // Tiny parts have significant normalized wrappers despite little content.
+    let id = store
+        .ingest_observation(&observation(
+            "many-parts",
+            "Many parts",
+            1,
+            vec![GraphNode {
+                parts: vec![json!(""); 200_000],
+                ..node("n", None, "")
+            }],
+        ))
+        .unwrap();
+    assert!(matches!(
+        store.detail_snapshot(&id),
+        Err(chat_hub::error::Error::ReadBudgetExceeded { .. })
+    ));
+    assert_eq!(
+        store.read_normalized(&id).unwrap().unwrap()["messages"][0]["parts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        200_000
+    );
 }
 #[test]
 fn huge_parts_list_summary_search_preflight_and_null_cursor_walk() {
@@ -249,10 +329,14 @@ fn huge_parts_list_summary_search_preflight_and_null_cursor_walk() {
     let c = &page.items[0];
     assert_eq!(c.as_object().unwrap().len(), 6);
     assert_eq!(c["id"], huge);
-    assert!(matches!(
-        s.search_page_snapshot("needle", 10, None, None),
-        Err(chat_hub::error::Error::ReadBudgetExceeded { .. })
-    ));
+    let search = s.search_page_snapshot("needle", 10, None, None).unwrap();
+    let message_hit = search
+        .hits
+        .iter()
+        .find(|hit| hit["node_id"] == "n")
+        .expect("message match should be searchable without loading opaque parts");
+    assert_eq!(message_hit["conversation"]["id"], huge);
+    assert_eq!(message_hit["leaf_node_id"], "n");
 }
 
 #[test]

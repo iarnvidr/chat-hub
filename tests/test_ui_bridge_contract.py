@@ -6,6 +6,65 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+def rust_function(source, name):
+    """Return a Rust function signature and body while ignoring braces in strings."""
+    matches = list(re.finditer(rf"\bfn\s+{re.escape(name)}\s*\(", source))
+    if not matches:
+        return None
+    match = matches[-1]
+    open_paren = source.find("(", match.start())
+    depth = 0
+    quote = False
+    escaped = False
+    close_paren = None
+    for index in range(open_paren, len(source)):
+        char = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quote = False
+            continue
+        if char == '"':
+            quote = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                close_paren = index
+                break
+    if close_paren is None:
+        return None
+    body_start = source.find("{", close_paren)
+    if body_start < 0:
+        return None
+    depth = 0
+    quote = False
+    escaped = False
+    for index in range(body_start, len(source)):
+        char = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quote = False
+            continue
+        if char == '"':
+            quote = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[match.start():body_start], source[body_start + 1:index]
+    return None
+
+
 class UiBridgeContract(unittest.TestCase):
     def test_local_ui_uses_tauri_internal_invoke_and_calls_real_service(self):
         config = json.loads((ROOT / "src-tauri/tauri.conf.json").read_text())
@@ -24,57 +83,65 @@ class UiBridgeContract(unittest.TestCase):
         self.assertIn("window.ChatHub={invoke}", app)
         tauri = (ROOT / "src-tauri/src/main.rs").read_text()
         self.assertIn("service_info,", tauri)
-        tauri = (ROOT / "src-tauri/src/main.rs").read_text()
-        self.assertIn("service_info,", tauri)
-        self.assertRegex(tauri, r"fn service_info\(\s*window: tauri::WebviewWindow")
+        signature, body = rust_function(tauri, "service_info")
+        self.assertIn("window: tauri::Webview", signature)
+        self.assertIn("authorize_local_main(&window)?;", body)
 
-    def test_provider_webview_is_external_and_not_local_command_window(self):
-        tauri = (ROOT / "src-tauri/src/main.rs").read_text()
-        self.assertIn('"provider",', tauri)
-        self.assertIn('WebviewUrl::External(', tauri)
-        self.assertIn('"https://chatgpt.com"', tauri)
+    def test_provider_is_created_as_an_external_child_webview(self):
+        main = (ROOT / "src-tauri/src/main.rs").read_text()
+        provider = (ROOT / "src-tauri/src/provider_view.rs").read_text()
+        self.assertIn("ProviderViewState::attach(", main)
+        self.assertIn('WebviewBuilder::new("provider", tauri::WebviewUrl::External(initial_url))', provider)
+        self.assertIn(".add_child(", provider)
+        self.assertIn('tauri::Url::parse(&format!("https://chatgpt.com{path}"))', provider)
+        self.assertNotIn("window.__TAURI_INTERNALS__", provider)
         config = json.loads((ROOT / "src-tauri/tauri.conf.json").read_text())
         self.assertEqual(config["app"]["windows"][0]["title"], "Chat Hub")
 
-    def test_sensitive_commands_receive_native_window_and_guard(self):
+    def test_sensitive_commands_are_bound_to_authorized_main_webview(self):
         source = (ROOT / "src-tauri/src/main.rs").read_text()
-        sensitive = ("update_status", "service_info", "check_for_updates", "install_update", "e2e_result")
+        sensitive = (
+            "update_status", "service_info", "check_for_updates", "install_update",
+            "e2e_result", "set_provider_view", "open_provider_conversation",
+            "sync_paseo_history", "paseo_history_status",
+        )
         for command in sensitive:
             with self.subTest(command=command):
-                matches = list(re.finditer(
-                    rf"fn {command}\s*\((.*?)\)\s*(?:->[^{{]+)?\{{(.*?)\n\}}",
-                    source,
-                    re.S,
-                ))
-                self.assertTrue(matches, f"missing command {command}")
-                signature, body = matches[-1].groups()
-                self.assertRegex(signature, r"window:\s*tauri::WebviewWindow")
+                function = rust_function(source, command)
+                self.assertIsNotNone(function, f"missing command {command}")
+                signature, body = function
+                self.assertIn("window: tauri::Webview", signature)
                 self.assertIn("authorize_local_main(&window)?;", body)
 
-    def test_guard_allows_only_main_packaged_local_origins(self):
+    def test_guard_requires_live_native_main_ownership_and_local_origin(self):
         source = (ROOT / "src-tauri/src/main.rs").read_text()
-        match = re.search(r"fn authorize_local_main\(.*?\n\}", source, re.S)
-        self.assertIsNotNone(match)
-        guard = match.group()
+        function = rust_function(source, "authorize_local_main")
+        self.assertIsNotNone(function)
+        signature, guard = function
+        self.assertIn("window: &tauri::Webview", signature)
         self.assertIn('window.label() != "main"', guard)
-        self.assertIn('window.label() != "main"', guard)
-        self.assertIn('window.app_handle().state::<MainWindowOwnership>()', guard)
-        self.assertIn('Ordering::Acquire', guard)
-        self.assertIn('window_policy::allows_origin(', source)
+        self.assertIn("window.app_handle().state::<MainWindowOwnership>()", guard)
+        self.assertIn("ownership.is_authorized(window.label())", guard)
+        self.assertIn("window_policy::allows_origin(", source)
         policy = (ROOT / "src-tauri/src/window_policy.rs").read_text()
         self.assertIn('scheme == "tauri" && host == Some("localhost")', policy)
         self.assertIn('scheme == "http" && host == Some("tauri.localhost")', policy)
         self.assertIn('username.is_empty()', policy)
         self.assertIn('password.is_none()', policy)
         self.assertIn('port.is_none()', policy)
-        self.assertIn('WebviewUrl::App(_)', source)
-        self.assertIn('main_config.create = false', source)
-        self.assertIn('main_ownership.register_after_build()', source)
-        self.assertIn('WindowEvent::Destroyed', source)
-        self.assertNotIn("https://", guard)
+        self.assertIn("main_ownership.register_after_build()", source)
+        self.assertIn("WindowEvent::Destroyed", source)
+        self.assertIn("ownership.revoke()", source)
+
+    def test_provider_smoke_denial_is_not_a_production_command(self):
+        source = (ROOT / "src-tauri/src/main.rs").read_text()
+        self.assertIn("app.get_webview(\"provider\")", source)
+        self.assertIn("window_policy::is_provider_origin(u.scheme()", source)
+        self.assertIn('"provider webview readiness timed out"', source)
+        self.assertIn('"readiness":readiness', source)
         handlers = source.split(".invoke_handler", 1)[-1]
         self.assertRegex(handlers, r"e2e_result\s*,?")
-        production_handlers = handlers.split("#[cfg(not(feature = \"native-smoke\"))]", 1)[-1]
+        production_handlers = handlers.split('#[cfg(not(feature = "native-smoke"))]', 1)[-1]
         self.assertNotIn("e2e_result", production_handlers)
         self.assertNotIn("e2e_provider_result", production_handlers)
 

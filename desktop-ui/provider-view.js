@@ -5,6 +5,7 @@ const status = document.getElementById('provider-view-status');
 const libraryButton = document.getElementById('show-library');
 const providerButton = document.getElementById('show-chatgpt');
 let showing = false, sequence = 0, queue = Promise.resolve(), poll, resize;
+let activeTarget, current = {conversationId: null, title: 'New conversation', localId: null};
 
 function native() {
   const invoke = window.ChatHub?.invoke;
@@ -25,11 +26,12 @@ async function update(reload = false) {
 
 function report(result) {
   status.textContent = result?.state === 'ready'
-    ? 'ChatGPT is open. Sign in here to use your account.'
+    ? current.localId ? 'Continue this chat in ChatGPT. Use the same account as the saved conversation.'
+      : 'ChatGPT is open. Sign in here to use your account.'
     : result?.message || 'Loading ChatGPT…';
 }
 
-async function navigate(show) {
+async function navigate(show, target) {
   const token = ++sequence;
   clearTimeout(poll);
   if (!show) {
@@ -43,12 +45,19 @@ async function navigate(show) {
     return;
   }
   showing = true;
+  current = target || current;
   library.hidden = true; panel.hidden = false;
+  document.getElementById('provider-title').textContent = current.title || 'Conversation';
+  document.getElementById('provider-back').textContent = current.localId ? 'Read saved copy' : 'Back to library';
   document.body.classList.add('provider-open');
   providerButton.classList.add('active'); libraryButton.classList.remove('active');
   providerButton.setAttribute('aria-current', 'page'); libraryButton.removeAttribute('aria-current');
   status.textContent = 'Loading ChatGPT…';
   try {
+    if (target?.freshNavigation || activeTarget !== current.conversationId) {
+      await native()('open_provider_conversation', {conversationId: current.conversationId});
+      activeTarget = current.conversationId;
+    }
     const result = await update();
     if (token !== sequence) return;
     report(result);
@@ -74,20 +83,37 @@ function watch(token, deadline) {
   }, 2000);
 }
 
-function go(show) { queue = queue.catch(() => {}).then(() => navigate(show)); }
+function go(show, target) { queue = queue.catch(() => {}).then(() => navigate(show, target)); }
 providerButton.addEventListener('click', () => {
   window.dispatchEvent(new Event('chat-hub:live-open'));
-  go(true);
+  go(true, {conversationId: null, title: 'New conversation', localId: null, freshNavigation: true});
 });
-window.addEventListener('chat-hub:show-live', () => go(true));
+window.addEventListener('chat-hub:show-live', event => go(true, {
+  conversationId: event.detail?.conversationId ?? null,
+  title: event.detail?.title || 'New conversation', localId: event.detail?.localId ?? null,
+  leafNodeId: event.detail?.leafNodeId,
+  freshNavigation: !!event.detail?.freshNavigation,
+}));
 window.addEventListener('chat-hub:show-local', () => go(false));
-libraryButton.addEventListener('click', () => go(false));
-document.getElementById('provider-back').addEventListener('click', () => go(false));
+function readSaved() {
+  go(false);
+  if (current.localId) window.dispatchEvent(new CustomEvent('chat-hub:read-saved', {detail: {
+    localId: current.localId, leafNodeId: current.leafNodeId,
+  }}));
+}
+libraryButton.addEventListener('click', readSaved);
+document.getElementById('provider-back').addEventListener('click', readSaved);
 document.getElementById('provider-reload').addEventListener('click', async () => {
   if (!showing) return;
   clearTimeout(poll);
   status.textContent = 'Reloading ChatGPT…';
-  try { report(await update(true)); watch(sequence, Date.now() + 25000); }
+  try {
+    if (activeTarget !== current.conversationId) {
+      await native()('open_provider_conversation', {conversationId: current.conversationId});
+      activeTarget = current.conversationId;
+    }
+    report(await update(true)); watch(sequence, Date.now() + 25000);
+  }
   catch { status.textContent = 'ChatGPT could not reload. Check your connection and try again.'; }
 });
 new ResizeObserver(() => {

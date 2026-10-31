@@ -3,6 +3,33 @@ use serde::Serialize;
 use std::sync::Mutex;
 use tauri::{Manager, Webview, WebviewBuilder, WebviewWindow, Wry};
 
+/// Build only the provider's own URL. Conversation IDs are canonical UUIDs;
+/// callers cannot supply a URL, path, or other navigation target.
+pub fn target_url(conversation_id: Option<&str>) -> Result<tauri::Url, String> {
+    let path = match conversation_id {
+        None => "/".to_string(),
+        Some(id) if valid_conversation_id(id) => format!("/c/{id}"),
+        Some(_) => return Err("invalid_conversation_id".into()),
+    };
+    tauri::Url::parse(&format!("https://chatgpt.com{path}"))
+        .map_err(|_| "invalid_conversation_id".into())
+}
+
+fn valid_conversation_id(id: &str) -> bool {
+    let parts: Vec<_> = id.split('-').collect();
+    parts.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(parts)
+            .all(|(len, part)| part.len() == *len && part.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn allowed_provider_navigation(url: &tauri::Url) -> bool {
+    // Federated login may visit other HTTPS origins. Privileged IPC remains
+    // restricted to the native main webview regardless of the provider URL.
+    url.scheme() == "https" || url.as_str() == "about:blank"
+}
+
 #[derive(Clone, Serialize)]
 pub struct ProviderViewStatus {
     pub state: String,
@@ -34,7 +61,7 @@ impl ProviderViewState {
         let initial_url = tauri::Url::parse("about:blank").map_err(|e| e.to_string())?;
         let app_handle = app.clone();
         let builder = WebviewBuilder::new("provider", tauri::WebviewUrl::External(initial_url))
-            .on_navigation(|url| url.as_str() == "about:blank" || url.scheme() == "https")
+            .on_navigation(allowed_provider_navigation)
             .on_page_load(move |_webview, payload| {
                 if payload.url().scheme() != "https" {
                     return;
@@ -140,10 +167,7 @@ impl ProviderViewState {
         if reload {
             inner.loaded = false;
             inner.navigated = true;
-            inner
-                .webview
-                .navigate(tauri::Url::parse("https://chatgpt.com/").map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
+            inner.webview.reload().map_err(|e| e.to_string())?;
         } else if !inner.navigated {
             // The app-scoped CA delegate is installed before this first navigation.
             inner.navigated = true;
@@ -165,6 +189,16 @@ impl ProviderViewState {
         })
     }
 
+    /// Navigate only after an explicit main-window command. Calling this does
+    /// not change visibility or bounds, so the UI can keep its existing layout.
+    pub fn open_conversation(&self, conversation_id: Option<&str>) -> Result<(), String> {
+        let target = target_url(conversation_id)?;
+        let mut inner = self.inner.lock().map_err(|e| e.to_string())?;
+        inner.loaded = false;
+        inner.navigated = true;
+        inner.webview.navigate(target).map_err(|e| e.to_string())
+    }
+
     #[cfg(feature = "native-smoke")]
     pub fn set_smoke_view(&self, main: &Webview<Wry>) -> Result<(), String> {
         if !self.proxy_enabled && !self.direct_smoke_enabled {
@@ -173,5 +207,46 @@ impl ProviderViewState {
         let size = main.window().inner_size().map_err(|e| e.to_string())?;
         self.set_view(true, 0.0, 0.0, size.width as f64, size.height as f64, false)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod target_url_tests {
+    use super::{allowed_provider_navigation, target_url};
+
+    #[test]
+    fn accepts_only_chatgpt_root_or_uuid_conversation() {
+        assert_eq!(target_url(None).unwrap().as_str(), "https://chatgpt.com/");
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        assert_eq!(
+            target_url(Some(id)).unwrap().as_str(),
+            format!("https://chatgpt.com/c/{id}")
+        );
+        for bad in ["not-a-uuid", "https://example.com", "../settings", ""] {
+            assert!(target_url(Some(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn allows_https_login_redirects_but_rejects_local_or_script_navigation() {
+        for url in [
+            "about:blank",
+            "https://chatgpt.com/",
+            "https://login.microsoftonline.com/",
+        ] {
+            assert!(allowed_provider_navigation(
+                &tauri::Url::parse(url).unwrap()
+            ));
+        }
+        for url in [
+            "http://chatgpt.com/",
+            "file:///etc/hosts",
+            "javascript:alert(1)",
+            "data:text/html,hello",
+        ] {
+            assert!(!allowed_provider_navigation(
+                &tauri::Url::parse(url).unwrap()
+            ));
+        }
     }
 }
