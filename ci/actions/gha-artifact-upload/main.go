@@ -393,7 +393,7 @@ func (u *uploader) upload(ctx context.Context, name string, retention int, archi
 	if err != nil {
 		return err
 	}
-	finalize := map[string]any{"workflowRunBackendId": u.runBackend, "workflowJobRunBackendId": u.jobBackend, "name": name, "size": strconv.FormatInt(size, 10), "hash": map[string]string{"value": "sha256:" + hash}}
+	finalize := map[string]any{"workflowRunBackendId": u.runBackend, "workflowJobRunBackendId": u.jobBackend, "name": name, "size": strconv.FormatInt(size, 10), "hash": "sha256:" + hash}
 	var done finalizeArtifactResponse
 	if err := u.twirp(ctx, "FinalizeArtifact", finalize, &done); err != nil {
 		return err

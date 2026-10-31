@@ -212,8 +212,8 @@ func TestUploadProtocolDoesNotLeakTokensOrSignedURL(t *testing.T) {
 		t.Fatalf("unexpected FinalizeArtifact request: %#v", finalize)
 	}
 	wantHash := sha256.Sum256([]byte(payload))
-	hashField, ok := finalize["hash"].(map[string]any)
-	if !ok || hashField["value"] != "sha256:"+hex.EncodeToString(wantHash[:]) {
+	hashField, ok := finalize["hash"].(string)
+	if !ok || hashField != "sha256:"+hex.EncodeToString(wantHash[:]) {
 		t.Fatalf("missing archive digest in finalization: %#v", finalize["hash"])
 	}
 	log := &strings.Builder{}
