@@ -31,7 +31,7 @@ mkdir -p "$stage/payload" "$mount"
 ditto "$app" "$stage/payload/Chat Hub.app"
 ditto "$sources" "$stage/payload/Corresponding Source"
 ln -s /Applications "$stage/payload/Applications"
-hdiutil create -volname 'Chat Hub' -srcfolder "$stage/payload" -fs HFS+ -format UDZO -ov "$image"
+bash "$(dirname "$0")/create-dmg-image.sh" -volname 'Chat Hub' -srcfolder "$stage/payload" -fs HFS+ -format UDZO -ov "$image"
 hdiutil verify "$image"
 hdiutil attach "$image" -readonly -nobrowse -mountpoint "$mount"
 attached=1

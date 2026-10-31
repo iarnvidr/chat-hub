@@ -156,11 +156,11 @@ jobs:
           repository="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f2 | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/$owner/chat-hub-ci-$repository"
           reference="$image:release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          result="$("$oras_path" push "$reference" --artifact-type application/vnd.chat-hub.release-review.v1 \
+          result="$(cd "$RUNNER_TEMP" && "$oras_path" push "$reference" --artifact-type application/vnd.chat-hub.release-review.v1 \
             --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
             --annotation "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --annotation "org.chat-hub.release.tag=$INPUT_TAG" \
-            "$RUNNER_TEMP/release-review-transport.tar.gz:application/vnd.chat-hub.release-review.v1.tar+gzip" --format json)"
+            "release-review-transport.tar.gz:application/vnd.chat-hub.release-review.v1.tar+gzip" --format json)"
           digest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])' <<<"$result")"
           [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
           echo "digest=$digest" >> "$GITHUB_OUTPUT"

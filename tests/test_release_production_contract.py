@@ -1,11 +1,48 @@
 """Production build-chain contracts: real bundle, ad-hoc mode, evidence, gated publish."""
 import unittest
+import json
+import os
+import subprocess
+import tarfile
+import tempfile
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class ProductionContract(unittest.TestCase):
+    def test_main_transport_stages_the_actual_producer_artifact_paths(self):
+        action = (ROOT / "ci/actions/macos-native-build/action.yml").read_text()
+        step = action.split("- name: Stage immutable GitHub Packages transport archive\n", 1)[1].split("    - id: publish-transport", 1)[0]
+        script = textwrap.dedent(step.split("      run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace, runner = root / "workspace", root / "runner"
+            artifacts = workspace / "artifacts"
+            artifacts.mkdir(parents=True)
+            app = runner / "chat-hub/Chat Hub.app/Contents"
+            app.mkdir(parents=True)
+            (app / "Info.plist").write_text("fixture app")
+            safe = runner / "chat-hub-safe-evidence"
+            safe.mkdir()
+            (safe / "receipt.json").write_text("{}")
+            (runner / "chat-hub/verify-macos.txt").write_text("verified")
+            name = "Chat_Hub_0.2.1_macos-arm64"
+            expected = {name + ".zip": b"accepted archive", name + ".zip.sha256": b"checksum", name + ".dmg": b"accepted DMG", "native-receipt.json": b"{}"}
+            for filename, data in expected.items():
+                (artifacts / filename).write_bytes(data)
+            (runner / ("chat-hub/" + name + ".dmg")).write_bytes(expected[name + ".dmg"])
+            env = {**os.environ, "RUNNER_TEMP": str(runner), "GITHUB_REPOSITORY": "iarnvidr/chat-hub", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "a" * 40}
+            subprocess.run(["bash", "-e", "-c", script], cwd=workspace, env=env, check=True, capture_output=True)
+            transport = runner / "chat-hub-transport"
+            for filename, data in expected.items():
+                self.assertEqual((transport / "chat-hub-native-release-main-123-2" / filename).read_bytes(), data)
+            self.assertEqual((transport / "chat-hub-macos-arm64" / (name + ".zip")).read_bytes(), expected[name + ".zip"])
+            self.assertEqual(json.loads((transport / "transport.json").read_text()), {"repository": "iarnvidr/chat-hub", "run_id": "123", "run_attempt": "2", "sha": "a" * 40})
+            with tarfile.open(runner / "chat-hub-transport.tar.gz") as archive:
+                self.assertTrue(any(entry.name.endswith("native-receipt.json") for entry in archive))
+
     def test_ad_hoc_real_tauri_build(self):
         build = (ROOT / "build/build-native-macos.sh").read_text()
         config = (ROOT / "src-tauri/tauri.conf.json").read_text()
