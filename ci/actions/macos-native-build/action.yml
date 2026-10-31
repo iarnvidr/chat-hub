@@ -174,7 +174,7 @@ runs:
         cp -R "$RUNNER_TEMP/chat-hub-safe-evidence/." "$root/chat-hub-macos-release-evidence/"
         cp -R "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$root/chat-hub-macos-arm64/"
         cp -R "$RUNNER_TEMP/chat-hub-safe-evidence/." "$root/chat-hub-macos-arm64/"
-        cp "$RUNNER_TEMP"/chat-hub/Chat_Hub_*.zip "$RUNNER_TEMP"/chat-hub/Chat_Hub_*.zip.sha256 \
+        cp artifacts/Chat_Hub_*.zip artifacts/Chat_Hub_*.zip.sha256 \
           "$RUNNER_TEMP"/chat-hub/Chat_Hub_*.dmg "$RUNNER_TEMP/chat-hub/verify-macos.txt" \
           "$root/chat-hub-macos-arm64/"
         cp artifacts/* "$root/chat-hub-native-release-main-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
