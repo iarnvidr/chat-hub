@@ -1,22 +1,6 @@
 name: Apple Silicon build
 on:
   pull_request:
-    paths:
-      - "src-tauri/**"
-      - "build/**"
-      - "tests/native/**"
-      - "src/**"
-      - "frontend/**"
-      - "desktop-ui/**"
-      - "package.json"
-      - "package-lock.json"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "tauri.conf.json"
-      - ".github/workflows/macos.yml"
-      - ".github/workflows/check.yml"
-      - ".github/workflows/accept-native.yml"
   workflow_dispatch:
 permissions:
   contents: read
@@ -24,8 +8,34 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    outputs:
+      required: ${{ steps.native-scope.outputs.required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: native-scope
+        name: Determine whether native validation is required
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          result="$(python3 build/native_scope.py --root "$GITHUB_WORKSPACE" --base "$BASE_SHA" --head "$HEAD_SHA")"
+          echo "$result" >> "$GITHUB_STEP_SUMMARY"
+          required="$(printf '%s\n' "$result" | sed -n 's/^required=//p')"
+          test "$required" = true -o "$required" = false
+          echo "required=$required" >> "$GITHUB_OUTPUT"
   package:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    needs: scope
+    if: >-
+      always() &&
+      ((github.event_name == 'pull_request' && needs.scope.result == 'success' && needs.scope.outputs.required == 'true') ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -215,4 +225,33 @@ jobs:
             echo "Not a release: ad-hoc signed and not notarized. See README, Install on the Mac."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Download: $ARTIFACT_URL"
+  native-release-gate:
+    name: native-release-gate
+    if: always() && (github.event_name == 'pull_request' ||
+                     (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    needs: [scope, package]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require native build for in-scope changes and main manual builds
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          NATIVE_REQUIRED: ${{ needs.scope.outputs.required }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            test "$SCOPE_RESULT" = success || { echo "Native scope evaluation failed; failing closed." >&2; exit 1; }
+            case "$NATIVE_REQUIRED" in
+              true) test "$PACKAGE_RESULT" = success || { echo "Native changes require the complete macOS build and smoke suite." >&2; exit 1; } ;;
+              false) test "$PACKAGE_RESULT" = skipped || { echo "Unexpected native package result for out-of-scope changes." >&2; exit 1; } ;;
+              *) echo "Native scope result is missing or malformed." >&2; exit 1 ;;
+            esac
+          elif [[ "$EVENT_NAME" == workflow_dispatch && "$REF" == refs/heads/main ]]; then
+            test "$PACKAGE_RESULT" = success || { echo "Trusted-main manual native build did not succeed." >&2; exit 1; }
+          else
+            echo "Unsupported event/ref for required native gate." >&2
+            exit 1
+          fi
 # Deliberately no automatic GitHub release. See docs/PUBLICATION.md before releasing.
