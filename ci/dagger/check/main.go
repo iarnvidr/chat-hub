@@ -61,7 +61,7 @@ func (m *ChatHubCi) Contracts(ctx context.Context, source *dagger.Directory) (st
 	rust := dag.Container().From(rustImage)
 	node := dag.Container().From(nodeImage)
 	return python.
-		WithExec([]string{"sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends bash git && rm -rf /var/lib/apt/lists/*"}).
+		WithExec([]string{"sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends bash build-essential git && rm -rf /var/lib/apt/lists/*"}).
 		WithDirectory("/usr/local/cargo", rust.Directory("/usr/local/cargo")).
 		WithDirectory("/usr/local/rustup", rust.Directory("/usr/local/rustup")).
 		WithFile("/usr/local/bin/node", node.File("/usr/local/bin/node")).
@@ -77,6 +77,7 @@ func (m *ChatHubCi) LinuxChecks(ctx context.Context, source *dagger.Directory) (
 	var out strings.Builder
 	rust := dag.Container().From(rustImage).
 		WithExec([]string{"sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libxdo-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf ffmpeg && rm -rf /var/lib/apt/lists/*"}).
+		WithExec([]string{"rustup", "component", "add", "rustfmt", "clippy"}).
 		WithDirectory("/src", source).WithWorkdir("/src").
 		WithExec([]string{"cargo", "fmt", "--all", "--", "--check"}).
 		WithExec([]string{"cargo", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"}).
