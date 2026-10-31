@@ -16,6 +16,8 @@ const (
 	pythonImage = "python:3.14.0-slim-bookworm@sha256:d13fa0424035d290decef3d575cea23d1b7d5952cdf429df8f5542c71e961576"
 	rustImage   = "rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b"
 	bunImage    = "oven/bun:1.2.22@sha256:66ba69deede44e3af5dc542def218fdb3bcad2205900ea761dc5623bf973d2df"
+	noNodePath  = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	nodeGuard   = "if command -v node >/dev/null 2>&1; then echo 'Node executable is prohibited in this CI environment' >&2; exit 1; fi"
 )
 
 // Checks is the single authoritative Linux graph, including real browser checks.
@@ -48,6 +50,8 @@ func (m *ChatHubCi) Checks(ctx context.Context, source *dagger.Directory) (strin
 
 func (m *ChatHubCi) BrowserChecks(ctx context.Context, source *dagger.Directory) (string, error) {
 	return dag.Container().From(bunImage).
+		WithEnvVariable("PATH", noNodePath).
+		WithExec([]string{"sh", "-ec", nodeGuard}).
 		WithExec([]string{"sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends chromium && rm -rf /var/lib/apt/lists/*"}).
 		WithNewFile("/tmp/pwdeps/package.json", `{"private":true,"dependencies":{"playwright":"1.58.2"}}`).
 		WithWorkdir("/tmp/pwdeps").
@@ -58,7 +62,8 @@ func (m *ChatHubCi) BrowserChecks(ctx context.Context, source *dagger.Directory)
 		WithEnvVariable("CHROMIUM_PATH", "/usr/bin/chromium").
 		WithExec([]string{"bun", "tests/desktop_ui_browser.cjs"}).
 		WithExec([]string{"bun", "tests/desktop_workspace.cjs"}).
-		WithExec([]string{"bun", "tests/desktop_chat_features.cjs"}).Stdout(ctx)
+		WithExec([]string{"bun", "tests/desktop_chat_features.cjs"}).
+		WithExec([]string{"bun", "tests/desktop_ui_graph_browser.cjs"}).Stdout(ctx)
 }
 
 func (m *ChatHubCi) Contracts(ctx context.Context, source *dagger.Directory) (string, error) {
@@ -66,13 +71,15 @@ func (m *ChatHubCi) Contracts(ctx context.Context, source *dagger.Directory) (st
 	bun := dag.Container().From(bunImage)
 	rust := dag.Container().From(rustImage)
 	return python.
+		WithEnvVariable("PATH", "/usr/local/cargo/bin:"+noNodePath).
+		WithExec([]string{"sh", "-ec", nodeGuard}).
 		WithExec([]string{"sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends bash build-essential git && rm -rf /var/lib/apt/lists/*"}).
 		WithFile("/usr/local/bin/bun", bun.File("/usr/local/bin/bun")).
 		WithDirectory("/usr/local/cargo", rust.Directory("/usr/local/cargo")).
 		WithDirectory("/usr/local/rustup", rust.Directory("/usr/local/rustup")).
 		WithEnvVariable("CARGO_HOME", "/usr/local/cargo").
 		WithEnvVariable("RUSTUP_HOME", "/usr/local/rustup").
-		WithEnvVariable("PATH", "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin").
+		WithEnvVariable("PATH", "/usr/local/cargo/bin:"+noNodePath).
 		WithDirectory("/src", source).WithWorkdir("/src").
 		WithExec([]string{"python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"}).
 		WithExec([]string{"python3", "-m", "unittest", "discover", "-s", "build", "-p", "test_*.py"}).Stdout(ctx)
@@ -82,6 +89,8 @@ func (m *ChatHubCi) LinuxChecks(ctx context.Context, source *dagger.Directory) (
 	var out strings.Builder
 	bun := dag.Container().From(bunImage)
 	rust := dag.Container().From(rustImage).
+		WithEnvVariable("PATH", "/usr/local/cargo/bin:"+noNodePath).
+		WithExec([]string{"sh", "-ec", nodeGuard}).
 		WithExec([]string{"sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libxdo-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf ffmpeg libatomic1 && rm -rf /var/lib/apt/lists/*"}).
 		WithExec([]string{"rustup", "component", "add", "rustfmt", "clippy"}).
 		WithFile("/usr/local/bin/bun", bun.File("/usr/local/bin/bun")).
