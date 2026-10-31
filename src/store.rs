@@ -2254,17 +2254,29 @@ mod project_and_search_tests {
             "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES('legacy-paseo-project','paseo-chatgpt','paseo-cache:legacy-owner','g-p-legacy-project',NULL)",
             [],
         ).unwrap();
-        store.apply_project_titles(
-            "chatgpt",
-            &current_scope,
-            &[ProjectTitle { source_id: "g-p-legacy-project".into(), title: Some("Verified sidebar name".into()) }],
-        ).unwrap();
+        store
+            .apply_project_titles(
+                "chatgpt",
+                &current_scope,
+                &[ProjectTitle {
+                    source_id: "g-p-legacy-project".into(),
+                    title: Some("Verified sidebar name".into()),
+                }],
+            )
+            .unwrap();
         let record: (String, String, Option<String>) = store.connection.query_row(
             "SELECT provider,account_scope,title FROM projects WHERE project_key='legacy-paseo-project'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
-        assert_eq!(record, ("paseo-chatgpt".into(), "paseo-cache:legacy-owner".into(), Some("Verified sidebar name".into())));
+        assert_eq!(
+            record,
+            (
+                "paseo-chatgpt".into(),
+                "paseo-cache:legacy-owner".into(),
+                Some("Verified sidebar name".into())
+            )
+        );
     }
 
     #[test]
@@ -2284,21 +2296,33 @@ mod project_and_search_tests {
         ).unwrap();
         store.migrate().unwrap();
 
-        store.apply_project_titles(
-            "chatgpt",
-            &format!("chatgpt:observed:{}", "d".repeat(64)),
-            &[ProjectTitle { source_id: source_id.into(), title: Some("Migrated project name".into()) }],
-        ).unwrap();
+        store
+            .apply_project_titles(
+                "chatgpt",
+                &format!("chatgpt:observed:{}", "d".repeat(64)),
+                &[ProjectTitle {
+                    source_id: source_id.into(),
+                    title: Some("Migrated project name".into()),
+                }],
+            )
+            .unwrap();
         let projects = store.projects_snapshot("chatgpt").unwrap();
         assert_eq!(projects.projects.len(), 1);
         assert_eq!(projects.projects[0]["title"], "Migrated project name");
         assert_eq!(projects.projects[0]["project_id"], source_id);
         assert_eq!(projects.projects[0]["conversation_count"], 1);
-        let identity: (String, String) = store.connection.query_row(
-            "SELECT provider,account_scope FROM projects WHERE source_id=?1", [source_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
-        assert_eq!(identity, ("paseo-chatgpt".into(), "paseo-cache:legacy-owner".into()));
+        let identity: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT provider,account_scope FROM projects WHERE source_id=?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            identity,
+            ("paseo-chatgpt".into(), "paseo-cache:legacy-owner".into())
+        );
     }
 
     #[test]
