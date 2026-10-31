@@ -10,8 +10,8 @@ on:
       - "src/**"
       - "frontend/**"
       - "desktop-ui/**"
-      - "package.json"
-      - "package-lock.json"
+      - "ci/**"
+      - "ci/actions/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -30,21 +30,108 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  map:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+  native-build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    outputs:
+      transport_digest: ${{ steps.native-build.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Map exact main merge to accepted PR artifacts
+      - name: Fetch exact protected-main revision
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 build/release_artifact.py promote --root "$GITHUB_WORKSPACE" --merge-sha "$GITHUB_SHA"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA" '+refs/heads/*:refs/remotes/origin/*'
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+      - id: native-build
+        name: Build and smoke the exact merged main commit
+        uses: ./ci/actions/macos-native-build
+        with:
+          publish-transport: 'true'
+  artifact-transfer:
+    needs: native-build
+    if: needs.native-build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: read
+      packages: read
+    steps:
+      - name: Fetch exact protected-main revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA" '+refs/heads/*:refs/remotes/origin/*'
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+      - name: Install pinned ORAS client
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash build/install-oras.sh "$RUNNER_TEMP/oras"
+      - name: Retrieve and verify exact main build transport
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSPORT_DIGEST: ${{ needs.native-build.outputs.transport_digest }}
+        run: |
+          set -euo pipefail
+          test "$TRANSPORT_DIGEST" != ""
+          owner="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')"
+          repository="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f2 | tr '[:upper:]' '[:lower:]')"
+          oras="$RUNNER_TEMP/oras/oras"
+          printf '%s' "$GH_TOKEN" | "$oras" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          "$oras" pull "ghcr.io/$owner/chat-hub-ci-$repository@$TRANSPORT_DIGEST" --output "$GITHUB_WORKSPACE/artifact-transport"
+          tar -xzf "$GITHUB_WORKSPACE/artifact-transport/chat-hub-transport.tar.gz" -C "$GITHUB_WORKSPACE/artifact-transport"
+          python3 - "$GITHUB_WORKSPACE/artifact-transport/transport.json" <<'PY'
+          import json, os, sys
+          data=json.load(open(sys.argv[1]))
+          expected={"repository": os.environ["GITHUB_REPOSITORY"].lower(), "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "sha": os.environ["GITHUB_SHA"]}
+          if data != expected:
+              raise SystemExit("OCI transport identity does not match this main workflow run")
+          PY
+      - name: Upload accepted main build input
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-native-release-main-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifact-transport/chat-hub-native-release-main-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 90
+      - name: Upload downloadable macOS build
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-macos-arm64
+          path: artifact-transport/chat-hub-macos-arm64
+          retention-days: 30
+  map:
+    needs: [native-build, artifact-transfer]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Fetch exact main revision and ancestry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA" '+refs/heads/*:refs/remotes/origin/*'
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+      - name: Map exact main merge to the trusted same-run native artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 build/release_artifact.py promote --root "$GITHUB_WORKSPACE" --merge-sha "$GITHUB_SHA" --mapping-run-id "$GITHUB_RUN_ID"
+      - uses: ./ci/actions/gha-artifact-upload
         with:
           name: chat-hub-accepted-native-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: accepted-native.json
-          if-no-files-found: error
           retention-days: 90

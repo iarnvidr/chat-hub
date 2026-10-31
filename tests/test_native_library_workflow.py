@@ -63,6 +63,16 @@ def parse_workflow_steps(text, job='package'):
     return steps
 
 
+def parse_composite_action_steps(text):
+    """Adapt composite-action steps to the strict workflow-step parser above."""
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line == '  steps:'), None)
+    if start is None:
+        raise ValueError('composite action has no runs.steps sequence')
+    normalized = '  package:\n    steps:\n' + '\n'.join('  ' + line for line in lines[start + 1:])
+    return parse_workflow_steps(normalized, 'package')
+
+
 def _assert_workflow_contract(test, steps, kind):
     def find(fragment):
         return next(i for i, step in enumerate(steps)
@@ -119,7 +129,12 @@ def _assert_workflow_contract(test, steps, kind):
 
 class NativeLibraryWorkflowTests(unittest.TestCase):
     def test_macos_opt_in_gate_has_correct_dependencies(self):
-        _assert_workflow_contract(self, parse_workflow_steps((ROOT / '.github/workflows/macos.yml').read_text()), 'macos')
+        action = (ROOT / 'ci/actions/macos-native-build/action.yml').read_text()
+        _assert_workflow_contract(self, parse_composite_action_steps(action), 'macos')
+        workflow = (ROOT / '.github/workflows/macos.yml').read_text()
+        gate = workflow.split('  native-release-gate:', 1)[1]
+        self.assertIn('needs: [scope, package-pr, package-main, artifact-transfer]', gate)
+        self.assertIn('test "$TRANSFER_RESULT" = success', gate)
 
     def test_release_gate_has_correct_dependencies(self):
         text = (ROOT / '.github/workflows/release.yml').read_text()
@@ -128,13 +143,13 @@ class NativeLibraryWorkflowTests(unittest.TestCase):
         signing = next(i for i, step in enumerate(steps) if 'signer sign' in step.get('run', ''))
         self.assertLess(retrieval, signing)
         self.assertFalse(any('cargo build' in step.get('run', '') for step in steps))
-        self.assertIn('needs: [prepare, qualify]', text)
+        self.assertIn('needs: [prepare, qualify, artifact-transfer]', text)
 
     def test_contract_rejects_debug_prepare_after_gate_and_wrong_artifact(self):
         import copy
         for kind, filename in (('macos', 'macos.yml'),):
             with self.subTest(workflow=kind):
-                original = parse_workflow_steps((ROOT / '.github/workflows' / filename).read_text())
+                original = parse_composite_action_steps((ROOT / 'ci/actions/macos-native-build/action.yml').read_text())
                 find = lambda fragment: next(i for i, step in enumerate(original) if fragment in step.get('name', '') or fragment in step.get('id', ''))
                 gate = find('native-library-smoke') if kind == 'macos' else find('Required native library persisted-data smoke')
                 prep = find('Prepare isolated debug bundle')

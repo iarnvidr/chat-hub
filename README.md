@@ -26,7 +26,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
 ```
 
-Capture defaults off. The desktop offers **Save live chats on this Mac**, with an explicit save and restart action. It stores a private preference in the app data directory and waits for the local writer to stop before restarting. For an explicit development override, use `CHAT_HUB_CAPTURE_ENABLED=true CHAT_HUB_CAPTURE_PROFILE_SCOPE=provisional:default npm run tauri -- dev`. An environment value overrides the saved preference. Request-local account claims are attributed to opaque scopes; real account-switch and restart acceptance remains pending. Captured snapshots include conversation content in the local library.
+Capture defaults off. The desktop offers **Save live chats on this Mac**, with an explicit save and restart action. It stores a private preference in the app data directory and waits for the local writer to stop before restarting. For an explicit development override, use `CHAT_HUB_CAPTURE_ENABLED=true CHAT_HUB_CAPTURE_PROFILE_SCOPE=provisional:default cargo tauri dev`. An environment value overrides the saved preference. Request-local account claims are attributed to opaque scopes; real account-switch and restart acceptance remains pending. Captured snapshots include conversation content in the local library.
 
 Set the following environment variables for the Rust CLI/service; the native desktop app shares only the capture opt-in and profile-scope settings above, and uses Tauri's platform app-data directory and explicit database/CA paths instead of the CLI/service path overrides:
 

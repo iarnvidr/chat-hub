@@ -16,7 +16,6 @@ root_manifest = root / "Cargo.toml"
 config = root / "src-tauri/tauri.conf.json"
 lock = root / "src-tauri/Cargo.lock"
 root_lock = root / "Cargo.lock"
-package = root / "package.json"
 s = manifest.read_text()
 rs = root_manifest.read_text()
 rs, rn = re.subn(r'(?m)^version = "[^"]+"$', f'version = "{version}"', rs, count=1)
@@ -28,9 +27,6 @@ manifest.write_text(s)
 cfg = json.loads(config.read_text())
 cfg["version"] = version
 config.write_text(json.dumps(cfg, indent=2) + "\n")
-pkg = json.loads(package.read_text())
-pkg["version"] = version
-package.write_text(json.dumps(pkg, separators=(",", ":")) + "\n")
 # Regenerate both workspace lockfiles in this disposable copy. Both packages
 # are path dependencies, so changing either version invalidates locked records.
 for lockfile in (root_lock, lock):

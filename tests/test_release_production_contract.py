@@ -9,7 +9,7 @@ class ProductionContract(unittest.TestCase):
     def test_ad_hoc_real_tauri_build(self):
         build = (ROOT / "build/build-native-macos.sh").read_text()
         config = (ROOT / "src-tauri/tauri.conf.json").read_text()
-        self.assertIn("npm run tauri -- build", build)
+        self.assertIn("cargo tauri build", build)
         self.assertIn("--target aarch64-apple-darwin --bundles app -- --locked", build)
         self.assertNotIn("build --locked", build)
         self.assertIn("--bundles app", build)
@@ -21,11 +21,62 @@ class ProductionContract(unittest.TestCase):
 
     def test_artifact_must_contain_real_outputs(self):
         workflow = (ROOT / ".github/workflows/macos.yml").read_text()
+        build = (ROOT / "ci/actions/macos-native-build/action.yml").read_text()
         self.assertIn("runs-on: macos-15", workflow)
         self.assertIn("name: chat-hub-macos-arm64", workflow)
-        self.assertIn("if-no-files-found: error", workflow)
+        self.assertIn("uses: ./ci/actions/gha-artifact-upload", workflow)
+        self.assertIn("artifact-transfer:", workflow)
+        self.assertIn('test "$TRANSFER_RESULT" = success', workflow)
         for entry in ("Chat Hub.app", "Chat_Hub_*.dmg", "verify-macos.txt"):
-            self.assertIn(entry, workflow)
+            self.assertIn(entry, build)
+
+    def test_node_free_artifact_transfer_keeps_pr_unprivileged_and_main_fail_closed(self):
+        workflow = (ROOT / ".github/workflows/macos.yml").read_text()
+        pr = workflow.split("  package-pr:\n", 1)[1].split("  package-main:\n", 1)[0]
+        main = workflow.split("  package-main:\n", 1)[1].split("  artifact-transfer:\n", 1)[0]
+        gate = workflow.split("  native-release-gate:\n", 1)[1]
+        self.assertIn("permissions:\n      contents: read", pr)
+        self.assertNotIn("packages: write", pr)
+        self.assertNotIn("GH_TOKEN:", pr)
+        self.assertNotIn("gha-artifact-upload", pr)
+        self.assertIn("publish-transport: 'false'", pr)
+        self.assertIn("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", main)
+        self.assertIn("packages: write", main)
+        self.assertIn("publish-transport: 'true'", main)
+        self.assertIn('test "$TRANSFER_RESULT" = success', gate)
+        self.assertIn('test "$TRANSFER_RESULT" = skipped', gate)
+
+    def test_main_acceptance_rebuilds_exact_sha_and_requires_transfer_before_mapping(self):
+        workflow = (ROOT / ".github/workflows/accept-native.yml").read_text()
+        self.assertIn('branches: [main]', workflow)
+        native = workflow.split("  native-build:\n", 1)[1].split("  artifact-transfer:\n", 1)[0]
+        transfer = workflow.split("  artifact-transfer:\n", 1)[1].split("  map:\n", 1)[0]
+        mapping = workflow.split("  map:\n", 1)[1]
+        self.assertIn("packages: write", native)
+        self.assertIn('checkout --quiet --detach "$GITHUB_SHA"', native)
+        self.assertIn('if: needs.native-build.result == \'success\'', transfer)
+        self.assertIn("chat-hub-native-release-main-${{ github.run_id }}-${{ github.run_attempt }}", transfer)
+        self.assertIn("needs: [native-build, artifact-transfer]", mapping)
+        self.assertIn('--mapping-run-id "$GITHUB_RUN_ID"', mapping)
+
+    def test_native_actions_trigger_main_acceptance_and_ship_in_corresponding_source(self):
+        native_scope = (ROOT / "build/native_scope.py").read_text()
+        acceptance = (ROOT / ".github/workflows/accept-native.yml").read_text()
+        sources = (ROOT / "build/release_sources.py").read_text()
+        self.assertIn("'ci/actions/**'", native_scope)
+        self.assertIn('"ci/actions/**"', acceptance)
+        self.assertIn('"ci/actions"', sources)
+        self.assertIn('".github/workflows"', sources)
+
+    def test_workflow_checkouts_fetch_the_immutable_event_sha(self):
+        files = [*ROOT.joinpath(".github/workflows").glob("*.yml"),
+                 *ROOT.joinpath("ci/actions").rglob("*.yml")]
+        for path in files:
+            with self.subTest(path=path.relative_to(ROOT)):
+                content = path.read_text()
+                self.assertNotIn('fetch --no-tags origin "$GITHUB_REF"', content)
+                if 'checkout --quiet --detach "$GITHUB_SHA"' in content:
+                    self.assertIn('fetch --no-tags origin "$GITHUB_SHA"', content)
 
     def test_protected_publish_stays_separate(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

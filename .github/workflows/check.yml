@@ -10,8 +10,19 @@ concurrency:
 jobs:
   contracts:
     runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - name: Fetch exact workflow revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
       - name: Python contract suites (tests and build helpers)
         uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
         with:
@@ -22,10 +33,9 @@ jobs:
       - name: Record the exact successful PR check receipt
         if: github.event_name == 'pull_request'
         run: python3 build/release_artifact.py check-receipt --root "$GITHUB_WORKSPACE"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: ./ci/actions/gha-artifact-upload
         if: github.event_name == 'pull_request'
         with:
           name: chat-hub-check-receipt-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/check-receipt.json
-          if-no-files-found: error
           retention-days: 90

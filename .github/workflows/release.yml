@@ -32,24 +32,33 @@ jobs:
       name: chat-hub-release
     runs-on: macos-15
     timeout-minutes: 90
+    outputs:
+      transport_digest: ${{ steps.publish-review-transport.outputs.digest }}
     permissions:
       contents: read
       actions: read
+      packages: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Fetch exact workflow revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA" '+refs/heads/*:refs/remotes/origin/*'
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
       - name: Verify exact protected-main and existing tag/version
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/main
           git check-ref-format "refs/tags/$INPUT_TAG"
-          git fetch --force origin main "refs/tags/$INPUT_TAG:refs/tags/$INPUT_TAG"
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            fetch --force origin main "refs/tags/$INPUT_TAG:refs/tags/$INPUT_TAG"
           test "$GITHUB_SHA" = "$(git rev-parse HEAD^{commit})"
           test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main^{commit})"
           test "$(git rev-parse "refs/tags/$INPUT_TAG^{commit}")" = "$GITHUB_SHA"
@@ -86,13 +95,14 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$TAURI_SIGNING_PRIVATE_KEY"
-          command -v npm >/dev/null
+          cargo install tauri-cli --version 2.12.4 --locked
+          cargo tauri --version
           brew install minisign
-          npx --yes @tauri-apps/cli@2.10.1 signer --help
+          cargo tauri signer --help
           cd "$RUNNER_TEMP/chat-hub"
           rm -f 'Chat-Hub.app.tar.gz' 'Chat-Hub.app.tar.gz.sig'
           tar -czf 'Chat-Hub.app.tar.gz' 'Chat Hub.app'
-          npx --yes @tauri-apps/cli@2.10.1 signer sign 'Chat-Hub.app.tar.gz'
+          cargo tauri signer sign 'Chat-Hub.app.tar.gz'
           test -s 'Chat-Hub.app.tar.gz.sig'
           python3 - "$GITHUB_WORKSPACE/src-tauri/tauri.conf.json" "$GITHUB_WORKSPACE/build/updater_release.py" <<'PY'
           import base64, importlib.util, json, pathlib, sys
@@ -115,33 +125,113 @@ jobs:
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${INPUT_TAG}/Chat-Hub.app.tar.gz"
           python3 build/updater_release.py generate "$INPUT_VERSION" "$url" "$(cat "$RUNNER_TEMP/chat-hub/Chat-Hub.app.tar.gz.sig")" "$RUNNER_TEMP/chat-hub/latest.json" --repo "$GITHUB_REPOSITORY" --tag "$INPUT_TAG"
           python3 build/updater_release.py validate "$RUNNER_TEMP/chat-hub/latest.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Stage protected release review artifacts
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/release-review-transport"
+          mkdir -p "$root/release-review"
+          cp "$RUNNER_TEMP"/chat-hub/Chat_Hub_*.dmg "$RUNNER_TEMP/chat-hub/Chat-Hub.app.tar.gz" \
+            "$RUNNER_TEMP/chat-hub/Chat-Hub.app.tar.gz.sig" "$RUNNER_TEMP/chat-hub/latest.json" \
+            "$RUNNER_TEMP/chat-hub/SHA256SUMS" "$RUNNER_TEMP/chat-hub/release-review.txt" \
+            "$RUNNER_TEMP/chat-hub/verify-macos.txt" "$RUNNER_TEMP/chat-hub/release-input.json" "$root/release-review/"
+          python3 - "$root/transport.json" <<'PY'
+          import json, os, sys
+          with open(sys.argv[1], "w") as f:
+              json.dump({"repository": os.environ["GITHUB_REPOSITORY"].lower(), "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "sha": os.environ["GITHUB_SHA"], "tag": os.environ["INPUT_TAG"]}, f, sort_keys=True)
+              f.write("\n")
+          PY
+          tar -czf "$RUNNER_TEMP/release-review-transport.tar.gz" -C "$root" .
+      - id: publish-review-transport
+        name: Publish protected review bundle by immutable OCI digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          oras_path="$(bash build/install-oras.sh "$RUNNER_TEMP/oras")"
+          printf '%s' "$GH_TOKEN" | "$oras_path" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          owner="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')"
+          repository="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f2 | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/$owner/chat-hub-ci-$repository"
+          reference="$image:release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          result="$("$oras_path" push "$reference" --artifact-type application/vnd.chat-hub.release-review.v1 \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --annotation "org.chat-hub.release.tag=$INPUT_TAG" \
+            "$RUNNER_TEMP/release-review-transport.tar.gz:application/vnd.chat-hub.release-review.v1.tar+gzip" --format json)"
+          digest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])' <<<"$result")"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+  artifact-transfer:
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: read
+      packages: read
+    steps:
+      - name: Fetch exact workflow revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+      - name: Install pinned ORAS client
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash build/install-oras.sh "$RUNNER_TEMP/oras"
+      - name: Retrieve and verify exact protected review transport
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRANSPORT_DIGEST: ${{ needs.prepare.outputs.transport_digest }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$TRANSPORT_DIGEST" != ""
+          owner="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')"
+          repository="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f2 | tr '[:upper:]' '[:lower:]')"
+          oras="$RUNNER_TEMP/oras/oras"
+          printf '%s' "$GH_TOKEN" | "$oras" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          "$oras" pull "ghcr.io/$owner/chat-hub-ci-$repository@$TRANSPORT_DIGEST" --output "$GITHUB_WORKSPACE/release-transport"
+          tar -xzf "$GITHUB_WORKSPACE/release-transport/release-review-transport.tar.gz" -C "$GITHUB_WORKSPACE/release-transport"
+          python3 - "$GITHUB_WORKSPACE/release-transport/transport.json" <<'PY'
+          import json, os, sys
+          data=json.load(open(sys.argv[1]))
+          expected={"repository": os.environ["GITHUB_REPOSITORY"].lower(), "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "sha": os.environ["GITHUB_SHA"], "tag": os.environ["INPUT_TAG"]}
+          if data != expected:
+              raise SystemExit("release review transport identity does not match this workflow run")
+          PY
+      - uses: ./ci/actions/gha-artifact-upload
         with:
           name: release-review-${{ inputs.tag }}
-          path: |
-            ${{ runner.temp }}/chat-hub/Chat_Hub_*.dmg
-            ${{ runner.temp }}/chat-hub/Chat-Hub.app.tar.gz
-            ${{ runner.temp }}/chat-hub/Chat-Hub.app.tar.gz.sig
-            ${{ runner.temp }}/chat-hub/latest.json
-            ${{ runner.temp }}/chat-hub/SHA256SUMS
-            ${{ runner.temp }}/chat-hub/release-review.txt
-            ${{ runner.temp }}/chat-hub/verify-macos.txt
-            ${{ runner.temp }}/chat-hub/release-input.json
-          if-no-files-found: error
+          path: release-transport/release-review
           retention-days: 30
   qualify:
-    needs: prepare
+    needs: [prepare, artifact-transfer]
     runs-on: macos-15
     timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-review-${{ inputs.tag }}
-          path: release-assets
+      - name: Fetch protected main source for qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin refs/heads/main
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach FETCH_HEAD
+      - name: Download exact release review artifact from this workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --name "release-review-${{ inputs.tag }}" --dir release-assets
       - name: Verify transformed archive and launch without signing or publication credentials
         run: |
           (cd release-assets && shasum -a 256 -c SHA256SUMS)
@@ -151,17 +241,18 @@ jobs:
           SMOKE_EVIDENCE_DIR="$RUNNER_TEMP/chat-hub-qualified-evidence" bash build/smoke-native-macos.sh "$target/Chat Hub.app"
   publish:
     if: github.ref == 'refs/heads/main' && inputs.publish
-    needs: [prepare, qualify]
+    needs: [prepare, qualify, artifact-transfer]
     environment:
       name: chat-hub-release
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-review-${{ inputs.tag }}
-          path: release-assets
+      - name: Download exact release review artifact from this workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --name "release-review-${{ inputs.tag }}" --dir release-assets
       - name: Upload only reviewed DMG and updater assets
         env:
           GH_TOKEN: ${{ github.token }}

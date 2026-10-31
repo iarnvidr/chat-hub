@@ -1,0 +1,19 @@
+name: Upload GitHub Actions artifact (Node-free)
+description: Upload a file or directory as a v4 workflow artifact without a Node runtime.
+inputs:
+  name:
+    description: Artifact name
+    required: true
+  path:
+    description: Workspace-relative file or directory to upload
+    required: true
+  retention-days:
+    description: Optional retention period in days
+    required: false
+  include-hidden-files:
+    description: Include dotfiles and files beneath hidden directories
+    required: false
+    default: 'false'
+runs:
+  using: docker
+  image: Dockerfile

@@ -9,13 +9,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORMAT = "chat-hub-corresponding-source-v1"
-EXCLUDED_DIRS = {".git", "target", "node_modules", ".tools", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "dist", "build-cache"}
+EXCLUDED_DIRS = {".git", "target", ".tools", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "dist", "build-cache"}
 
 
 def _source_files(root):
     """Enumerate allowlisted source inputs without following symlinks."""
-    roots = ["src", "src-tauri", "desktop-ui", "build"]
-    root_files = ["Cargo.toml", "Cargo.lock", "package.json", "package-lock.json", "LICENSE", "NOTICE", "rust-toolchain", "rust-toolchain.toml", "rust-toolchain.yaml", "README.md"]
+    roots = ["src", "src-tauri", "desktop-ui", "build", "ci/actions", ".github/workflows"]
+    root_files = ["Cargo.toml", "Cargo.lock", "LICENSE", "NOTICE", "rust-toolchain", "rust-toolchain.toml", "rust-toolchain.yaml", "README.md"]
     candidates = set(root_files)
     for directory in roots:
         base = root / directory

@@ -78,10 +78,7 @@ impl ChatgptHistoryState {
     }
 
     pub fn snapshot(&self) -> Result<ChatgptHistoryStatus, String> {
-        let _persist = self
-            .persist_lock
-            .lock()
-            .map_err(|_| "status_unavailable")?;
+        let _persist = self.persist_lock.lock().map_err(|_| "status_unavailable")?;
         let mut status = self
             .status
             .lock()
@@ -233,10 +230,14 @@ impl ChatgptHistoryState {
 }
 
 fn write_status_snapshot(destination: &Path, status: &ChatgptHistoryStatus) -> std::io::Result<()> {
-    let parent = destination.parent().ok_or_else(|| std::io::Error::other("missing status directory"))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing status directory"))?;
     let parent_metadata = fs::symlink_metadata(parent)?;
     if !parent_metadata.file_type().is_dir() {
-        return Err(std::io::Error::other("status directory is not a regular directory"));
+        return Err(std::io::Error::other(
+            "status directory is not a regular directory",
+        ));
     }
     #[cfg(unix)]
     {
@@ -249,7 +250,11 @@ fn write_status_snapshot(destination: &Path, status: &ChatgptHistoryStatus) -> s
         }
     }
     let sequence = NEXT_STATUS_TEMP.fetch_add(1, Ordering::Relaxed);
-    let staging = parent.join(format!(".{STATUS_FILE_NAME}.{}.{}.tmp", std::process::id(), sequence));
+    let staging = parent.join(format!(
+        ".{STATUS_FILE_NAME}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
     let result = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -309,7 +314,10 @@ mod status_snapshot_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         fs::remove_dir_all(root).unwrap();
     }

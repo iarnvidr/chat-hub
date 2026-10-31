@@ -281,7 +281,15 @@ impl ProviderViewState {
     /// Initialize the provider's own signed-in browser session in the hidden
     /// child webview. This never reveals the view or replaces a live page.
     pub fn prepare_session(&self) -> Result<bool, String> {
-        let mut inner = self.inner.lock().map_err(|_| "provider_unavailable".to_string())?;
+        #[cfg(feature = "native-smoke")]
+        if crate::smoke() && !self.direct_smoke_enabled {
+            // Ordinary isolated fixture runs must never contact the live site.
+            return Ok(false);
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "provider_unavailable".to_string())?;
         if !should_prepare_session(inner.navigated) {
             return Ok(false);
         }
@@ -623,8 +631,9 @@ impl ProviderViewState {
 mod target_url_tests {
     use super::{
         allowed_provider_navigation, current_chatgpt_conversation_id, exact_chatgpt_origin,
-        page_metadata_script, parse_page_metadata_callback, parse_probe_callback, target_url,
-        should_prepare_session, valid_observed_scope, ChatGptConnectionState, ProbePoll,
+        page_metadata_script, parse_page_metadata_callback, parse_probe_callback,
+        should_prepare_session, target_url, valid_observed_scope, ChatGptConnectionState,
+        ProbePoll,
     };
 
     #[test]

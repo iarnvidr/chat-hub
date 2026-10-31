@@ -1,0 +1,208 @@
+name: Build and verify Chat Hub for macOS
+description: Compile the native app and run the required Apple Silicon smokes.
+inputs:
+  publish-transport:
+    description: Publish a trusted-main build bundle for Linux artifact transfer.
+    required: false
+    default: 'false'
+outputs:
+  digest:
+    description: Immutable GHCR digest for the staged native artifact bundle.
+    value: ${{ steps.publish-transport.outputs.digest }}
+runs:
+  using: composite
+  steps:
+    - name: Install helper build tools
+      shell: bash
+      run: brew install meson ninja pkgconf
+    - name: Select the pinned Rust toolchain and preserve real homes for isolated smoke steps
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup show active-toolchain
+        echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+        echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+    - name: Install pinned native Tauri CLI
+      shell: bash
+      run: cargo install tauri-cli --version 2.12.4 --locked
+    - name: Early production Tauri compile gate
+      shell: bash
+      run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin
+    - name: Early native-smoke Tauri compile gate
+      shell: bash
+      run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets --target aarch64-apple-darwin --features native-smoke
+    - name: Build real Tauri app, ad-hoc signed (not notarized)
+      shell: bash
+      run: bash build/build-native-macos.sh "$RUNNER_TEMP/chat-hub"
+    - name: Build and mount-verify the DMG with corresponding sources
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 build/release_sources.py prepare "$RUNNER_TEMP/chat-hub/corresponding-source"
+        version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+        bash build/package-dmg.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$RUNNER_TEMP/chat-hub/corresponding-source" "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg"
+    - id: native-smoke-artifact
+      name: Resolve native-smoke Cargo artifact path
+      shell: bash
+      run: |
+        set -euo pipefail
+        binary="$(python3 build/native_smoke_artifact.py src-tauri/Cargo.toml)"
+        test -n "$binary"
+        echo "binary=$binary" >> "$GITHUB_OUTPUT"
+    - name: Compile native-smoke feature (required)
+      shell: bash
+      run: cargo check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
+    - name: Build debug binary for native UI interactions
+      shell: bash
+      run: cargo build --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin --features native-smoke
+    - id: prepare-debug-smoke
+      name: Prepare isolated debug bundle for native smokes
+      shell: bash
+      run: |
+        set -euo pipefail
+        app="$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app"
+        mkdir -p "$(dirname "$app")"
+        ditto "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$app"
+        exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+        debug_binary="${{ steps.native-smoke-artifact.outputs.binary }}"
+        test -x "$debug_binary"
+        cp "$debug_binary" "$app/Contents/MacOS/$exe"
+        test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "$exe"
+        cmp -s "$debug_binary" "$app/Contents/MacOS/$exe"
+        codesign --force --sign - "$app"
+        codesign --verify --deep --strict "$app"
+    - id: native-library-smoke
+      name: Required native library persisted-data smoke (debug bundle only)
+      shell: bash
+      env:
+        NATIVE_LIBRARY_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-library-evidence
+      run: |
+        set -euo pipefail
+        MUNINN_E2E_DIR="$(mktemp -d "$RUNNER_TEMP/chat-hub-native-library-e2e.XXXXXX")"
+        export MUNINN_E2E_DIR
+        mkdir -p "$NATIVE_LIBRARY_EVIDENCE_DIR"
+        home="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
+        if bash build/native-library-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$NATIVE_LIBRARY_EVIDENCE_DIR" --allow-default-app-data --disposable-home "$home"; then
+          echo "native library smoke: ran (success)" | tee -a "$GITHUB_STEP_SUMMARY"
+        else
+          rc=$?
+          echo "native library smoke: ran (failure, exit $rc)" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+        fi
+    - name: Required release app launch and localhost health smoke
+      shell: bash
+      env:
+        SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-release-evidence
+      run: bash build/smoke-native-macos.sh "$RUNNER_TEMP/chat-hub/Chat Hub.app"
+    - id: updater-smoke
+      if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
+      name: Native signed updater integration smoke (debug bundle)
+      shell: bash
+      env:
+        MUNINN_UPDATER_SMOKE_APP: ${{ runner.temp }}/chat-hub-debug-smoke/Chat Hub.app
+        MUNINN_UPDATER_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-updater-evidence
+      run: bash build/updater-smoke/run-macos.sh
+    - name: Required native launch, UI, API, update status, reopen, shutdown smoke (debug bundle)
+      shell: bash
+      env:
+        HOME: ${{ runner.temp }}/chat-hub-launch-home
+        RUSTUP_HOME: ${{ env.RUSTUP_HOME }}
+        CARGO_HOME: ${{ env.CARGO_HOME }}
+        NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-native-launch-evidence
+      run: |
+        set -uo pipefail
+        final_rc=1
+        for attempt in 1 2; do
+          evidence="$RUNNER_TEMP/chat-hub-native-launch-evidence/attempt-$attempt"
+          set +e
+          bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$evidence" basic
+          rc=$?
+          set -e
+          echo "Required native launch smoke attempt $attempt exit code: $rc; evidence: $evidence" | tee -a "$GITHUB_STEP_SUMMARY"
+          final_rc=$rc
+          if [ "$rc" -eq 0 ]; then break; fi
+        done
+        exit "$final_rc"
+    - name: Advisory provider proxy capture and denial smoke (debug bundle)
+      if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        HOME: ${{ runner.temp }}/chat-hub-provider-home
+        RUSTUP_HOME: ${{ env.RUSTUP_HOME }}
+        CARGO_HOME: ${{ env.CARGO_HOME }}
+        NATIVE_LAUNCH_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-provider-evidence
+      run: |
+        set +e
+        bash build/native-launch-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-provider-evidence" full
+        rc=$?
+        echo "::warning::Advisory provider proxy capture/denial smoke exited $rc; provider interception is not yet verified on macOS."
+        echo "Provider proxy capture/denial advisory exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+        exit 0
+    - name: Optional updater UI interaction smoke (debug bundle only)
+      if: ${{ !cancelled() && steps['prepare-debug-smoke'].outcome == 'success' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        NATIVE_UI_EVIDENCE_DIR: ${{ runner.temp }}/chat-hub-debug-ui-evidence
+      run: bash build/native-ui-smoke.sh "$RUNNER_TEMP/chat-hub-debug-smoke/Chat Hub.app" "$RUNNER_TEMP/chat-hub-debug-ui-evidence"
+    - name: Prepare allowlisted release and native smoke evidence
+      if: always()
+      shell: bash
+      run: |
+        args=()
+        args+=(--native-library-source "$RUNNER_TEMP/chat-hub-native-library-evidence")
+        python3 build/prepare-native-evidence.py "$RUNNER_TEMP/chat-hub-safe-evidence" "$RUNNER_TEMP/chat-hub-release-evidence" "$RUNNER_TEMP/chat-hub-native-launch-evidence" "$RUNNER_TEMP/chat-hub-debug-ui-evidence" "$RUNNER_TEMP/chat-hub-provider-evidence" "$RUNNER_TEMP/chat-hub-updater-evidence" "${args[@]}"
+    - name: Retain accepted native release input
+      if: ${{ inputs.publish-transport == 'true' }}
+      shell: bash
+      run: |
+        version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+        mkdir -p artifacts
+        ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/chat-hub/Chat Hub.app" "artifacts/Chat_Hub_${version}_macos-arm64.zip"
+        (cd artifacts && shasum -a 256 "Chat_Hub_${version}_macos-arm64.zip" > "Chat_Hub_${version}_macos-arm64.zip.sha256")
+        cp "$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg" artifacts/
+        python3 build/release_artifact.py receipt
+    - name: Stage immutable GitHub Packages transport archive
+      if: ${{ inputs.publish-transport == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        root="$RUNNER_TEMP/chat-hub-transport"
+        mkdir -p "$root/chat-hub-macos-release-evidence" "$root/chat-hub-macos-arm64" \
+          "$root/chat-hub-native-release-main-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        cp -R "$RUNNER_TEMP/chat-hub-safe-evidence/." "$root/chat-hub-macos-release-evidence/"
+        cp -R "$RUNNER_TEMP/chat-hub/Chat Hub.app" "$root/chat-hub-macos-arm64/"
+        cp -R "$RUNNER_TEMP/chat-hub-safe-evidence/." "$root/chat-hub-macos-arm64/"
+        cp "$RUNNER_TEMP"/chat-hub/Chat_Hub_*.zip "$RUNNER_TEMP"/chat-hub/Chat_Hub_*.zip.sha256 \
+          "$RUNNER_TEMP"/chat-hub/Chat_Hub_*.dmg "$RUNNER_TEMP/chat-hub/verify-macos.txt" \
+          "$root/chat-hub-macos-arm64/"
+        cp artifacts/* "$root/chat-hub-native-release-main-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
+        python3 - "$root/transport.json" <<'PY'
+        import json, os, sys
+        with open(sys.argv[1], "w") as f:
+            json.dump({"repository": os.environ["GITHUB_REPOSITORY"].lower(), "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "sha": os.environ["GITHUB_SHA"]}, f, sort_keys=True)
+            f.write("\n")
+        PY
+        tar -czf "$RUNNER_TEMP/chat-hub-transport.tar.gz" -C "$root" .
+    - id: publish-transport
+      name: Publish the build bundle by immutable OCI digest
+      if: ${{ inputs.publish-transport == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        oras_path="$(bash build/install-oras.sh "$RUNNER_TEMP/oras")"
+        printf '%s' "$GH_TOKEN" | "$oras_path" login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+        owner="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')"
+        repository="$(printf '%s' "$GITHUB_REPOSITORY" | cut -d/ -f2 | tr '[:upper:]' '[:lower:]')"
+        image="ghcr.io/$owner/chat-hub-ci-$repository"
+        reference="$image:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        result="$("$oras_path" push "$reference" --artifact-type application/vnd.chat-hub.ci-transport.v1 \
+          --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+          --annotation "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+          "$RUNNER_TEMP/chat-hub-transport.tar.gz:application/vnd.chat-hub.ci-transport.v1.tar+gzip" --format json)"
+        digest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])' <<<"$result")"
+        [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+        echo "digest=$digest" >> "$GITHUB_OUTPUT"

@@ -152,15 +152,15 @@ class LibrarySmokeDriverTests(unittest.TestCase):
             evidence=root/'evidence'; data=root/'Library/Application Support/example.app'; data.parent.mkdir(parents=True); data_expected=str(data.resolve()); data=data
             (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable':'app','CFBundleIdentifier':'example.app','CFBundleShortVersionString':'1.2'}))
             e2e=root/'e2e'; e2e.mkdir(); env={'MUNINN_E2E_DIR':str(e2e)}
-            service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary)}
-            state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary),'window_visible':True}
+            service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary.resolve())}
+            state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary.resolve()),'window_visible':True}
             calls=[]; counts={'state':0,'list':0,'service':0,'launch':0,'reader':0}
             def request(_e2e,op,**kw):
                 calls.append((op,kw.get('js','')))
                 if op=='state':
                     counts['state']+=1; return state(101 if counts['launch']<3 else 202)
                 if op=='default_data_info':
-                    data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('fresh-token'); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':str(data),'platform_default_data_dir':str(data)}
+                    data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('fresh-token'); resolved=str(data.resolve()); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':resolved,'platform_default_data_dir':resolved}
                 if op=='import_library_fixture': return {'ok':True,'receipt':{'imported':1,'updated':0,'unchanged':0,'failed':0,'errors_truncated':False}}
                 js=kw.get('js','')
                 if 'service_info' in js:
@@ -196,15 +196,15 @@ class LibrarySmokeDriverTests(unittest.TestCase):
             evidence=root/'evidence'; data=root/'Library/Application Support/example.app'; data.parent.mkdir(parents=True); data_expected=str(data.resolve()); data=data
             (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable':'app','CFBundleIdentifier':'example.app','CFBundleShortVersionString':'1.2'}))
             e2e=root/'e2e'; e2e.mkdir(); env={'MUNINN_E2E_DIR':str(e2e)}
-            service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary)}
-            state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary),'window_visible':True}
+            service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary.resolve())}
+            state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary.resolve()),'window_visible':True}
             calls=[]; counts={'state':0,'list':0,'service':0,'launch':0,'reader':0}
             def request(_e2e,op,**kw):
                 calls.append((op,kw.get('js','')))
                 if op=='state':
                     counts['state']+=1; return state(101 if counts['launch']<3 else 202)
                 if op=='default_data_info':
-                    data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('fresh-token'); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':str(data),'platform_default_data_dir':str(data)}
+                    data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('fresh-token'); resolved=str(data.resolve()); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':resolved,'platform_default_data_dir':resolved}
                 if op=='import_library_fixture': return {'ok':True,'receipt':{'imported':1,'updated':0,'unchanged':0,'failed':0,'errors_truncated':False}}
                 js=kw.get('js','')
                 if 'service_info' in js:
@@ -250,15 +250,15 @@ class LibrarySmokeDriverTests(unittest.TestCase):
             evidence=root/'evidence'; data=root/'Library/Application Support/example.app'; data.parent.mkdir(parents=True); data_expected=str(data.resolve()); data=data
             (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable':'app','CFBundleIdentifier':'example.app','CFBundleShortVersionString':'1.2'}))
             e2e=root/'e2e'; e2e.mkdir(); env={'MUNINN_E2E_DIR':str(e2e)}
-            service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary)}
-            state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary),'window_visible':True}
+            service=lambda pid,port:{'api':f'http://127.0.0.1:{port}','proxy':f'http://127.0.0.1:{port+1}','pid':pid,'version':'1.2','executable':str(binary.resolve())}
+            state=lambda pid:{'process_id':pid,'version':'1.2','executable_path':str(binary.resolve()),'window_visible':True}
             calls=[]; counts={'state':0,'list':0,'service':0,'launch':0,'reader':0}
             def request(_e2e,op,**kw):
                 calls.append((op,kw.get('js','')))
                 if op=='state':
                     counts['state']+=1; return state(101 if counts['launch']<3 else 202)
                 if op=='default_data_info':
-                    data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('fresh-token'); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':str(data),'platform_default_data_dir':str(data)}
+                    data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('fresh-token'); resolved=str(data.resolve()); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':resolved,'platform_default_data_dir':resolved}
                 if op=='import_library_fixture': return {'ok':True,'receipt':{'imported':1,'updated':0,'unchanged':0,'failed':0,'errors_truncated':False}}
                 js=kw.get('js','')
                 if 'service_info' in js:
@@ -316,15 +316,15 @@ class LibrarySmokeDriverTests(unittest.TestCase):
             evidence=root/'evidence'; e2e=root/'e2e'; e2e.mkdir()
             (app/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable':'app','CFBundleIdentifier':'example.app','CFBundleShortVersionString':'1.2'}))
             def req(_e2e,op,**kw):
-                if op=='state': return {'process_id':333,'version':'1.2','executable_path':str(binary),'window_visible':True}
-                if op=='eval' and 'service_info' in kw.get('js',''): return {'api':'http://127.0.0.1:4100','proxy':'127.0.0.1:4101','pid':333,'version':'1.2','executable':str(binary)}
+                if op=='state': return {'process_id':333,'version':'1.2','executable_path':str(binary.resolve()),'window_visible':True}
+                if op=='eval' and 'service_info' in kw.get('js',''): return {'api':'http://127.0.0.1:4100','proxy':'127.0.0.1:4101','pid':333,'version':'1.2','executable':str(binary.resolve())}
                 if op=='eval' and 'service_health' in kw.get('js',''): return {'healthy':True}
                 if op=='eval' and 'list_conversations' in kw.get('js',''): return {'library_revision':1,'items':[]}
-                if op=='eval' and 'service_info' in kw.get('js',''): return {'api':'http://127.0.0.1:4100','proxy':'127.0.0.1:4101','pid':333,'version':'1.2','executable':str(binary)}
+                if op=='eval' and 'service_info' in kw.get('js',''): return {'api':'http://127.0.0.1:4100','proxy':'127.0.0.1:4101','pid':333,'version':'1.2','executable':str(binary.resolve())}
                 if op=='import_library_fixture': return {'ok':True,'receipt':{'imported':0,'updated':0,'unchanged':0,'failed':0,'errors_truncated':False}}
                 if op=='default_data_info':
                     data=root/'Library/Application Support/example.app'; data.mkdir(parents=True,exist_ok=True); (data/'service.token').write_text('token')
-                    return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':str(data),'platform_default_data_dir':str(data)}
+                    resolved=str(data.resolve()); return {'ok':True,'data_dir_source':'platform_default','configured_matches_platform_default':True,'configured_data_dir':resolved,'platform_default_data_dir':resolved}
                 if op=='eval': raise AssertionError(kw.get('js'))
                 raise AssertionError(op)
             class Proc:
