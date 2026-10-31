@@ -3,28 +3,51 @@ import {branchChoices,orderedMessages,messageText,hasUnsupportedContent,renderMa
 import {updateStatus} from './status.js';
 import {createConversationTabs, findCapturedChatRecord} from './conversation-tabs.js';
 import {chatgptConversationId} from './continuation.js';
-const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';const adapter=fixture?fixtureAdapter():{async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value});},async getConversation(id,leafNodeId){return invoke('get_conversation',leafNodeId!==undefined?{id,leafNodeId}:{id});},async importChatgptExport(){return invoke('import_chatgpt_export');}};$('fixture-banner').hidden=!fixture;let selected=null,conversation=null,items=[],timer,queryToken=0,readerToken=0,cursor=null,revision=null,queryValue='',cursorRetry=false,lastConversationButton=null,liveDraftSequence=0;const errText=e=>String(e?.message||e);const safeError=code=>({invalid_request:'The request was invalid.',invalid_cursor:'The page cursor is invalid.',stale_cursor:'The library changed; restart the search.',library_changed:'The library changed; restart the search.',unauthorized:'Sign in to the desktop service.',not_found:'The requested conversation was not found.',service_unavailable:'The desktop service is unavailable.',busy:'The desktop service is busy.',response_too_large:'This conversation is too large to display (8 MiB response limit). No content has been truncated.'}[code]||'The desktop service returned an error.');function showError(s){$('list-state').textContent=s;}
+import {groupSearchConversations, appendSearchHighlight} from './search.js';
+const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';
+const adapter=fixture?fixtureAdapter():{
+  async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value,projectKey:$('project-filter').value||null});},
+  async getConversation(id,leafNodeId){return invoke('get_conversation',leafNodeId!==undefined?{id,leafNodeId}:{id});},
+  async importChatgptExport(){return invoke('import_chatgpt_export');}
+};
+$('fixture-banner').hidden=!fixture;let selected=null,conversation=null,items=[],timer,queryToken=0,readerToken=0,cursor=null,revision=null,queryValue='',cursorRetry=false,lastConversationButton=null,liveDraftSequence=0;const errText=e=>String(e?.message||e);const safeError=code=>({invalid_request:'The request was invalid.',invalid_cursor:'The page cursor is invalid.',stale_cursor:'The library changed; restart the search.',library_changed:'The library changed; restart the search.',unauthorized:'Sign in to the desktop service.',not_found:'The requested conversation was not found.',service_unavailable:'The desktop service is unavailable.',busy:'The desktop service is busy.',response_too_large:'This conversation is too large to display (8 MiB response limit). No content has been truncated.'}[code]||'The desktop service returned an error.');function showError(s){$('list-state').textContent=s;}
 function providerLabel(provider) {
   return {'chatgpt':'ChatGPT', 'paseo-chatgpt':'ChatGPT · imported', 'paseo-codex_local':'Codex local · imported', 'paseo-codex_cloud':'Codex cloud · imported'}[provider] || provider || 'Unknown provider';
+}
+const projectNames = new Map();
+function projectLabel(project) {
+  return project.title || projectNames.get(project.project_key) || 'Project name pending';
 }
 function drawList() {
   const box = $('conversation-list');
   box.replaceChildren();
   $('load-more').hidden = !cursor;
-  for (const c of items) {
+  const displayed = queryValue ? groupSearchConversations(items) : items;
+  if (queryValue && displayed.length) showError(`${displayed.length} chat${displayed.length === 1 ? '' : 's'}${cursor ? ' · more results available' : ''}`);
+  for (const c of displayed) {
     const button = document.createElement('button');
     button.className = 'conversation-item' + (c.id === selected ? ' selected' : '');
     button.type = 'button';
     button.title = c.title || 'Untitled conversation';
     const title = document.createElement('strong'), metadata = document.createElement('span');
-    title.textContent = c.title ?? 'Untitled conversation';
+    if (queryValue) appendSearchHighlight(title, c.title ?? 'Untitled conversation', queryValue);
+    else title.textContent = c.title ?? 'Untitled conversation';
     metadata.textContent = providerLabel(c.provider);
-    metadata.hidden = $('history-source').value === 'chatgpt' && !c.search_hit;
+    metadata.hidden = $('history-source').value === 'chatgpt';
     if (!c.provider?.startsWith('paseo-') && Number.isFinite(c.message_count)) metadata.textContent += ` · ${c.message_count} messages`;
     button.append(title, metadata);
+    if (c.project) {
+      const project = document.createElement('span'); project.className = 'project-label';
+      project.textContent = projectLabel(c.project);
+      project.title = c.project.title || 'Project name has not synced yet'; button.append(project);
+    }
     if (c.search_hit) {
       const snippet = document.createElement('span');
-      snippet.className = 'search-snippet'; snippet.textContent = c.snippet || ''; button.append(snippet);
+      snippet.className = 'search-snippet'; appendSearchHighlight(snippet, c.snippet || '', queryValue); button.append(snippet);
+      if (c.matched_message_count > 1) {
+        const count = document.createElement('span'); count.className = 'search-match-count';
+        count.textContent = `${c.matched_message_count} matching messages`; button.append(count);
+      }
     }
     button.addEventListener('click', () => openConversation(c.id, c.search_leaf_node_id, c.search_node_id));
     box.append(button);
@@ -151,12 +174,49 @@ async function rereadSelected() {
     undefined, {focus: false, selectTab: false});
 }
 window.addEventListener('chat-hub:history-updated', async () => {
+  await loadProjects();
   await loadList($('search').value, true);
   const tab = conversationTabs.selected();
   if (tab?.mode === 'live') reconcileLiveTab(tab);
   await rereadSelected();
 });
+for (const [id, source] of [['source-chat', 'chatgpt'], ['source-codex', 'codex']]) {
+  $(id).addEventListener('click', () => {
+    if ($('history-source').value === source) return;
+    $('history-source').value = source;
+    $('source-chat').setAttribute('aria-pressed', String(source === 'chatgpt'));
+    $('source-codex').setAttribute('aria-pressed', String(source === 'codex'));
+    $('project-filter').value = '';
+    loadProjects();
+    loadList($('search').value, true);
+  });
+}
 $('history-source').addEventListener('change', () => loadList($('search').value, true));
+$('project-filter').addEventListener('change', () => loadList($('search').value, true));
+let projectsRequest = 0;
+async function loadProjects() {
+  if (!native) return;
+  const token = ++projectsRequest, source = $('history-source').value;
+  try {
+    const response = await invoke('list_projects', {source});
+    if (token !== projectsRequest || source !== $('history-source').value || !Array.isArray(response?.projects)) return;
+    const select = $('project-filter'), selectedProject = select.value;
+    projectNames.clear();
+    select.replaceChildren();
+    const all = document.createElement('option'); all.value = ''; all.textContent = 'All projects'; select.append(all);
+    for (const [index, project] of response.projects.entries()) {
+      const option = document.createElement('option'); option.value = project.project_key;
+      const label = project.title || `Unnamed project ${index + 1}`;
+      projectNames.set(project.project_key, label);
+      option.textContent = `${label} (${project.conversation_count})`;
+      option.selected = option.value === selectedProject; select.append(option);
+    }
+    if (selectedProject && response.projects.some(project => project.project_key === selectedProject)) select.value = selectedProject;
+    drawList();
+    if (conversation?.conversation?.project) $('reader-project').textContent = projectLabel(conversation.conversation.project);
+  } catch { /* Saved chats remain usable while project metadata is unavailable. */ }
+}
+loadProjects();
 function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   const focus = options.focus !== false;
   if (focus) window.dispatchEvent(new Event('chat-hub:show-local'));
@@ -172,12 +232,16 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   $('account-attribution').textContent = '';
   $('messages').replaceChildren();
   $('continue-chatgpt').hidden = true;
+  $('reader-project').hidden = true;
   adapter.getConversation(id, leafNodeId).then(c => {
     if(token!==readerToken)return;
     if (c?.conversation?.id !== id) throw Error('not_found');
     conversation = {...c.conversation, ...c, selected_node_id: c.selection?.selected_node_id};
     $('continue-chatgpt').hidden = !chatgptConversationId(c.conversation);
     $('title').textContent = c.conversation?.title ?? 'Untitled conversation';
+    const project = c.conversation?.project;
+    $('reader-project').hidden = !project;
+    $('reader-project').textContent = project ? projectLabel(project) : '';
     conversationTabs.update(options.tabId || id, {title: $('title').textContent});
     $('provider').textContent = providerLabel(c.conversation?.provider);
     const scope = c.conversation?.account_scope;
@@ -187,7 +251,7 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
     const select = $('branch');
     const cachedTranscript = c.conversation?.provider?.startsWith('paseo-');
     select.closest('label').hidden = !!cachedTranscript;
-    if (cachedTranscript) $('account-attribution').textContent = 'Saved Paseo transcript. Alternate branches were not stored in this cache.';
+    if (cachedTranscript) $('account-attribution').textContent = 'Saved copy · read offline or continue this chat in ChatGPT';
     select.replaceChildren();
     for (const n of branchChoices(c)) {
       const option = document.createElement('option');

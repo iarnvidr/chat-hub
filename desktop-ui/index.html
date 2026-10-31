@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="./styles.css">
   <link rel="stylesheet" href="./update-menu.css">
   <link rel="stylesheet" href="./library-layout.css">
+  <link rel="stylesheet" href="./markdown.css">
 </head>
 <body>
   <div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
@@ -15,7 +16,9 @@
     <aside class="list-pane" aria-label="Conversation library">
       <div class="sidebar-heading"><a class="brand" href="#">Chat Hub</a><button id="show-chatgpt" class="primary" type="button">New chat</button></div>
       <label class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Search conversations</span><input id="search" type="search" placeholder="Search chats" autocomplete="off"></label>
-      <label class="history-source"><span class="sr-only">Show</span><select id="history-source" aria-label="History source"><option value="chatgpt" selected>ChatGPT conversations</option><option value="all">All saved conversations</option></select></label>
+      <div class="source-toggle" role="group" aria-label="Conversation source"><button id="source-chat" type="button" aria-pressed="true" data-source="chatgpt">Chat</button><button id="source-codex" type="button" aria-pressed="false" data-source="codex">Codex</button></div>
+      <select id="history-source" aria-label="History source" hidden><option value="chatgpt" selected>Chat</option><option value="codex">Codex</option></select>
+      <label class="project-filter"><span class="sr-only">Filter by project</span><select id="project-filter" aria-label="Filter by project"><option value="">All projects</option></select></label>
       <div id="list-state" class="subtle" role="status" aria-live="polite"></div>
       <div class="list-scroll"><div id="conversation-list" class="conversation-list"></div><button id="load-more" type="button" hidden>Load more</button></div>
       <footer class="sidebar-footer"><button id="show-settings" type="button"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 3-.5 2-2 1-2-.5-2 3 1.5 1.5v3L2.5 15l2 3 2-.5 2 1L9 21h4l.5-2.5 2-1 2 .5 2-3-1.5-2v-3L19.5 8l-2-3-2 .5-2-1L13 3Z"/><circle cx="11" cy="12" r="3"/></svg>Settings</button><button id="workspace-sync-state" type="button" aria-label="History sync details" aria-live="polite">Saved on this Mac</button></footer>
@@ -26,8 +29,8 @@
         <section id="library-reader" class="reader-pane" aria-label="Saved conversation">
           <div id="reader-empty" class="reader-empty"><h1>Pick up a conversation</h1><p>Open a chat from your history, or start something new.</p><button class="primary" type="button" data-library-action="show-chatgpt">New chat</button></div>
           <div id="reader" hidden>
-            <div class="reader-head"><button id="back-to-library" type="button" aria-label="Back to library">Back</button><div class="reader-heading"><div id="provider" class="eyebrow"></div><h1 id="title"></h1><p id="account-attribution" class="subtle"></p></div><label class="branch-label">Branch<select id="branch"></select></label></div>
-            <div class="reader-tools" role="search" aria-label="Find in this branch"><input id="branch-find" type="search" placeholder="Find in this chat…" aria-label="Find in this branch"><span id="branch-find-count" role="status" aria-live="polite"></span><button id="branch-find-prev" type="button" aria-label="Previous match" disabled>↑</button><button id="branch-find-next" type="button" aria-label="Next match" disabled>↓</button><button id="copy-branch" type="button">Copy branch</button><button id="continue-chatgpt" type="button" hidden>Continue in ChatGPT</button></div>
+            <div class="reader-head"><button id="back-to-library" type="button" aria-label="Back to library">Back</button><div class="reader-heading"><div id="provider" class="eyebrow"></div><h1 id="title"></h1><p id="account-attribution" class="subtle"></p><span id="reader-project" class="project-label" hidden></span></div><button id="continue-chatgpt" class="primary" type="button" hidden>Continue chat</button><label class="branch-label">Branch<select id="branch"></select></label></div>
+            <div class="reader-tools" role="search" aria-label="Find in this branch"><input id="branch-find" type="search" placeholder="Find in this chat…" aria-label="Find in this branch"><span id="branch-find-count" role="status" aria-live="polite"></span><button id="branch-find-prev" type="button" aria-label="Previous match" disabled>↑</button><button id="branch-find-next" type="button" aria-label="Next match" disabled>↓</button><button id="copy-branch" type="button">Copy branch</button></div>
             <div id="messages" class="messages"></div>
           </div>
         </section>

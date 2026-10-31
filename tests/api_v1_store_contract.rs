@@ -59,7 +59,7 @@ fn bounded_list_returns_summaries_even_when_detail_exceeds_budget() {
     assert_eq!(page.items.len(), 1);
     assert_eq!(
         page.items[0].as_object().unwrap().len(),
-        6,
+        7,
         "bounded list must select summary columns, never a full graph DTO"
     );
     assert!(page.items[0].get("nodes").is_none() && page.items[0].get("messages").is_none());

@@ -120,7 +120,19 @@ fn lower_hex(value: &str, exact_len: usize) -> bool {
 }
 
 fn validate_chunk(value: &Value) -> Result<ChunkMeta, String> {
-    if value.as_object().is_none_or(|object| object.len() != 5) {
+    const FIELDS: &[&str] = &[
+        "sequence",
+        "owner",
+        "account_scope",
+        "format",
+        "conversations",
+        "project_catalog",
+        "conversation_projects",
+    ];
+    if value
+        .as_object()
+        .is_none_or(|object| object.keys().any(|key| !FIELDS.contains(&key.as_str())))
+    {
         return Err("browser_history_invalid_chunk".into());
     }
     let sequence = value
@@ -151,7 +163,11 @@ fn validate_chunk(value: &Value) -> Result<ChunkMeta, String> {
             .strip_prefix("chatgpt:observed:")
             .is_some_and(|digest| lower_hex(digest, 64))
         || format != "chat-hub-history-v1"
-        || conversations.is_empty()
+        || (conversations.is_empty()
+            && value
+                .get("conversation_projects")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty))
         || conversations.len() > 1000
         || conversations
             .iter()
@@ -159,6 +175,15 @@ fn validate_chunk(value: &Value) -> Result<ChunkMeta, String> {
         || chunk_bytes > MAX_CHUNK_BYTES
     {
         return Err("browser_history_invalid_chunk".into());
+    }
+    for field in ["project_catalog", "conversation_projects"] {
+        if value.get(field).is_some_and(|v| {
+            v.as_array().is_none_or(|items| {
+                items.len() > 1000 || items.iter().any(|item| !item.is_object())
+            })
+        }) {
+            return Err("browser_history_invalid_chunk".into());
+        }
     }
     Ok(ChunkMeta {
         sequence,
@@ -586,6 +611,15 @@ mod tests {
         assert!(validate_chunk(&bad_scope).is_err());
         let mut empty = chunk(1);
         empty["conversations"] = json!([]);
+        assert!(validate_chunk(&empty).is_err());
+        empty["project_catalog"] = json!([{"id":"project-a","title":"Research"}]);
+        empty["conversation_projects"] =
+            json!([{"conversation_id":"chat-a","project_id":"project-a"}]);
+        assert_eq!(validate_chunk(&empty).unwrap().conversations, 0);
+        empty["conversation_projects"] = json!("not-an-array");
+        assert!(validate_chunk(&empty).is_err());
+        empty["conversation_projects"] = json!([{}]);
+        empty["unexpected"] = json!(true);
         assert!(validate_chunk(&empty).is_err());
     }
 

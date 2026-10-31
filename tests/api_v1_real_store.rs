@@ -119,6 +119,7 @@ async fn import_list_search_anchor_and_view_only_branch_use_real_store() {
     let id = list["items"][0]["id"].as_str().unwrap();
     assert_ne!(id, "one");
     assert_eq!(list["items"][0].as_object().unwrap().len(), 6);
+    assert_eq!(list["items"][0]["project"], Value::Null);
     let path = format!("/api/v1/conversations/{id}");
     let (status, detail) = request(&app, &path, None).await;
     assert_eq!(status, StatusCode::OK, "{detail}");

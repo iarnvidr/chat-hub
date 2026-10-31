@@ -164,7 +164,90 @@ pub fn import_chatgpt_history(
     {
         return Err(invalid());
     }
-    import_scoped(store, bytes, scope, "chatgpt-history-v1", false)
+    let catalog = match envelope.get("project_catalog") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items.clone(),
+        _ => return Err(invalid()),
+    };
+    let memberships = match envelope.get("conversation_projects") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items.clone(),
+        _ => return Err(invalid()),
+    };
+    if catalog.len() > MAX_ENTRIES || memberships.len() > MAX_ENTRIES {
+        return Err(invalid());
+    }
+    let mut titles = std::collections::HashMap::<String, Option<String>>::new();
+    for project in catalog {
+        let Some(id) = project
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 256)
+        else {
+            return Err(invalid());
+        };
+        let title = match project.get("title") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(title)) if title.len() <= 4096 => {
+                let title = title.trim();
+                (!title.is_empty()).then(|| title.to_owned())
+            }
+            _ => return Err(invalid()),
+        };
+        if titles.insert(id.to_owned(), title).is_some() {
+            return Err(invalid());
+        }
+    }
+    let mut mappings = Vec::<crate::store::ProjectMembership>::new();
+    let mut seen = std::collections::HashSet::new();
+    for membership in memberships {
+        let Some(source_id) = membership
+            .get("conversation_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 512)
+        else {
+            return Err(invalid());
+        };
+        let project_id = match membership.get("project_id") {
+            Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() && id.len() <= 256 => Some(id.clone()),
+            _ => return Err(invalid()),
+        };
+        if !seen.insert(source_id.to_owned()) {
+            return Err(invalid());
+        }
+        if project_id
+            .as_ref()
+            .is_some_and(|id| !titles.contains_key(id))
+        {
+            return Err(invalid());
+        }
+        mappings.push(crate::store::ProjectMembership {
+            source_id: source_id.to_owned(),
+            project_id,
+            title: None,
+        });
+    }
+    for mapping in &mut mappings {
+        mapping.title = mapping
+            .project_id
+            .as_ref()
+            .and_then(|id| titles.get(id))
+            .and_then(Clone::clone);
+    }
+    let receipt = if envelope
+        .get("conversations")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.is_empty())
+    {
+        ImportReceipt::default()
+    } else {
+        import_scoped(store, bytes, scope, "chatgpt-history-v1", false)?
+    };
+    store
+        .apply_project_memberships("chatgpt", scope, &mappings)
+        .map_err(|_| invalid())?;
+    Ok(receipt)
 }
 
 fn import_scoped(
@@ -303,4 +386,96 @@ fn normalize_paseo_cached_transcript(
     observation.url = doc.get("url").and_then(Value::as_str).map(str::to_owned);
     observation.completeness = "cached_transcript".into();
     Ok(observation)
+}
+
+#[cfg(test)]
+mod project_metadata_import_tests {
+    use super::*;
+
+    fn seed(store: &mut crate::store::Store, source_id: &str) {
+        let scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        store
+            .ingest_observation(&crate::store::Observation {
+                provider: "chatgpt".into(),
+                account_scope: scope,
+                source_id: source_id.into(),
+                title: "Seed conversation".into(),
+                url: None,
+                current_node: None,
+                graph: vec![],
+                raw_payload: Value::Null,
+                source_time: None,
+                observed_ms: 1,
+                parser: "test".into(),
+                completeness: "complete".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn metadata_only_envelope_updates_project_and_revision_without_graph_import() {
+        let mut store = crate::store::Store::in_memory().unwrap();
+        seed(&mut store, "existing");
+        let scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        let body = serde_json::json!({
+            "format":"chat-hub-history-v1", "account_scope":scope, "conversations":[],
+            "project_catalog":[{"id":"project-1","title":"Project title"}],
+            "conversation_projects":[{"conversation_id":"existing","project_id":"project-1"}]
+        });
+        let before = store.library_revision().unwrap();
+        let receipt =
+            import_chatgpt_history(&mut store, &serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(
+            receipt.imported + receipt.updated + receipt.unchanged + receipt.failed,
+            0
+        );
+        assert!(store.library_revision().unwrap() > before);
+        let projects = store.projects_snapshot("chatgpt").unwrap();
+        assert_eq!(projects.projects[0]["title"], "Project title");
+        assert_eq!(projects.projects[0]["conversation_count"], 1);
+    }
+
+    #[test]
+    fn metadata_only_unknown_target_rolls_back_every_mapping() {
+        let mut store = crate::store::Store::in_memory().unwrap();
+        seed(&mut store, "existing");
+        let scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        let body = serde_json::json!({
+            "format":"chat-hub-history-v1", "account_scope":scope, "conversations":[],
+            "project_catalog":[{"id":"project-1","title":"Project title"}],
+            "conversation_projects":[{"conversation_id":"existing","project_id":"project-1"},{"conversation_id":"missing","project_id":"project-1"}]
+        });
+        assert!(import_chatgpt_history(&mut store, &serde_json::to_vec(&body).unwrap()).is_err());
+        assert!(store
+            .projects_snapshot("chatgpt")
+            .unwrap()
+            .projects
+            .is_empty());
+    }
+
+    #[test]
+    fn project_metadata_rejects_wrong_shapes_missing_id_and_bad_titles() {
+        let mut store = crate::store::Store::in_memory().unwrap();
+        let scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        let base = serde_json::json!({"format":"chat-hub-history-v1","account_scope":scope,"conversations":[]});
+        for (field, value) in [
+            ("project_catalog", serde_json::json!(true)),
+            ("conversation_projects", serde_json::json!("bad")),
+            (
+                "project_catalog",
+                serde_json::json!([{"id":"p","title":17}]),
+            ),
+            (
+                "conversation_projects",
+                serde_json::json!([{"conversation_id":"c"}]),
+            ),
+        ] {
+            let mut envelope = base.clone();
+            envelope[field] = value;
+            assert!(
+                import_chatgpt_history(&mut store, &serde_json::to_vec(&envelope).unwrap())
+                    .is_err()
+            );
+        }
+    }
 }

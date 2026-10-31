@@ -417,20 +417,32 @@ async fn list_conversations(
     query: String,
     cursor: Option<String>,
     source: Option<String>,
+    project_key: Option<String>,
 ) -> Result<desktop_api::Page, String> {
     authorize_local_main(&window)?;
     match source.as_deref() {
-        None | Some("all") | Some("chatgpt") => {}
+        None | Some("all") | Some("chatgpt") | Some("codex") => {}
         _ => return Err("invalid_source".into()),
     }
-    desktop_api::list_in_source(
+    desktop_api::list_in_scope(
         &s.api,
         &s.token,
         &query,
         cursor.as_deref(),
         source.as_deref(),
+        project_key.as_deref(),
     )
     .await
+}
+#[tauri::command]
+async fn list_projects(
+    window: tauri::Webview,
+    s: State<'_, AppState>,
+    source: Option<String>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    let source = source.as_deref().unwrap_or("all");
+    desktop_api::projects(&s.api, &s.token, source).await
 }
 #[tauri::command]
 async fn get_conversation(
@@ -1183,6 +1195,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             update_status,
             list_conversations,
+            list_projects,
             get_conversation,
             import_chatgpt_export,
             backup_library,
@@ -1233,6 +1246,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             update_status,
             list_conversations,
+            list_projects,
             get_conversation,
             import_chatgpt_export,
             backup_library,

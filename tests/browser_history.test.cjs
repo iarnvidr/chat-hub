@@ -135,6 +135,28 @@ test('signed-out session fails without API history requests', async () => {
   assert.equal(job.state.chunk, null);
 });
 
+test('project labels and membership travel separately without refetching or changing raw graphs', async () => {
+  const original = graph('chat-1'), normal = normalHandler([original]);
+  const job = setup((url, options) => {
+    const path = new URL(url).pathname;
+    if (path === '/backend-api/gizmos/snorlax/sidebar') return response(200, {
+      items: [{gizmo: {gizmo: {id: 'project-a', display: {name: 'Research'}}}}], cursor: null});
+    if (path === '/backend-api/gizmos/project-a/conversations') return response(200, {items: [{id: 'chat-1'}], cursor: null});
+    return normal(url, options);
+  });
+  await until(() => job.state.chunk !== null);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversations[0])), original);
+  job.state.ackSequence = 1;
+  await until(() => job.state.chunk?.sequence === 2);
+  assert.equal(job.state.chunk.conversations.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.project_catalog)), [{id: 'project-a', title: 'Research'}]);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversation_projects)), [{conversation_id: 'chat-1', project_id: 'project-a'}]);
+  job.state.ackSequence = 2;
+  await job.state.ready;
+  assert.equal(job.state.complete, true);
+  assert.equal(job.calls.filter(call => new URL(call.url).pathname === '/backend-api/conversations/batch').length, 1);
+});
+
 test('429 stops immediately and publishes bounded retry timing', async () => {
   const job = setup((url) => {
     const path = new URL(url).pathname;

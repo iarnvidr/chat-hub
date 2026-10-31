@@ -24,6 +24,7 @@
   let accountId = '';
   let accountScope = '';
   let owner = '';
+  const projectCatalog = new Map();
 
   function validId(value) {
     return typeof value === 'string' && value.length > 0 && value.length <= 256 && /^[A-Za-z0-9_:-]+$/.test(value);
@@ -143,7 +144,9 @@
             const gizmo = wrapper.gizmo && typeof wrapper.gizmo === 'object' ? wrapper.gizmo : wrapper;
             if (gizmo.id !== undefined) {
               if (!validId(gizmo.id)) throw Object.assign(new Error(), {code: 'invalid_response', stage});
-              output.push({gizmo: {id: gizmo.id}});
+              const title = gizmo.display?.name ?? gizmo.title ?? gizmo.name;
+              const safeTitle = typeof title === 'string' && enc.encode(title).byteLength <= 4096 ? title : null;
+              output.push({gizmo: {id: gizmo.id, title: safeTitle}});
             }
           } else {
             const id = providerId(item);
@@ -184,12 +187,17 @@
     const id = row && (row.id || row.conversation_id);
     return typeof id === 'string' && id ? id : '';
   }
-  async function sendChunk(graphs) {
-    if (!graphs.length) return;
+  async function sendChunk(graphs, projectForId = new Map()) {
+    if (!graphs.length && !projectForId.size) return;
     checkCancelled();
     const sequence = ++state.sequence;
     state.chunk = {sequence, owner, account_scope: accountScope,
       format: 'chat-hub-history-v1', conversations: graphs};
+    if (projectForId.size) {
+      state.chunk.project_catalog = [...new Set(projectForId.values())].filter(Boolean)
+        .map(id => ({id, title: projectCatalog.get(id) ?? null}));
+      state.chunk.conversation_projects = [...projectForId].map(([conversation_id, project_id]) => ({conversation_id, project_id}));
+    }
     state.exports++;
     while (state.ackSequence < sequence && state.chunk && state.chunk.sequence === sequence) {
       checkCancelled();
@@ -200,6 +208,7 @@
   async function deliverGraphs(rows, projectForId) {
     let pending = [];
     let pendingBytes = 0;
+    let pendingProjects = new Map();
     const changed = [];
     for (const [id, row] of rows) changed.push({id, row});
     for (let start = 0; start < changed.length; start += 10) {
@@ -224,16 +233,18 @@
         const bytes = enc.encode(JSON.stringify(graph)).byteLength;
         if (bytes > HARD_BODY) throw Object.assign(new Error(), {code: 'conversation_too_large', stage: 'detail'});
         if (pending.length && (pending.length >= SOFT_COUNT || pendingBytes + bytes > SOFT_EXPORT)) {
-          await sendChunk(pending);
-          pending = []; pendingBytes = 0;
+          await sendChunk(pending, pendingProjects);
+          pending = []; pendingBytes = 0; pendingProjects = new Map();
         }
         pending.push(graph); pendingBytes += bytes; state.conversations++;
+        const projectId = projectForId.get(item.id) || item.row.gizmo_id || graph.gizmo_id;
+        if (validId(projectId)) pendingProjects.set(item.id, projectId);
       }
       if (pending.length >= SOFT_COUNT || pendingBytes >= SOFT_EXPORT) {
-        await sendChunk(pending); pending = []; pendingBytes = 0;
+        await sendChunk(pending, pendingProjects); pending = []; pendingBytes = 0; pendingProjects = new Map();
       }
     }
-    if (pending.length) await sendChunk(pending);
+    if (pending.length) await sendChunk(pending, pendingProjects);
   }
   async function run() {
     try {
@@ -275,18 +286,25 @@
       const projects = await pages('gizmos/snorlax/sidebar', {
         conversations_per_gizmo: 0, limit: 20, owned_only: 'false'}, true, 'project');
       const projectRows = new Map();
+      let memberships = new Map();
+      const newProjectForId = new Map();
       for (const item of projects) {
         const wrapper = item.gizmo || {};
         const gizmo = wrapper.gizmo || wrapper;
         if (!gizmo || !validId(gizmo.id)) continue;
+        projectCatalog.set(gizmo.id, gizmo.title || null);
         const chats = await pages('gizmos/' + encodeURIComponent(gizmo.id) + '/conversations',
           {cursor: '0'}, true, 'project');
         for (const row of chats) {
           const id = providerId(row);
-          if (id && !rows.has(id)) projectRows.set(id, row);
+          if (!id) continue;
+          if (rows.has(id)) memberships.set(id, gizmo.id);
+          else { projectRows.set(id, row); newProjectForId.set(id, gizmo.id); }
+          if (memberships.size >= 100) { await sendChunk([], memberships); memberships = new Map(); }
         }
       }
-      if (projectRows.size) await deliverGraphs(projectRows, new Map());
+      if (memberships.size) await sendChunk([], memberships);
+      if (projectRows.size) await deliverGraphs(projectRows, newProjectForId);
       state.stage = 'complete';
       state.status = 'complete';
       state.complete = true;

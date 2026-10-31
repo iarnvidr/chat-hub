@@ -42,6 +42,17 @@ pub struct SearchPageSnapshot {
     pub hits: Vec<Value>,
 }
 #[derive(Clone, Debug)]
+pub struct ProjectSnapshot {
+    pub library_revision: i64,
+    pub projects: Vec<Value>,
+}
+#[derive(Clone, Debug)]
+pub struct ProjectMembership {
+    pub source_id: String,
+    pub project_id: Option<String>,
+    pub title: Option<String>,
+}
+#[derive(Clone, Debug)]
 pub struct DetailSnapshot {
     pub library_revision: i64,
     pub conversation: Option<Value>,
@@ -220,6 +231,35 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(8)", [])?;
             tx.commit()?;
         }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 9 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS projects(project_key TEXT PRIMARY KEY,provider TEXT NOT NULL,account_scope TEXT NOT NULL,source_id TEXT NOT NULL,title TEXT,UNIQUE(provider,account_scope,source_id)); CREATE TABLE IF NOT EXISTS conversation_projects(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,project_key TEXT NOT NULL REFERENCES projects(project_key) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS conversation_projects_project ON conversation_projects(project_key,conversation_id); INSERT OR IGNORE INTO projects(project_key,provider,account_scope,source_id,title) SELECT 'project:'||json_array(c.provider,c.account_scope,json_extract(o.raw_payload,'$.paseo_cache.project')),c.provider,c.account_scope,json_extract(o.raw_payload,'$.paseo_cache.project'),NULL FROM conversations c JOIN observations o ON o.conversation_id=c.id AND o.id=(SELECT max(latest.id) FROM observations latest WHERE latest.conversation_id=c.id) WHERE c.provider='paseo-chatgpt' AND json_type(o.raw_payload,'$.paseo_cache.project')='text' AND trim(json_extract(o.raw_payload,'$.paseo_cache.project'))<>''; INSERT OR IGNORE INTO conversation_projects(conversation_id,project_key) SELECT c.id,'project:'||json_array(c.provider,c.account_scope,json_extract(o.raw_payload,'$.paseo_cache.project')) FROM conversations c JOIN observations o ON o.conversation_id=c.id AND o.id=(SELECT max(latest.id) FROM observations latest WHERE latest.conversation_id=c.id) WHERE c.provider='paseo-chatgpt' AND json_type(o.raw_payload,'$.paseo_cache.project')='text' AND trim(json_extract(o.raw_payload,'$.paseo_cache.project'))<>'';")?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(9)", [])?;
+            tx.commit()?;
+        }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 10 {
+            let tx = self.connection.transaction()?;
+            let mappings = tx.execute("DELETE FROM conversation_projects WHERE project_key IN (SELECT project_key FROM projects WHERE trim(source_id)='')", [])?;
+            let projects = tx.execute("DELETE FROM projects WHERE trim(source_id)=''", [])?;
+            if mappings > 0 || projects > 0 {
+                tx.execute(
+                    "UPDATE library_state SET revision=revision+1 WHERE singleton=1",
+                    [],
+                )?;
+            }
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(10)", [])?;
+            tx.commit()?;
+        }
         self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id); CREATE INDEX IF NOT EXISTS observations_conversation_order ON observations(conversation_id,id DESC);")?;
         Ok(())
     }
@@ -238,6 +278,85 @@ impl Store {
             .query_row("SELECT max(version) FROM schema_migrations", [], |r| {
                 r.get(0)
             })?)
+    }
+    pub fn apply_project_memberships(
+        &mut self,
+        provider: &str,
+        account_scope: &str,
+        memberships: &[ProjectMembership],
+    ) -> Result<()> {
+        let tx = self.connection.transaction()?;
+        let mut changed = false;
+        for membership in memberships {
+            let conversation_id: Option<String> = tx.query_row("SELECT id FROM conversations WHERE provider=?1 AND account_scope=?2 AND source_id=?3", params![provider,account_scope,membership.source_id], |r| r.get(0)).optional()?;
+            let Some(conversation_id) = conversation_id else {
+                return Err(Error::Configuration(
+                    "project mapping references unknown conversation".into(),
+                ));
+            };
+            if let Some(project_id) = membership.project_id.as_deref() {
+                if project_id.is_empty() || project_id.len() > 256 {
+                    return Err(Error::Configuration("invalid project id".into()));
+                }
+                let key = project_key(provider, account_scope, project_id);
+                let old_title: Option<Option<String>> = tx.query_row("SELECT title FROM projects WHERE provider=?1 AND account_scope=?2 AND source_id=?3",params![provider,account_scope,project_id],|r|r.get(0)).optional()?;
+                if old_title.is_none()
+                    || (membership.title.is_some()
+                        && old_title.flatten().as_ref() != membership.title.as_ref())
+                {
+                    changed = true;
+                }
+                tx.execute("INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(provider,account_scope,source_id) DO UPDATE SET title=coalesce(excluded.title,projects.title)",params![key,provider,account_scope,project_id,membership.title.as_deref().filter(|s| !s.trim().is_empty())])?;
+                let key: String = tx.query_row("SELECT project_key FROM projects WHERE provider=?1 AND account_scope=?2 AND source_id=?3",params![provider,account_scope,project_id],|r|r.get(0))?;
+                let prior: Option<String> = tx
+                    .query_row(
+                        "SELECT project_key FROM conversation_projects WHERE conversation_id=?1",
+                        [&conversation_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if prior.as_deref() != Some(key.as_str()) {
+                    changed = true;
+                }
+                tx.execute("INSERT INTO conversation_projects(conversation_id,project_key) VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET project_key=excluded.project_key",params![conversation_id,key])?;
+            } else {
+                changed |= tx.execute(
+                    "DELETE FROM conversation_projects WHERE conversation_id=?1",
+                    [&conversation_id],
+                )? > 0;
+            }
+        }
+        if changed {
+            tx.execute(
+                "UPDATE library_state SET revision=revision+1 WHERE singleton=1",
+                [],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn projects_snapshot(&self, source: &str) -> Result<ProjectSnapshot> {
+        let tx = self.connection.unchecked_transaction()?;
+        let revision: i64 = tx.query_row(
+            "SELECT revision FROM library_state WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let filter = match source {
+            "chatgpt" => "p.provider IN ('chatgpt','paseo-chatgpt')",
+            "codex" => "p.provider LIKE 'codex%' OR p.provider LIKE 'paseo-codex%'",
+            "all" => "1=1",
+            _ => return Err(Error::Configuration("invalid source".into())),
+        };
+        let sql = format!("SELECT p.project_key,p.source_id,p.title,count(cp.conversation_id) FROM projects p LEFT JOIN conversation_projects cp ON cp.project_key=p.project_key WHERE {filter} GROUP BY p.project_key,p.source_id,p.title ORDER BY coalesce(p.title,p.source_id) COLLATE NOCASE,p.project_key");
+        let mut st = tx.prepare(&sql)?;
+        let projects = st.query_map([], |r| Ok(serde_json::json!({"project_key":r.get::<_,String>(0)?,"project_id":r.get::<_,String>(1)?,"title":r.get::<_,Option<String>>(2)?,"conversation_count":r.get::<_,i64>(3)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        drop(st);
+        tx.commit()?;
+        Ok(ProjectSnapshot {
+            library_revision: revision,
+            projects,
+        })
     }
     pub fn library_revision(&self) -> Result<i64> {
         Ok(self.connection.query_row(
@@ -273,11 +392,7 @@ impl Store {
         })
     }
     pub fn search_snapshot(&self, query: &str) -> Result<SearchSnapshot> {
-        let terms: Vec<String> = query
-            .split_whitespace()
-            .filter(|t| t.chars().any(char::is_alphanumeric))
-            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-            .collect();
+        let terms = literal_search_terms(query);
         let tx = self.connection.unchecked_transaction()?;
         let revision = tx.query_row(
             "SELECT revision FROM library_state WHERE singleton=1",
@@ -344,7 +459,7 @@ impl Store {
                 };
                 hits.push(serde_json::json!({"conversation":{"id":id,"provider":p,"account_scope":a,"source_id":s,"title":t,"updated_at_ms":u},"node_id":n,"message_id":m,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected_branch}));
             }
-            let mut st=tx.prepare("SELECT c.id,c.provider,c.account_scope,c.source_id,c.title,c.updated_at_ms,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1 ORDER BY bm25(title_fts),c.id")?;
+            let mut st=tx.prepare("SELECT c.id,c.provider,c.account_scope,c.source_id,c.title,c.updated_at_ms,bm25(title_fts)*2.0 FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1 ORDER BY bm25(title_fts)*2.0,c.id")?;
             let rows = st.query_map([&q], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -396,12 +511,38 @@ impl Store {
     ) -> Result<ListPageSnapshot> {
         self.list_page_snapshot_filtered(limit, after, expected_revision, true)
     }
+    pub fn source_list_page_snapshot(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+        source: &str,
+        project_key: Option<&str>,
+    ) -> Result<ListPageSnapshot> {
+        self.list_page_snapshot_scoped(limit, after, expected_revision, source, project_key)
+    }
     fn list_page_snapshot_filtered(
         &self,
         limit: usize,
         after: Option<&ListKey>,
         expected_revision: Option<i64>,
         chat_only: bool,
+    ) -> Result<ListPageSnapshot> {
+        self.list_page_snapshot_scoped(
+            limit,
+            after,
+            expected_revision,
+            if chat_only { "chatgpt" } else { "all" },
+            None,
+        )
+    }
+    fn list_page_snapshot_scoped(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+        source: &str,
+        project_key: Option<&str>,
     ) -> Result<ListPageSnapshot> {
         let tx = self.connection.unchecked_transaction()?;
         let revision: i64 = tx.query_row(
@@ -415,12 +556,14 @@ impl Store {
         }
         if expected_revision.is_none_or(|v| v == revision) {
             let lim = limit.min(101) as i64;
-            let chat_filter = if chat_only {
-                "provider IN ('chatgpt','paseo-chatgpt') AND "
-            } else {
-                ""
+            let source_filter = match source {
+                "all" => "",
+                "chatgpt" => "provider IN ('chatgpt','paseo-chatgpt') AND ",
+                "codex" => "(provider LIKE 'codex%' OR provider LIKE 'paseo-codex%') AND ",
+                _ => return Err(Error::Configuration("invalid source".into())),
             };
-            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {chat_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
+            let project_filter = "(?6 IS NULL OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=conversations.id AND cp.project_key=?6)) AND ";
+            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {source_filter}{project_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
             let mut pre = tx.prepare(&budget_sql)?;
             let source_bytes: i64 = pre.query_row(
                 params![
@@ -428,7 +571,8 @@ impl Store {
                     after.and_then(|k| k.updated_at_ms),
                     after.map(|k| k.id.as_str()).unwrap_or(""),
                     after.is_some() as i64,
-                    lim
+                    lim,
+                    project_key
                 ],
                 |r| r.get(0),
             )?;
@@ -442,12 +586,12 @@ impl Store {
                     limit: 8 * 1024 * 1024 - 64 * 1024,
                 });
             }
-            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms FROM conversations WHERE {chat_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
+            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms,(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=conversations.id) FROM conversations WHERE {source_filter}{project_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
             let mut st = tx.prepare(&page_sql)?;
             let ids = st
                 .query_map(
-                    params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim],
-                    |r| Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"provider":r.get::<_,String>(1)?,"account_scope":r.get::<_,String>(2)?,"source_id":r.get::<_,String>(3)?,"title":r.get::<_,String>(4)?,"updated_at_ms":r.get::<_,Option<i64>>(5)?})),
+                    params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim, project_key],
+                    |r| { let project: Option<String> = r.get(6)?; Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"provider":r.get::<_,String>(1)?,"account_scope":r.get::<_,String>(2)?,"source_id":r.get::<_,String>(3)?,"title":r.get::<_,String>(4)?,"updated_at_ms":r.get::<_,Option<i64>>(5)?,"project":project.and_then(|value|serde_json::from_str::<Value>(&value).ok())})) },
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             items.extend(ids);
@@ -548,6 +692,24 @@ impl Store {
     ) -> Result<SearchPageSnapshot> {
         self.search_page_snapshot_filtered(raw_query, limit, after, expected_revision, true)
     }
+    pub fn source_search_page_snapshot(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        source: &str,
+        project_key: Option<&str>,
+    ) -> Result<SearchPageSnapshot> {
+        self.search_page_snapshot_scoped(
+            raw_query,
+            limit,
+            after,
+            expected_revision,
+            source,
+            project_key,
+        )
+    }
     fn search_page_snapshot_filtered(
         &self,
         raw_query: &str,
@@ -556,11 +718,25 @@ impl Store {
         expected_revision: Option<i64>,
         chat_only: bool,
     ) -> Result<SearchPageSnapshot> {
-        let terms: Vec<String> = raw_query
-            .split_whitespace()
-            .filter(|t| t.chars().any(char::is_alphanumeric))
-            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-            .collect();
+        self.search_page_snapshot_scoped(
+            raw_query,
+            limit,
+            after,
+            expected_revision,
+            if chat_only { "chatgpt" } else { "all" },
+            None,
+        )
+    }
+    fn search_page_snapshot_scoped(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        source: &str,
+        project_key: Option<&str>,
+    ) -> Result<SearchPageSnapshot> {
+        let terms = literal_search_terms(raw_query);
         if after.is_some_and(|k| !k.score.is_finite()) {
             return Err(crate::error::Error::Configuration(
                 "search cursor score must be finite".into(),
@@ -588,25 +764,34 @@ impl Store {
             let mut total_bytes = 0usize;
             while hits.len() < limit.min(101) && scanned < 1024 {
                 let lim = (limit.min(101) - hits.len()).min(1024 - scanned) as i64;
-                let chat_message_filter = if chat_only {
-                    " AND f.conversation_id IN (SELECT id FROM conversations WHERE provider IN ('chatgpt','paseo-chatgpt'))"
-                } else {
-                    ""
+                let source_message_filter = match source { "all" => "", "chatgpt" => " AND f.conversation_id IN (SELECT id FROM conversations WHERE provider IN ('chatgpt','paseo-chatgpt'))", "codex" => " AND f.conversation_id IN (SELECT id FROM conversations WHERE provider LIKE 'codex%' OR provider LIKE 'paseo-codex%')", _ => return Err(Error::Configuration("invalid source".into())) };
+                let source_title_filter = match source {
+                    "all" => "",
+                    "chatgpt" => " AND c.provider IN ('chatgpt','paseo-chatgpt')",
+                    "codex" => " AND (c.provider LIKE 'codex%' OR c.provider LIKE 'paseo-codex%')",
+                    _ => return Err(Error::Configuration("invalid source".into())),
                 };
-                let chat_title_filter = if chat_only {
-                    " AND c.provider IN ('chatgpt','paseo-chatgpt')"
-                } else {
-                    ""
-                };
+                let project_message_filter = " AND (?6 IS NULL OR f.conversation_id IN (SELECT conversation_id FROM conversation_projects WHERE project_key=?6))";
+                let project_title_filter = " AND (?6 IS NULL OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=c.id AND cp.project_key=?6))";
+                let chat_message_filter =
+                    format!("{source_message_filter}{project_message_filter}");
+                let chat_title_filter = format!("{source_title_filter}{project_title_filter}");
                 // FTS counts tokens, not bytes: a single token may contain an
                 // entire long URL or pasted blob. Bound the excerpt separately
                 // while keeping the complete text in the authoritative store.
-                let sql = format!("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,substr(snippet(message_fts,3,'','','…',12),1,2048) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1{chat_message_filter} UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts) FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1{chat_title_filter}) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5");
+                let sql = format!("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,substr(snippet(message_fts,3,'','','…',12),1,2048) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1{chat_message_filter} UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts)*2.0 FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1{chat_title_filter}) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5");
                 let mut st = tx.prepare(&sql)?;
                 let mut prospective_bytes = total_bytes;
                 let rows = st
                     .query_map(
-                        params![q, cursor_score, cursor_conversation, cursor_node, lim],
+                        params![
+                            q,
+                            cursor_score,
+                            cursor_conversation,
+                            cursor_node,
+                            lim,
+                            project_key
+                        ],
                         |r| {
                             let estimate = r.get::<_, i64>(5)?;
                             let candidate_bytes = estimate.max(0) as usize;
@@ -731,7 +916,7 @@ impl Store {
                     let selected = node
                         .as_ref()
                         .is_some_and(|n| graph.selected_thread.contains(n));
-                    let summary: Value=tx.query_row("SELECT json_object('id',id,'provider',provider,'account_scope',account_scope,'source_id',source_id,'title',title,'updated_at_ms',updated_at_ms) FROM conversations WHERE id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
+                    let summary: Value=tx.query_row("SELECT json_object('id',c.id,'provider',c.provider,'account_scope',c.account_scope,'source_id',c.source_id,'title',c.title,'updated_at_ms',c.updated_at_ms,'project',(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=c.id)) FROM conversations c WHERE c.id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
                     hits.push(serde_json::json!({"conversation":summary,"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
                     if serde_json::to_vec(&hits)
                         .map_or(true, |v| v.len() > 8 * 1024 * 1024 - 64 * 1024)
@@ -760,11 +945,7 @@ impl Store {
         // Treat input as literal terms, never as FTS5 query syntax. Quoting each
         // whitespace-delimited term preserves AND-style matching without allowing
         // operators, column selectors, or embedded quotes to alter the query.
-        let terms: Vec<String> = q
-            .split_whitespace()
-            .filter(|term| term.chars().any(char::is_alphanumeric))
-            .map(|term| format!("\"{}\"", term.replace('\"', "\"\"")))
-            .collect();
+        let terms = literal_search_terms(q);
         if terms.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -1104,6 +1285,25 @@ fn canonical_conversation_id(o: &Observation) -> String {
     format!(
         "conversation:{}",
         serde_json::json!([o.provider, o.account_scope, o.source_id])
+    )
+}
+
+fn literal_search_terms(raw_query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = raw_query
+        .split_whitespace()
+        .filter(|term| term.chars().any(char::is_alphanumeric))
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect();
+    if let Some(last) = terms.last_mut() {
+        last.push('*');
+    }
+    terms
+}
+
+fn project_key(provider: &str, account_scope: &str, source_id: &str) -> String {
+    format!(
+        "project:{}",
+        serde_json::json!([provider, account_scope, source_id])
     )
 }
 
@@ -1505,5 +1705,168 @@ mod identity_tests {
             .unwrap();
         assert_eq!(id, "legacy-msg");
         assert_eq!(content, "updated");
+    }
+}
+
+#[cfg(test)]
+mod project_and_search_tests {
+    use super::*;
+
+    fn conversation(store: &Store, id: &str, provider: &str, title: &str) {
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,?2,?3,'scope',?1,1)",
+            params![id,title,provider],
+        ).unwrap();
+    }
+
+    #[test]
+    fn source_project_filters_and_last_token_prefix_are_applied_before_paging() {
+        let mut store = Store::in_memory().unwrap();
+        conversation(&store, "chat_project", "chatgpt", "alpha beta");
+        conversation(&store, "chat_other", "chatgpt", "alpha gamma");
+        conversation(&store, "codex", "codex_local", "alpha beta");
+        store
+            .apply_project_memberships(
+                "chatgpt",
+                "scope",
+                &[ProjectMembership {
+                    source_id: "chat_project".into(),
+                    project_id: Some("gizmo-1".into()),
+                    title: Some("Research".into()),
+                }],
+            )
+            .unwrap();
+        let projects = store.projects_snapshot("chatgpt").unwrap();
+        assert_eq!(projects.projects.len(), 1);
+        assert_eq!(projects.projects[0]["title"], "Research");
+        assert_eq!(projects.projects[0]["conversation_count"], 1);
+        let key = projects.projects[0]["project_key"].as_str().unwrap();
+        let page = store
+            .source_list_page_snapshot(10, None, None, "chatgpt", Some(key))
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0]["id"], "chat_project");
+        assert_eq!(page.items[0]["project"]["title"], "Research");
+        let codex = store
+            .source_list_page_snapshot(10, None, None, "codex", None)
+            .unwrap();
+        assert_eq!(codex.items.len(), 1);
+        assert_eq!(codex.items[0]["id"], "codex");
+        let hits = store
+            .source_search_page_snapshot("alpha be", 10, None, None, "chatgpt", Some(key))
+            .unwrap();
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0]["conversation"]["id"], "chat_project");
+    }
+
+    #[test]
+    fn project_metadata_rejects_unknown_targets_without_partial_update() {
+        let mut store = Store::in_memory().unwrap();
+        conversation(&store, "known", "chatgpt", "alpha");
+        let result = store.apply_project_memberships(
+            "chatgpt",
+            "scope",
+            &[
+                ProjectMembership {
+                    source_id: "known".into(),
+                    project_id: Some("p".into()),
+                    title: Some("Title".into()),
+                },
+                ProjectMembership {
+                    source_id: "missing".into(),
+                    project_id: Some("q".into()),
+                    title: None,
+                },
+            ],
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            store.projects_snapshot("chatgpt").unwrap().projects.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn project_migration_uses_only_latest_observation() {
+        let mut store = Store::in_memory().unwrap();
+        store.connection.execute_batch("DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;").unwrap();
+        store.connection.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES('legacy','cached','paseo-chatgpt','paseo-cache:owner','legacy')", []).unwrap();
+        store.connection.execute("INSERT INTO observations(id,conversation_id,source_time,observed_ms,parser,completeness,raw_payload) VALUES(1,'legacy',NULL,1,'p','complete','{\"paseo_cache\":{\"project\":\"old\"}}'),(2,'legacy',NULL,2,'p','complete','{\"paseo_cache\":{\"project\":\"new\"}}')", []).unwrap();
+        store.migrate().unwrap();
+        let project_id: String = store
+            .connection
+            .query_row("SELECT source_id FROM projects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(project_id, "new");
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>("SELECT count(*) FROM conversation_projects", [], |row| row
+                    .get(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn project_migration_ignores_empty_ids_and_v10_cleans_existing_empty_memberships() {
+        let mut store = Store::in_memory().unwrap();
+        store.connection.execute_batch("DROP TABLE conversation_projects; DROP TABLE projects; DELETE FROM schema_migrations WHERE version>=9;").unwrap();
+        store.connection.execute("INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES('legacy-empty','cached','paseo-chatgpt','paseo-cache:owner','legacy-empty')", []).unwrap();
+        store.connection.execute("INSERT INTO observations(id,conversation_id,observed_ms,parser,completeness,raw_payload) VALUES(1,'legacy-empty',1,'p','complete','{\"paseo_cache\":{\"project\":\"\"}}')", []).unwrap();
+        store.migrate().unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |row| row.get(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.schema_version().unwrap(), 10);
+
+        store.connection.execute("INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES('bad-empty','paseo-chatgpt','paseo-cache:owner','','Assigned project')", []).unwrap();
+        store.connection.execute("INSERT INTO conversation_projects(conversation_id,project_key) VALUES('legacy-empty','bad-empty')", []).unwrap();
+        store
+            .connection
+            .execute("DELETE FROM schema_migrations WHERE version=10", [])
+            .unwrap();
+        store.migrate().unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |row| row.get(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>("SELECT count(*) FROM conversation_projects", [], |row| row
+                    .get(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.library_revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn title_matches_receive_relevance_boost_and_search_cursor_order_is_stable() {
+        let store = Store::in_memory().unwrap();
+        conversation(&store, "title_hit", "chatgpt", "focus phrase");
+        conversation(&store, "body_hit", "chatgpt", "unrelated");
+        store.connection.execute("INSERT INTO graph_nodes(conversation_id,source_node_id,source_message_id,message_id,parent_id,role,parts_json,content) VALUES('body_hit','node','message','message',NULL,'assistant','[]','focus phrase')", []).unwrap();
+        let page = store
+            .search_page_snapshot("focus phrase", 10, None, None)
+            .unwrap();
+        assert!(page.hits.len() >= 2);
+        assert_eq!(page.hits[0]["conversation"]["id"], "title_hit");
+        assert!(page.hits.windows(2).all(|pair| {
+            let a = pair[0]["score"].as_f64().unwrap();
+            let b = pair[1]["score"].as_f64().unwrap();
+            a < b
+                || (a == b
+                    && pair[0]["conversation"]["id"].as_str()
+                        <= pair[1]["conversation"]["id"].as_str())
+        }));
     }
 }

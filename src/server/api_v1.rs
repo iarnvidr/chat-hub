@@ -41,6 +41,26 @@ pub trait ReadAdapter: Send {
     ) -> Result<ListPageSnapshot, ReadError> {
         Err(ReadError::Unavailable)
     }
+    fn scoped_list_page_snapshot(
+        &mut self,
+        source: &str,
+        project_key: Option<&str>,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        if project_key.is_some() {
+            return Err(ReadError::Unavailable);
+        }
+        match source {
+            "all" => self.list_page_snapshot(limit, after, expected_revision),
+            "chatgpt" => self.chat_list_page_snapshot(limit, after, expected_revision),
+            _ => Err(ReadError::Unavailable),
+        }
+    }
+    fn projects_snapshot(&mut self, _source: &str) -> Result<(i64, Vec<Value>), ReadError> {
+        Err(ReadError::Unavailable)
+    }
     /// RAW text, not FTS grammar. The store literalizes whitespace-separated
     /// Unicode terms and ANDs them. Do not prequote or resolve summaries later.
     fn search_page_snapshot(
@@ -59,6 +79,24 @@ pub trait ReadAdapter: Send {
         _expected_revision: Option<i64>,
     ) -> Result<SearchPageSnapshot, ReadError> {
         Err(ReadError::Unavailable)
+    }
+    fn scoped_search_page_snapshot(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        source: &str,
+        project_key: Option<&str>,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        if project_key.is_some() {
+            return Err(ReadError::Unavailable);
+        }
+        match source {
+            "all" => self.search_page_snapshot(query, limit, after, expected_revision),
+            "chatgpt" => self.chat_search_page_snapshot(query, limit, after, expected_revision),
+            _ => Err(ReadError::Unavailable),
+        }
     }
     fn detail_snapshot(&mut self, canonical_id: &str) -> Result<DetailSnapshot, ReadError>;
     /// Service readiness must be known independently of the database probe.
@@ -107,6 +145,14 @@ pub struct Summary {
     pub source_id: String,
     pub title: String,
     pub updated_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<ProjectSummary>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProjectSummary {
+    pub project_key: String,
+    pub project_id: String,
+    pub title: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conversation {
@@ -199,6 +245,49 @@ impl ReadAdapter for StoreReader {
                 .map_err(|_| ReadError::InvalidData)?,
         })
     }
+    fn scoped_list_page_snapshot(
+        &mut self,
+        source: &str,
+        project_key: Option<&str>,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        let after = after.map(|key| crate::store::ListKey {
+            updated_at_ms: key.updated_at_ms,
+            id: key.id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .source_list_page_snapshot(
+                limit,
+                after.as_ref(),
+                expected_revision,
+                source,
+                project_key,
+            )
+            .map_err(store_read_error)?;
+        Ok(ListPageSnapshot {
+            library_revision: snapshot.library_revision,
+            items: snapshot
+                .items
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
+    }
+    fn projects_snapshot(&mut self, source: &str) -> Result<(i64, Vec<Value>), ReadError> {
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .projects_snapshot(source)
+            .map_err(store_read_error)?;
+        Ok((snapshot.library_revision, snapshot.projects))
+    }
     fn search_page_snapshot(
         &mut self,
         query: &str,
@@ -216,6 +305,43 @@ impl ReadAdapter for StoreReader {
             .lock()
             .map_err(|_| ReadError::Unavailable)?
             .search_page_snapshot(query, limit, after.as_ref(), expected_revision)
+            .map_err(store_read_error)?;
+        Ok(SearchPageSnapshot {
+            library_revision: snapshot.library_revision,
+            hits: snapshot
+                .hits
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
+    }
+    fn scoped_search_page_snapshot(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        source: &str,
+        project_key: Option<&str>,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        let after = after.map(|key| crate::store::SearchKey {
+            score: key.score,
+            conversation_id: key.conversation_id.clone(),
+            node_id: key.node_id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .source_search_page_snapshot(
+                query,
+                limit,
+                after.as_ref(),
+                expected_revision,
+                source,
+                project_key,
+            )
             .map_err(store_read_error)?;
         Ok(SearchPageSnapshot {
             library_revision: snapshot.library_revision,
@@ -383,6 +509,7 @@ pub(super) fn routes(
         .route("/api/v1/status", get(status))
         .route("/api/v1/version", get(version))
         .route("/api/v1/conversations", get(list))
+        .route("/api/v1/projects", get(projects))
         .route("/api/v1/search", get(search))
         .route("/api/v1/chat/conversations", get(chat_list))
         .route("/api/v1/chat/search", get(chat_search))
@@ -555,6 +682,8 @@ async fn version(State(s): State<ApiState>) -> ApiResult {
 struct PageQuery {
     limit: Option<usize>,
     cursor: Option<String>,
+    source: Option<String>,
+    project_key: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -562,11 +691,18 @@ struct SearchQuery {
     q: String,
     limit: Option<usize>,
     cursor: Option<String>,
+    source: Option<String>,
+    project_key: Option<String>,
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DetailQuery {
     leaf_node_id: Option<String>,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectsQuery {
+    source: Option<String>,
 }
 fn query<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
     q.map(|Query(q)| q).map_err(|_| invalid_request())
@@ -705,23 +841,49 @@ fn after_list(item: &Summary, key: &Key) -> bool {
         == Ordering::Greater
 }
 async fn list(State(s): State<ApiState>, q: Result<Query<PageQuery>, QueryRejection>) -> ApiResult {
-    list_route(State(s), q, "list", false).await
+    list_route(State(s), q, "list", None).await
 }
 async fn chat_list(
     State(s): State<ApiState>,
     q: Result<Query<PageQuery>, QueryRejection>,
 ) -> ApiResult {
-    list_route(State(s), q, "chat-list", true).await
+    list_route(State(s), q, "chat-list", Some("chatgpt")).await
+}
+async fn projects(
+    State(s): State<ApiState>,
+    q: Result<Query<ProjectsQuery>, QueryRejection>,
+) -> ApiResult {
+    let q = query(q)?;
+    let source = q.source.unwrap_or_else(|| "all".into());
+    if !matches!(source.as_str(), "all" | "chatgpt" | "codex") {
+        return Err(invalid_request());
+    }
+    let (library_revision, projects) =
+        run_read(&s, move |reader| reader.projects_snapshot(&source)).await?;
+    checked_json(json!({"projects":projects,"library_revision":library_revision}))
 }
 async fn list_route(
     State(s): State<ApiState>,
     q: Result<Query<PageQuery>, QueryRejection>,
     route: &'static str,
-    chat_only: bool,
+    forced_source: Option<&'static str>,
 ) -> ApiResult {
     let q = query(q)?;
     let limit = limit(q.limit)?;
-    let cursor = decode_cursor(q.cursor.as_deref(), route, None)?;
+    let source = forced_source
+        .map(str::to_owned)
+        .or_else(|| q.source.clone())
+        .unwrap_or_else(|| "all".into());
+    if !matches!(source.as_str(), "all" | "chatgpt" | "codex")
+        || q.project_key
+            .as_ref()
+            .is_some_and(|key| key.is_empty() || key.len() > 1024)
+    {
+        return Err(invalid_request());
+    }
+    let cursor_scope = (source != "all" && forced_source.is_none() || q.project_key.is_some())
+        .then(|| format!("{source}|{}", q.project_key.as_deref().unwrap_or("")));
+    let cursor = decode_cursor(q.cursor.as_deref(), route, cursor_scope.as_deref())?;
     let after = cursor.as_ref().and_then(|c| match &c.after {
         Key::List { updated_at_ms, id } => Some(ListKey {
             updated_at_ms: *updated_at_ms,
@@ -730,12 +892,15 @@ async fn list_route(
         _ => None,
     });
     let expected = cursor.as_ref().map(|c| c.revision);
+    let project_key = q.project_key.clone();
     let snapshot = run_read(&s, move |r| {
-        if chat_only {
-            r.chat_list_page_snapshot(limit + 1, after.as_ref(), expected)
-        } else {
-            r.list_page_snapshot(limit + 1, after.as_ref(), expected)
-        }
+        r.scoped_list_page_snapshot(
+            &source,
+            project_key.as_deref(),
+            limit + 1,
+            after.as_ref(),
+            expected,
+        )
     })
     .await?;
     revision(&cursor, snapshot.library_revision)?;
@@ -756,7 +921,7 @@ async fn list_route(
         let last = items.last().ok_or_else(invalid_data)?;
         Some(encode_cursor(
             route,
-            None,
+            cursor_scope.as_deref(),
             snapshot.library_revision,
             Key::List {
                 updated_at_ms: last.updated_at_ms,
@@ -797,28 +962,49 @@ async fn search(
     State(s): State<ApiState>,
     q: Result<Query<SearchQuery>, QueryRejection>,
 ) -> ApiResult {
-    search_route(State(s), q, "search", false).await
+    search_route(State(s), q, "search", None).await
 }
 async fn chat_search(
     State(s): State<ApiState>,
     q: Result<Query<SearchQuery>, QueryRejection>,
 ) -> ApiResult {
-    search_route(State(s), q, "chat-search", true).await
+    search_route(State(s), q, "chat-search", Some("chatgpt")).await
 }
 async fn search_route(
     State(s): State<ApiState>,
     q: Result<Query<SearchQuery>, QueryRejection>,
     route: &'static str,
-    chat_only: bool,
+    forced_source: Option<&'static str>,
 ) -> ApiResult {
     let q = query(q)?;
     let limit = limit(q.limit)?;
     let normalized = q.q.split_whitespace().collect::<Vec<_>>().join(" ");
+    let source = forced_source
+        .map(str::to_owned)
+        .or_else(|| q.source.clone())
+        .unwrap_or_else(|| "all".into());
+    if !matches!(source.as_str(), "all" | "chatgpt" | "codex")
+        || q.project_key
+            .as_ref()
+            .is_some_and(|key| key.is_empty() || key.len() > 1024)
+    {
+        return Err(invalid_request());
+    }
     if !normalized.chars().any(char::is_alphanumeric) {
         return Err(invalid_request());
     }
-    let cursor = decode_cursor(q.cursor.as_deref(), route, Some(&normalized))?;
+    let cursor_scope = if (source == "all" || forced_source.is_some()) && q.project_key.is_none() {
+        normalized.clone()
+    } else {
+        format!(
+            "{normalized}|{source}|{}",
+            q.project_key.as_deref().unwrap_or("")
+        )
+    };
+    let cursor = decode_cursor(q.cursor.as_deref(), route, Some(&cursor_scope))?;
     let raw_query = normalized.clone();
+    let source = source.to_owned();
+    let project_key = q.project_key.clone();
     let after = cursor.as_ref().and_then(|c| match &c.after {
         Key::Search {
             score,
@@ -833,11 +1019,14 @@ async fn search_route(
     });
     let expected = cursor.as_ref().map(|c| c.revision);
     let snapshot = run_read(&s, move |r| {
-        if chat_only {
-            r.chat_search_page_snapshot(&raw_query, limit + 1, after.as_ref(), expected)
-        } else {
-            r.search_page_snapshot(&raw_query, limit + 1, after.as_ref(), expected)
-        }
+        r.scoped_search_page_snapshot(
+            &raw_query,
+            limit + 1,
+            after.as_ref(),
+            expected,
+            &source,
+            project_key.as_deref(),
+        )
     })
     .await?;
     revision(&cursor, snapshot.library_revision)?;
@@ -870,7 +1059,7 @@ async fn search_route(
         let h = items.last().ok_or_else(invalid_data)?;
         Some(encode_cursor(
             route,
-            Some(&normalized),
+            Some(&cursor_scope),
             snapshot.library_revision,
             Key::Search {
                 score: h.score,

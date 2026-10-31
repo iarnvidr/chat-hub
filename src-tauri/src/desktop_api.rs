@@ -173,6 +173,15 @@ pub fn list_url_for_source(
     cursor: Option<&str>,
     source: Option<&str>,
 ) -> Result<Url, String> {
+    list_url_for_scope(base, query, cursor, source, None)
+}
+pub fn list_url_for_scope(
+    base: &str,
+    query: &str,
+    cursor: Option<&str>,
+    source: Option<&str>,
+    project_key: Option<&str>,
+) -> Result<Url, String> {
     let mut q = vec![("limit", "50")];
     if !query.trim().is_empty() {
         q.push(("q", query.trim()));
@@ -180,23 +189,24 @@ pub fn list_url_for_source(
     if let Some(c) = cursor {
         q.push(("cursor", c));
     }
-    let filtered = match source {
-        None | Some("all") => false,
-        Some("chatgpt") => true,
-        _ => return Err("invalid_source".into()),
-    };
-    let endpoint = match (filtered, query.trim().is_empty()) {
-        (false, true) => "conversations",
-        (false, false) => "search",
-        (true, true) => "conversations",
-        (true, false) => "search",
-    };
-    let segments: &[&str] = if filtered {
-        &["api", "v1", "chat", endpoint]
+    if let Some(source) = source {
+        if !matches!(source, "all" | "chatgpt" | "codex") {
+            return Err("invalid_source".into());
+        }
+        q.push(("source", source));
+    }
+    if let Some(project_key) = project_key {
+        if project_key.is_empty() || project_key.len() > 1024 {
+            return Err("invalid_project".into());
+        }
+        q.push(("project_key", project_key));
+    }
+    let endpoint = if query.trim().is_empty() {
+        "conversations"
     } else {
-        &["api", "v1", endpoint]
+        "search"
     };
-    url(base, segments, &q)
+    url(base, &["api", "v1", endpoint], &q)
 }
 pub fn detail_url(base: &str, id: &str, leaf: Option<&str>) -> Result<Url, String> {
     let mut u = url(base, &["api", "v1", "conversations", id], &[])?;
@@ -275,11 +285,32 @@ pub async fn list_in_source(
     cursor: Option<&str>,
     source: Option<&str>,
 ) -> Result<Page, String> {
+    list_in_scope(base, token, q, cursor, source, None).await
+}
+pub async fn list_in_scope(
+    base: &str,
+    token: &str,
+    q: &str,
+    cursor: Option<&str>,
+    source: Option<&str>,
+    project_key: Option<&str>,
+) -> Result<Page, String> {
     let c = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| "Desktop API unavailable")?;
-    let u = list_url_for_source(base, q, cursor, source)?;
+    let u = list_url_for_scope(base, q, cursor, source, project_key)?;
+    get(&c, u, token).await
+}
+pub async fn projects(base: &str, token: &str, source: &str) -> Result<Value, String> {
+    if !matches!(source, "all" | "chatgpt" | "codex") {
+        return Err("invalid_source".into());
+    }
+    let c = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = url(base, &["api", "v1", "projects"], &[("source", source)])?;
     get(&c, u, token).await
 }
 pub async fn detail(
@@ -298,10 +329,10 @@ pub async fn detail(
 
 #[cfg(test)]
 mod source_list_tests {
-    use super::list_url_for_source;
+    use super::{list_url_for_scope, list_url_for_source};
 
     #[test]
-    fn source_selects_server_side_list_and_search_routes() {
+    fn source_and_project_filters_are_sent_to_server_before_pagination() {
         let base = "http://127.0.0.1:8000";
         assert_eq!(
             list_url_for_source(base, "", None, None).unwrap().path(),
@@ -317,17 +348,28 @@ mod source_list_tests {
             list_url_for_source(base, " term ", None, Some("chatgpt"))
                 .unwrap()
                 .path(),
-            "/api/v1/chat/search"
+            "/api/v1/search"
         );
         assert_eq!(
             list_url_for_source(base, "", Some("cursor"), Some("chatgpt"))
                 .unwrap()
                 .path(),
-            "/api/v1/chat/conversations"
+            "/api/v1/conversations"
         );
+        let codex = list_url_for_source(base, "", None, Some("codex")).unwrap();
         assert_eq!(
-            list_url_for_source(base, "", None, Some("codex")).unwrap_err(),
-            "invalid_source"
+            codex.query_pairs().find(|(k, _)| k == "source").unwrap().1,
+            "codex"
+        );
+        let project =
+            list_url_for_scope(base, "", None, Some("chatgpt"), Some("project:key")).unwrap();
+        assert_eq!(
+            project
+                .query_pairs()
+                .find(|(k, _)| k == "project_key")
+                .unwrap()
+                .1,
+            "project:key"
         );
     }
 }

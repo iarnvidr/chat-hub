@@ -2,7 +2,7 @@ const button = document.getElementById('sync-history');
 const status = document.getElementById('history-sync-status') || document.getElementById('app-status');
 const appStatus = document.getElementById('app-status');
 const workspaceStatus = document.getElementById('workspace-sync-state');
-let pollTimer, cooldownTimer, lastChanges = 0, running = false, pendingConnection = false;
+let pollTimer, cooldownTimer, lastChanges = 0, lastExports = 0, running = false, pendingConnection = false;
 let startPromise = null, interactiveSync = false, cooldownUntil = 0, automaticSyncUntil = 0, lastConnectionStart = 0;
 let configured = true;
 const hasNative = typeof window.__TAURI_INTERNALS__?.invoke === 'function';
@@ -52,10 +52,12 @@ function setCooldown(seconds, _message, manual = false) {
 
 function publishChanges(result) {
   const changes = (result?.imported || 0) + (result?.updated || 0);
-  if (changes !== lastChanges && changes > 0) {
+  const exports = result?.processed_exports || 0;
+  if ((changes !== lastChanges && changes > 0) || (exports !== lastExports && exports > 0)) {
     window.dispatchEvent(new Event('chat-hub:history-updated'));
   }
   lastChanges = changes;
+  lastExports = exports;
 }
 
 async function poll({allowConnect = interactiveSync} = {}) {
