@@ -1,8 +1,8 @@
-use crate::config::Config;
+use crate::config::{default_data_dir, Config, APP_NAME};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -11,6 +11,7 @@ use std::{
 const MAX_RECORD: u64 = 16 * 1024;
 const MAX_TOKEN: u64 = 4096;
 const MAX_HEALTH_BODY: usize = 16 * 1024;
+const MAX_DESKTOP_TOKEN: u64 = 4096;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceRecord {
     pub schema: u32,
@@ -207,6 +208,164 @@ async fn read_bounded_health_body(
     }
     serde_json::from_slice(&body).map_err(|e| e.to_string())
 }
+
+#[derive(Clone, Debug, Deserialize)]
+struct DesktopServiceRecord {
+    api: String,
+    process_id: u32,
+    service: String,
+    version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DesktopVerification {
+    Running,
+    IdentityMismatch,
+    Unverified,
+}
+
+#[derive(Clone, Debug)]
+struct DesktopServiceStatus {
+    record: DesktopServiceRecord,
+    verification: DesktopVerification,
+}
+
+fn parse_desktop_service_record(bytes: &[u8]) -> Option<DesktopServiceRecord> {
+    if bytes.len() > MAX_RECORD as usize {
+        return None;
+    }
+    let record: DesktopServiceRecord = serde_json::from_slice(bytes).ok()?;
+    loopback_http_addr(&record.api)?;
+    if record.process_id == 0
+        || record.service != APP_NAME
+        || record.version.is_empty()
+        || record.version.len() > 128
+    {
+        return None;
+    }
+    Some(record)
+}
+
+fn loopback_http_addr(api: &str) -> Option<SocketAddr> {
+    let url = reqwest::Url::parse(api).ok()?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let ip = host.parse::<std::net::IpAddr>().ok()?;
+    if !ip.is_loopback() {
+        return None;
+    }
+    Some(SocketAddr::new(ip, url.port()?))
+}
+
+fn read_bounded_regular_file(path: &Path, maximum: u64) -> Option<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > maximum {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= maximum).then_some(bytes)
+}
+
+async fn check_desktop_service(data_dir: &Path) -> Option<DesktopServiceStatus> {
+    let record_bytes = read_bounded_regular_file(&data_dir.join("service.json"), MAX_RECORD)?;
+    let record = parse_desktop_service_record(&record_bytes)?;
+    let token_bytes = read_bounded_regular_file(&data_dir.join("service.token"), MAX_DESKTOP_TOKEN);
+    let verification = if let Some(token) = token_bytes
+        .filter(|token| !token.is_empty())
+        .and_then(|token| String::from_utf8(token).ok())
+    {
+        let addr = loopback_http_addr(&record.api)?;
+        match reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(1))
+            .build()
+        {
+            Ok(client) => match client
+                .get(format!("http://{addr}/api/health"))
+                .bearer_auth(token)
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    match read_bounded_health_body(response).await {
+                        Ok(body)
+                            if body["process_id"].as_u64()
+                                == Some(u64::from(record.process_id))
+                                || body["pid"].as_u64() == Some(u64::from(record.process_id)) =>
+                        {
+                            DesktopVerification::Running
+                        }
+                        Ok(_) => DesktopVerification::IdentityMismatch,
+                        Err(_) => DesktopVerification::Unverified,
+                    }
+                }
+                _ => DesktopVerification::Unverified,
+            },
+            Err(_) => DesktopVerification::Unverified,
+        }
+    } else {
+        DesktopVerification::Unverified
+    };
+    Some(DesktopServiceStatus {
+        record,
+        verification,
+    })
+}
+
+fn desktop_service_fields(status: &DesktopServiceStatus) -> serde_json::Value {
+    let service = match status.verification {
+        DesktopVerification::Running => "running",
+        DesktopVerification::IdentityMismatch => "identity_mismatch",
+        DesktopVerification::Unverified => "unverified",
+    };
+    let verification = match status.verification {
+        DesktopVerification::Running => "authenticated_pid",
+        DesktopVerification::IdentityMismatch => "pid_mismatch",
+        DesktopVerification::Unverified => "unverified",
+    };
+    serde_json::json!({
+        "service": service,
+        "pid": status.record.process_id,
+        "instance_id": null,
+        "api_addr": status.record.api,
+        "proxy_addr": null,
+        "source": "desktop_descriptor",
+        "verification": verification,
+        "version": status.record.version,
+    })
+}
+
+fn desktop_data_dir(c: &Config) -> PathBuf {
+    if let Some(path) = std::env::var_os("CHAT_HUB_DATA_DIR") {
+        return PathBuf::from(path);
+    }
+    let database_parent = Path::new(&c.database_path).parent();
+    let ca_parent = c.ca_dir.parent();
+    if let (Some(database_parent), Some(ca_parent)) = (database_parent, ca_parent) {
+        if database_parent == ca_parent {
+            return database_parent.to_path_buf();
+        }
+    }
+    default_data_dir().unwrap_or_else(|_| ca_parent.unwrap_or_else(|| Path::new(".")).to_path_buf())
+}
+
 pub async fn status(c: &Config) -> Result<serde_json::Value, String> {
     let dir = Path::new(&c.database_path)
         .parent()
@@ -264,9 +423,39 @@ pub async fn status(c: &Config) -> Result<serde_json::Value, String> {
             }
         }
     }
-    Ok(
-        serde_json::json!({"schema":1,"database_health":dbhealth,"service":if running{"running"}else if identity_mismatch{"identity_mismatch"}else{"stopped"},"pid":record.as_ref().map(|r|r.pid),"instance_id":record.as_ref().map(|r|&r.instance_id),"api_addr":record.as_ref().map(|r|&r.api_addr),"proxy_addr":record.as_ref().map(|r|&r.proxy_addr)}),
-    )
+    let desktop = if running {
+        None
+    } else {
+        check_desktop_service(&desktop_data_dir(c)).await
+    };
+    let mut result = if running {
+        serde_json::json!({
+            "service":"running",
+            "pid":record.as_ref().map(|r|r.pid),
+            "instance_id":record.as_ref().map(|r|&r.instance_id),
+            "api_addr":record.as_ref().map(|r|&r.api_addr),
+            "proxy_addr":record.as_ref().map(|r|&r.proxy_addr),
+            "source":"cli_runtime",
+            "verification":"instance_id",
+            "version":null
+        })
+    } else if let Some(desktop) = desktop.as_ref() {
+        desktop_service_fields(desktop)
+    } else {
+        serde_json::json!({
+            "service":if identity_mismatch{"identity_mismatch"}else{"stopped"},
+            "pid":record.as_ref().map(|r|r.pid),
+            "instance_id":record.as_ref().map(|r|&r.instance_id),
+            "api_addr":record.as_ref().map(|r|&r.api_addr),
+            "proxy_addr":record.as_ref().map(|r|&r.proxy_addr),
+            "source":record.as_ref().map(|_|"cli_runtime"),
+            "verification":if identity_mismatch {Some("instance_id_mismatch")} else {None},
+            "version":null
+        })
+    };
+    result["schema"] = serde_json::json!(1);
+    result["database_health"] = serde_json::json!(dbhealth);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -299,6 +488,146 @@ mod publication_tests {
             pid: std::process::id(),
             instance_id: "synthetic-publication-instance".into(),
         }
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "chat-hub-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn publish_desktop_descriptor(dir: &Path, api: &str, pid: u32, token: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("service.json"),
+            serde_json::json!({
+                "api":api,
+                "process_id":pid,
+                "service":APP_NAME,
+                "version":"test-version"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(dir.join("service.token"), token).unwrap();
+    }
+
+    fn fake_health_server(
+        pid: u32,
+        expected_token: String,
+    ) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let authorized = request.lines().any(|line| {
+                line.eq_ignore_ascii_case(&format!("authorization: Bearer {expected_token}"))
+            });
+            let body = if authorized {
+                serde_json::json!({"status":"ok","pid":pid}).to_string()
+            } else {
+                "{}".into()
+            };
+            let status = if authorized {
+                "200 OK"
+            } else {
+                "401 Unauthorized"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).unwrap();
+        });
+        (addr, task)
+    }
+
+    #[test]
+    fn desktop_descriptor_rejects_foreign_services_and_non_loopback_endpoints() {
+        let valid = serde_json::json!({
+            "api":"http://127.0.0.1:41000",
+            "process_id":42,
+            "service":APP_NAME,
+            "version":"1.2.3"
+        });
+        assert_eq!(
+            parse_desktop_service_record(&serde_json::to_vec(&valid).unwrap())
+                .unwrap()
+                .process_id,
+            42
+        );
+        let mut ipv6_loopback = valid.clone();
+        ipv6_loopback["api"] = serde_json::json!("http://[::1]:41000/");
+        assert!(
+            parse_desktop_service_record(&serde_json::to_vec(&ipv6_loopback).unwrap()).is_some()
+        );
+        let mut foreign_api = valid.clone();
+        foreign_api["api"] = serde_json::json!("http://192.0.2.10:41000");
+        assert!(parse_desktop_service_record(&serde_json::to_vec(&foreign_api).unwrap()).is_none());
+        let mut foreign_service = valid;
+        foreign_service["service"] = serde_json::json!("other-service");
+        assert!(
+            parse_desktop_service_record(&serde_json::to_vec(&foreign_service).unwrap()).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_status_requires_authenticated_matching_pid_and_never_returns_token() {
+        const SECRET: &str = "desktop-runtime-token-canary";
+        for (health_pid, expected) in [
+            (42, DesktopVerification::Running),
+            (43, DesktopVerification::IdentityMismatch),
+        ] {
+            let dir = temp_dir("desktop-runtime-status");
+            let (addr, server) = fake_health_server(health_pid, SECRET.into());
+            publish_desktop_descriptor(&dir, &format!("http://{addr}"), 42, SECRET);
+            let status = check_desktop_service(&dir).await.unwrap();
+            server.join().unwrap();
+            assert_eq!(status.verification, expected);
+            let public = desktop_service_fields(&status);
+            assert_eq!(public["source"], "desktop_descriptor");
+            assert_eq!(
+                public["verification"],
+                if expected == DesktopVerification::Running {
+                    "authenticated_pid"
+                } else {
+                    "pid_mismatch"
+                }
+            );
+            assert!(
+                public["instance_id"].is_null(),
+                "desktop verification must not invent an instance ID"
+            );
+            assert!(!public.to_string().contains(SECRET));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn status_discovers_desktop_root_descriptor_and_reports_pid_verification_honestly() {
+        const SECRET: &str = "status-output-must-not-contain-this-token";
+        let config = config();
+        let data_dir = Path::new(&config.database_path).parent().unwrap();
+        let (addr, server) = fake_health_server(42, SECRET.into());
+        publish_desktop_descriptor(data_dir, &format!("http://{addr}"), 42, SECRET);
+        let response = status(&config).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(response["service"], "running");
+        assert_eq!(response["source"], "desktop_descriptor");
+        assert_eq!(response["verification"], "authenticated_pid");
+        assert_eq!(response["pid"], 42);
+        assert!(response["instance_id"].is_null());
+        assert!(!response.to_string().contains(SECRET));
+        fs::remove_dir_all(data_dir).unwrap();
     }
 
     #[test]

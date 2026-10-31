@@ -7,7 +7,7 @@ fn invoke(command: &str, extra: &[&str], db: &std::path::Path) -> std::process::
     Command::new(env!("CARGO_BIN_EXE_chat-hub"))
         .arg(command)
         .args(extra)
-        .env("CHAT_HUB_TOKEN", "synthetic-token")
+        .env_remove("CHAT_HUB_TOKEN")
         .env("CHAT_HUB_DATABASE", db)
         .output()
         .unwrap()

@@ -103,6 +103,18 @@ impl Config {
     }
 
     pub fn from_env() -> Result<Self, String> {
+        Self::load_from_env(true)
+    }
+
+    /// Configuration for local CLI commands that do not start the HTTP service.
+    /// The empty credential is never published or installed into process env;
+    /// commands that need the live service should use its authenticated runtime
+    /// descriptor instead.
+    pub fn for_local_cli() -> Result<Self, String> {
+        Self::load_from_env(false)
+    }
+
+    fn load_from_env(require_token: bool) -> Result<Self, String> {
         let bind_addr: SocketAddr = env::var("CHAT_HUB_BIND")
             .unwrap_or_else(|_| "127.0.0.1:0".into())
             .parse()
@@ -117,9 +129,13 @@ impl Config {
         if !proxy_addr.ip().is_loopback() {
             return Err("CHAT_HUB_PROXY_ADDR must use a loopback address".into());
         }
-        let bearer_token =
-            env::var("CHAT_HUB_TOKEN").map_err(|_| "CHAT_HUB_TOKEN is required".to_string())?;
-        if bearer_token.is_empty() {
+        let bearer_token = match env::var("CHAT_HUB_TOKEN") {
+            Ok(token) if !token.is_empty() => token,
+            Ok(_) if require_token => return Err("CHAT_HUB_TOKEN must not be empty".into()),
+            Err(_) if require_token => return Err("CHAT_HUB_TOKEN is required".into()),
+            _ => String::new(),
+        };
+        if require_token && bearer_token.is_empty() {
             return Err("CHAT_HUB_TOKEN must not be empty".into());
         }
         let data_dir = env::var_os("CHAT_HUB_DATA_DIR")
@@ -276,6 +292,37 @@ mod tests {
         assert_eq!(
             c.proxy_addr,
             "127.0.0.1:8788".parse::<SocketAddr>().unwrap()
+        );
+        clear();
+    }
+
+    #[test]
+    fn local_cli_configuration_needs_no_token_or_filesystem_setup() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear();
+        let data_dir = std::env::temp_dir().join(format!(
+            "chat-hub-cli-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        env::set_var("CHAT_HUB_DATA_DIR", &data_dir);
+        assert!(env::var_os("CHAT_HUB_TOKEN").is_none());
+        let config = Config::for_local_cli().unwrap();
+        assert!(config.bearer_token.is_empty());
+        assert_eq!(
+            config.database_path,
+            data_dir
+                .join("chat-hub.sqlite3")
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert!(!data_dir.exists(), "configuration must not create app data");
+        assert!(
+            env::var_os("CHAT_HUB_TOKEN").is_none(),
+            "configuration must not mutate process env"
         );
         clear();
     }

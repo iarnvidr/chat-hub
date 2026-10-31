@@ -20,6 +20,18 @@ The CLI restore command remains available for restoring into an empty library: s
 
 Requires stable Rust, rustfmt, and Clippy.
 
+Install or update the Rust CLI locally:
+
+```sh
+sh build/install-cli.sh
+chat-hub --help
+chat-hub status
+chat-hub search diablo
+chat-hub read <chat-id>
+```
+
+The installer builds an optimized binary into `~/.local/bin`, which must be on your shell's `PATH`. Set `CHAT_HUB_CLI_INSTALL_ROOT` to choose another installation root. The CLI shares the desktop library by default, works offline for library commands, and needs no manually supplied token for those commands. `status` discovers the desktop app or a standalone service using their private local runtime files. Live ChatGPT sign-in, fetching and sending currently use the desktop app; the CLI does not implement those browser operations.
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -30,7 +42,7 @@ Capture defaults off. The desktop offers **Save live chats on this Mac**, with a
 
 Set the following environment variables for the Rust CLI/service; the native desktop app shares only the capture opt-in and profile-scope settings above, and uses Tauri's platform app-data directory and explicit database/CA paths instead of the CLI/service path overrides:
 
-- `CHAT_HUB_TOKEN` — required non-empty bearer token.
+- `CHAT_HUB_TOKEN` — required non-empty bearer token for `serve`; unnecessary for local library commands and `status`.
 - `CHAT_HUB_DATA_DIR` — optional data-directory override; by default macOS uses `~/Library/Application Support/io.github.iarnvidr.chat-hub`, Linux uses `$XDG_DATA_HOME/io.github.iarnvidr.chat-hub` or `~/.local/share/io.github.iarnvidr.chat-hub`, and Windows uses `%APPDATA%/io.github.iarnvidr.chat-hub`.
 - `CHAT_HUB_DATABASE` — optional SQLite path; by default it is `chat-hub.sqlite3` inside the selected data directory.
 - `CHAT_HUB_BIND` — API bind address (default `127.0.0.1:0`; loopback required).
