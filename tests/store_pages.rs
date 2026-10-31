@@ -327,7 +327,7 @@ fn huge_parts_list_summary_search_preflight_and_null_cursor_walk() {
         .unwrap();
     let page = s.list_page_snapshot(1, None, None).unwrap();
     let c = &page.items[0];
-    assert_eq!(c.as_object().unwrap().len(), 6);
+    assert_eq!(c.as_object().unwrap().len(), 7);
     assert_eq!(c["id"], huge);
     let search = s.search_page_snapshot("needle", 10, None, None).unwrap();
     let message_hit = search
