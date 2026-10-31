@@ -44,6 +44,32 @@ type actionInput struct {
 	includeHidden bool
 }
 
+type createArtifactResponse struct {
+	OK                   bool   `json:"ok"`
+	SignedUploadURL      string `json:"signedUploadUrl"`
+	SignedUploadURLSnake string `json:"signed_upload_url"`
+}
+
+func (r createArtifactResponse) uploadURL() string {
+	if r.SignedUploadURL != "" {
+		return r.SignedUploadURL
+	}
+	return r.SignedUploadURLSnake
+}
+
+type finalizeArtifactResponse struct {
+	OK              bool            `json:"ok"`
+	ArtifactID      json.RawMessage `json:"artifactId"`
+	ArtifactIDSnake json.RawMessage `json:"artifact_id"`
+}
+
+func (r finalizeArtifactResponse) artifactID() json.RawMessage {
+	if len(r.ArtifactID) != 0 {
+		return r.ArtifactID
+	}
+	return r.ArtifactIDSnake
+}
+
 func main() {
 	if err := run(context.Background(), os.Getenv, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "artifact upload failed:", err)
@@ -348,31 +374,27 @@ func (u *uploader) upload(ctx context.Context, name string, retention int, archi
 	if expires != nil {
 		create["expiresAt"] = expires
 	}
-	var created struct {
-		OK              bool   `json:"ok"`
-		SignedUploadURL string `json:"signedUploadUrl"`
-	}
+	var created createArtifactResponse
 	if err := u.twirp(ctx, "CreateArtifact", create, &created); err != nil {
 		return err
 	}
 	if !created.OK {
 		return errors.New("artifact service rejected creation")
 	}
-	blobURL, err := url.Parse(created.SignedUploadURL)
+	signedUploadURL := created.uploadURL()
+	blobURL, err := url.Parse(signedUploadURL)
 	if err != nil {
 		return errors.New("artifact service returned a malformed storage URL")
 	}
 	if blobURL.Scheme != "https" || blobURL.Host == "" || blobURL.User != nil {
-		return fmt.Errorf("artifact service returned an invalid storage URL (scheme=%q host-present=%t userinfo-present=%t length=%d)", blobURL.Scheme, blobURL.Host != "", blobURL.User != nil, len(created.SignedUploadURL))
+		return fmt.Errorf("artifact service returned an invalid storage URL (scheme=%q host-present=%t userinfo-present=%t length=%d)", blobURL.Scheme, blobURL.Host != "", blobURL.User != nil, len(signedUploadURL))
 	}
 	hash, err := u.uploadBlocks(ctx, blobURL, archive, size)
 	if err != nil {
 		return err
 	}
 	finalize := map[string]any{"workflowRunBackendId": u.runBackend, "workflowJobRunBackendId": u.jobBackend, "name": name, "size": strconv.FormatInt(size, 10), "hash": map[string]string{"value": "sha256:" + hash}}
-	var done struct {
-		OK bool `json:"ok"`
-	}
+	var done finalizeArtifactResponse
 	if err := u.twirp(ctx, "FinalizeArtifact", finalize, &done); err != nil {
 		return err
 	}

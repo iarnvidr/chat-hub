@@ -222,6 +222,45 @@ func TestUploadProtocolDoesNotLeakTokensOrSignedURL(t *testing.T) {
 	}
 }
 
+func TestArtifactResponsesAcceptProtoAndCamelCaseFieldNames(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		response   string
+		wantURL    string
+		wantIDJSON string
+	}{
+		{
+			name:       "camelCase",
+			response:   `{"ok":true,"signedUploadUrl":"https://blob.example/upload?sig=redacted","artifactId":"123"}`,
+			wantURL:    "https://blob.example/upload?sig=redacted",
+			wantIDJSON: `"123"`,
+		},
+		{
+			name:       "protoFieldNames",
+			response:   `{"ok":true,"signed_upload_url":"https://blob.example/upload?sig=redacted","artifact_id":"456"}`,
+			wantURL:    "https://blob.example/upload?sig=redacted",
+			wantIDJSON: `"456"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var created createArtifactResponse
+			if err := json.Unmarshal([]byte(tc.response), &created); err != nil {
+				t.Fatal("could not decode CreateArtifact response")
+			}
+			var finalized finalizeArtifactResponse
+			if err := json.Unmarshal([]byte(tc.response), &finalized); err != nil {
+				t.Fatal("could not decode FinalizeArtifact response")
+			}
+			if !created.OK || created.uploadURL() != tc.wantURL {
+				t.Fatal("CreateArtifact response fields were not decoded")
+			}
+			if !finalized.OK || string(finalized.artifactID()) != tc.wantIDJSON {
+				t.Fatal("FinalizeArtifact response fields were not decoded")
+			}
+		})
+	}
+}
+
 func TestParseHTTPSBaseUsesOriginAndRejectsPlainHTTP(t *testing.T) {
 	origin, err := parseHTTPSBase("https://results.example.test/some/path?ignored=no")
 	if err != nil || origin != "https://results.example.test" {
