@@ -117,16 +117,17 @@ test('uses the current WebView session and keeps account scope, owner and raw gr
 test('waits for native ACK between bounded raw graph chunks', async () => {
   const graphs = Array.from({length: 101}, (_, i) => graph(`chat-${String(i).padStart(3, '0')}`));
   const job = setup(normalHandler(graphs));
-  await until(() => job.state.chunk !== null);
-  assert.equal(job.state.chunk.sequence, 1);
-  assert.equal(job.state.chunk.conversations.length, 100);
-  assert.equal(job.calls.filter(call => new URL(call.url).pathname === '/backend-api/conversations/batch').length, 10,
-    'worker must pause before fetching the eleventh detail batch');
-  assert.equal(job.state.chunk.conversations[0].mapping.assistant.message.content.parts[0], 'leaf');
-  job.state.ackSequence = 1;
-  await until(() => job.state.chunk !== null && job.state.chunk.sequence === 2);
-  assert.equal(job.state.chunk.conversations.length, 1);
-  job.state.ackSequence = 2;
+  for (let sequence = 1; sequence <= 11; sequence++) {
+    await until(() => job.state.chunk !== null && job.state.chunk.sequence === sequence);
+    const remaining = 101 - (sequence - 1) * 10;
+    assert.equal(job.state.chunk.conversations.length, Math.min(10, remaining));
+    assert.equal(job.calls.filter(call => new URL(call.url).pathname === '/backend-api/conversations/batch').length, sequence,
+      `detail batch ${sequence + 1} must wait for ACK ${sequence}`);
+    if (sequence === 1) {
+      assert.equal(job.state.chunk.conversations[0].mapping.assistant.message.content.parts[0], 'leaf');
+    }
+    job.state.ackSequence = sequence;
+  }
   await job.state.ready;
   assert.equal(job.state.complete, true);
   assert.equal(job.state.conversations, 101);
