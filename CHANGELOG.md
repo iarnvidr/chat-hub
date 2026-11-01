@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5 — release candidate
+
+- Uses one Cargo workspace, root lockfile and shared build directory for the core, desktop and stable crates.
+- Extracts shared models and bounded import/transcript decoding into independent `chat-hub-model` and `chat-hub-formats` crates (both version 0.1.0), while preserving the existing application APIs.
+- Adds bounded, repository-scoped compiled Rust cache reuse for trusted CI builds, with verified cache contracts and retention limits.
+
 ## 0.2.4 — release candidate
 
 - History sync commits active conversations before archived-list and project enrichment requests. It acknowledges each successfully fetched detail batch after local import, so later rate limits preserve saved progress.
