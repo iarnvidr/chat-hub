@@ -119,7 +119,9 @@ const server = http.createServer((request, response) => {
     // Starting a fresh live chat clears every library filter so its pending row
     // is immediately visible, selected, and removable until the provider assigns an ID.
     await page.evaluate(() => { window.__providerConversationId = null; });
-    await page.locator('#project-disclosure summary').click();
+    if (!await page.locator('#project-disclosure').evaluate(details => details.open)) {
+      await page.locator('#project-disclosure summary').click();
+    }
     await page.locator('#project-options button[data-project-key="chat-project:key"]').click();
     await page.locator('#tag-filter').evaluate(select => {
       const option = document.createElement('option'); option.value = 'fixture-tag'; option.textContent = 'Fixture tag';
