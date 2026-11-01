@@ -116,7 +116,9 @@ async fn aliased_search_paginates_by_saved_source_and_opens_its_original_message
     current.graph[0].parts = vec![json!("Current content")];
     let current_id = store.ingest_observation(&current).unwrap();
     let mut saved = Vec::new();
-    for (scope, node) in [("paseo-cache:a", "z-old"), ("paseo-cache:b", "a-old")] {
+    // Equal-ranked copies may reuse the same upstream node ID. Only the
+    // physical conversation ID can distinguish their ordering and cursor.
+    for (scope, node) in [("paseo-cache:a", "same-old"), ("paseo-cache:b", "same-old")] {
         let mut archive = source_observation(
             "paseo-chatgpt",
             &format!("conversation:{uuid}"),
