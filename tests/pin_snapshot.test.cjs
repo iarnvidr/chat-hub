@@ -31,3 +31,7 @@ test('pin snapshot checks the observed account before reading pins and retains s
   const wrong=await run({items:[]},{scopeAccount:'other-account'});assert.equal(wrong.state.error_code,'account_changed');assert.equal(wrong.calls.length,1);
   const limited=await run(null,{response:new Response(null,{status:429,headers:{'retry-after':'7200'}})});assert.equal(limited.state.error_code,'rate_limited');assert.equal(limited.state.retry_after,7200);assert.equal(limited.state.pinned_ids,undefined);
 });
+test('HTTP failure diagnostics expose the status without publishing the response body',async()=>{
+  const failure=await run(null,{response:new Response('private provider response',{status:422})});
+  assert.equal(failure.state.state,'failed');assert.equal(failure.state.error_code,'request_failed');assert.equal(failure.state.http_status,422);assert.equal(failure.state.pinned_ids,undefined);assert.ok(!JSON.stringify(failure.state).includes('private provider response'));
+});

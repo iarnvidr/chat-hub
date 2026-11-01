@@ -38,7 +38,7 @@ function (key, nonce, expectedScope) {
           throw Object.assign(fail("rate_limited"), { retry_after: Math.min(365 * 24 * 60 * 60 + 1, retry) });
         }
         if (response.status === 401 || response.status === 403) throw fail("signed_out");
-        if (!response.ok) throw fail("request_failed");
+        if (!response.ok) throw Object.assign(fail("request_failed"), { http_status: response.status });
         if (!/\bjson\b/i.test(response.headers.get("content-type") || "")) throw fail("invalid_pin_list");
         if (!response.body || !response.body.getReader) throw fail("invalid_pin_list");
         const reader = response.body.getReader();
@@ -126,7 +126,8 @@ function (key, nonce, expectedScope) {
     } catch (error) {
       finish("failed", {
         error_code: error && typeof error.safe === "string" ? error.safe : "request_failed",
-        ...(error && Number.isSafeInteger(error.retry_after) ? { retry_after: error.retry_after } : {})
+        ...(error && Number.isSafeInteger(error.retry_after) ? { retry_after: error.retry_after } : {}),
+        ...(error && Number.isSafeInteger(error.http_status) ? { http_status: error.http_status } : {})
       });
     } finally {
       active?.abort();

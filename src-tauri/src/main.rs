@@ -1369,9 +1369,10 @@ async fn sync_chatgpt_pins(
         .ok_or_else(|| "chatgpt_account_unavailable".to_string())?;
     let outcome = provider.read_chatgpt_pin_snapshot(observed_scope).await?;
     eprintln!(
-        "ChatGPT pin snapshot completed={} code={} count={} retry_after={}",
+        "ChatGPT pin snapshot completed={} code={} http_status={} count={} retry_after={}",
         outcome.complete,
         outcome.error_code.as_deref().unwrap_or("none"),
+        outcome.http_status.unwrap_or(0),
         outcome.pinned_ids.len(),
         outcome.retry_after.unwrap_or(0),
     );

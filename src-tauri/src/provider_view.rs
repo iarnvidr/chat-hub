@@ -105,6 +105,7 @@ pub struct ChatgptPinSnapshotOutcome {
     pub pinned_ids: Vec<String>,
     pub error_code: Option<String>,
     pub retry_after: Option<u64>,
+    pub http_status: Option<u16>,
 }
 
 impl ChatGptConnectionStatus {
@@ -162,6 +163,7 @@ enum PinSnapshotPoll {
     Failed {
         error_code: String,
         retry_after: Option<u64>,
+        http_status: Option<u16>,
     },
 }
 
@@ -220,11 +222,11 @@ fn parse_pin_snapshot_callback(
             }
             Some(PinSnapshotPoll::Complete(pinned_ids))
         }
-        "failed" if (4..=5).contains(&object.len()) => {
+        "failed" if (4..=6).contains(&object.len()) => {
             if object.keys().any(|key| {
                 !matches!(
                     key.as_str(),
-                    "nonce" | "state" | "cancelled" | "error_code" | "retry_after"
+                    "nonce" | "state" | "cancelled" | "error_code" | "retry_after" | "http_status"
                 )
             }) {
                 return None;
@@ -256,9 +258,22 @@ fn parse_pin_snapshot_callback(
             } else {
                 None
             };
+            let http_status = if let Some(value) = object.get("http_status") {
+                if error_code != "request_failed" || retry_after.is_some() {
+                    return None;
+                }
+                let status = value.as_u64()?;
+                if !(400..=599).contains(&status) {
+                    return None;
+                }
+                Some(status as u16)
+            } else {
+                None
+            };
             Some(PinSnapshotPoll::Failed {
                 error_code: error_code.into(),
                 retry_after,
+                http_status,
             })
         }
         _ => None,
@@ -963,6 +978,7 @@ impl ProviderViewState {
                                 pinned_ids,
                                 error_code: None,
                                 retry_after: None,
+                                http_status: None,
                             })
                         } else {
                             Err("chatgpt_page_changed".into())
@@ -971,6 +987,7 @@ impl ProviderViewState {
                     Some(PinSnapshotPoll::Failed {
                         error_code,
                         retry_after,
+                        http_status,
                     }) => {
                         if error_code == "rate_limited" {
                             self.note_pin_snapshot_rate_limit(expected_scope, retry_after)?;
@@ -982,6 +999,7 @@ impl ProviderViewState {
                             pinned_ids: Vec::new(),
                             error_code: Some(error_code),
                             retry_after,
+                            http_status,
                         });
                     }
                     None => {
@@ -1700,7 +1718,15 @@ mod target_url_tests {
         });
         assert!(matches!(
             parse_pin_snapshot_callback(&failed.to_string(), "pins-1", &scope),
-            Some(PinSnapshotPoll::Failed { error_code, retry_after: Some(3600) }) if error_code == "rate_limited"
+            Some(PinSnapshotPoll::Failed { error_code, retry_after: Some(3600), .. }) if error_code == "rate_limited"
+        ));
+        let rejected_status = serde_json::json!({
+            "nonce":"pins-1", "state":"failed", "cancelled":false,
+            "error_code":"request_failed", "http_status":422
+        });
+        assert!(matches!(
+            parse_pin_snapshot_callback(&rejected_status.to_string(), "pins-1", &scope),
+            Some(PinSnapshotPoll::Failed { error_code, http_status: Some(422), retry_after: None }) if error_code == "request_failed"
         ));
         for invalid in [
             serde_json::json!({"nonce":"wrong","state":"complete","cancelled":false,"complete":true,"account_scope":scope,"pinned_ids":[id]}),
@@ -1709,6 +1735,8 @@ mod target_url_tests {
             serde_json::json!({"nonce":"pins-1","state":"complete","cancelled":false,"complete":true,"account_scope":scope,"pinned_ids":[id,id]}),
             serde_json::json!({"nonce":"pins-1","state":"complete","cancelled":false,"complete":true,"account_scope":scope,"pinned_ids":["123E4567-E89B-12D3-A456-426614174000"]}),
             serde_json::json!({"nonce":"pins-1","state":"complete","cancelled":false,"complete":true,"account_scope":scope,"pinned_ids":[],"token":"secret"}),
+            serde_json::json!({"nonce":"pins-1","state":"failed","cancelled":false,"error_code":"request_failed","http_status":200}),
+            serde_json::json!({"nonce":"pins-1","state":"failed","cancelled":false,"error_code":"rate_limited","retry_after":60,"http_status":429}),
         ] {
             assert!(parse_pin_snapshot_callback(&invalid.to_string(), "pins-1", &scope).is_none());
         }
