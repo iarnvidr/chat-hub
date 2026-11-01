@@ -17,6 +17,23 @@ test('source links find the original alternate branch without inventing roots or
   assert.equal(branchForAnchor(detail,'alternate'),'leaf');assert.equal(branchForAnchor(detail,'root'),'selected');
   assert.equal(branchForAnchor({...detail,nodes:[{id:'leaf',parent_id:'leaf'}]},'absent'),undefined);
 });
+test('entity maps group saved copies without losing the original file reference',async()=>{
+  const {entityGraph}=await import('../desktop-ui/entity-model.js');
+  const archive={conversation_id:'archive',canonical_conversation_id:'current',title:'Old title',role:'archive',relation:'produces',source_node_id:'old-message'};
+  const current={conversation_id:'current',title:'Current title',relation:'mentions',node_id:'new-message'};
+  const result=entityGraph({entity:{id:'file',kind:'file_artifact',label:'report.xlsx'},references:[archive,current]});
+  assert.equal(result.nodes.length,2);
+  assert.equal(result.nodes[1].conversation_id,'current');
+  assert.equal(result.nodes[1].search_conversation_id,'current');
+  assert.equal(result.nodes[1].label,'Current title');
+  assert.equal(result.edges.length,1);
+  assert.equal(result.edges[0].relation,'produces');
+  assert.equal(result.edges[0].reference.conversation_id,'archive');
+  assert.equal(result.edges[0].reference.source_node_id,'old-message');
+  const olderOnly=entityGraph({entity:{id:'domain',kind:'domain',label:'example.test'},references:[archive]});
+  assert.equal(olderOnly.nodes[1].conversation_id,'current');
+  assert.equal(olderOnly.nodes[1].search_conversation_id,'archive','an older-only reference still opens its saved source');
+});
 test('map search ranks saved hits, deduplicates chats, and preserves message anchors',async()=>{
   const {mergeMapSearch}=await import('../desktop-ui/map-search.js');
   const result=mergeMapSearch([{id:'chat:a',conversation_id:'a',label:'A',kind:'chat'}],

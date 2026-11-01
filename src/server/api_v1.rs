@@ -269,6 +269,9 @@ pub struct Message {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchHit {
     pub conversation: Summary,
+    /// Physical saved copy owning the message/branch anchors and search key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_conversation_id: Option<String>,
     pub node_id: Option<String>,
     pub message_id: Option<String>,
     pub leaf_node_id: Option<String>,
@@ -1793,8 +1796,13 @@ fn compare_search(a: &SearchHit, b: &SearchHit) -> Ordering {
     a.score
         .partial_cmp(&b.score)
         .unwrap_or(Ordering::Equal)
-        .then_with(|| a.conversation.id.cmp(&b.conversation.id))
+        .then_with(|| search_source_id(a).cmp(search_source_id(b)))
         .then_with(|| a.node_id.cmp(&b.node_id))
+}
+fn search_source_id(hit: &SearchHit) -> &str {
+    hit.matched_conversation_id
+        .as_deref()
+        .unwrap_or(&hit.conversation.id)
 }
 fn after_search(hit: &SearchHit, key: &Key) -> bool {
     let Key::Search {
@@ -1808,7 +1816,7 @@ fn after_search(hit: &SearchHit, key: &Key) -> bool {
     hit.score
         .partial_cmp(score)
         .unwrap_or(Ordering::Equal)
-        .then_with(|| hit.conversation.id.cmp(conversation_id))
+        .then_with(|| search_source_id(hit).cmp(conversation_id.as_str()))
         .then_with(|| hit.node_id.cmp(node_id))
         == Ordering::Greater
 }
@@ -1899,7 +1907,11 @@ async fn search_route(
             && h.leaf_node_id.is_none()
             && !h.selected_branch;
         let message = h.node_id.is_some() && h.message_id.is_some() && h.leaf_node_id.is_some();
-        if !h.score.is_finite() || !(title || message) {
+        if !h.score.is_finite()
+            || !(title || message)
+            || search_source_id(h).is_empty()
+            || search_source_id(h).len() > 256
+        {
             return Err(invalid_data());
         }
     }
@@ -1927,7 +1939,7 @@ async fn search_route(
             snapshot.tag_revision,
             Key::Search {
                 score: h.score,
-                conversation_id: h.conversation.id.clone(),
+                conversation_id: search_source_id(h).to_owned(),
                 node_id: h.node_id.clone(),
             },
         )?)

@@ -118,6 +118,8 @@ fn is_zero_i64(value: &i64) -> bool {
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct CatalogEntityReference {
     pub conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_conversation_id: Option<String>,
     pub source_id: String,
     pub title: String,
     pub provider: String,

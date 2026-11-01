@@ -65,7 +65,7 @@ function openChat(id, leafNodeId, anchorNodeId) {
   window.dispatchEvent(new CustomEvent('chat-hub:open-conversation', {detail: {id, leafNodeId, anchorNodeId}}));
 }
 function openNode(node) {
-  if (node.kind === 'chat') openChat(node.conversation_id,node.search_leaf_node_id,node.search_node_id);
+  if (node.kind === 'chat') openChat(node.search_conversation_id||node.conversation_id,node.search_leaf_node_id,node.search_node_id);
   else if(node.entity_id)showSelection(node);
   else if (node.message_id) openChat(messageDetail.conversation.id, node.leaf_node_id, node.id);
 }
@@ -208,6 +208,7 @@ function showEdge(edge) {
   const names = [edge.source, edge.target].map(id => graph.nodes.find(node => node.id === id)?.label || 'Chat');
   root.append(element('p', names.join(' ↔ ')), element('p', edge.reason || 'Original stored parent relationship.'));
   if (edge.evidence?.length) root.append(element('p', `Evidence: ${edge.evidence.join(', ')}`));
+  if(edge.reference?.conversation_id)appendAction(root,'Open source message',()=>openChat(edge.reference.conversation_id,undefined,edge.reference.source_node_id||edge.reference.node_id||undefined));
   for (const id of [edge.source, edge.target]) {
     const node = graph.nodes.find(node => node.id === id);
     if (node) appendAction(root, `Open ${node.label}`, () => openNode(node));
@@ -251,7 +252,7 @@ function showSelection(node) {
     const connectionsSection=element('section',undefined,'inspector-connections-section');connectionsSection.append(element('h3','Related chats'));
     const connectionList=element('div',undefined,'inspector-connections-scroll');connectionList.tabIndex=0;connectionList.setAttribute('role','region');connectionList.setAttribute('aria-label','Related saved chats');
     connectionsSection.append(connectionList);root.append(connectionsSection);
-    const detailPromise=invoke('get_conversation',{id:node.conversation_id}).then(detail=>{
+    const detailPromise=invoke('get_conversation',{id:node.search_conversation_id||node.conversation_id}).then(detail=>{
       if(token!==selectionRequest)return null;
       transcript.replaceChildren();
       const messages=orderedMessages(detail);
@@ -315,9 +316,10 @@ function showEntitySelection(root,detail,token){
   if(item.repository_id&&item.repository_id!==item.id)appendAction(root,'View repository',()=>window.dispatchEvent(new CustomEvent('chat-hub:inspect-entity',{detail:{id:item.repository_id}})));
   root.append(element('h3','Referenced in'));
   const seen=new Set();for(const ref of detail.references){
-    const key=JSON.stringify([ref.conversation_id,ref.node_id]);if(seen.has(key))continue;seen.add(key);
+    const anchor=ref.source_node_id||ref.node_id||undefined;
+    const key=JSON.stringify([ref.conversation_id,anchor]);if(seen.has(key))continue;seen.add(key);
     const entry=element('div',undefined,'entity-reference');
-    appendAction(entry,ref.title||'Open saved chat',()=>openChat(ref.conversation_id,undefined,ref.node_id||undefined));
+    appendAction(entry,ref.title||'Open saved chat',()=>openChat(ref.conversation_id,undefined,anchor));
     entry.append(element('small',ref.relation==='produces'?'Produced here':ref.relation==='attaches'?'Attached here':'Mentioned here'));root.append(entry);
     if(ref.conversation_id)previewRows.push(previewController.bind(entry,hoverPreview,{conversationId:ref.conversation_id,title:ref.title||'Saved chat'}));
     if(seen.size>=20)break;
@@ -388,7 +390,7 @@ function renderSearchResults(rows,{query,loading,error}){
   const root=$('map-search-results');root.replaceChildren();root.hidden=!query;if(!query)return;
   for(const row of rows){const button=element('button');button.type='button';button.append(element('span',row.label),element('small',row.inMap?'In this map':'Saved chat · explore connections'));
     button.addEventListener('click',async()=>{
-      root.hidden=true;const hit={search_leaf_node_id:row.search_leaf_node_id,search_node_id:row.search_node_id,snippet:row.snippet};
+      root.hidden=true;const hit={search_conversation_id:row.search_conversation_id,search_leaf_node_id:row.search_leaf_node_id,search_node_id:row.search_node_id,snippet:row.snippet};
       const existing=graph?.nodes.find(node=>node.conversation_id===row.conversation_id);
       if(existing)view.select(existing.id,hit);
       else{await focusChat(row.conversation_id);const node=graph?.nodes.find(n=>n.conversation_id===row.conversation_id);if(node)view.select(node.id,hit);}

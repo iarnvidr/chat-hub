@@ -560,16 +560,28 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
     let api = reqwest::Client::builder().no_proxy().build().unwrap();
     let api_url = format!("http://{}", status.api_addr.unwrap());
     let detail = loop {
-        let bytes = api
+        let response = api
             .get(format!("{api_url}/api/v1/status"))
             .bearer_auth("test")
             .send()
             .await
-            .unwrap()
-            .bytes()
-            .await
             .unwrap();
+        let http_status = response.status();
+        let bytes = response.bytes().await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // A concurrent capture write can briefly occupy the read adapter. Retry
+        // only that explicit admission failure, within the original deadline.
+        if http_status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && v["error"]["code"] == "service_unavailable"
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "status polling timed out: HTTP {http_status}, service_unavailable"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+        assert_eq!(http_status, reqwest::StatusCode::OK);
         assert_eq!(v["capture"]["enabled"], enabled);
         assert_eq!(v["service"]["status"], "ready");
         assert_eq!(v["database"]["status"], "healthy");
@@ -581,8 +593,12 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         if !enabled && handle.status().ingest.ignored == 1 {
             break v;
         }
-        assert!(tokio::time::Instant::now() < deadline, "{v}");
-        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "capture polling timed out: HTTP {http_status}, terminal counter {}",
+            v["capture"]["counters"][terminal]
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     };
     if !enabled {
         assert_eq!(detail["capture"]["counters"]["started"], 0);

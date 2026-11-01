@@ -16,6 +16,87 @@ pub(crate) fn canonical_tag_key(tag: &str) -> Result<String> {
 /// Reserved query-only selector for conversations without a project assignment.
 pub const NO_PROJECT_FILTER: &str = "__none__";
 
+fn project_summary_subquery(conversation_id: &str) -> String {
+    format!(
+        "(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',coalesce(p.title,(SELECT lp.title FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.title,''))<>'' ORDER BY lp.project_key LIMIT 1)),'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) WHEN EXISTS(SELECT 1 FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.local_name,''))<>'') THEN (SELECT trim(lp.local_name) FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.local_name,''))<>'' ORDER BY lp.project_key LIMIT 1) ELSE (SELECT trim(lp.title) FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.title,''))<>'' ORDER BY lp.project_key LIMIT 1) END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' WHEN EXISTS(SELECT 1 FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.local_name,''))<>'') THEN 'local' WHEN EXISTS(SELECT 1 FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.title,''))<>'') THEN 'upstream' ELSE 'unknown' END) FROM effective_projects ep JOIN projects p ON p.project_key=ep.project_key WHERE ep.conversation_id={conversation_id} LIMIT 1)"
+    )
+}
+
+/// Read-only identity projection for imported ChatGPT caches. Physical rows,
+/// source scopes, and observations remain untouched. A cache UUID aliases only
+/// when exactly one observed ChatGPT account owns that normalized UUID.
+pub(crate) const CHAT_IDENTITY_CTES: &str = r#"
+WITH normalized_chats AS (
+    SELECT * FROM (
+        SELECT id,provider,account_scope,source_id,
+               lower(CASE WHEN substr(source_id,1,13)='conversation:'
+                          THEN substr(source_id,14) ELSE source_id END) AS source_uuid
+        FROM conversations
+    )
+    WHERE length(source_uuid)=36
+      AND substr(source_uuid,9,1)='-'
+      AND substr(source_uuid,14,1)='-'
+      AND substr(source_uuid,19,1)='-'
+      AND substr(source_uuid,24,1)='-'
+      AND length(replace(source_uuid,'-',''))=32
+      AND replace(source_uuid,'-','') NOT GLOB '*[^0-9a-f]*'
+), conversation_alias_candidates AS (
+    SELECT legacy.id AS legacy_conversation_id,
+           current.id AS canonical_conversation_id,
+           current.account_scope AS canonical_account_scope
+    FROM normalized_chats legacy
+    JOIN normalized_chats current ON current.source_uuid=legacy.source_uuid
+    WHERE legacy.provider='paseo-chatgpt'
+      AND substr(legacy.account_scope,1,12)='paseo-cache:'
+      AND length(legacy.account_scope)>12
+      AND current.provider='chatgpt'
+      AND substr(current.account_scope,1,17)='chatgpt:observed:'
+      AND length(current.account_scope)=81
+      AND substr(current.account_scope,18) NOT GLOB '*[^0-9a-f]*'
+), conversation_aliases AS (
+    SELECT legacy_conversation_id,
+           min(canonical_conversation_id) AS canonical_conversation_id,
+           min(canonical_account_scope) AS canonical_account_scope
+    FROM conversation_alias_candidates
+    GROUP BY legacy_conversation_id
+    HAVING count(DISTINCT canonical_conversation_id)=1
+       AND count(DISTINCT canonical_account_scope)=1
+), project_alias_candidates AS (
+    SELECT legacy_project.project_key AS legacy_project_key,
+           current_project.project_key AS canonical_project_key,
+           current_project.account_scope AS canonical_account_scope
+    FROM conversation_aliases chats
+    JOIN conversation_projects legacy_membership
+      ON legacy_membership.conversation_id=chats.legacy_conversation_id
+    JOIN projects legacy_project
+      ON legacy_project.project_key=legacy_membership.project_key
+     AND legacy_project.provider='paseo-chatgpt'
+     AND legacy_project.account_scope LIKE 'paseo-cache:%'
+    JOIN conversation_projects current_membership
+      ON current_membership.conversation_id=chats.canonical_conversation_id
+    JOIN projects current_project
+      ON current_project.project_key=current_membership.project_key
+     AND current_project.provider='chatgpt'
+     AND current_project.account_scope=chats.canonical_account_scope
+     AND current_project.source_id=legacy_project.source_id
+), project_aliases AS (
+    SELECT legacy_project_key,
+           min(canonical_project_key) AS canonical_project_key,
+           min(canonical_account_scope) AS canonical_account_scope
+    FROM project_alias_candidates
+    GROUP BY legacy_project_key
+    HAVING count(DISTINCT canonical_project_key)=1
+       AND count(DISTINCT canonical_account_scope)=1
+), effective_projects AS (
+    SELECT cp.conversation_id,
+           coalesce(pa.canonical_project_key,cp.project_key) AS project_key
+    FROM conversation_projects cp
+    LEFT JOIN project_aliases pa ON pa.legacy_project_key=cp.project_key
+    LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=cp.conversation_id
+    WHERE ca.legacy_conversation_id IS NULL
+)
+"#;
+
 #[cfg(test)]
 thread_local! { static CANDIDATE_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
@@ -70,11 +151,6 @@ impl Store {
     }
     fn migrate(&mut self) -> Result<()> {
         self.connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);")?;
-        let v: i64 = self.connection.query_row(
-            "SELECT coalesce(max(version),0) FROM schema_migrations",
-            [],
-            |r| r.get(0),
-        )?;
         if v < 1 {
             let tx = self.connection.transaction()?;
             tx.execute_batch("CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',provider TEXT NOT NULL DEFAULT '',url TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,parent_id TEXT,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT '');")?;
@@ -252,6 +328,11 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(14)", [])?;
             tx.commit()?;
         }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
         self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id); CREATE INDEX IF NOT EXISTS observations_conversation_order ON observations(conversation_id,id DESC);")?;
         Ok(())
     }
@@ -393,13 +474,36 @@ impl Store {
             "all" => "1=1",
             _ => return Err(Error::Configuration("invalid source".into())),
         };
-        let sql = format!("SELECT p.project_key,p.source_id,p.title,p.local_name,count(cp.conversation_id) FROM projects p LEFT JOIN conversation_projects cp ON cp.project_key=p.project_key WHERE {filter} GROUP BY p.project_key,p.source_id,p.title,p.local_name ORDER BY coalesce(nullif(trim(p.local_name),''),nullif(trim(p.title),''),p.source_id) COLLATE NOCASE,p.project_key");
+        let sql = format!(
+            "{CHAT_IDENTITY_CTES}
+             SELECT p.project_key,p.source_id,p.title,p.local_name,
+                    coalesce((SELECT count(DISTINCT coalesce(ca.canonical_conversation_id,c.id))
+                              FROM effective_projects ep JOIN conversations c ON c.id=ep.conversation_id
+                              LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=c.id
+                              WHERE ep.project_key=p.project_key),0),
+                    (SELECT lp.local_name FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.local_name,''))<>'' ORDER BY lp.project_key LIMIT 1),
+                    (SELECT lp.title FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.title,''))<>'' ORDER BY lp.project_key LIMIT 1)
+             FROM projects p
+             WHERE {filter}
+               AND NOT EXISTS (SELECT 1 FROM project_aliases pa WHERE pa.legacy_project_key=p.project_key)
+             ORDER BY coalesce(nullif(trim(p.local_name),''),nullif(trim(p.title),''),
+                                (SELECT lp.title FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=p.project_key AND trim(coalesce(lp.title,''))<>'' ORDER BY lp.project_key LIMIT 1),
+                               p.source_id) COLLATE NOCASE,p.project_key"
+        );
         let mut st = tx.prepare(&sql)?;
         let projects = st.query_map([], |r| {
             let local_name: Option<String> = r.get(3)?;
             let title: Option<String> = r.get(2)?;
-            let (display_name, name_source) = project_display_name(local_name.as_deref(), title.as_deref());
-            Ok(serde_json::json!({"project_key":r.get::<_,String>(0)?,"project_id":r.get::<_,String>(1)?,"title":title,"display_name":display_name,"name_source":name_source,"conversation_count":r.get::<_,i64>(4)?}))
+            let legacy_local_name: Option<String> = r.get(5)?;
+            let legacy_title: Option<String> = r.get(6)?;
+            let current_display =
+                project_display_name(local_name.as_deref(), title.as_deref());
+            let (display_name, name_source) = if current_display.0.is_some() {
+                current_display
+            } else {
+                project_display_name(legacy_local_name.as_deref(), legacy_title.as_deref())
+            };
+            Ok(serde_json::json!({"project_key":r.get::<_,String>(0)?,"project_id":r.get::<_,String>(1)?,"title":title.or(legacy_title),"display_name":display_name,"name_source":name_source,"conversation_count":r.get::<_,i64>(4)?}))
         })?.collect::<std::result::Result<Vec<_>,_>>()?;
         drop(st);
         tx.commit()?;
@@ -1066,8 +1170,9 @@ impl Store {
                 "codex" => "(provider LIKE 'codex%' OR provider LIKE 'paseo-codex%') AND ",
                 _ => return Err(Error::Configuration("invalid source".into())),
             };
-            let project_filter = format!("(?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=conversations.id)) OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=conversations.id AND cp.project_key=?6)) AND ", NO_PROJECT_FILTER);
-            let tag_filter = "(?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=conversations.id AND tt.name_key=?7)) AND ";
+            let alias_filter = "NOT EXISTS(SELECT 1 FROM conversation_aliases duplicate WHERE duplicate.legacy_conversation_id=conversations.id) AND ";
+            let project_filter = format!("(?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id=conversations.id)) OR EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id=conversations.id AND ep.project_key=?6)) AND ", NO_PROJECT_FILTER);
+            let tag_filter = "(?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=conversations.id AND tt.name_key=?7) OR EXISTS(SELECT 1 FROM conversation_aliases duplicate JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=duplicate.legacy_conversation_id WHERE duplicate.canonical_conversation_id=conversations.id AND tt.name_key=?7)) AND ";
             let pinned_expr = "coalesce((SELECT pinned FROM conversation_local_state cs WHERE cs.conversation_id=conversations.id),0)";
             let archived_expr = "coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=conversations.id),0)";
             let archive_filter = match archive_state {
@@ -1076,7 +1181,7 @@ impl Store {
                 _ => unreachable!(),
             };
             let after_filter = format!("(?1=1 OR {pinned_expr} < ?8 OR ({pinned_expr}=?8 AND ((?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3))))");
-            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {source_filter}{project_filter}{tag_filter}{archive_filter}{after_filter} ORDER BY {pinned_expr} DESC,updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
+            let budget_sql = format!("{CHAT_IDENTITY_CTES} SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {source_filter}{alias_filter}{project_filter}{tag_filter}{archive_filter}{after_filter} ORDER BY {pinned_expr} DESC,updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
             let mut pre = tx.prepare(&budget_sql)?;
             let source_bytes: i64 = pre.query_row(
                 params![
@@ -1101,7 +1206,8 @@ impl Store {
                     limit: 8 * 1024 * 1024 - 64 * 1024,
                 });
             }
-            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms,(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=conversations.id),{pinned_expr},{archived_expr} FROM conversations WHERE {source_filter}{project_filter}{tag_filter}{archive_filter}{after_filter} ORDER BY {pinned_expr} DESC,updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
+            let project_summary = project_summary_subquery("conversations.id");
+            let page_sql = format!("{CHAT_IDENTITY_CTES} SELECT id,provider,account_scope,source_id,title,updated_at_ms,{project_summary},{pinned_expr},{archived_expr} FROM conversations WHERE {source_filter}{alias_filter}{project_filter}{tag_filter}{archive_filter}{after_filter} ORDER BY {pinned_expr} DESC,updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
             let mut st = tx.prepare(&page_sql)?;
             let ids = st
                 .query_map(
@@ -1348,19 +1454,20 @@ impl Store {
                     "codex" => " AND (c.provider LIKE 'codex%' OR c.provider LIKE 'paseo-codex%')",
                     _ => return Err(Error::Configuration("invalid source".into())),
                 };
-                let project_message_filter = format!(" AND (?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=f.conversation_id)) OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=f.conversation_id AND cp.project_key=?6))", NO_PROJECT_FILTER);
-                let project_title_filter = format!(" AND (?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=c.id)) OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=c.id AND cp.project_key=?6))", NO_PROJECT_FILTER);
-                let tag_message_filter = " AND (?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=f.conversation_id AND tt.name_key=?7))";
-                let tag_title_filter = " AND (?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=c.id AND tt.name_key=?7))";
+                let canonical_message_id = "coalesce((SELECT ca.canonical_conversation_id FROM conversation_aliases ca WHERE ca.legacy_conversation_id=f.conversation_id),f.conversation_id)";
+                let canonical_title_id = "coalesce((SELECT ca.canonical_conversation_id FROM conversation_aliases ca WHERE ca.legacy_conversation_id=c.id),c.id)";
+                let project_message_filter = format!(" AND (?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id={canonical_message_id})) OR EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id={canonical_message_id} AND ep.project_key=?6))", NO_PROJECT_FILTER);
+                let project_title_filter = format!(" AND (?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id={canonical_title_id})) OR EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id={canonical_title_id} AND ep.project_key=?6))", NO_PROJECT_FILTER);
+                let tag_message_filter = format!(" AND (?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id={canonical_message_id} AND tt.name_key=?7) OR EXISTS(SELECT 1 FROM conversation_aliases ca JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=ca.legacy_conversation_id WHERE ca.canonical_conversation_id={canonical_message_id} AND tt.name_key=?7))");
+                let tag_title_filter = format!(" AND (?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id={canonical_title_id} AND tt.name_key=?7) OR EXISTS(SELECT 1 FROM conversation_aliases ca JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=ca.legacy_conversation_id WHERE ca.canonical_conversation_id={canonical_title_id} AND tt.name_key=?7))");
                 let archived_value = if archive_state == "archived" { 1 } else { 0 };
-                let archive_message_filter = format!(" AND coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=f.conversation_id),0)={archived_value}");
-                let archive_title_filter = format!(" AND coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=c.id),0)={archived_value}");
-                let chat_message_filter = format!("{source_message_filter}{project_message_filter}{tag_message_filter}{archive_message_filter}");
-                let chat_title_filter = format!("{source_title_filter}{project_title_filter}{tag_title_filter}{archive_title_filter}");
+                let archive_message_filter = format!(" AND coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id={canonical_message_id}),0)={archived_value}");
+                let archive_title_filter = format!(" AND coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id={canonical_title_id}),0)={archived_value}");
                 // FTS counts tokens, not bytes: a single token may contain an
                 // entire long URL or pasted blob. Bound the excerpt separately
                 // while keeping the complete text in the authoritative store.
-                let sql = format!("WITH results AS (SELECT f.conversation_id,f.node_id,f.message_id,substr(snippet(message_fts,3,'','','…',12),1,2048) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1{chat_message_filter} UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts)*2.0 FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1{chat_title_filter}) SELECT conversation_id,node_id,message_id,snippet,score, (length(CAST(conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512 FROM results WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (conversation_id>?3 OR (conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,conversation_id,node_id LIMIT ?5");
+                let chat_message_filter = format!("{source_message_filter}{project_message_filter}{tag_message_filter}{archive_message_filter}");
+                let sql = format!("{CHAT_IDENTITY_CTES}, results AS (SELECT f.conversation_id,f.node_id,f.message_id,substr(snippet(message_fts,3,'','','…',12),1,2048) snippet,bm25(message_fts) score FROM message_fts f WHERE message_fts MATCH ?1{chat_message_filter} UNION ALL SELECT f.id,NULL,NULL,c.title,bm25(title_fts)*2.0 FROM title_fts f JOIN conversations c ON c.id=f.id WHERE title_fts MATCH ?1{source_title_filter}{project_title_filter}{tag_title_filter}{archive_title_filter}) SELECT results.conversation_id,node_id,message_id,snippet,score, (length(CAST(results.conversation_id AS BLOB))+coalesce(length(CAST(node_id AS BLOB)),0)+coalesce(length(CAST(message_id AS BLOB)),0)+length(CAST(snippet AS BLOB))+coalesce((SELECT length(CAST(title AS BLOB)) FROM conversations WHERE id=results.conversation_id),0))*6+512,coalesce(ca.canonical_conversation_id,results.conversation_id) FROM results LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=results.conversation_id WHERE (?2 IS NULL OR score>?2 OR (score=?2 AND (results.conversation_id>?3 OR (results.conversation_id=?3 AND (node_id>?4 OR (?4 IS NULL AND node_id IS NOT NULL)))))) ORDER BY score,results.conversation_id,node_id LIMIT ?5");
                 let mut st = tx.prepare(&sql)?;
                 let mut prospective_bytes = total_bytes;
                 let rows = st
@@ -1397,6 +1504,7 @@ impl Store {
                                 r.get::<_, String>(3)?,
                                 r.get::<_, f64>(4)?,
                                 estimate,
+                                r.get::<_, String>(6)?,
                             ))
                         },
                     )?
@@ -1416,7 +1524,7 @@ impl Store {
                 if rows.is_empty() {
                     break;
                 }
-                for (id, node, msg, snip, score, _estimate) in rows {
+                for (id, node, msg, snip, score, _estimate, canonical_id) in rows {
                     scanned += 1;
                     cursor_score = Some(score);
                     cursor_conversation = id.clone();
@@ -1498,8 +1606,9 @@ impl Store {
                     let selected = node
                         .as_ref()
                         .is_some_and(|n| graph.selected_thread.contains(n));
-                    let summary: Value=tx.query_row("SELECT json_object('id',c.id,'provider',c.provider,'account_scope',c.account_scope,'source_id',c.source_id,'title',c.title,'updated_at_ms',c.updated_at_ms,'pinned',json(CASE WHEN coalesce((SELECT pinned FROM conversation_local_state cs WHERE cs.conversation_id=c.id),0)<>0 THEN 'true' ELSE 'false' END),'archived',json(CASE WHEN coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=c.id),0)<>0 THEN 'true' ELSE 'false' END),'project',(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=c.id)) FROM conversations c WHERE c.id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
-                    hits.push(serde_json::json!({"conversation":summary,"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
+                    let project_summary = project_summary_subquery("c.id");
+                    let summary: Value=tx.query_row(&format!("{CHAT_IDENTITY_CTES} SELECT json_object('id',c.id,'provider',c.provider,'account_scope',c.account_scope,'source_id',c.source_id,'title',c.title,'updated_at_ms',c.updated_at_ms,'pinned',json(CASE WHEN coalesce((SELECT pinned FROM conversation_local_state cs WHERE cs.conversation_id=c.id),0)<>0 THEN 'true' ELSE 'false' END),'archived',json(CASE WHEN coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=c.id),0)<>0 THEN 'true' ELSE 'false' END),'project',{project_summary}) FROM conversations c WHERE c.id=?1"),[&canonical_id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
+                    hits.push(serde_json::json!({"conversation":summary,"matched_conversation_id":id,"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
                     if serde_json::to_vec(&hits)
                         .map_or(true, |v| v.len() > 8 * 1024 * 1024 - 64 * 1024)
                     {
@@ -2362,6 +2471,133 @@ mod identity_tests {
             .unwrap();
         assert_eq!(id, "legacy-msg");
         assert_eq!(content, "updated");
+    }
+
+    #[test]
+    fn archive_aliases_fold_only_for_one_observed_account_and_current_archive_state_wins() {
+        let mut store = Store::in_memory().unwrap();
+        let account_a = format!("chatgpt:observed:{}", "a".repeat(64));
+        let account_b = format!("chatgpt:observed:{}", "b".repeat(64));
+        let shared_uuid = "12345678-1234-4abc-8def-1234567890ab";
+        let ambiguous_uuid = "aaaaaaaa-1234-4abc-8def-1234567890ab";
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES
+             ('direct','Current full chat','chatgpt',?1,?2,20),
+             ('cache-a','Old archive copy','paseo-chatgpt','paseo-cache:first',?2,10),
+             ('cache-b','Second archive copy','paseo-chatgpt','paseo-cache:second',?3,9),
+             ('account-a','Ambiguous A','chatgpt',?1,?4,30),
+             ('account-b','Ambiguous B','chatgpt',?5,?4,29),
+             ('ambiguous-cache','Ambiguous old copy','paseo-chatgpt','paseo-cache:ambiguous',?4,1)",
+            params![account_a, shared_uuid, format!("conversation:{shared_uuid}"), ambiguous_uuid, account_b],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO conversation_local_state(conversation_id,pinned,archived,updated_at_ms) VALUES('direct',0,1,1)",
+            [],
+        ).unwrap();
+
+        let active = store.list_page_snapshot_scoped(20, None, None, "all", None, None, "active").unwrap();
+        let active_ids = active.items.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(active_ids.len(), 3);
+        assert!(!active_ids.contains(&"cache-a"));
+        assert!(!active_ids.contains(&"cache-b"));
+        assert!(active_ids.contains(&"ambiguous-cache"), "multiple observed accounts keep the cache row distinct");
+
+        let archived = store.list_page_snapshot_scoped(20, None, None, "all", None, None, "archived").unwrap();
+        let archived_ids = archived.items.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(archived_ids, ["direct"], "the old active cache copy must not resurrect the archived current chat");
+    }
+
+    #[test]
+    fn project_facets_fold_only_overlapping_project_ids_and_keep_legacy_only_chats() {
+        let mut store = Store::in_memory().unwrap();
+        let account = format!("chatgpt:observed:{}", "c".repeat(64));
+        let shared_uuid = "12345678-1234-4abc-8def-1234567890ab";
+        let moved_uuid = "11111111-2222-4abc-8def-1234567890ab";
+        let legacy_only_uuid = "87654321-4321-4abc-8def-1234567890ab";
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES
+             ('direct','Full chat','chatgpt',?1,?2,20),
+             ('cache','Archive copy','paseo-chatgpt','paseo-cache:owner',?2,10),
+             ('moved-direct','Moved current chat','chatgpt',?1,?3,15),
+             ('moved-cache','Stale old membership','paseo-chatgpt','paseo-cache:owner',?3,8),
+             ('legacy-only','Legacy only','paseo-chatgpt','paseo-cache:owner',?4,5)",
+            params![account, shared_uuid, moved_uuid, legacy_only_uuid],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES
+             ('current-project','chatgpt',?1,'g-p-same','Current title'),
+             ('legacy-project','paseo-chatgpt','paseo-cache:owner','g-p-same','Cached title'),
+             ('other-project','chatgpt',?1,'g-p-other','Other project'),
+             ('same-title-other-id','chatgpt',?1,'g-p-different','Current title')",
+            params![account],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO conversation_projects(conversation_id,project_key) VALUES
+             ('direct','current-project'),('cache','legacy-project'),
+             ('moved-direct','other-project'),('moved-cache','legacy-project'),
+             ('legacy-only','legacy-project')",
+            [],
+        ).unwrap();
+
+        let projects = store.projects_snapshot("chatgpt").unwrap().projects;
+        assert_eq!(projects.len(), 3);
+        let folded = projects.iter().find(|p| p["project_key"] == "current-project").unwrap();
+        assert_eq!(folded["conversation_count"], 2);
+        assert_eq!(folded["title"], "Current title");
+        let other = projects.iter().find(|p| p["project_key"] == "other-project").unwrap();
+        assert_eq!(other["conversation_count"], 1);
+        assert!(projects.iter().any(|p| p["project_key"] == "same-title-other-id"));
+        assert!(!projects.iter().any(|p| p["project_key"] == "legacy-project"));
+
+        let page = store.list_page_snapshot_scoped(
+            20,
+            None,
+            None,
+            "chatgpt",
+            Some("current-project"),
+            None,
+            "active",
+        ).unwrap();
+        let ids = page.items.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"direct"));
+        assert!(ids.contains(&"legacy-only"));
+        assert!(!ids.contains(&"moved-direct"), "a stale archive membership cannot override a current move");
+        assert!(!ids.contains(&"cache"), "the stale archive membership is represented by the canonical row");
+    }
+
+    #[test]
+    fn archive_alias_identity_rejects_extra_hyphens_double_prefixes_and_case_variants() {
+        let store = Store::in_memory().unwrap();
+        let account = format!("chatgpt:observed:{}", "f".repeat(64));
+        let extra_hyphen = "-2345678-1234-4abc-8def-1234567890ab";
+        let double_prefix = "87654321-4321-4abc-8def-1234567890ab";
+        let case_prefix = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES
+             ('direct-hyphen','Direct','chatgpt',?1,?2),
+             ('cache-hyphen','Cache','paseo-chatgpt','paseo-cache:one',?2),
+             ('direct-double','Direct','chatgpt',?1,?3),
+             ('cache-double','Cache','paseo-chatgpt','paseo-cache:two',?4),
+             ('direct-case','Direct','chatgpt',?1,?5),
+             ('cache-case','Cache','paseo-chatgpt','paseo-cache:three',?6)",
+            params![
+                account,
+                extra_hyphen,
+                double_prefix,
+                format!("conversation:conversation:{double_prefix}"),
+                case_prefix,
+                format!("Conversation:{case_prefix}"),
+            ],
+        ).unwrap();
+        let aliases: i64 = store.connection.query_row(
+            &format!(
+                "{CHAT_IDENTITY_CTES} SELECT count(*) FROM conversation_aliases"
+            ),
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(aliases, 0);
     }
 }
 

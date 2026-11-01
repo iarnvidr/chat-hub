@@ -108,6 +108,64 @@ async fn large_local_transcript_detail_and_search_preserve_exact_text() {
 }
 
 #[tokio::test]
+async fn aliased_search_paginates_by_saved_source_and_opens_its_original_message() {
+    let mut store = Store::in_memory().unwrap();
+    let uuid = "12345678-1234-4abc-8def-1234567890ab";
+    let mut current = source_observation("chatgpt", uuid, "Current title", 30);
+    current.account_scope = format!("chatgpt:observed:{}", "e".repeat(64));
+    current.graph[0].parts = vec![json!("Current content")];
+    let current_id = store.ingest_observation(&current).unwrap();
+    let mut saved = Vec::new();
+    for (scope, node) in [("paseo-cache:a", "z-old"), ("paseo-cache:b", "a-old")] {
+        let mut archive = source_observation(
+            "paseo-chatgpt",
+            &format!("conversation:{uuid}"),
+            "Saved copy",
+            10,
+        );
+        archive.account_scope = scope.into();
+        archive.current_node = Some(node.into());
+        archive.graph[0].source_node_id = node.into();
+        archive.graph[0].source_message_id = Some(node.into());
+        archive.graph[0].parts = vec![json!("identityneedle older-only text")];
+        archive.completeness = "cached_transcript".into();
+        saved.push((store.ingest_observation(&archive).unwrap(), node));
+    }
+    let app = server::router(store, "secret".into());
+    let mut uri = "/api/v1/chat/search?q=identityneedle&limit=1".to_owned();
+    let mut seen = std::collections::HashSet::new();
+    for page in 0..2 {
+        let (status, result) = request(&app, &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let hits = result["items"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(hit["conversation"]["id"], current_id);
+        assert_eq!(hit["conversation"]["title"], "Current title");
+        let source = hit["matched_conversation_id"].as_str().unwrap();
+        assert!(seen.insert(source.to_owned()), "a saved hit must not repeat across pages");
+        let (_, node) = saved.iter().find(|(id, _)| id == source).unwrap();
+        assert_eq!(hit["node_id"], *node);
+        assert_eq!(hit["leaf_node_id"], *node);
+        let (status, detail) = request(
+            &app,
+            &format!("/api/v1/conversations/{source}?leaf_node_id={node}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["messages"][0]["content"], "identityneedle older-only text");
+        if page == 0 {
+            let cursor = result["next_cursor"].as_str().unwrap();
+            uri = format!("/api/v1/chat/search?q=identityneedle&limit=1&cursor={cursor}");
+        } else {
+            assert!(result["next_cursor"].is_null());
+        }
+    }
+    assert_eq!(seen.len(), 2);
+}
+
+#[tokio::test]
 async fn import_list_search_anchor_and_view_only_branch_use_real_store() {
     let app = app();
     assert_eq!(

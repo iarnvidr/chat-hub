@@ -1,5 +1,6 @@
 use super::{Store, TagSnapshot, TaggedTargetSnapshot};
 use crate::error::{Error, Result};
+use crate::store::CHAT_IDENTITY_CTES;
 use rusqlite::{params, OptionalExtension};
 use std::collections::HashSet;
 
@@ -81,17 +82,28 @@ impl Store {
         {
             return Err(Error::Configuration("unknown tag target".into()));
         }
-        let existing_keys = read_target_tag_keys(&tx, target_kind, target_id)?;
+        let (storage_id, related_ids) = if target_kind == "conversation" {
+            let ids = conversation_identity_ids(&tx, target_id)?;
+            (ids[0].clone(), ids)
+        } else {
+            (target_id.to_owned(), vec![target_id.to_owned()])
+        };
         let requested_keys = tags.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
-        if existing_keys == requested_keys {
-            let mut saved = read_target_tags(&tx, target_kind, target_id)?;
+        let canonical_keys = read_target_tag_keys(&tx, target_kind, &storage_id)?;
+        let mut aliases_have_tags = false;
+        for id in related_ids.iter().skip(1) {
+            aliases_have_tags |= !read_target_tag_keys(&tx, target_kind, id)?.is_empty();
+        }
+        if canonical_keys == requested_keys && !aliases_have_tags {
+            let mut saved = read_target_tags(&tx, target_kind, &storage_id)?;
+            saved.target_id = target_id.to_owned();
             saved.tag_revision = current_tag_revision(&tx)?;
             tx.commit()?;
             return Ok(saved);
         }
         tx.execute(
-            "DELETE FROM target_tags WHERE target_kind=?1 AND target_id=?2",
-            params![target_kind, target_id],
+            "DELETE FROM target_tags WHERE target_kind=?1 AND target_id IN (SELECT value FROM json_each(?2))",
+            params![target_kind, serde_json::to_string(&related_ids).map_err(|e| Error::Configuration(e.to_string()))?],
         )?;
         for (ordinal, (key, name)) in tags.iter().enumerate() {
             tx.execute(
@@ -100,7 +112,7 @@ impl Store {
             )?;
             tx.execute(
                 "INSERT INTO target_tags(target_kind,target_id,name_key,ordinal) VALUES(?1,?2,?3,?4)",
-                params![target_kind, target_id, key, ordinal as i64],
+                params![target_kind, storage_id, key, ordinal as i64],
             )?;
         }
         tx.execute("DELETE FROM tags WHERE NOT EXISTS(SELECT 1 FROM target_tags WHERE target_tags.name_key=tags.name_key)", [])?;
@@ -108,7 +120,8 @@ impl Store {
             "UPDATE tag_state SET revision=revision+1 WHERE singleton=1",
             [],
         )?;
-        let mut saved = read_target_tags(&tx, target_kind, target_id)?;
+        let mut saved = read_target_tags(&tx, target_kind, &storage_id)?;
+        saved.target_id = target_id.to_owned();
         saved.tag_revision = current_tag_revision(&tx)?;
         tx.commit()?;
         Ok(saved)
@@ -116,6 +129,10 @@ impl Store {
 
     pub fn target_tags(&self, target_kind: &str, target_id: &str) -> Result<Vec<String>> {
         validate_target(target_kind, target_id)?;
+        if target_kind == "conversation" {
+            let ids = conversation_identity_ids(&self.connection, target_id)?;
+            return read_target_tags_for_ids(&self.connection, target_kind, &ids);
+        }
         let mut stmt = self.connection.prepare(
             "SELECT t.name FROM target_tags x JOIN tags t ON t.name_key=x.name_key WHERE x.target_kind=?1 AND x.target_id=?2 ORDER BY x.ordinal,t.name_key",
         )?;
@@ -150,9 +167,9 @@ impl Store {
                 .flat_map(char::to_lowercase)
                 .collect::<String>()
         });
-        let mut stmt = self.connection.prepare(
-            "SELECT t.name,count(*) FROM tags t JOIN target_tags x ON x.name_key=t.name_key WHERE (?1 IS NULL OR x.target_kind=?1) AND (?2 IS NULL OR instr(t.name_key,?2)>0) GROUP BY t.name_key,t.name ORDER BY t.name_key LIMIT ?3",
-        )?;
+        let mut stmt = self.connection.prepare(&format!(
+            "{CHAT_IDENTITY_CTES} SELECT t.name,count(DISTINCT x.target_kind || ':' || CASE WHEN x.target_kind='conversation' THEN coalesce(ca.canonical_conversation_id,x.target_id) ELSE x.target_id END) FROM tags t JOIN target_tags x ON x.name_key=t.name_key LEFT JOIN conversation_aliases ca ON x.target_kind='conversation' AND ca.legacy_conversation_id=x.target_id WHERE (?1 IS NULL OR x.target_kind=?1) AND (?2 IS NULL OR instr(t.name_key,?2)>0) GROUP BY t.name_key,t.name ORDER BY t.name_key LIMIT ?3"
+        ))?;
         let values = stmt
             .query_map(params![target_kind, query, limit as i64], |row| {
                 Ok(TagSnapshot {
@@ -203,9 +220,26 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        let mut stmt = tx.prepare(
-            "WITH matching AS (SELECT x.target_kind,x.target_id FROM target_tags x WHERE x.name_key=?1 AND (?2 IS NULL OR x.target_kind=?2) AND (?3=0 OR x.target_kind>?4 OR (x.target_kind=?4 AND x.target_id>?5)) GROUP BY x.target_kind,x.target_id ORDER BY x.target_kind,x.target_id LIMIT ?6) SELECT m.target_kind,m.target_id,t.name FROM matching m JOIN target_tags x ON x.target_kind=m.target_kind AND x.target_id=m.target_id JOIN tags t ON t.name_key=x.name_key ORDER BY m.target_kind,m.target_id,x.ordinal,t.name_key",
-        )?;
+        let mut stmt = tx.prepare(&format!(
+            "{CHAT_IDENTITY_CTES}, matching AS (
+               SELECT x.target_kind,
+                      CASE WHEN x.target_kind='conversation' THEN coalesce(ca.canonical_conversation_id,x.target_id) ELSE x.target_id END AS target_id,
+                      x.target_id AS physical_id
+               FROM target_tags x
+               LEFT JOIN conversation_aliases ca ON x.target_kind='conversation' AND ca.legacy_conversation_id=x.target_id
+               WHERE x.name_key=?1 AND (?2 IS NULL OR x.target_kind=?2)
+            ), target_page AS (
+               SELECT target_kind,target_id FROM matching
+               WHERE (?3=0 OR target_kind>?4 OR (target_kind=?4 AND target_id>?5))
+               GROUP BY target_kind,target_id ORDER BY target_kind,target_id LIMIT ?6
+            )
+            SELECT p.target_kind,p.target_id,t.name
+            FROM target_page p JOIN matching m ON m.target_kind=p.target_kind AND m.target_id=p.target_id
+            JOIN target_tags x ON x.target_kind=m.target_kind AND x.target_id=m.physical_id
+            JOIN tags t ON t.name_key=x.name_key
+            GROUP BY p.target_kind,p.target_id,t.name_key,t.name
+            ORDER BY p.target_kind,p.target_id,min(x.ordinal),t.name_key"
+        ))?;
         let mut rows = stmt.query(params![
             tag_key,
             target_kind,
@@ -239,6 +273,63 @@ impl Store {
             items: targets,
         })
     }
+}
+
+fn conversation_identity_ids(
+    connection: &rusqlite::Connection,
+    conversation_id: &str,
+) -> Result<Vec<String>> {
+    let canonical_id: String = connection.query_row(
+        &format!(
+            "{CHAT_IDENTITY_CTES} SELECT coalesce((SELECT canonical_conversation_id FROM conversation_aliases WHERE legacy_conversation_id=?1),?1)"
+        ),
+        [conversation_id],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare(&format!(
+        "{CHAT_IDENTITY_CTES} SELECT canonical_conversation_id,legacy_conversation_id
+         FROM conversation_aliases
+         WHERE canonical_conversation_id=?1
+         ORDER BY legacy_conversation_id"
+    ))?;
+    let aliases = statement
+        .query_map([&canonical_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if aliases.is_empty() {
+        return Ok(vec![canonical_id]);
+    }
+    let canonical = aliases[0].0.clone();
+    let mut ids = Vec::with_capacity(aliases.len() + 1);
+    ids.push(canonical.clone());
+    ids.extend(
+        aliases
+            .into_iter()
+            .map(|(_, legacy)| legacy)
+            .filter(|id| id != &canonical),
+    );
+    ids.sort();
+    ids.dedup();
+    if let Some(position) = ids.iter().position(|id| id == &canonical) {
+        ids.swap(0, position);
+    }
+    Ok(ids)
+}
+
+fn read_target_tags_for_ids(
+    connection: &rusqlite::Connection,
+    target_kind: &str,
+    target_ids: &[String],
+) -> Result<Vec<String>> {
+    let json_ids = serde_json::to_string(target_ids)
+        .map_err(|error| Error::Configuration(error.to_string()))?;
+    let mut statement = connection.prepare(
+        "SELECT t.name FROM (SELECT x.name_key,min(CAST(ids.key AS INTEGER)) AS target_order,min(x.ordinal) AS tag_order FROM json_each(?1) ids JOIN target_tags x ON x.target_id=ids.value AND x.target_kind=?2 GROUP BY x.name_key) picked JOIN tags t ON t.name_key=picked.name_key ORDER BY picked.target_order,picked.tag_order,picked.name_key",
+    )?;
+    Ok(statement
+        .query_map(params![json_ids, target_kind], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn read_target_tags(
@@ -285,6 +376,47 @@ fn current_tag_revision(connection: &rusqlite::Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_tags_union_all_verified_archive_aliases_and_replace_them_atomically() {
+        let mut store = Store::in_memory().unwrap();
+        let current_scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        let uuid = "12345678-1234-4abc-8def-1234567890ab";
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES
+             ('direct','Current','chatgpt',?1,?2),
+             ('cache-a','Archive A','paseo-chatgpt','paseo-cache:owner-a',?2),
+             ('cache-b','Archive B','paseo-chatgpt','paseo-cache:owner-b',?3)",
+            params![current_scope, uuid, format!("conversation:{uuid}")],
+        ).unwrap();
+        for (key, name, id) in [
+            ("current", "Current", "direct"),
+            ("legacy-a", "Legacy A", "cache-a"),
+            ("legacy-b", "Legacy B", "cache-b"),
+        ] {
+            store.connection.execute("INSERT INTO tags(name_key,name) VALUES(?1,?2)", params![key, name]).unwrap();
+            store.connection.execute(
+                "INSERT INTO target_tags(target_kind,target_id,name_key,ordinal) VALUES('conversation',?1,?2,0)",
+                params![id, key],
+            ).unwrap();
+        }
+        let from_first_alias = store.target_tags("conversation", "cache-a").unwrap();
+        assert_eq!(from_first_alias, ["Current", "Legacy A", "Legacy B"]);
+        let from_second_alias = store.target_tags("conversation", "cache-b").unwrap();
+        assert_eq!(from_second_alias, from_first_alias);
+
+        store.set_target_tags(
+            "conversation",
+            "cache-a",
+            &["Kept".to_owned()],
+        ).unwrap();
+        for id in ["direct", "cache-a", "cache-b"] {
+            assert_eq!(store.target_tags("conversation", id).unwrap(), ["Kept"]);
+        }
+        let page = store.tagged_targets_snapshot(Some("conversation"), "kept", 10, None).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].target_id, "direct");
+    }
 
     #[test]
     fn tags_replace_dedupe_casefold_and_filter_by_target_kind() {

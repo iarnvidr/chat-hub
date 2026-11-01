@@ -11,7 +11,8 @@ export function normalizeSearch(response) {
     const summary = hit.conversation;
     if (!summary || typeof summary !== 'object') throw new Error('Invalid search hit');
     return { ...summary, snippet: hit.snippet, score: hit.score,
-      selected_branch: hit.selected_branch, search_node_id: hit.node_id ?? null,
+      selected_branch: hit.selected_branch, search_conversation_id: hit.matched_conversation_id ?? summary.id,
+      search_node_id: hit.node_id ?? null,
       search_message_id: hit.message_id ?? null, search_leaf_node_id: hit.leaf_node_id ?? null,
       search_hit: true };
   }) };

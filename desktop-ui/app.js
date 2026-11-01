@@ -51,7 +51,7 @@ function drawList() {
   for (const c of displayed) {
     const button = document.createElement('button');
     const activePendingId=conversationTabs?.selected?.()?.pendingId;
-    button.className = 'conversation-item' + (c.id === selected || (c.pending && c.pending_id===activePendingId) ? ' selected' : '') + (c.pending?' pending-conversation':'');
+    button.className = 'conversation-item' + (c.id === selected || c.search_conversation_id === selected || (c.pending && c.pending_id===activePendingId) ? ' selected' : '') + (c.pending?' pending-conversation':'');
     button.type = 'button';
     button.setAttribute('aria-label',c.pending?`${c.title}, not saved to the library yet`:c.title || 'Untitled conversation');
     const title = document.createElement('strong'), metadata = document.createElement('span');
@@ -78,7 +78,7 @@ function drawList() {
       }
     }
     if(c.pending)button.addEventListener('click',()=>openPendingConversation(c));
-    else button.addEventListener('click', () => openConversation(c.id, c.search_leaf_node_id, c.search_node_id));
+    else button.addEventListener('click', () => openConversation(c.search_conversation_id || c.id, c.search_leaf_node_id, c.search_node_id));
     box.append(c.pending?button:rowActions.wrap(c,button));
     if(c.pending && c.pending_id===pendingScrollId)pendingScrollButton=button;
   }
@@ -125,8 +125,8 @@ async function loadList(query=$('search').value,reset=true){
     if(!page||!Array.isArray(page.items))throw Error('Invalid conversation list response');
     if(revision!==null&&page.library_revision!==revision){cursor=null;revision=null;items=[];showError('Library changed; refreshed results');if(!reset)return loadList(queryValue,true);return;}
     revision=page.library_revision;cursor=page.next_cursor;
-    const seen=new Set(items.map(x=>queryValue?JSON.stringify([x.id,x.search_node_id]):x.id));
-    items.push(...page.items.filter(x=>!seen.has(queryValue?JSON.stringify([x.id,x.search_node_id]):x.id)));
+    const seen=new Set(items.map(x=>queryValue?JSON.stringify([x.id,x.search_conversation_id,x.search_node_id]):x.id));
+    items.push(...page.items.filter(x=>!seen.has(queryValue?JSON.stringify([x.id,x.search_conversation_id,x.search_node_id]):x.id)));
     pendingConversationStore.reconcileCaptured(items);
     showError('');drawList();
   }catch(e){
