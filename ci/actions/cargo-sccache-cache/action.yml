@@ -56,21 +56,21 @@ runs:
           echo "path=" >> "$GITHUB_OUTPUT"
           echo "Pinned ORAS unavailable (cache destination and shared runner destination failed; final installer exit $install_status). Cache transfer will be skipped." >> "$GITHUB_STEP_SUMMARY"
           python3 - "$cache_error" "$shared_error" <<'PY'
-import os, re, sys
-token = os.environ.get("GH_TOKEN", "")
-lines = []
-for name in sys.argv[1:]:
-    try:
-        value = open(name, encoding="utf-8", errors="replace").read()
-    except OSError:
-        continue
-    if token:
-        value = value.replace(token, "[redacted]")
-    value = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", value)
-    value = re.sub(r"(?i)(token|access_token|authorization)=([^\s&]+)", r"\1=[redacted]", value)
-    lines.extend(line.strip() for line in value.splitlines() if line.strip())
-print("ORAS installer diagnostic (sanitized): " + (" | ".join(lines[-3:])[:600] if lines else "(no stderr)"))
-PY
+        import os, re, sys
+        token = os.environ.get("GH_TOKEN", "")
+        lines = []
+        for name in sys.argv[1:]:
+            try:
+                value = open(name, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            if token:
+                value = value.replace(token, "[redacted]")
+            value = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", value)
+            value = re.sub(r"(?i)(token|access_token|authorization)=([^\s&]+)", r"\1=[redacted]", value)
+            lines.extend(line.strip() for line in value.splitlines() if line.strip())
+        print("ORAS installer diagnostic (sanitized): " + (" | ".join(lines[-3:])[:600] if lines else "(no stderr)"))
+        PY
         fi
     - name: Restore protected-main compiler cache
       if: ${{ inputs.mode == 'restore' }}
