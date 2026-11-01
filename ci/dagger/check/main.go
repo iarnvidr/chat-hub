@@ -119,6 +119,13 @@ func (m *ChatHubCi) LinuxChecks(ctx context.Context, source *dagger.Directory) (
 	return m.linuxChecks(ctx, source, "off", nil, "", "", "", "", "", "", "", false)
 }
 
+// CachedLinuxChecks is the cache-enabled compiler path for the manual CI workflow.
+func (m *ChatHubCi) CachedLinuxChecks(ctx context.Context, source *dagger.Directory,
+	registryToken *dagger.Secret, repository, eventName, ref, actor, runID, runAttempt, sha string) (string, error) {
+	return m.linuxChecks(ctx, source, "read", registryToken, repository, eventName,
+		ref, actor, runID, runAttempt, sha, true)
+}
+
 func (m *ChatHubCi) linuxChecks(ctx context.Context, source *dagger.Directory, cacheMode string,
 	registryToken *dagger.Secret, repository, eventName, ref, actor, runID, runAttempt, sha string,
 	verifyWarmReuse bool) (string, error) {

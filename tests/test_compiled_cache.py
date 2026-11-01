@@ -200,14 +200,20 @@ class TrustedWriterTests(unittest.TestCase):
         self.assertIn("packages: write", seed_job)
         self.assertIn("seed-linux-cache", seed_job)
 
+        manual_ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        rust_job = manual_ci.split("  rust:", 1)[1].split("  browser:", 1)[0]
+        self.assertIn("packages: read", rust_job)
+        self.assertIn("cached-linux-checks", rust_job)
+        self.assertIn("--registry-token env:GH_TOKEN", rust_job)
+
     def test_dagger_removes_cache_secret_before_any_cargo_command(self):
         dagger_source = (ROOT / "ci/dagger/check/main.go").read_text()
         cargo_start = dagger_source.index('WithExec([]string{"cargo", "fmt"')
-        pull_secret_removal = dagger_source.index('.WithoutSecretVariable("GH_TOKEN")')
-        guard = dagger_source.index('test -z \\\"${GH_TOKEN+x}\\\"')
+        pull_secret_removal = dagger_source.index('WithoutSecretVariable("GH_TOKEN")')
+        guard = dagger_source.index('${GH_TOKEN+x}')
         self.assertLess(pull_secret_removal, cargo_start)
         self.assertLess(guard, cargo_start)
-        self.assertIn('.WithoutEnvVariable("GH_TOKEN")', dagger_source[pull_secret_removal:cargo_start])
+        self.assertIn('WithoutEnvVariable("GH_TOKEN")', dagger_source[pull_secret_removal:cargo_start])
 
 
 class CachePublisherTests(unittest.TestCase):

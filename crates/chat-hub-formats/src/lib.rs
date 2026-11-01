@@ -164,7 +164,10 @@ mod tests {
     fn bounded_json_export_parser_preserves_existing_envelope_rules() {
         assert_eq!(parse_export(br#"[{"id":"one"}]"#).unwrap().len(), 1);
         assert_eq!(parse_export(br#"{"conversations":[]}"#).unwrap().len(), 0);
-        assert_eq!(parse_export(b"PK\x03\x04").unwrap_err().code, "invalid_request");
+        assert_eq!(
+            parse_export(b"PK\x03\x04").unwrap_err().code,
+            "invalid_request"
+        );
         assert_eq!(
             read_input(vec![0; MAX_BYTES + 1].as_slice())
                 .unwrap_err()
