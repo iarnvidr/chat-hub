@@ -421,7 +421,10 @@ mod tests {
              ('conversation','direct','zeta',0),('conversation','cache-a','current',0);";
         store.connection.execute_batch(sql).unwrap();
         let from_first_alias = store.target_tags("conversation", "cache-a").unwrap();
-        assert_eq!(from_first_alias, ["Zeta", "Current", "Legacy A", "Legacy B"]);
+        assert_eq!(
+            from_first_alias,
+            ["Zeta", "Current", "Legacy A", "Legacy B"]
+        );
         let from_second_alias = store.target_tags("conversation", "cache-b").unwrap();
         assert_eq!(from_second_alias, from_first_alias);
 
