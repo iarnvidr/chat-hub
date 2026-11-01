@@ -1,99 +1,16 @@
 //! Bounded ChatGPT export ingestion shared by CLI and HTTP adapters.
-use serde::Serialize;
+use chat_hub_formats::validate_input_size as check_size;
+pub use chat_hub_formats::{
+    parse_export, read_input, validate_input_size, ImportError, ImportReceipt, ItemError,
+    MAX_BYTES, MAX_ENTRIES, MAX_IMPORT_BYTES,
+};
 use serde_json::Value;
-use std::io::Read;
-
-pub const MAX_IMPORT_BYTES: usize = 67_108_864;
-pub const MAX_BYTES: usize = MAX_IMPORT_BYTES;
-pub const MAX_ENTRIES: usize = 10_000;
-
-#[derive(Debug, Default, Serialize, PartialEq, Eq)]
-pub struct ImportReceipt {
-    pub imported: usize,
-    pub updated: usize,
-    pub unchanged: usize,
-    pub failed: usize,
-    pub errors: Vec<ItemError>,
-    pub errors_truncated: bool,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct ItemError {
-    pub item_index: usize,
-    pub code: &'static str,
-    pub message: &'static str,
-}
-
-/// Safe admission errors; never include source bytes, file paths or DB diagnostics.
-#[derive(Debug, PartialEq, Eq)]
-pub struct ImportError {
-    pub code: &'static str,
-    pub message: &'static str,
-}
-impl std::fmt::Display for ImportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)
-    }
-}
-impl std::error::Error for ImportError {}
 
 fn invalid() -> ImportError {
     ImportError {
         code: "invalid_request",
         message: "Expected a UTF-8 JSON conversation array or an object containing conversations.",
     }
-}
-
-/// Read at most the limit plus one byte, including when metadata is unavailable.
-pub fn read_input(reader: impl Read) -> Result<Vec<u8>, ImportError> {
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ImportError {
-            code: "input_unavailable",
-            message: "Unable to read import input.",
-        })?;
-    check_size(&bytes)?;
-    Ok(bytes)
-}
-
-fn check_size(bytes: &[u8]) -> Result<(), ImportError> {
-    if bytes.len() > MAX_BYTES {
-        return Err(ImportError {
-            code: "payload_too_large",
-            message: "Import exceeds the 64 MiB limit.",
-        });
-    }
-    Ok(())
-}
-
-/// Validate the entire global envelope before returning any items for ingestion.
-pub fn parse_export(bytes: &[u8]) -> Result<Vec<Value>, ImportError> {
-    check_size(bytes)?;
-    if bytes.starts_with(b"PK") {
-        return Err(ImportError {
-            code: "invalid_request",
-            message: "Extract conversations.json from the ZIP archive before importing.",
-        });
-    }
-    let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
-    let value: Value = serde_json::from_str(text).map_err(|_| invalid())?;
-    let entries = match value {
-        Value::Array(entries) => entries,
-        Value::Object(mut object) => match object.remove("conversations") {
-            Some(Value::Array(entries)) => entries,
-            _ => return Err(invalid()),
-        },
-        _ => return Err(invalid()),
-    };
-    if entries.len() > MAX_ENTRIES {
-        return Err(ImportError {
-            code: "invalid_request",
-            message: "Import exceeds the 10000 conversation limit.",
-        });
-    }
-    Ok(entries)
 }
 
 /// Commit each valid item independently. A disconnected caller cannot undo commits.
@@ -383,57 +300,15 @@ fn normalize_paseo_cached_transcript(
     scope: &str,
 ) -> crate::error::Result<crate::store::Observation> {
     let invalid = || crate::error::Error::Configuration("Invalid Paseo cached conversation".into());
-    let source = doc
-        .get("source")
-        .and_then(Value::as_str)
-        .filter(|source| matches!(*source, "chatgpt" | "codex_local" | "codex_cloud"))
-        .ok_or_else(invalid)?;
-    if doc.get("kind").and_then(Value::as_str) != Some("conversation") {
-        return Err(invalid());
-    }
-    let id = doc
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(invalid)?;
-    let text = doc
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or_else(invalid)?;
-    // The plugin cache contains a rendered selected transcript, not the original
-    // message graph. Preserve it as one archive record; never invent user/assistant
-    // boundaries by parsing headings that may also occur inside message content.
-    let mut graph = serde_json::json!({
-        "id": id, "title": doc.get("title").and_then(Value::as_str).unwrap_or("Saved conversation"),
-        "current_node": "paseo-cached-transcript", "paseo_cache": doc,
-        "mapping": {"paseo-cached-transcript": {
-            "id": "paseo-cached-transcript", "parent": null, "children": [],
-            "message": {"id":"paseo-cached-transcript", "author":{"role":"archive"},
-                "content":{"content_type":"text", "parts":[text]}}
-        }}
-    });
-    if let Some(updated) = doc.get("updated").and_then(Value::as_str) {
-        let seconds = updated
-            .parse::<f64>()
-            .ok()
-            .filter(|value| value.is_finite())
-            .or_else(|| {
-                time::OffsetDateTime::parse(updated, &time::format_description::well_known::Rfc3339)
-                    .ok()
-                    .map(|value| value.unix_timestamp_nanos() as f64 / 1_000_000_000.0)
-            });
-        if let Some(value) = seconds.and_then(serde_json::Number::from_f64) {
-            graph["update_time"] = Value::Number(value);
-        }
-    }
+    let transcript = chat_hub_formats::paseo_cached_transcript(doc).ok_or_else(invalid)?;
     let mut observation = crate::capture::normalize_chatgpt_document_in_scope(
-        &graph,
+        &transcript.graph,
         "paseo-cache-transcript-v1",
         observed_ms,
         scope,
     )?;
-    observation.provider = format!("paseo-{source}");
-    observation.url = doc.get("url").and_then(Value::as_str).map(str::to_owned);
+    observation.provider = format!("paseo-{}", transcript.source);
+    observation.url = transcript.url;
     observation.completeness = "cached_transcript".into();
     Ok(observation)
 }

@@ -1,6 +1,6 @@
 # Chat Hub
 
-Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.4; a version bump is not a release or release acceptance.
+Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.5; a version bump is not a release or release acceptance.
 
 Provider capture is disabled by default. No real provider account, provider traffic capture, or production ingestion path has been accepted. The selective CONNECT proxy intercepts only the exact host `chatgpt.com`; subdomains, authentication/sign-in hosts and other hosts tunnel without TLS decryption. The per-install CA is not automatically added to system trust. Linux proxy checks use synthetic traffic and do not establish real-provider behavior.
 
@@ -31,6 +31,8 @@ The No project filter selects unassigned conversations before pagination, includ
 Set project and project rename open anchored hover controls, with keyboard focus and click support. There is no local-only project-editing choice. Existing cached IDs are normalized only for the verified ChatGPT request; the stored conversation identity remains intact.
 
 ## Build and run
+
+The Rust packages share one Cargo workspace and root lockfile. Stable conversation/catalog types live in `crates/chat-hub-model`; bounded import parsing and transcript decoding live in `crates/chat-hub-formats`. Their versions are independent of app releases. See [workspace and compiled-output reuse](docs/workspace-builds.md) for the CI build layout and cache policy.
 
 Requires stable Rust, rustfmt, and Clippy.
 

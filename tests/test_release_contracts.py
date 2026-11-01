@@ -93,10 +93,13 @@ class ReleaseContracts(unittest.TestCase):
             for name in ("LICENSE", "NOTICE", "README.md", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
                 (root / name).write_text(name)
             for directory, files in {
-                "src": ["main.rs"], "src-tauri": ["Cargo.toml", "Cargo.lock", "tauri.conf.json", "Info.plist", "src/main.rs", "icons/icon.png"],
+                "src": ["main.rs"], "src-tauri": ["Cargo.toml", "tauri.conf.json", "Info.plist", "src/main.rs", "icons/icon.png"],
+                "crates/chat-hub-model": ["Cargo.toml", "src/lib.rs"],
+                "crates/chat-hub-formats": ["Cargo.toml", "src/lib.rs"],
                 "desktop-ui": ["index.html"], "build": ["build-native-macos.sh"],
                 "ci/actions/macos-native-build": ["action.yml"],
                 "ci/actions/gha-artifact-upload": ["action.yml", "main.go"],
+                "ci/scripts": ["compiled_cache.py"],
                 ".github/workflows": ["macos.yml", "accept-native.yml"],
             }.items():
                 for name in files:
@@ -114,13 +117,16 @@ class ReleaseContracts(unittest.TestCase):
             self.assertEqual(manifest["format"], release_sources.FORMAT)
             paths = {item["path"] for item in manifest["files"]}
             self.assertTrue({
-                "src/main.rs", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock",
+                "src/main.rs", "src-tauri/Cargo.toml",
+                "crates/chat-hub-model/Cargo.toml", "crates/chat-hub-model/src/lib.rs",
+                "crates/chat-hub-formats/Cargo.toml", "crates/chat-hub-formats/src/lib.rs",
                 "src-tauri/tauri.conf.json", "src-tauri/Info.plist",
                 "src-tauri/src/main.rs", "src-tauri/icons/icon.png",
                 "desktop-ui/index.html", "build/build-native-macos.sh",
                 "ci/actions/macos-native-build/action.yml",
                 "ci/actions/gha-artifact-upload/action.yml",
                 "ci/actions/gha-artifact-upload/main.go",
+                "ci/scripts/compiled_cache.py",
                 ".github/workflows/macos.yml", ".github/workflows/accept-native.yml",
                 "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
                 "LICENSE", "NOTICE",

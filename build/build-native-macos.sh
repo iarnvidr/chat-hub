@@ -12,8 +12,7 @@ out="$(cd "$out" && pwd)"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 cargo test --locked --manifest-path src-tauri/Cargo.toml --workspace
 cargo tauri build --config src-tauri/tauri.conf.json --target aarch64-apple-darwin --bundles app -- --locked
-app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Chat Hub.app"
-if [[ ! -d "$app" ]]; then app="target/aarch64-apple-darwin/release/bundle/macos/Chat Hub.app"; fi
+app="${CARGO_TARGET_DIR:-target}/aarch64-apple-darwin/release/bundle/macos/Chat Hub.app"
 test -d "$app"
 resources="$app/Contents/Resources"
 mkdir -p "$resources"

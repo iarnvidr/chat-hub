@@ -1,0 +1,74 @@
+name: Reuse verified Rust compilation outputs
+description: Restore and publish a bounded sccache directory through protected-main GHCR OCI tags.
+inputs:
+  mode:
+    description: restore before compiling, report after compiling, or publish from trusted main.
+    required: true
+  github-token:
+    description: Job-scoped GHCR token. Read-only for PR restore and write-enabled only for protected main.
+    required: false
+    default: ''
+  platform-id:
+    description: Stable runner identity included in the cache contract.
+    required: true
+  platform:
+    description: Pinned sccache release platform identifier.
+    required: true
+  target:
+    description: Rust target triple included in the cache contract.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install pinned compiler wrapper and prepare cache contract
+      if: ${{ inputs.mode == 'restore' }}
+      shell: bash
+      run: >-
+        python3 "$GITHUB_WORKSPACE/ci/scripts/compiled_cache.py" prepare
+        --root "$GITHUB_WORKSPACE"
+        --platform "${{ inputs.platform }}"
+        --platform-id "${{ inputs['platform-id'] }}"
+        --target "${{ inputs.target }}"
+        --cache-dir "$RUNNER_TEMP/chat-hub-sccache/cache"
+        --state-dir "$RUNNER_TEMP/chat-hub-sccache/state"
+        --github-env "$GITHUB_ENV"
+        --summary "$GITHUB_STEP_SUMMARY"
+    - name: Install pinned ORAS client
+      id: oras
+      if: ${{ inputs.mode == 'restore' || inputs.mode == 'publish' }}
+      shell: bash
+      run: |
+        set -u
+        if path="$(bash "$GITHUB_WORKSPACE/build/install-oras.sh" "$RUNNER_TEMP/chat-hub-oras" 2>/dev/null)"; then
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+        else
+          echo "path=" >> "$GITHUB_OUTPUT"
+          echo "Pinned ORAS unavailable; compile cache transfer will be skipped." >> "$GITHUB_STEP_SUMMARY"
+        fi
+    - name: Restore protected-main compiler cache
+      if: ${{ inputs.mode == 'restore' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: >-
+        python3 "$GITHUB_WORKSPACE/ci/scripts/compiled_cache.py" pull
+        --state-dir "$RUNNER_TEMP/chat-hub-sccache/state"
+        --oras "${{ steps.oras.outputs.path }}"
+        --summary "$GITHUB_STEP_SUMMARY"
+    - name: Record compiler-cache hit evidence
+      if: ${{ inputs.mode == 'report' }}
+      shell: bash
+      run: >-
+        python3 "$GITHUB_WORKSPACE/ci/scripts/compiled_cache.py" report
+        --state-dir "$RUNNER_TEMP/chat-hub-sccache/state"
+        --summary "$GITHUB_STEP_SUMMARY"
+    - name: Publish compiler cache from protected main only
+      if: ${{ inputs.mode == 'publish' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: >-
+        python3 "$GITHUB_WORKSPACE/ci/scripts/compiled_cache.py" publish
+        --state-dir "$RUNNER_TEMP/chat-hub-sccache/state"
+        --oras "${{ steps.oras.outputs.path }}"
+        --summary "$GITHUB_STEP_SUMMARY"

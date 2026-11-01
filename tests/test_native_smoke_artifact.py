@@ -10,9 +10,9 @@ spec.loader.exec_module(resolver)
 
 
 class NativeSmokeArtifact(unittest.TestCase):
-    def test_nested_cargo_target_directory_and_declared_binary_name(self):
+    def test_shared_cargo_target_directory_and_declared_binary_name(self):
         metadata = {
-            "target_directory": "/runner/work/repo/src-tauri/target",
+            "target_directory": "/runner/work/repo/target",
             "packages": [{"name": "chat-hub-desktop", "targets": [
                 {"name": "chat-hub-desktop", "kind": ["bin"]},
                 {"name": "build-script-build", "kind": ["custom-build"]},
@@ -20,7 +20,7 @@ class NativeSmokeArtifact(unittest.TestCase):
         }
         self.assertEqual(
             resolver.artifact_path(metadata),
-            "/runner/work/repo/src-tauri/target/aarch64-apple-darwin/debug/chat-hub-desktop",
+            "/runner/work/repo/target/aarch64-apple-darwin/debug/chat-hub-desktop",
         )
 
     def test_workflows_use_metadata_artifact_and_isolated_bundle(self):

@@ -9,6 +9,9 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Fetch exact workflow revision
         env:
@@ -21,11 +24,17 @@ jobs:
           git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
       - name: Linux Rust and desktop UI checks
         uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           version: 0.21.11
           verb: call
           module: ./ci/dagger/check
-          args: linux-checks --source .
+          args: >-
+            cached-linux-checks --source . --registry-token env:GH_TOKEN
+            --repository ${{ github.repository }} --event-name ${{ github.event_name }}
+            --ref ${{ github.ref }} --actor ${{ github.actor }}
+            --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }} --sha ${{ github.sha }}
   browser:
     name: Desktop UI browser (Linux)
     runs-on: ubuntu-24.04
