@@ -48,6 +48,7 @@ $('project-filter').addEventListener('change', () => {
 });
 $('edit-project-name').addEventListener('click', async event => {
   if (renameBusy) return;
+  const anchor = event.currentTarget;
   const request = ++renameRequest;
   try {
     await loadProjects();
@@ -55,7 +56,7 @@ $('edit-project-name').addEventListener('click', async event => {
     const editingProject = projects.find(project => project.project_key === $('project-filter').value);
     if (!editingProject) return;
     if (!projectCanBeRenamed(editingProject)) throw Error('project_not_available');
-    editor.open(event.currentTarget, panel => {
+    editor.open(anchor, panel => {
       const form = document.createElement('form');
       form.className = 'project-rename-form';
       const title = document.createElement('strong'); title.textContent = 'Rename in ChatGPT';

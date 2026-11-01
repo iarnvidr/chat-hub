@@ -8,13 +8,11 @@
 .thread-action-rail{display:flex;align-items:center;justify-content:center;gap:1px;position:relative;padding:0 2px 0 4px;min-width:0}
 .thread-action-rail::before{content:'';position:absolute;left:0;top:23%;bottom:23%;width:1px;background:linear-gradient(transparent,var(--border-strong),transparent);opacity:0;transition:opacity .13s}
 .conversation-row:hover .thread-action-rail::before,.conversation-row:focus-within .thread-action-rail::before{opacity:1}
-.thread-action-rail .thread-action{display:flex;align-items:center;justify-content:center;flex:none;width:25px;min-width:25px;height:30px;min-height:30px;padding:4px;border:0;background:transparent;color:var(--muted);border-radius:3px;opacity:0;transform:translateX(3px);transition:opacity .13s,transform .16s,color .13s,background .13s;pointer-events:none}
+.thread-action-rail .thread-action{display:flex;align-items:center;justify-content:center;flex:1;width:100%;min-width:25px;height:30px;min-height:30px;padding:4px;border:0;background:transparent;color:var(--muted);border-radius:3px;opacity:0;transform:translateX(3px);transition:opacity .13s,transform .16s,color .13s,background .13s;pointer-events:none}
 .thread-action svg{width:15px;height:15px;transition:transform .16s}
 .thread-more svg{stroke-width:3}
-.conversation-row:hover .thread-action,.conversation-row:focus-within .thread-action,.thread-action-rail .thread-pin[aria-pressed="true"]{opacity:1;transform:translateX(0);pointer-events:auto}
-.thread-action-rail .thread-pin[aria-pressed="true"]{color:var(--accent);background:transparent}
+.conversation-row:hover .thread-action,.conversation-row:focus-within .thread-action{opacity:1;transform:translateX(0);pointer-events:auto}
 .thread-action-rail .thread-action:hover,.thread-action-rail .thread-action[aria-expanded="true"]{background:var(--accent-soft);color:var(--accent-bright)}
-.thread-action-rail .thread-pin:hover svg{transform:translateY(-1px) rotate(-12deg)}
 .thread-action-rail .thread-more:hover svg{transform:translateX(1px)}
 .conversation-row[data-busy="true"] .thread-action{opacity:.5;transform:none}
 .thread-action[data-hint]::after{content:attr(data-hint);position:absolute;bottom:calc(100% + 3px);right:0;padding:3px 6px;background:var(--surface-2);color:var(--text);font:10px var(--mono);border:1px solid var(--border);border-radius:3px;opacity:0;pointer-events:none;white-space:nowrap;transform:translateY(2px);transition:opacity .12s,transform .12s;z-index:4}

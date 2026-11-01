@@ -25,14 +25,21 @@ async function setup(invoke){const {createRowActions}=await import('../desktop-u
 
 test('pin only refreshes after a verified native receipt; a rejection leaves the row unchanged',async()=>{
   let accept;const calls=[];const ui=await setup((command,args)=>{calls.push([command,args]);return new Promise(resolve=>accept=resolve);});
-  const button=ui.row.querySelector('.thread-pin');const request=button.fire('click');assert.equal(ui.changed,0);assert.equal(button.disabled,true);assert.equal(button.getAttribute('aria-pressed'),'false');
+  assert.equal(ui.row.querySelectorAll('.thread-action').length,1);assert.equal(ui.row.querySelector('.thread-pin'),null);await ui.row.querySelector('.thread-more').fire('click');const button=ui.menu.querySelectorAll('button').find(b=>b.dataset.action==='pin');const request=button.fire('click');assert.equal(ui.changed,0);assert.equal(button.disabled,true);
   accept({verified:true,library_revision:3});await request;assert.equal(ui.changed,1);assert.deepEqual(calls,[['set_conversation_state',{conversationId:chat.id,pinned:true}]]);
-  const failed=await setup(async()=>({verified:false,library_revision:4}));await failed.row.querySelector('.thread-pin').fire('click');assert.equal(failed.changed,0);assert.match(failed.doc.status.textContent,/did not confirm/);
+  const failed=await setup(async()=>({verified:false,library_revision:4}));await failed.row.querySelector('.thread-more').fire('click');await failed.menu.querySelectorAll('button').find(b=>b.dataset.action==='pin').fire('click');assert.equal(failed.changed,0);assert.match(failed.menu.querySelector('.thread-menu-status').textContent,/did not confirm/);
 });
 test('row action clicks never open the primary conversation and Escape returns focus to its menu trigger',async()=>{
   const ui=await setup(async()=>({}));let opened=0;ui.primary.addEventListener('click',()=>opened++);
   const more=ui.row.querySelector('.thread-more');await more.fire('click');assert.equal(opened,0);assert.equal(ui.menu.hidden,false);assert.equal(more.getAttribute('aria-expanded'),'true');
   await ui.menu.fire('keydown',{key:'Escape'});assert.equal(ui.menu.hidden,true);assert.equal(ui.doc.activeElement,more);assert.equal(more.getAttribute('aria-expanded'),'false');
+});
+test('the single row action area opens one menu on hover and preserves pointer transfer into it',async()=>{
+  const ui=await setup(async()=>({}));ui.win.setTimeout=setTimeout;
+  const rail=ui.row.querySelector('.thread-action-rail');await rail.fire('pointerenter',{pointerType:'mouse'});assert.equal(ui.menu.hidden,true);
+  await new Promise(resolve=>setTimeout(resolve,210));assert.equal(ui.menu.hidden,false);assert.equal(ui.row.querySelectorAll('.thread-action').length,1);
+  await rail.fire('pointerleave');await ui.menu.fire('pointerenter');await new Promise(resolve=>setTimeout(resolve,250));assert.equal(ui.menu.hidden,false);
+  await ui.menu.fire('pointerleave');await new Promise(resolve=>setTimeout(resolve,310));assert.equal(ui.menu.hidden,true);
 });
 test('project submenu includes No project and sends null with verified upstream scope',async()=>{
   const calls=[];const ui=await setup(async(command,args)=>{calls.push([command,args]);if(command==='list_projects')return {projects:[{project_key:'project:["chatgpt","chatgpt:observed:owner","g-p-example"]',title:'Example'}]};return {scope:'upstream',verified:true,library_revision:4};});

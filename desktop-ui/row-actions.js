@@ -17,8 +17,9 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
   const node=(tag,text,cls)=>{const n=doc.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
   function icon(kind){const svg=doc.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');const path=doc.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d',paths[kind]||paths.more);svg.append(path);return svg;}
   const menu=node('div',undefined,'thread-menu');menu.id='thread-actions-menu';menu.hidden=true;menu.setAttribute('role','menu');doc.body.append(menu);
-  const pending=new Set();let target=null,trigger=null,view='actions',generation=0,busy=false,hoverPicker=false,hoverCloseTimer=0;
+  const pending=new Set();let target=null,trigger=null,view='actions',generation=0,busy=false,hoverPicker=false,hoverCloseTimer=0,hoverOpenTimer=0;
   function close(restoreFocus=true){
+    clearTimeout(hoverOpenTimer);
     if(menu.hidden)return;
     clearTimeout(hoverCloseTimer);hoverPicker=false;
     const prior=trigger;++generation;menu.hidden=true;menu.replaceChildren();target=null;trigger=null;view='actions';
@@ -106,9 +107,9 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
     catch(error){if(target===chat)status(actionError(error));else doc.getElementById('app-status').textContent=actionError(error);}
     finally{busy=false;if(target)for(const b of menu.querySelectorAll('button,input'))b.disabled=false;}
   }
-  function open(chat,button){
-    if(target?.id===chat.id&&trigger===button&&!menu.hidden){close();return;}
-    close(false);target=chat;trigger=button;menu.hidden=false;button.setAttribute('aria-expanded','true');actions();menu.querySelector('button:not(:disabled)')?.focus();
+  function open(chat,button,hover=false){
+    if(target?.id===chat.id&&trigger===button&&!menu.hidden){if(!hover)close();return;}
+    close(false);target=chat;trigger=button;hoverPicker=hover;menu.hidden=false;button.setAttribute('aria-expanded','true');actions();if(!hover)menu.querySelector('button:not(:disabled)')?.focus();
   }
   win.addEventListener('chat-hub:open-project-picker',event=>{
     const chat=event.detail?.chat,button=event.detail?.anchor;
@@ -123,16 +124,16 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
   menu.addEventListener('pointerleave',()=>{
     if(!hoverPicker)return;
     clearTimeout(hoverCloseTimer);hoverCloseTimer=win.setTimeout(()=>{
-      if(!menu.matches(':hover')&&!trigger?.matches(':hover'))close(false);
+      if(!menu.matches(':hover')&&!trigger?.matches(':hover')&&!menu.contains(doc.activeElement))close(false);
     },280);
   });
   function wrap(chat,primary){
     const row=node('div',undefined,'conversation-row');row.dataset.id=chat.id;row.dataset.pinned=String(Boolean(chat.pinned));row.classList.toggle('selected',primary.classList.contains('selected'));
     const rail=node('div',undefined,'thread-action-rail');rail.setAttribute('role','group');rail.setAttribute('aria-label','Chat actions');
-    if(chatgptConversationId(chat)){
-      const pin=node('button',undefined,'thread-action thread-pin');pin.type='button';pin.append(icon('pin'));pin.setAttribute('aria-label',`${chat.pinned?'Unpin':'Pin'} ${chat.title||'conversation'}`);pin.setAttribute('aria-pressed',String(Boolean(chat.pinned)));pin.dataset.hint=chat.pinned?'Unpin':'Pin';pin.addEventListener('click',()=>mutate(chat,{pinned:!chat.pinned},row));rail.append(pin);
-    }
-    const more=node('button',undefined,'thread-action thread-more');more.type='button';more.append(icon('more'));more.setAttribute('aria-label',`Actions for ${chat.title||'conversation'}`);more.setAttribute('aria-haspopup','menu');more.setAttribute('aria-expanded','false');more.setAttribute('aria-controls',menu.id);more.dataset.hint='Actions';more.addEventListener('click',()=>open(chat,more));rail.append(more);
+    const more=node('button',undefined,'thread-action thread-more');more.type='button';more.append(icon('more'));more.setAttribute('aria-label',`Actions for ${chat.title||'conversation'}`);more.setAttribute('aria-haspopup','menu');more.setAttribute('aria-expanded','false');more.setAttribute('aria-controls',menu.id);more.addEventListener('click',()=>open(chat,more));rail.append(more);
+    rail.addEventListener('pointerenter',event=>{if(event.pointerType==='touch')return;clearTimeout(hoverCloseTimer);clearTimeout(hoverOpenTimer);hoverOpenTimer=setTimeout(()=>open(chat,more,true),180);});
+    rail.addEventListener('pointerleave',()=>{clearTimeout(hoverOpenTimer);if(target?.id!==chat.id||!hoverPicker)return;clearTimeout(hoverCloseTimer);hoverCloseTimer=setTimeout(()=>{if(!menu.matches(':hover')&&!menu.contains(doc.activeElement))close(false);},220);});
+    more.addEventListener('keydown',event=>{if(event.key==='ArrowDown'){event.preventDefault();open(chat,more);}});
     row.append(primary,rail);
     row.addEventListener('contextmenu',event=>{event.preventDefault();open(chat,more);});
     primary.addEventListener('keydown',event=>{if(event.key==='ContextMenu'||(event.shiftKey&&event.key==='F10')){event.preventDefault();open(chat,more);}});

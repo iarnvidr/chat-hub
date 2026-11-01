@@ -147,6 +147,7 @@ class UiBridgeContract(unittest.TestCase):
             set(commands),
             {
                 "catalog_entities", "catalog_entity", "list_local_tags",
+                "catalog_entity_graph", "catalog_tag_suggestions",
                 "get_target_tags", "set_target_tags", "tagged_targets",
                 "saved_artifacts", "attach_artifact_file", "export_artifact_file",
                 "open_artifact_file", "open_catalog_link",

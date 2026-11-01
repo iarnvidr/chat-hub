@@ -1291,6 +1291,13 @@ fn is_generic_tag_suggestion(term: &str) -> bool {
             | "actually" | "seems" | "perhaps" | "really" | "please" | "thanks" | "thank you"
             | "something" | "anything" | "everything" | "people" | "things" | "using"
             | "several" | "various" | "clearer" | "now" | "today" | "tomorrow" | "yesterday"
+            | "web" | "search" | "executive" | "conclusion" | "correctly" | "identifies"
+            | "important" | "interpretation" | "advance" | "registration" | "connecting"
+            | "communicating" | "activities" | "tool" | "tools" | "workflow" | "workflows"
+            | "procedure" | "procedures" | "step" | "steps" | "process" | "online"
+            | "internet" | "analysis" | "analyze" | "reasoning" | "summary" | "summarize"
+            | "recommendation" | "recommendations" | "output" | "generated" | "provided"
+            | "details" | "detail"
             | "new chat" | "new conversation" | "untitled conversation" | "your conversation"
             | "project name pending" | "assigned project" | "unnamed project" | "new project"
             | "chatgpt" | "chatgpt conversation" | "openai" | "github com" | "www github com"
@@ -1327,6 +1334,12 @@ fn extract_content_phrases(sample: &str) -> Vec<String> {
         "archive", "archived", "untitled", "source", "provider", "account", "timestamp", "created",
         "updated", "true", "false", "null", "none", "json", "http", "https", "www",
         "across", "consolidate", "project", "repeated",
+        "web", "search", "executive", "conclusion", "correctly", "identifies",
+        "important", "interpretation", "advance", "registration", "connecting",
+        "communicating", "activities", "tool", "tools", "workflow", "workflows",
+        "procedure", "procedures", "step", "steps", "process", "online", "internet",
+        "analysis", "analyze", "reasoning", "summary", "summarize", "recommendation",
+        "recommendations", "output", "generated", "provided", "details", "detail",
     ];
     let mut counts = HashMap::<String, usize>::new();
     let mut scored = HashMap::<String, usize>::new();
@@ -3524,7 +3537,7 @@ mod tests {
                 "node",
                 None,
                 "user",
-                "Village research project: repeated field surveys. Rust SQLite migration planning: schema migrations across villages. The schema migrations will consolidate survey notes. Actually it seems clearer now. See https://github.com/acme/graph-rust, https://maps.village.net, https://data.usgs.gov and https://openstreetmap.org; track 83eb910af65a. ChatGPT conversation archive.",
+                "Village research project: repeated field surveys. Rust SQLite migration planning: schema migrations across villages. The schema migrations will consolidate survey notes. Actually it seems clearer now. Web search web search. Executive conclusion executive conclusion. Correctly identifies correctly identifies important interpretation important interpretation. Advance registration advance registration. Connecting homeowner associations; communicating activities. Homeowner associations matter in village surveys. See https://github.com/acme/graph-rust, https://maps.village.net, https://data.usgs.gov and https://openstreetmap.org; track 83eb910af65a. ChatGPT conversation archive.",
             )],
             "complete",
         );
@@ -3539,6 +3552,12 @@ mod tests {
             "repeated multiword topic should be suggested: {:?}", suggestions.items);
         assert!(suggestions.items.iter().any(|item| item.name == "rust sqlite"),
             "short technical terms should survive as a phrase: {:?}", suggestions.items);
+        for noisy in ["web search", "executive conclusion", "correctly identifies", "important interpretation", "advance registration", "connecting homeowner", "communicating activities"] {
+            assert!(!suggestions.items.iter().any(|item| item.name == noisy),
+                "procedural filler should be suppressed ({noisy}): {:?}", suggestions.items);
+        }
+        assert!(suggestions.items.iter().any(|item| item.name == "homeowner associations"),
+            "repeated substantive phrase should remain: {:?}", suggestions.items);
         assert!(suggestions.items.iter().filter(|item| item.reason == "Referenced domain").count() <= 2,
             "raw domains must not crowd out topics: {:?}", suggestions.items);
         assert!(suggestions.items.iter().all(|item| {
