@@ -34,12 +34,14 @@ function visiblePendingConversations() {
   return pendingConversationStore.list().sort((a,b)=>b.created_at_ms-a.created_at_ms).map(pendingConversationItem).filter(item=>
     item && (!query || item.title.toLocaleLowerCase().includes(query)));
 }
+let pendingScrollId=null;
 function drawList() {
   const box = $('conversation-list');
   rowActions.close(false);
   box.replaceChildren();
   $('load-more').hidden = !cursor;
   const displayed = queryValue ? groupSearchConversations(items) : [...items];
+  let pendingScrollButton=null;
   const pending=visiblePendingConversations();
   if(pending.length){
     const boundary=displayed.findIndex(item=>item.pinned!==true);
@@ -78,7 +80,9 @@ function drawList() {
     if(c.pending)button.addEventListener('click',()=>openPendingConversation(c));
     else button.addEventListener('click', () => openConversation(c.id, c.search_leaf_node_id, c.search_node_id));
     box.append(c.pending?button:rowActions.wrap(c,button));
+    if(c.pending && c.pending_id===pendingScrollId)pendingScrollButton=button;
   }
+  if(pendingScrollButton){pendingScrollButton.scrollIntoView?.({block:'nearest'});pendingScrollId=null;}
   if (!displayed.length && !$('list-state').textContent.includes('failed') && !$('list-state').textContent.startsWith('Could not load')) showError('No conversations found.');
 }
 function resetSidebarForNewChat() {
@@ -163,6 +167,7 @@ window.addEventListener('chat-hub:live-open', () => {
   const pendingId=`pending-chatgpt:${Date.now()}-${++liveDraftSequence}`;
   const id=`draft:chatgpt:${Date.now()}-${++liveDraftSequence}`;
   pendingConversationStore.createDraft(pendingId);
+  pendingScrollId=pendingId;
   conversationTabs.open({id,pendingId,title:'New ChatGPT conversation',mode:'live',sourceConversationId:null});
   drawList();
   void loadList('',true);

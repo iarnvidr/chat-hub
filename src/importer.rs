@@ -239,22 +239,53 @@ pub fn import_chatgpt_history(
         .into_iter()
         .map(|(source_id, title)| crate::store::ProjectTitle { source_id, title })
         .collect::<Vec<_>>();
-    let receipt = if envelope
+    let entries = envelope
         .get("conversations")
         .and_then(Value::as_array)
-        .is_some_and(|items| items.is_empty())
-    {
-        ImportReceipt::default()
+        .ok_or_else(invalid)?;
+    let (receipt, failed_items) = if entries.is_empty() {
+        (ImportReceipt::default(), Vec::new())
     } else {
-        import_scoped(store, bytes, scope, "chatgpt-history-v1", false)?
+        import_scoped_detailed(store, bytes, scope, "chatgpt-history-v1", false)?
     };
+    let failed_source_ids = failed_items
+        .into_iter()
+        .filter_map(|index| entries.get(index).and_then(history_source_id))
+        .collect::<std::collections::HashSet<_>>();
+    let mut applicable_mappings = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        let exists: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE provider=?1 AND account_scope=?2 AND source_id=?3)",
+            rusqlite::params!["chatgpt", scope, mapping.source_id],
+            |row| row.get(0),
+        ).map_err(|_| invalid())?;
+        if exists {
+            applicable_mappings.push(mapping);
+        } else if !entries.is_empty() && !failed_source_ids.contains(&mapping.source_id) {
+            return Err(invalid());
+        }
+    }
     store
         .apply_project_titles("chatgpt", scope, &project_titles)
         .map_err(|_| invalid())?;
     store
-        .apply_project_memberships("chatgpt", scope, &mappings)
+        .apply_project_memberships("chatgpt", scope, &applicable_mappings)
         .map_err(|_| invalid())?;
     Ok(receipt)
+}
+
+fn history_source_id(document: &Value) -> Option<String> {
+    document
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 512)
+        .or_else(|| {
+            document
+                .get("conversation_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && id.len() <= 512)
+        })
+        .map(ToOwned::to_owned)
 }
 
 fn import_scoped(
@@ -264,9 +295,20 @@ fn import_scoped(
     parser: &str,
     cached: bool,
 ) -> Result<ImportReceipt, ImportError> {
+    import_scoped_detailed(store, bytes, scope, parser, cached).map(|(receipt, _)| receipt)
+}
+
+fn import_scoped_detailed(
+    store: &mut crate::store::Store,
+    bytes: &[u8],
+    scope: &str,
+    parser: &str,
+    cached: bool,
+) -> Result<(ImportReceipt, Vec<usize>), ImportError> {
     use crate::store::IngestOutcome;
     let entries = parse_export(bytes)?;
     let mut receipt = ImportReceipt::default();
+    let mut failed_items = Vec::new();
     for (item_index, doc) in entries.iter().enumerate() {
         let observed_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -302,6 +344,7 @@ fn import_scoped(
         };
         if let Some((code, message)) = failure {
             receipt.failed += 1;
+            failed_items.push(item_index);
             if receipt.errors.len() < 100 {
                 receipt.errors.push(ItemError {
                     item_index,
@@ -313,7 +356,7 @@ fn import_scoped(
             }
         }
     }
-    Ok(receipt)
+    Ok((receipt, failed_items))
 }
 
 fn ingest_cached_if_changed(
@@ -475,7 +518,7 @@ mod project_metadata_import_tests {
     }
 
     #[test]
-    fn metadata_only_unknown_target_rolls_back_every_mapping() {
+    fn metadata_only_uncommitted_target_is_ignored_while_valid_mapping_is_applied() {
         let mut store = crate::store::Store::in_memory().unwrap();
         seed(&mut store, "existing");
         let scope = format!("chatgpt:observed:{}", "a".repeat(64));
@@ -484,12 +527,42 @@ mod project_metadata_import_tests {
             "project_catalog":[{"id":"project-1","title":"Project title"}],
             "conversation_projects":[{"conversation_id":"existing","project_id":"project-1"},{"conversation_id":"missing","project_id":"project-1"}]
         });
-        assert!(import_chatgpt_history(&mut store, &serde_json::to_vec(&body).unwrap()).is_err());
-        assert!(store
-            .projects_snapshot("chatgpt")
-            .unwrap()
-            .projects
-            .is_empty());
+        let receipt =
+            import_chatgpt_history(&mut store, &serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(receipt.failed, 0);
+        let projects = store.projects_snapshot("chatgpt").unwrap();
+        assert_eq!(projects.projects.len(), 1);
+        assert_eq!(projects.projects[0]["title"], "Project title");
+        assert_eq!(projects.projects[0]["conversation_count"], 1);
+    }
+
+    #[test]
+    fn metadata_only_uncommitted_target_never_rebinds_another_account_row() {
+        let mut store = crate::store::Store::in_memory().unwrap();
+        seed(&mut store, "same-source-id");
+        let other_scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        store
+            .apply_project_memberships(
+                "chatgpt",
+                &other_scope,
+                &[crate::store::ProjectMembership {
+                    source_id: "same-source-id".into(),
+                    project_id: Some("existing-project".into()),
+                    title: Some("Other account project".into()),
+                }],
+            )
+            .unwrap();
+        let current_scope = format!("chatgpt:observed:{}", "b".repeat(64));
+        let body = serde_json::json!({
+            "format":"chat-hub-history-v1", "account_scope":current_scope, "conversations":[],
+            "project_catalog":[{"id":"new-project","title":"Current account project"}],
+            "conversation_projects":[{"conversation_id":"same-source-id","project_id":"new-project"}]
+        });
+        import_chatgpt_history(&mut store, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let projects = store.projects_snapshot("chatgpt").unwrap();
+        assert_eq!(projects.projects.len(), 1);
+        assert_eq!(projects.projects[0]["title"], "Other account project");
+        assert_eq!(projects.projects[0]["conversation_count"], 1);
     }
 
     #[test]

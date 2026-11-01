@@ -178,16 +178,10 @@ impl ChatgptHistoryState {
                             desktop_api::import_chatgpt_history(&api, &token, data.to_vec(), count),
                         )?;
                         let mut current = worker_status.lock().map_err(|_| "status_unavailable")?;
-                        current.processed_exports += 1;
-                        current.processed_conversations =
-                            current.processed_conversations.saturating_add(count);
-                        current.imported = current.imported.saturating_add(receipt.imported);
-                        current.updated = current.updated.saturating_add(receipt.updated);
-                        current.unchanged = current.unchanged.saturating_add(receipt.unchanged);
-                        current.failed = current.failed.saturating_add(receipt.failed);
-                        if receipt.failed != 0 {
-                            return Err("history_import_failed".into());
-                        }
+                        record_import_receipt(&mut current, &receipt, count);
+                        // Item-level failures are represented in the receipt. Keep
+                        // acknowledging this chunk so one malformed graph cannot
+                        // block the rest of the account's history from syncing.
                         Ok(())
                     },
                     |stage, count| {
@@ -206,8 +200,14 @@ impl ChatgptHistoryState {
                     match result {
                         Ok(outcome) if outcome.complete => {
                             current.state = "completed".into();
-                            current.message =
-                                "ChatGPT history is saved in your local library.".into();
+                            current.message = if current.failed == 0 {
+                                "ChatGPT history is saved in your local library.".into()
+                            } else {
+                                format!(
+                                    "History sync finished; {} conversation(s) could not be saved.",
+                                    current.failed
+                                )
+                            };
                             current.total_conversations = current.processed_conversations;
                         }
                         Ok(outcome) => {
@@ -271,6 +271,19 @@ impl ChatgptHistoryState {
 }
 
 const MAX_AUTOMATIC_RETRY_AFTER_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+fn record_import_receipt(
+    status: &mut ChatgptHistoryStatus,
+    receipt: &desktop_api::ImportReceipt,
+    count: u64,
+) {
+    status.processed_exports = status.processed_exports.saturating_add(1);
+    status.processed_conversations = status.processed_conversations.saturating_add(count);
+    status.imported = status.imported.saturating_add(receipt.imported);
+    status.updated = status.updated.saturating_add(receipt.updated);
+    status.unchanged = status.unchanged.saturating_add(receipt.unchanged);
+    status.failed = status.failed.saturating_add(receipt.failed);
+}
 
 fn write_status_snapshot(destination: &Path, status: &ChatgptHistoryStatus) -> std::io::Result<()> {
     let parent = destination
@@ -432,5 +445,38 @@ mod status_snapshot_tests {
 
         state.note_provider_rate_limit(Some(MAX_AUTOMATIC_RETRY_AFTER_SECONDS + 1));
         assert!(state.status.lock().unwrap().automatic_retry_paused);
+    }
+
+    #[test]
+    fn item_failure_in_one_receipt_does_not_prevent_later_chunk_progress() {
+        let mut status = ChatgptHistoryStatus::default();
+        record_import_receipt(
+            &mut status,
+            &desktop_api::ImportReceipt {
+                imported: 1,
+                updated: 0,
+                unchanged: 0,
+                failed: 1,
+                errors: Vec::new(),
+                errors_truncated: false,
+            },
+            2,
+        );
+        record_import_receipt(
+            &mut status,
+            &desktop_api::ImportReceipt {
+                imported: 1,
+                updated: 0,
+                unchanged: 0,
+                failed: 0,
+                errors: Vec::new(),
+                errors_truncated: false,
+            },
+            1,
+        );
+        assert_eq!(status.processed_exports, 2);
+        assert_eq!(status.processed_conversations, 3);
+        assert_eq!(status.imported, 2);
+        assert_eq!(status.failed, 1);
     }
 }
