@@ -26,6 +26,7 @@ function bootApp({records = () => [], detail = id => ({conversation: {id, title:
     focus() {}
     scrollIntoView() {}
     querySelector() { return null; }
+    querySelectorAll() { return []; }
   }
   const getElementById = id => {
     if (!elements.has(id)) elements.set(id, new Element(id));
@@ -34,8 +35,18 @@ function bootApp({records = () => [], detail = id => ({conversation: {id, title:
   const invoke = async (command, args) => {
     if (command === 'list_conversations') return {items: records(), next_cursor: null, library_revision: 7};
     if (command === 'get_conversation') return detail(args.id);
+    if (command === 'get_chatgpt_connection') return {state:'connected',account_scope:SCOPE};
     return {};
   };
+  const pendingRows=[];
+  const createPendingConversationStore=()=>({
+    list:()=>pendingRows.map(row=>({...row})),get:id=>{const row=pendingRows.find(item=>item.pending_id===id);return row?{...row}:null;},
+    createDraft:(pending_id,created_at_ms=Date.now())=>{let row=pendingRows.find(item=>item.pending_id===pending_id);if(!row){row={pending_id,source_id:null,account_scope:null,created_at_ms};pendingRows.push(row);}return {...row};},
+    attachProviderConversation:(pending_id,source_id,account_scope)=>{let row=pendingRows.find(item=>item.pending_id===pending_id);if(!row){row={pending_id,created_at_ms:Date.now()};pendingRows.push(row);}Object.assign(row,{source_id,account_scope});return {...row};},
+    setAccountScope:(pending_id,account_scope)=>{const row=pendingRows.find(item=>item.pending_id===pending_id);if(row){row.account_scope=account_scope;return true;}return false;},
+    removeUnstartedDraft:pending_id=>{const i=pendingRows.findIndex(row=>row.pending_id===pending_id&&!row.source_id);if(i<0)return false;pendingRows.splice(i,1);return true;},
+    reconcileCaptured:items=>{const before=pendingRows.length;for(let i=pendingRows.length-1;i>=0;i--){const row=pendingRows[i];if(row.source_id&&row.account_scope&&items.filter(item=>item.provider==='chatgpt'&&item.source_id===row.source_id&&item.account_scope===row.account_scope).length===1)pendingRows.splice(i,1);}return before-pendingRows.length;},
+  });
   const window = {
     __TAURI_INTERNALS__: {invoke},
     addEventListener(name, fn) { listeners.set(name, fn); },
@@ -60,6 +71,7 @@ function bootApp({records = () => [], detail = id => ({conversation: {id, title:
     hasUnsupportedContent: () => false, renderMarkdown: () => {},
     updateStatus: async () => {},
     createRowActions: () => ({wrap: (chat, button) => button, close() {}}),
+    createPendingConversationStore,pendingConversationItem:row=>({id:`pending:${row.pending_id}`,pending_id:row.pending_id,source_id:row.source_id||null,account_scope:row.account_scope||null,provider:'chatgpt-pending',title:row.source_id?'ChatGPT conversation':'New ChatGPT conversation',updated_at_ms:row.created_at_ms,pending:true}),
   });
   const tabs = fs.readFileSync(`${ROOT}/desktop-ui/conversation-tabs.js`, 'utf8')
     .replaceAll('export function', 'function');
@@ -94,6 +106,33 @@ test('a created draft rekeys to its provider UUID and New keeps the prior live t
   assert.equal(ui.tabs.all().length, 2);
   assert.equal(ui.tabs.all()[0].id, `live:chatgpt:${UUID}`);
   assert.match(ui.tabs.selected().id, /^draft:chatgpt:/);
+});
+
+test('a new ChatGPT draft appears in the sidebar immediately, resets filters, and upgrades without a duplicate',async()=>{
+  let captured=false;const ui=bootApp({records:()=>captured?[{id:`chatgpt:${UUID}`,provider:'chatgpt',source_id:UUID,account_scope:SCOPE,title:'Captured chat'}]:[]});
+  await ui.flush();
+  ui.elements.get('history-source').value='codex';ui.elements.get('search').value='old search';
+  ui.elements.get('project-filter').value='project:one';ui.elements.get('tag-filter').value='important';
+  ui.elements.get('show-archived').setAttribute('aria-pressed','true');
+  ui.dispatch('chat-hub:live-open');await ui.flush();
+  assert.equal(ui.elements.get('history-source').value,'chatgpt');
+  assert.equal(ui.elements.get('search').value,'');assert.equal(ui.elements.get('project-filter').value,'');
+  assert.equal(ui.elements.get('tag-filter').value,'');assert.equal(ui.elements.get('show-archived').getAttribute('aria-pressed'),'false');
+  let rows=ui.elements.get('conversation-list').children;
+  assert.equal(rows.length,1);assert.match(rows[0].className,/pending-conversation/);
+  assert.match(rows[0].children[1].textContent,/Not saved to library yet/);
+  ui.dispatch('chat-hub:provider-conversation',{conversationId:UUID,accountScope:SCOPE});await ui.flush();
+  rows=ui.elements.get('conversation-list').children;assert.equal(rows.length,1);assert.match(rows[0].className,/pending-conversation/);
+  captured=true;ui.dispatch('chat-hub:history-updated');await ui.flush();
+  rows=ui.elements.get('conversation-list').children;assert.equal(rows.length,1);assert.doesNotMatch(rows[0].className,/pending-conversation/);
+  assert.equal(rows[0].children[0].textContent,'Captured chat');
+});
+
+test('closing an unsent blank draft removes its ephemeral sidebar row',async()=>{
+  const ui=bootApp();await ui.flush();ui.dispatch('chat-hub:live-open');await ui.flush();
+  assert.equal(ui.elements.get('conversation-list').children.length,1);
+  assert.equal(ui.tabs.closeSelected(),true);await ui.flush();
+  assert.equal(ui.elements.get('conversation-list').children.length,0);
 });
 
 test('capture refresh adopts one unambiguous account record without switching away from live ChatGPT', async () => {

@@ -8,6 +8,7 @@ import {groupSearchConversations, appendSearchHighlight} from './search.js';
 import {branchForAnchor} from './entity-model.js';
 import {createRowActions} from './row-actions.js';
 import {appendPinMarker} from './pin-marker.js';
+import {createPendingConversationStore,pendingConversationItem} from './pending-conversations.js';
 const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';
 const adapter=fixture?fixtureAdapter():{
   async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value,projectKey:$('project-filter').value||null,tag:$('tag-filter').value||null,archiveState:$('show-archived').getAttribute('aria-pressed')==='true'?'archived':'active'});},
@@ -19,36 +20,54 @@ function providerLabel(provider) {
   return {'chatgpt':'ChatGPT', 'paseo-chatgpt':'ChatGPT · imported', 'paseo-codex_local':'Codex local · imported', 'paseo-codex_cloud':'Codex cloud · imported'}[provider] || provider || 'Unknown provider';
 }
 const projectNames = new Map();
+let pendingConversationStore;
+try { pendingConversationStore=createPendingConversationStore(window.localStorage); }
+catch { pendingConversationStore=createPendingConversationStore(null); }
 const rowActions = createRowActions({invoke, onChanged: () => window.dispatchEvent(new Event('chat-hub:history-updated'))});
 function projectLabel(project) {
   return project.display_name || project.title || projectNames.get(project.project_key) || 'Project name pending';
+}
+function visiblePendingConversations() {
+  if ($('history-source').value !== 'chatgpt' || $('project-filter').value || $('tag-filter').value ||
+      $('show-archived').getAttribute('aria-pressed') === 'true') return [];
+  const query=queryValue.trim().toLocaleLowerCase();
+  return pendingConversationStore.list().sort((a,b)=>b.created_at_ms-a.created_at_ms).map(pendingConversationItem).filter(item=>
+    item && (!query || item.title.toLocaleLowerCase().includes(query)));
 }
 function drawList() {
   const box = $('conversation-list');
   rowActions.close(false);
   box.replaceChildren();
   $('load-more').hidden = !cursor;
-  const displayed = queryValue ? groupSearchConversations(items) : items;
-  if (queryValue && displayed.length) showError(`${displayed.length} chat${displayed.length === 1 ? '' : 's'}${cursor ? ' · more results available' : ''}`);
+  const displayed = queryValue ? groupSearchConversations(items) : [...items];
+  const pending=visiblePendingConversations();
+  if(pending.length){
+    const boundary=displayed.findIndex(item=>item.pinned!==true);
+    displayed.splice(boundary<0?displayed.length:boundary,0,...pending);
+  }
+  if (queryValue && displayed.length && !$('list-state').textContent.startsWith('Could not load')) showError(`${displayed.length} chat${displayed.length === 1 ? '' : 's'}${cursor ? ' · more results available' : ''}`);
   for (const c of displayed) {
     const button = document.createElement('button');
-    button.className = 'conversation-item' + (c.id === selected ? ' selected' : '');
+    const activePendingId=conversationTabs?.selected?.()?.pendingId;
+    button.className = 'conversation-item' + (c.id === selected || (c.pending && c.pending_id===activePendingId) ? ' selected' : '') + (c.pending?' pending-conversation':'');
     button.type = 'button';
-    button.setAttribute('aria-label',c.title || 'Untitled conversation');
+    button.setAttribute('aria-label',c.pending?`${c.title}, not saved to the library yet`:c.title || 'Untitled conversation');
     const title = document.createElement('strong'), metadata = document.createElement('span');
-    if (queryValue) appendSearchHighlight(title, c.title ?? 'Untitled conversation', queryValue);
+    if (c.pending) title.textContent=c.title;
+    else if (queryValue) appendSearchHighlight(title, c.title ?? 'Untitled conversation', queryValue);
     else title.textContent = c.title ?? 'Untitled conversation';
-    appendPinMarker(title,c.pinned === true);
-    metadata.textContent = providerLabel(c.provider);
-    metadata.hidden = $('history-source').value === 'chatgpt';
-    if (!c.provider?.startsWith('paseo-') && Number.isFinite(c.message_count)) metadata.textContent += ` · ${c.message_count} messages`;
+    if(!c.pending)appendPinMarker(title,c.pinned === true);
+    metadata.textContent = c.pending?'Not saved to library yet':providerLabel(c.provider);
+    if(c.pending)metadata.className='pending-conversation-status';
+    metadata.hidden = !c.pending && $('history-source').value === 'chatgpt';
+    if (!c.pending&&!c.provider?.startsWith('paseo-') && Number.isFinite(c.message_count)) metadata.textContent += ` · ${c.message_count} messages`;
     button.append(title, metadata);
-    if (c.project) {
+    if (!c.pending && c.project) {
       const project = document.createElement('span'); project.className = 'project-label';
       project.textContent = projectLabel(c.project);
       button.append(project);
     }
-    if (c.search_hit) {
+    if (!c.pending && c.search_hit) {
       const snippet = document.createElement('span');
       snippet.className = 'search-snippet'; appendSearchHighlight(snippet, c.snippet || '', queryValue); button.append(snippet);
       if (c.matched_message_count > 1) {
@@ -56,12 +75,63 @@ function drawList() {
         count.textContent = `${c.matched_message_count} matching messages`; button.append(count);
       }
     }
-    button.addEventListener('click', () => openConversation(c.id, c.search_leaf_node_id, c.search_node_id));
-    box.append(rowActions.wrap(c,button));
+    if(c.pending)button.addEventListener('click',()=>openPendingConversation(c));
+    else button.addEventListener('click', () => openConversation(c.id, c.search_leaf_node_id, c.search_node_id));
+    box.append(c.pending?button:rowActions.wrap(c,button));
   }
-  if (!items.length && !$('list-state').textContent.includes('failed')) showError('No conversations found.');
+  if (!displayed.length && !$('list-state').textContent.includes('failed') && !$('list-state').textContent.startsWith('Could not load')) showError('No conversations found.');
 }
-async function loadList(query=$('search').value,reset=true){const token=++queryToken;if(reset){queryValue=query.trim();cursor=null;revision=null;items=[];cursorRetry=false;}showError('Loading conversations…');try{const response=await adapter.listConversations(queryValue,cursor);const page=queryValue?normalizeSearch(response):normalizeList(response);if(token!==queryToken)return;if(!page||!Array.isArray(page.items))throw Error('Invalid conversation list response');if(revision!==null&&page.library_revision!==revision){cursor=null;revision=null;items=[];showError('Library changed; refreshed results');if(!reset)return loadList(queryValue,true);return;}revision=page.library_revision;cursor=page.next_cursor;const seen=new Set(items.map(x=>queryValue?JSON.stringify([x.id,x.search_node_id]):x.id));items.push(...page.items.filter(x=>!seen.has(queryValue?JSON.stringify([x.id,x.search_node_id]):x.id)));showError('');drawList();}catch(e){if(token!==queryToken)return;const s=errText(e);if(!reset&&!cursorRetry&&/invalid_cursor|stale_cursor|library_changed/i.test(s)){cursorRetry=true;cursor=null;revision=null;items=[];showError('Library changed; restarting from the first page.');return loadList(queryValue,false);}showError(`Could not load conversations: ${safeError(s)}`);}}
+function resetSidebarForNewChat() {
+  $('history-source').value='chatgpt';
+  $('source-chat').setAttribute('aria-pressed','true');
+  $('source-codex').setAttribute('aria-pressed','false');
+  $('search').value='';$('project-filter').value='';$('tag-filter').value='';
+  $('edit-project-name').disabled=true;
+  $('project-selection').textContent='All projects';
+  for(const option of $('project-options').querySelectorAll('button'))
+    option.setAttribute('aria-pressed',String(option.dataset.projectKey===''));
+  $('show-archived').setAttribute('aria-pressed','false');
+  $('chat-list-label').textContent='Chats';
+  void loadProjects();
+}
+async function openPendingConversation(item) {
+  if(!item?.pending_id)return;
+  const existing=conversationTabs.all().find(tab=>tab.pendingId===item.pending_id);
+  if(existing){conversationTabs.select(existing.id);return;}
+  if(!item.source_id){$('app-status').textContent='This new chat is still opening in ChatGPT.';return;}
+  if(!item.account_scope){$('app-status').textContent='The account for this pending chat could not be verified. Open it in the ChatGPT session that created it.';return;}
+  try {
+    const connection=await invoke('get_chatgpt_connection');
+    if(connection?.state!=='connected'||connection.account_scope!==item.account_scope){
+      $('app-status').textContent='Connect the same ChatGPT account that started this pending chat to continue it.';return;
+    }
+    const canonical=`live:chatgpt:${item.source_id}`;
+    const id=conversationTabs.get(canonical)?`${canonical}:pending:${++liveDraftSequence}`:canonical;
+    conversationTabs.open({id,pendingId:item.pending_id,title:'ChatGPT conversation',mode:'live',
+      sourceConversationId:item.source_id,accountScope:item.account_scope,localId:null,leafNodeId:null});
+  } catch { $('app-status').textContent='ChatGPT is not available right now. The pending chat remains in your list.'; }
+}
+async function loadList(query=$('search').value,reset=true){
+  const token=++queryToken;
+  if(reset){queryValue=query.trim();cursor=null;revision=null;items=[];cursorRetry=false;}
+  showError('Loading conversations…');
+  try{
+    const response=await adapter.listConversations(queryValue,cursor),page=queryValue?normalizeSearch(response):normalizeList(response);
+    if(token!==queryToken)return;
+    if(!page||!Array.isArray(page.items))throw Error('Invalid conversation list response');
+    if(revision!==null&&page.library_revision!==revision){cursor=null;revision=null;items=[];showError('Library changed; refreshed results');if(!reset)return loadList(queryValue,true);return;}
+    revision=page.library_revision;cursor=page.next_cursor;
+    const seen=new Set(items.map(x=>queryValue?JSON.stringify([x.id,x.search_node_id]):x.id));
+    items.push(...page.items.filter(x=>!seen.has(queryValue?JSON.stringify([x.id,x.search_node_id]):x.id)));
+    pendingConversationStore.reconcileCaptured(items);
+    showError('');drawList();
+  }catch(e){
+    if(token!==queryToken)return;
+    const s=errText(e);
+    if(!reset&&!cursorRetry&&/invalid_cursor|stale_cursor|library_changed/i.test(s)){cursorRetry=true;cursor=null;revision=null;items=[];showError('Library changed; restarting from the first page.');return loadList(queryValue,false);}
+    showError(`Could not load conversations: ${safeError(s)}`);drawList();
+  }
+}
 const conversationTabs = createConversationTabs({
   container: $('conversation-tabs'),
   onSelect: tab => {
@@ -70,6 +140,10 @@ const conversationTabs = createConversationTabs({
       leafNodeId: tab.leafNodeId, accountScope: tab.accountScope,
     }}));
     else openConversation(tab.id, tab.leafNodeId, tab.anchorNodeId);
+  },
+  onClose: tab => {
+    if (tab?.pendingId) pendingConversationStore.removeUnstartedDraft(tab.pendingId);
+    drawList();
   },
   onEmpty: () => {
     ++readerToken; selected = null; conversation = null;
@@ -85,8 +159,13 @@ installTabShortcuts({
 });
 window.addEventListener('chat-hub:live-open', () => {
   ++readerToken;
-  conversationTabs.open({id: `draft:chatgpt:${Date.now()}-${++liveDraftSequence}`,
-    title: 'New conversation', mode: 'live', sourceConversationId: null});
+  resetSidebarForNewChat();
+  const pendingId=`pending-chatgpt:${Date.now()}-${++liveDraftSequence}`;
+  const id=`draft:chatgpt:${Date.now()}-${++liveDraftSequence}`;
+  pendingConversationStore.createDraft(pendingId);
+  conversationTabs.open({id,pendingId,title:'New ChatGPT conversation',mode:'live',sourceConversationId:null});
+  drawList();
+  void loadList('',true);
 });
 window.addEventListener('chat-hub:read-saved', event => {
   if (event.detail?.localId) openConversation(event.detail.localId, event.detail.leafNodeId);
@@ -111,7 +190,8 @@ function reconcileLiveTab(tab) {
   const prior = items.find(item => item.id === tab.localId);
   const changes = {mode: 'live', sourceConversationId: tab.sourceConversationId,
     localId: record.id, accountScope: record.account_scope,
-    title: record.title || tab.title || 'ChatGPT conversation'};
+    title: record.title || tab.title || 'ChatGPT conversation',pendingId:null};
+  if(tab.pendingId)pendingConversationStore.reconcileCaptured([...items,record]);
   if (prior?.provider === 'paseo-chatgpt') {
     changes.leafNodeId = null;
     changes.anchorNodeId = null;
@@ -119,6 +199,28 @@ function reconcileLiveTab(tab) {
   }
   if (tab.id === record.id) { conversationTabs.update(tab.id, changes); return true; }
   return conversationTabs.rekey(tab.id, record.id, changes);
+}
+function attachPendingToLiveTab(tab,sourceConversationId,accountScope) {
+  const captured=findCapturedChatRecord(items,sourceConversationId,accountScope);
+  if(captured){
+    pendingConversationStore.reconcileCaptured([...items,captured]);
+    if(tab.pendingId)conversationTabs.update(tab.id,{pendingId:null});
+    drawList();
+    return conversationTabs.get(tab.id);
+  }
+  let pendingId=tab.pendingId;
+  const existing=pendingId?pendingConversationStore.get(pendingId):null;
+  if(existing?.source_id&&(existing.source_id!==sourceConversationId||
+      (existing.account_scope&&accountScope&&existing.account_scope!==accountScope)))pendingId=null;
+  if(!pendingId){
+    const same=pendingConversationStore.list().filter(row=>row.source_id===sourceConversationId&&row.account_scope===accountScope);
+    if(same.length===1)pendingId=same[0].pending_id;
+    else {pendingId=`pending-chatgpt:${Date.now()}-${++liveDraftSequence}`;pendingConversationStore.createDraft(pendingId);}
+  }
+  pendingConversationStore.attachProviderConversation(pendingId,sourceConversationId,accountScope);
+  conversationTabs.update(tab.id,{pendingId,sourceConversationId,accountScope,title:'ChatGPT conversation'});
+  drawList();
+  return conversationTabs.get(tab.id);
 }
 function providerConversationChanged(event) {
   const sourceConversationId = event.detail?.conversationId;
@@ -169,9 +271,24 @@ function providerConversationChanged(event) {
       conversationTabs.open({id, ...changes, mode: 'live'}); tab = conversationTabs.get(id);
     }
   }
+  tab=attachPendingToLiveTab(tab,sourceConversationId,accountScope);
   reconcileLiveTab(tab);
 }
 window.addEventListener('chat-hub:provider-conversation', providerConversationChanged);
+window.addEventListener('chat-hub:chatgpt-connected', async () => {
+  const tab=conversationTabs.selected();
+  if(tab?.mode!=='live'||!tab.sourceConversationId||tab.accountScope)return;
+  try{
+    const connection=await invoke('get_chatgpt_connection');
+    const scope=connection?.state==='connected'&&/^chatgpt:observed:[0-9a-f]{64}$/.test(connection.account_scope||'')?connection.account_scope:null;
+    if(!scope||conversationTabs.selected()?.id!==tab.id)return;
+    conversationTabs.update(tab.id,{accountScope:scope});
+    if(tab.pendingId)pendingConversationStore.setAccountScope(tab.pendingId,scope);
+    const current=conversationTabs.get(tab.id);
+    const attached=attachPendingToLiveTab(current,tab.sourceConversationId,scope);
+    reconcileLiveTab(attached);
+  }catch{/* Keep an unverified pending row visible without adopting another account's record. */}
+});
 async function rereadSelected() {
   const tab = conversationTabs.selected();
   if (tab?.mode === 'live') {

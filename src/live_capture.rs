@@ -233,11 +233,19 @@ pub fn eligible(context: &CaptureContext, metadata: &CaptureMetadata) -> bool {
         && source_id(path).is_some()
         && content_type.is_none_or(|value| value.eq_ignore_ascii_case("application/json"));
     let stream = context.method == "POST"
-        && path == "/backend-api/conversation"
+        && is_create_conversation_path(path)
         && content_type.is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream"));
     (snapshot || stream)
         && metadata.host.eq_ignore_ascii_case("chatgpt.com")
         && (200..300).contains(&metadata.status)
+}
+/// ChatGPT uses both the legacy and current route for conversation generation.
+/// Keep the query string out of route matching; it can contain request metadata.
+pub(crate) fn is_create_conversation_path(path: &str) -> bool {
+    matches!(
+        path.split('?').next().unwrap_or(path),
+        "/backend-api/conversation" | "/backend-api/f/conversation"
+    )
 }
 fn source_id(path: &str) -> Option<&str> {
     path.split('?')
@@ -485,7 +493,7 @@ impl Work {
             )
             .map_err(|_| ())?;
             observation.raw_payload = if is_stream {
-                Value::String(String::from_utf8(decoded.clone()).map_err(|_| ())?)
+                Value::String(sanitize_sse_raw_payload(&decoded)?)
             } else {
                 raw
             };
@@ -523,16 +531,16 @@ fn parse_sse_document(body: &[u8], request_body: Option<&[u8]>) -> Result<Value,
         {
             stream.conversation_id = Some(id.to_owned());
         }
-        let messages = request
-            .get("messages")
-            .and_then(Value::as_array)
-            .filter(|messages| !messages.is_empty())
-            .ok_or(())?;
+        let messages = match request.get("messages") {
+            None => None,
+            Some(Value::Array(messages)) => Some(messages),
+            Some(_) => return Err(()),
+        };
         let parent_message_id = request
             .get("parent_message_id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
-        for (index, request_message) in messages.iter().enumerate() {
+        for (index, request_message) in messages.into_iter().flatten().enumerate() {
             let Some(id) = request_message
                 .get("id")
                 .and_then(Value::as_str)
@@ -584,6 +592,80 @@ fn parse_sse_document(body: &[u8], request_body: Option<&[u8]>) -> Result<Value,
     }))
 }
 
+fn sanitize_sse_raw_payload(body: &[u8]) -> Result<String, ()> {
+    let text = std::str::from_utf8(body).map_err(|_| ())?;
+    let mut output = String::with_capacity(text.len());
+    let mut prefix = Vec::<String>::new();
+    let mut data_lines = Vec::<String>::new();
+    let mut data_values = Vec::<String>::new();
+    for raw_line in text.split_inclusive('\n') {
+        let content_with_cr = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let content = content_with_cr
+            .strip_suffix('\r')
+            .unwrap_or(content_with_cr);
+        if content.is_empty() {
+            write_sanitized_sse_event(&mut output, &mut prefix, &mut data_lines, &mut data_values);
+            output.push_str(raw_line);
+        } else if let Some(value) = content.strip_prefix("data:") {
+            data_values.push(value.strip_prefix(' ').unwrap_or(value).to_owned());
+            data_lines.push(raw_line.to_owned());
+        } else if data_lines.is_empty() {
+            prefix.push(raw_line.to_owned());
+        } else {
+            // SSE fields after data but before the blank line belong to that event.
+            prefix.push(raw_line.to_owned());
+        }
+    }
+    write_sanitized_sse_event(&mut output, &mut prefix, &mut data_lines, &mut data_values);
+    Ok(output)
+}
+
+fn write_sanitized_sse_event(
+    output: &mut String,
+    prefix: &mut Vec<String>,
+    data_lines: &mut Vec<String>,
+    data_values: &mut Vec<String>,
+) {
+    let joined = data_values.join("\n");
+    let is_resume_event = prefix.iter().any(|line| {
+        line.trim_end()
+            .strip_prefix("event:")
+            .is_some_and(|name| name.trim() == "resume_conversation_token")
+    });
+    let redacted = serde_json::from_str::<Value>(&joined)
+        .ok()
+        .filter(|value| {
+            (is_resume_event
+                || value.get("type").and_then(Value::as_str) == Some("resume_conversation_token"))
+                && value.get("token").is_some()
+        })
+        .map(|mut value| {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("token");
+            }
+            value
+        });
+    for line in prefix.drain(..) {
+        output.push_str(&line);
+    }
+    if let Some(value) = redacted {
+        let ending = data_lines
+            .first()
+            .and_then(|line| line.strip_suffix('\n'))
+            .map(|line| if line.ends_with('\r') { "\r\n" } else { "\n" })
+            .unwrap_or("");
+        output.push_str("data: ");
+        output.push_str(&value.to_string());
+        output.push_str(ending);
+    } else {
+        for line in data_lines.drain(..) {
+            output.push_str(&line);
+        }
+    }
+    data_lines.clear();
+    data_values.clear();
+}
+
 #[derive(Default)]
 struct SseDocument {
     conversation_id: Option<String>,
@@ -591,6 +673,13 @@ struct SseDocument {
     messages: BTreeMap<String, Value>,
     current_node: Option<String>,
     done: bool,
+    delta_mode: bool,
+    delta_messages: BTreeMap<usize, Value>,
+    delta_message_ids: BTreeMap<usize, String>,
+    next_delta_index: usize,
+    last_delta_op: Option<String>,
+    last_delta_path: Option<String>,
+    last_delta_index: Option<usize>,
 }
 
 fn dispatch_sse_event(stream: &mut SseDocument, data: &mut Vec<String>) -> Result<(), ()> {
@@ -607,6 +696,10 @@ fn dispatch_sse_event(stream: &mut SseDocument, data: &mut Vec<String>) -> Resul
         return Err(());
     }
     let value: Value = serde_json::from_str(&event).map_err(|_| ())?;
+    if value.as_str() == Some("v1") {
+        stream.delta_mode = true;
+        return Ok(());
+    }
     if let Some(id) = value.get("conversation_id") {
         match id {
             Value::Null => {}
@@ -633,6 +726,14 @@ fn dispatch_sse_event(stream: &mut SseDocument, data: &mut Vec<String>) -> Resul
             stream.title = Some(title.to_owned());
         }
     }
+    let has_delta_fields = value.get("o").is_some() || value.get("p").is_some();
+    if has_delta_fields {
+        stream.delta_mode = true;
+    }
+    if stream.delta_mode {
+        apply_delta_event(stream, &value)?;
+        return Ok(());
+    }
     let message = value
         .get("message")
         .or_else(|| value.get("v").and_then(|v| v.get("message")));
@@ -646,6 +747,227 @@ fn dispatch_sse_event(stream: &mut SseDocument, data: &mut Vec<String>) -> Resul
         };
         stream.current_node = Some(id.to_owned());
         stream.messages.insert(id.to_owned(), message.clone());
+    }
+    Ok(())
+}
+
+const MAX_DELTA_INDEX: usize = 10_000;
+const MAX_DELTA_PATH_BYTES: usize = 1_024;
+const MAX_DELTA_PATH_PARTS: usize = 32;
+const MAX_PATCH_OPERATIONS: usize = 256;
+
+fn apply_delta_event(stream: &mut SseDocument, value: &Value) -> Result<(), ()> {
+    let mut explicit_index = None;
+    if let Some(op) = value.get("o") {
+        stream.last_delta_op = Some(op.as_str().ok_or(())?.to_owned());
+    }
+    if let Some(path) = value.get("p") {
+        let path = path.as_str().ok_or(())?;
+        if path.len() > MAX_DELTA_PATH_BYTES {
+            return Err(());
+        }
+        stream.last_delta_path = Some(path.to_owned());
+    }
+    if let Some(index) = value.get("c") {
+        let index = index.as_u64().ok_or(())? as usize;
+        if index > MAX_DELTA_INDEX {
+            return Err(());
+        }
+        stream.last_delta_index = Some(index);
+        explicit_index = Some(index);
+    }
+    let Some(payload) = value.get("v") else {
+        return Ok(());
+    };
+    let op = stream.last_delta_op.as_deref().ok_or(())?;
+    let path = stream.last_delta_path.as_deref().ok_or(())?;
+    if op == "add" && (path.is_empty() || path == "/") {
+        let message = payload
+            .get("message")
+            .filter(|message| message.is_object())
+            .ok_or(())?;
+        let id = message
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or(())?
+            .to_owned();
+        if stream.delta_messages.len() >= MAX_DELTA_INDEX
+            || stream.messages.len() >= MAX_DELTA_INDEX
+        {
+            return Err(());
+        }
+        let index = explicit_index.unwrap_or(stream.next_delta_index);
+        if let Some(existing) = stream.delta_message_ids.get(&index) {
+            if existing != &id {
+                return Err(());
+            }
+        }
+        stream.last_delta_index = Some(index);
+        stream.next_delta_index = stream.next_delta_index.max(index.saturating_add(1));
+        stream.delta_message_ids.insert(index, id.clone());
+        stream.delta_messages.insert(index, payload.clone());
+        stream.messages.insert(id.clone(), message.clone());
+        stream.current_node = Some(id);
+        return Ok(());
+    }
+
+    let index = stream.last_delta_index.ok_or(())?;
+    let envelope = stream.delta_messages.get_mut(&index).ok_or(())?;
+    apply_delta_operation(envelope, op, path, payload)?;
+    let message = envelope
+        .get("message")
+        .filter(|message| message.is_object())
+        .ok_or(())?;
+    let id = stream.delta_message_ids.get(&index).ok_or(())?;
+    if message.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+        return Err(());
+    }
+    stream.messages.insert(id.clone(), message.clone());
+    Ok(())
+}
+
+fn pointer_parts(path: &str) -> Result<Vec<String>, ()> {
+    if path.is_empty() {
+        return Ok(Vec::new());
+    }
+    if path.len() > MAX_DELTA_PATH_BYTES || !path.starts_with('/') {
+        return Err(());
+    }
+    let mut parts = Vec::new();
+    for raw in path[1..].split('/') {
+        let mut decoded = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '~' {
+                match chars.next().ok_or(())? {
+                    '0' => decoded.push('~'),
+                    '1' => decoded.push('/'),
+                    _ => return Err(()),
+                }
+            } else {
+                decoded.push(ch);
+            }
+        }
+        parts.push(decoded);
+        if parts.len() > MAX_DELTA_PATH_PARTS {
+            return Err(());
+        }
+    }
+    if parts.first().map(String::as_str) != Some("message") {
+        return Err(());
+    }
+    Ok(parts)
+}
+
+fn pointer_parent_mut<'a, 'b>(
+    value: &'a mut Value,
+    parts: &'b [String],
+) -> Result<(&'a mut Value, &'b str), ()> {
+    let (last, parents) = parts.split_last().ok_or(())?;
+    let mut current = value;
+    for part in parents {
+        current = match current {
+            Value::Object(object) => object.get_mut(part).ok_or(())?,
+            Value::Array(array) => array.get_mut(parse_array_index(part)?).ok_or(())?,
+            _ => return Err(()),
+        };
+    }
+    Ok((current, last))
+}
+
+fn parse_array_index(value: &str) -> Result<usize, ()> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return Err(());
+    }
+    value.parse::<usize>().map_err(|_| ())
+}
+
+fn apply_delta_operation(
+    root: &mut Value,
+    op: &str,
+    path: &str,
+    payload: &Value,
+) -> Result<(), ()> {
+    if op == "patch" {
+        let operations = payload
+            .as_array()
+            .filter(|ops| ops.len() <= MAX_PATCH_OPERATIONS)
+            .ok_or(())?;
+        for operation in operations {
+            let op = operation.get("o").and_then(Value::as_str).ok_or(())?;
+            let path = operation.get("p").and_then(Value::as_str).ok_or(())?;
+            let value = operation.get("v").unwrap_or(&Value::Null);
+            if op == "patch" {
+                return Err(());
+            }
+            apply_delta_operation(root, op, path, value)?;
+        }
+        return Ok(());
+    }
+    let parts = pointer_parts(path)?;
+    if parts.is_empty() {
+        return Err(());
+    }
+    let (parent, key) = pointer_parent_mut(root, &parts)?;
+    match op {
+        "add" | "replace" => match parent {
+            Value::Object(object) => {
+                if op == "replace" && !object.contains_key(key) {
+                    return Err(());
+                }
+                object.insert(key.to_owned(), payload.clone());
+            }
+            Value::Array(array) if op == "add" && key == "-" => array.push(payload.clone()),
+            Value::Array(array) => {
+                let index = parse_array_index(key)?;
+                if op == "add" {
+                    if index > array.len() {
+                        return Err(());
+                    }
+                    array.insert(index, payload.clone());
+                } else {
+                    *array.get_mut(index).ok_or(())? = payload.clone();
+                }
+            }
+            _ => return Err(()),
+        },
+        "append" => {
+            let target = match parent {
+                Value::Object(object) => object.get_mut(key).ok_or(())?,
+                Value::Array(array) => array.get_mut(parse_array_index(key)?).ok_or(())?,
+                _ => return Err(()),
+            };
+            match (target, payload) {
+                (Value::String(target), Value::String(suffix)) => target.push_str(suffix),
+                (Value::Array(target), Value::Array(values)) => {
+                    target.extend(values.iter().cloned())
+                }
+                (Value::Array(target), value) => target.push(value.clone()),
+                (Value::Object(target), Value::Object(values)) => {
+                    target.extend(
+                        values
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone())),
+                    );
+                }
+                _ => return Err(()),
+            }
+        }
+        "remove" => match parent {
+            Value::Object(object) => {
+                object.remove(key).ok_or(())?;
+            }
+            Value::Array(array) => {
+                let index = parse_array_index(key)?;
+                if index >= array.len() {
+                    return Err(());
+                }
+                array.remove(index);
+            }
+            _ => return Err(()),
+        },
+        _ => return Err(()),
     }
     Ok(())
 }
@@ -720,6 +1042,15 @@ mod tests {
         let stream = stream_context();
         let meta = stream_metadata();
         assert!(eligible(&stream, &meta));
+        let mut modern_stream = stream.clone();
+        modern_stream.path = "/backend-api/f/conversation?variant=stream".into();
+        assert!(eligible(&modern_stream, &meta));
+        assert!(is_create_conversation_path(
+            "/backend-api/f/conversation?variant=stream"
+        ));
+        assert!(!is_create_conversation_path(
+            "/backend-api/f/conversation/resume"
+        ));
         let mut wrong_host = meta.clone();
         wrong_host.host = "accounts.chatgpt.com".into();
         assert!(!eligible(&stream, &wrong_host));
@@ -796,6 +1127,60 @@ mod tests {
         let c = counters(&sink.status);
         assert_eq!(c.committed_imported, 1);
         assert_eq!(c.invalid_snapshot, 0);
+    }
+    #[test]
+    fn named_resume_event_redacts_token_without_changing_source_bytes() {
+        let body = b"event: resume_conversation_token\r\ndata: {\"conversation_id\":\"modern-id\",\"token\":\"PRIVATE_EVENT_TOKEN\"}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let retained = sanitize_sse_raw_payload(body).unwrap();
+        assert!(!retained.contains("PRIVATE_EVENT_TOKEN"));
+        assert!(retained.contains("modern-id"));
+        assert!(retained.contains("event: resume_conversation_token"));
+        assert!(retained.contains("[DONE]"));
+        assert!(std::str::from_utf8(body)
+            .unwrap()
+            .contains("PRIVATE_EVENT_TOKEN"));
+    }
+
+    #[test]
+    fn delta_encoding_v1_replays_inherited_and_batched_message_patches() {
+        let body = concat!(
+            "data: \"v1\"\n\n",
+            "data: {\"type\":\"resume_conversation_token\",\"conversation_id\":\"modern-id\"}\n\n",
+            "data: {\"p\":\"\",\"o\":\"add\",\"c\":0,\"v\":{\"message\":{\"id\":\"user-node\",\"parent_id\":null,\"author\":{\"role\":\"user\"},\"content\":{\"content_type\":\"text\",\"parts\":[\"question\"]}}}}\n\n",
+            "data: {\"p\":\"\",\"o\":\"add\",\"c\":1,\"v\":{\"message\":{\"id\":\"assistant-node\",\"parent_id\":\"user-node\",\"author\":{\"role\":\"assistant\"},\"content\":{\"content_type\":\"text\",\"parts\":[\"\"]},\"status\":\"in_progress\",\"end_turn\":null}}}\n\n",
+            "data: {\"p\":\"/message/content/parts/0\",\"o\":\"append\",\"c\":1,\"v\":\"hello\"}\n\n",
+            "data: {\"v\":\" world\"}\n\n",
+            "data: {\"o\":\"patch\",\"p\":\"\",\"c\":1,\"v\":[{\"p\":\"/message/status\",\"o\":\"replace\",\"v\":\"finished_successfully\"},{\"p\":\"/message/end_turn\",\"o\":\"replace\",\"v\":true}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let parsed = parse_sse_document(body.as_bytes(), Some(br#"{}"#)).unwrap();
+        assert_eq!(parsed["conversation_id"], "modern-id");
+        assert_eq!(parsed["current_node"], "assistant-node");
+        assert_eq!(parsed["mapping"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            parsed["mapping"]["assistant-node"]["message"]["content"]["parts"][0],
+            "hello world"
+        );
+        assert_eq!(
+            parsed["mapping"]["assistant-node"]["message"]["status"],
+            "finished_successfully"
+        );
+    }
+    #[test]
+    fn delta_encoding_v1_rejects_unknown_ops_and_unbounded_paths() {
+        for event in [
+            json!({"p":"", "o":"execute", "v":{}}),
+            json!({"p":"/message/content/parts/0", "o":"append", "c":0, "v":"x"}),
+        ] {
+            let body = format!("data: \"v1\"\n\ndata: {}\n\ndata: [DONE]\n\n", event);
+            assert!(parse_sse_document(body.as_bytes(), Some(br#"{}"#)).is_err());
+        }
+        let path = format!("/message/{}", "x".repeat(MAX_DELTA_PATH_BYTES));
+        let body = format!(
+            "data: \"v1\"\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"p":path, "o":"replace", "v":null})
+        );
+        assert!(parse_sse_document(body.as_bytes(), Some(br#"{}"#)).is_err());
     }
     #[test]
     fn incomplete_or_cross_conversation_sse_is_not_normalized() {

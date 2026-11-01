@@ -304,10 +304,16 @@ async fn live_tls_gzip_and_deflate_snapshots_persist_without_changing_wire_respo
     exercise_live_tls(true, Some("deflate")).await;
     exercise_live_tls(true, Some("bad_gzip")).await;
     exercise_live_tls(true, Some("sse")).await;
+    exercise_live_tls(true, Some("modern_sse")).await;
 }
 
 async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
-    let is_sse = case == Some("sse");
+    let is_sse = matches!(case, Some("sse" | "modern_sse"));
+    let request_path = if case == Some("modern_sse") {
+        "/backend-api/f/conversation"
+    } else {
+        "/backend-api/conversation"
+    };
     let root = tmp("tls");
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = CertificateParams::new(vec!["chatgpt.com".into()])
@@ -355,7 +361,7 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         Some("null_empty") => doc["conversation_id"] = serde_json::Value::Null,
         _ => {}
     }
-    let request_payload = if case == Some("sse") {
+    let request_payload = if is_sse {
         serde_json::json!({
             "conversation_id": null,
             "parent_message_id": "root-node",
@@ -370,7 +376,24 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
     } else {
         b"request".to_vec()
     };
-    let body = if case == Some("sse") {
+    let body = if case == Some("modern_sse") {
+        let mut stream = String::from("data: \"v1\"\r\n\r\n");
+        let values = [
+            serde_json::json!({"type":"resume_conversation_token","conversation_id":"sse-conversation","token":"PRIVATE_RESUME_CANARY"}),
+            serde_json::json!({"conversation_id":"sse-conversation","title":"SSE Test"}),
+            serde_json::json!({"p":"","o":"add","c":0,"v":{"message":{"id":"user-node","parent_id":"root-node","author":{"role":"user"},"content":{"content_type":"text","parts":["streamed question"]}}}}),
+            serde_json::json!({"p":"","o":"add","c":1,"v":{"message":{"id":"assistant-node","parent_id":"user-node","author":{"role":"assistant"},"content":{"content_type":"text","parts":[""]},"status":"in_progress","end_turn":null}}}),
+            serde_json::json!({"p":"/message/content/parts/0","o":"append","c":1,"v":"live answer"}),
+            serde_json::json!({"o":"patch","p":"","c":1,"v":[{"p":"/message/status","o":"replace","v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}),
+        ];
+        for value in values {
+            stream.push_str("data: ");
+            stream.push_str(&value.to_string());
+            stream.push_str("\r\n\r\n");
+        }
+        stream.push_str("data: [DONE]\r\n\r\n");
+        stream.into_bytes()
+    } else if is_sse {
         let mut stream = String::new();
         for value in [
             serde_json::json!({"conversation_id":"sse-conversation","title":"SSE Test"}),
@@ -431,7 +454,7 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         }
         _ => body.clone(),
     };
-    let response_content_type = if case == Some("sse") {
+    let response_content_type = if is_sse {
         "Content-Type: text/event-stream\r\n"
     } else {
         "Content-Type: application/json\r\n"
@@ -452,7 +475,7 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         }
         let text = String::from_utf8_lossy(&request);
         if is_sse {
-            assert!(text.starts_with("POST /backend-api/conversation HTTP/1.1"));
+            assert!(text.starts_with(&format!("POST {request_path} HTTP/1.1")));
         }
         let length: usize = text
             .lines()
@@ -502,9 +525,9 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap();
-    let response = if case == Some("sse") {
+    let response = if is_sse {
         client
-            .post("https://chatgpt.com/backend-api/conversation")
+            .post(format!("https://chatgpt.com{request_path}"))
             .header("content-type", "application/json")
             .body(request_payload)
             .send()
@@ -589,7 +612,7 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
             .await
             .unwrap();
         let graph: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        if case == Some("sse") {
+        if is_sse {
             assert_eq!(graph["conversation"]["title"], "SSE Test");
             assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
             assert_eq!(graph["selection"]["selected_node_id"], "assistant-node");
@@ -627,7 +650,7 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
             .unwrap()
             .unwrap();
         assert_eq!(saved["messages"].as_array().unwrap().len(), 2);
-        if case == Some("sse") {
+        if is_sse {
             assert!(saved.to_string().contains("streamed question"));
             assert!(saved.to_string().contains("live answer"));
         } else {
@@ -637,12 +660,18 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
         let raw: String = inspector
             .query_row("SELECT raw_payload FROM observations", [], |r| r.get(0))
             .unwrap();
-        if case == Some("sse") {
-            assert!(serde_json::from_str::<serde_json::Value>(&raw)
+        if is_sse {
+            let retained_stream = serde_json::from_str::<serde_json::Value>(&raw)
                 .unwrap()
                 .as_str()
                 .unwrap()
-                .contains("[DONE]"));
+                .to_owned();
+            assert!(retained_stream.contains("[DONE]"));
+            if case == Some("modern_sse") {
+                assert!(!retained_stream.contains("PRIVATE_RESUME_CANARY"));
+                assert!(retained_stream.contains("sse-conversation"));
+                assert!(retained_stream.contains("live answer"));
+            }
         } else {
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&raw).unwrap(),

@@ -49,6 +49,12 @@ pub const MAX_CAPTURE_BODY: usize = 2 * 1024 * 1024;
 const MAX_REQUEST_CAPTURE_BODY: usize = 512 * 1024;
 const OPERATION_BODY_LIMIT: usize = 64 * 1024;
 const REQUEST_CAPTURE_SLOTS: usize = 8;
+
+fn is_create_chat_request(method: &str, path: &str, content_type: &str) -> bool {
+    method == "POST"
+        && crate::live_capture::is_create_conversation_path(path)
+        && content_type.eq_ignore_ascii_case("application/json")
+}
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
     pub ca_dir: PathBuf,
@@ -543,9 +549,11 @@ async fn client(mut s: TcpStream, context: ClientContext) -> std::io::Result<()>
                     .and_then(|value| value.split(';').next())
                     .map(str::trim)
                     .unwrap_or("");
-                let create_chat_request = req.method().as_str() == "POST"
-                    && path.split('?').next() == Some("/backend-api/conversation")
-                    && content_type.eq_ignore_ascii_case("application/json");
+                let create_chat_request = is_create_chat_request(
+                    req.method().as_str(),
+                    &path,
+                    content_type,
+                );
                 let learn_operation_request = operation_learner::OperationSink::is_candidate_request(
                     req.method().as_str(), &path,
                 ) && content_type.eq_ignore_ascii_case("application/json");
@@ -626,4 +634,36 @@ async fn client(mut s: TcpStream, context: ClientContext) -> std::io::Result<()>
         .await
         .map_err(std::io::Error::other)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_create_chat_request;
+
+    #[test]
+    fn request_body_capture_covers_exact_legacy_and_current_generation_routes() {
+        for path in [
+            "/backend-api/conversation",
+            "/backend-api/f/conversation?variant=stream",
+        ] {
+            assert!(is_create_chat_request("POST", path, "application/json"));
+        }
+        for path in [
+            "/backend-api/f/conversation/resume",
+            "/backend-api/f/conversation/extra",
+            "/backend-api/other",
+        ] {
+            assert!(!is_create_chat_request("POST", path, "application/json"));
+        }
+        assert!(!is_create_chat_request(
+            "GET",
+            "/backend-api/f/conversation",
+            "application/json"
+        ));
+        assert!(!is_create_chat_request(
+            "POST",
+            "/backend-api/f/conversation",
+            "text/plain"
+        ));
+    }
 }
