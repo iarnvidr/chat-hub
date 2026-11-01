@@ -7,6 +7,7 @@ import {chatgptConversationId} from './continuation.js';
 import {groupSearchConversations, appendSearchHighlight} from './search.js';
 import {branchForAnchor} from './entity-model.js';
 import {createRowActions} from './row-actions.js';
+import {appendPinMarker} from './pin-marker.js';
 const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';
 const adapter=fixture?fixtureAdapter():{
   async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value,projectKey:$('project-filter').value||null,tag:$('tag-filter').value||null,archiveState:$('show-archived').getAttribute('aria-pressed')==='true'?'archived':'active'});},
@@ -37,6 +38,7 @@ function drawList() {
     const title = document.createElement('strong'), metadata = document.createElement('span');
     if (queryValue) appendSearchHighlight(title, c.title ?? 'Untitled conversation', queryValue);
     else title.textContent = c.title ?? 'Untitled conversation';
+    appendPinMarker(title,c.pinned === true);
     metadata.textContent = providerLabel(c.provider);
     metadata.hidden = $('history-source').value === 'chatgpt';
     if (!c.provider?.startsWith('paseo-') && Number.isFinite(c.message_count)) metadata.textContent += ` · ${c.message_count} messages`;

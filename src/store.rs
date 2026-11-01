@@ -340,6 +340,29 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(13)", [])?;
             tx.commit()?;
         }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 14 {
+            let mut columns = self
+                .connection
+                .prepare("PRAGMA table_info(conversation_local_state)")?;
+            let names = columns
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(columns);
+            let tx = self.connection.transaction()?;
+            if !names.iter().any(|name| name == "pinned_scope") {
+                tx.execute_batch(
+                    "ALTER TABLE conversation_local_state ADD COLUMN pinned_scope TEXT;",
+                )?;
+            }
+            tx.execute_batch("CREATE INDEX IF NOT EXISTS conversation_local_state_pin_scope ON conversation_local_state(pinned_scope,pinned,conversation_id);")?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(14)", [])?;
+            tx.commit()?;
+        }
         self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id); CREATE INDEX IF NOT EXISTS observations_conversation_order ON observations(conversation_id,id DESC);")?;
         Ok(())
     }
@@ -1743,7 +1766,8 @@ impl Store {
 
 mod conversation_state;
 pub use conversation_state::{
-    ConversationStateChange, ConversationStateSnapshot, VerifiedConversationStateReceipt,
+    ChatgptPinSnapshotSummary, ConversationStateChange, ConversationStateSnapshot,
+    VerifiedChatgptPinSnapshotReceipt, VerifiedConversationStateReceipt,
 };
 #[derive(Clone, Debug, Default)]
 struct SearchTopology {
@@ -2887,7 +2911,10 @@ mod project_and_search_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(persisted_source_id, format!("conversation:{conversation_id}"));
+        assert_eq!(
+            persisted_source_id,
+            format!("conversation:{conversation_id}")
+        );
         let upstream_title: String = store
             .connection
             .query_row(
@@ -2916,7 +2943,9 @@ mod project_and_search_tests {
             "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Bad cached source','paseo-chatgpt','paseo-cache:owner',?2,1)",
             params![nested_prefix_id, format!("conversation:conversation:{nested_prefix_id}")],
         ).unwrap();
-        assert!(store.project_assignment_context(nested_prefix_id, None).is_err());
+        assert!(store
+            .project_assignment_context(nested_prefix_id, None)
+            .is_err());
     }
 
     #[test]
@@ -2981,7 +3010,7 @@ mod project_and_search_tests {
                 .unwrap(),
             0
         );
-        assert_eq!(store.schema_version().unwrap(), 13);
+        assert_eq!(store.schema_version().unwrap(), 14);
 
         store.connection.execute("INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES('bad-empty','paseo-chatgpt','paseo-cache:owner','','Assigned project')", []).unwrap();
         store.connection.execute("INSERT INTO conversation_projects(conversation_id,project_key) VALUES('legacy-empty','bad-empty')", []).unwrap();

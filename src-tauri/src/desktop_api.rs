@@ -626,6 +626,50 @@ pub async fn commit_conversation_state(
     serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
 }
 
+pub async fn sync_chatgpt_pin_snapshot(
+    base: &str,
+    token: &str,
+    receipt: &serde_json::Value,
+) -> Result<Value, String> {
+    if !receipt.is_object() {
+        return Err("invalid_request".into());
+    }
+    let c = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = url(base, &["api", "v1", "chatgpt", "pins", "snapshot"], &[])?;
+    let body = serde_json::to_vec(&serde_json::json!({ "receipt": receipt }))
+        .map_err(|_| "invalid_request")?;
+    if body.len() > 128 * 1024 {
+        return Err("invalid_request".into());
+    }
+    let response = c
+        .post(u)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "Desktop API unavailable")?;
+    if !response.status().is_success() {
+        return Err(map_http_error(response.status(), None).into());
+    }
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Desktop API unavailable")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err("response_too_large".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
+}
+
 pub async fn conversation_state_identity(
     base: &str,
     token: &str,

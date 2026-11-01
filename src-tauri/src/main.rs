@@ -1344,6 +1344,77 @@ async fn set_conversation_state(
 }
 
 #[tauri::command]
+async fn sync_chatgpt_pins(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    provider: State<'_, ProviderViewState>,
+    history: State<'_, chatgpt_history::ChatgptHistoryState>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    let _permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    let connection = provider.chatgpt_connection().await;
+    if connection.state != provider_view::ChatGptConnectionState::Connected {
+        return Err(match connection.state {
+            provider_view::ChatGptConnectionState::SignedOut => "chatgpt_signed_out",
+            provider_view::ChatGptConnectionState::Loading => "chatgpt_loading",
+            provider_view::ChatGptConnectionState::NotOpen => "chatgpt_not_open",
+            _ => "chatgpt_unavailable",
+        }
+        .into());
+    }
+    let observed_scope = connection
+        .account_scope
+        .as_deref()
+        .ok_or_else(|| "chatgpt_account_unavailable".to_string())?;
+    let outcome = provider.read_chatgpt_pin_snapshot(observed_scope).await?;
+    eprintln!(
+        "ChatGPT pin snapshot completed={} code={} count={} retry_after={}",
+        outcome.complete,
+        outcome.error_code.as_deref().unwrap_or("none"),
+        outcome.pinned_ids.len(),
+        outcome.retry_after.unwrap_or(0),
+    );
+    if outcome.error_code.as_deref() == Some("rate_limited") {
+        history.note_provider_rate_limit(outcome.retry_after);
+        return Err("chatgpt_rate_limited".into());
+    }
+    if !outcome.complete || outcome.account_scope != observed_scope {
+        return Err(outcome
+            .error_code
+            .unwrap_or_else(|| "pin_snapshot_incomplete".into()));
+    }
+    let receipt = serde_json::json!({
+        "verified": true,
+        "complete": true,
+        "scope": observed_scope,
+        "pinned_source_ids": outcome.pinned_ids,
+    });
+    let result = desktop_api::sync_chatgpt_pin_snapshot(&state.api, &state.token, &receipt).await?;
+    if result.get("verified").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("pin_snapshot_commit_unverified".into());
+    }
+    eprintln!(
+        "ChatGPT pin snapshot committed pinned={} matched={} unknown={}",
+        result
+            .get("pinned_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        result
+            .get("matched_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        result
+            .get("unknown_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    );
+    let _ = app.emit("chatgpt-pins-updated", ());
+    let _ = app.emit("library-changed", ());
+    Ok(result)
+}
+
+#[tauri::command]
 fn prepare_chatgpt_session(
     window: tauri::Webview,
     state: State<'_, ProviderViewState>,
@@ -1737,6 +1808,7 @@ fn main() {
             inspect_project_client,
             set_conversation_project,
             set_conversation_state,
+            sync_chatgpt_pins,
             prepare_chatgpt_session,
             sync_chatgpt_history,
             chatgpt_history_status,
@@ -1810,6 +1882,7 @@ fn main() {
             inspect_project_client,
             set_conversation_project,
             set_conversation_state,
+            sync_chatgpt_pins,
             prepare_chatgpt_session,
             sync_chatgpt_history,
             chatgpt_history_status,

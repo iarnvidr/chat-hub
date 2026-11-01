@@ -4,11 +4,15 @@ const appStatus = document.getElementById('app-status');
 const workspaceStatus = document.getElementById('workspace-sync-state');
 let pollTimer, cooldownTimer, autoRetryTimer, lastChanges = 0, lastExports = 0, running = false, pendingConnection = false;
 let startPromise = null, interactiveSync = false, cooldownUntil = 0, automaticSyncUntil = 0, lastConnectionStart = 0;
+let pinSyncPromise = null, pinSyncInFlightScope = null, lastConnectionScope = null,
+  pinsNeedPostHistoryRefresh = false;
+const pinSyncCooldowns = new Map();
 let configured = true;
 let sessionTimer;
 const hasNative = typeof window.__TAURI_INTERNALS__?.invoke === 'function';
 const AUTO_EVENT_DEBOUNCE_MS = 5000;
 const AUTO_SYNC_COALESCE_MS = 5 * 60 * 1000;
+const PIN_SYNC_FAILURE_COOLDOWN_MS = 5000;
 const MAX_AUTOMATIC_RETRIES = 3;
 const MAX_COOLDOWN_SECONDS = 30 * 60;
 const AUTOMATIC_BACKOFF_BASE_SECONDS = 15;
@@ -150,6 +154,52 @@ function publishChanges(result) {
   lastExports = exports;
 }
 
+const observedScope = value => typeof value === 'string' && /^chatgpt:observed:[0-9a-f]{64}$/.test(value) ? value : null;
+
+async function connectedScope() {
+  try {
+    const connection = await window.ChatHub.invoke('get_chatgpt_connection');
+    return connection?.state === 'connected' ? observedScope(connection.account_scope) : null;
+  } catch { return null; }
+}
+
+async function syncPins({accountScope = null, afterHistory = false} = {}) {
+  if (!hasNative) return false;
+  const scope = observedScope(accountScope) || await connectedScope();
+  if (!scope) return false;
+  if (pinSyncPromise) {
+    if (pinSyncInFlightScope === scope) return pinSyncPromise;
+    await pinSyncPromise;
+    return syncPins({accountScope:scope,afterHistory});
+  }
+  if (!afterHistory && (pinSyncCooldowns.get(scope) || 0) > Date.now()) return false;
+  pinSyncCooldowns.set(scope,Date.now()+PIN_SYNC_FAILURE_COOLDOWN_MS);
+  pinSyncInFlightScope = scope;
+  pinSyncPromise = (async () => {
+    try {
+      const result = await window.ChatHub.invoke('sync_chatgpt_pins');
+      if (result?.verified !== true || !Number.isSafeInteger(result.library_revision) ||
+          !Number.isSafeInteger(result.pinned_count) || result.pinned_count < 0 ||
+          !Number.isSafeInteger(result.matched_count) || result.matched_count < 0 ||
+          !Number.isSafeInteger(result.unknown_count) || result.unknown_count < 0) return false;
+      pinSyncCooldowns.set(scope,Date.now()+AUTO_SYNC_COALESCE_MS);
+      window.dispatchEvent(new Event('chat-hub:pins-synced'));
+      window.dispatchEvent(new Event('chat-hub:history-updated'));
+      return true;
+    } catch {
+      // Pin refresh is read-only and independent of conversation-history status.
+      // Leave existing local values untouched when the remote result is unavailable.
+      pinSyncCooldowns.set(scope,Date.now()+PIN_SYNC_FAILURE_COOLDOWN_MS);
+      return false;
+    } finally {
+      pinSyncPromise = null;
+      pinSyncInFlightScope = null;
+      while(pinSyncCooldowns.size>8)pinSyncCooldowns.delete(pinSyncCooldowns.keys().next().value);
+    }
+  })();
+  return pinSyncPromise;
+}
+
 async function poll({allowConnect = interactiveSync} = {}) {
   if (!hasNative) return;
   try {
@@ -197,6 +247,10 @@ async function poll({allowConnect = interactiveSync} = {}) {
       footer(cooldownUntil > Date.now() ? 'History sync waiting' : 'Open ChatGPT to sync history');
     }
     if (running) pollTimer = setTimeout(() => poll({allowConnect}), 2000);
+    else if (pinsNeedPostHistoryRefresh && (result?.state === 'complete' || result?.state === 'completed')) {
+      pinsNeedPostHistoryRefresh = false;
+      void syncPins({afterHistory:true});
+    }
     return result;
   } catch {
     running = false;
@@ -227,10 +281,12 @@ async function runStart(automatic) {
   say(startingMessage, {manual: !automatic});
   footer('Syncing history…');
   try {
+    pinsNeedPostHistoryRefresh = true;
     await window.ChatHub.invoke('sync_chatgpt_history');
     automaticSyncUntil = Date.now() + AUTO_SYNC_COALESCE_MS;
     await poll({allowConnect: interactiveSync});
   } catch (error) {
+    pinsNeedPostHistoryRefresh = false;
     running = false;
     updateButton();
     const code = errorCode(error);
@@ -286,10 +342,13 @@ async function startup() {
     footer(verificationNeeded ? 'ChatGPT verification needed' : 'Sync paused — choose Sync history to retry');
     return;
   }
-  if (running || !configured || cooldownUntil > Date.now()) return;
+  if (running || cooldownUntil > Date.now()) return;
   try {
     const connection = await window.ChatHub.invoke('get_chatgpt_connection');
-    if (connection?.state === 'connected') await start({automatic: true});
+    if (connection?.state === 'connected') {
+      await syncPins({accountScope:connection.account_scope});
+      if (configured) await start({automatic: true});
+    }
     else if (connection?.state === 'not_open' || connection?.state === 'loading') {
       // Initialize only an untouched hidden session. Native code refuses to
       // navigate a page that already hosts a live chat or an unsent draft.
@@ -299,7 +358,11 @@ async function startup() {
         if (running || cooldownUntil > Date.now()) return;
         try {
           const session = await window.ChatHub.invoke('get_chatgpt_connection');
-          if (session?.state === 'connected') { await start({automatic: true}); return; }
+          if (session?.state === 'connected') {
+            await syncPins({accountScope:session.account_scope});
+            if (configured) await start({automatic: true});
+            return;
+          }
           if (session?.state === 'signed_out') {
             footer('Connect ChatGPT in Settings');
             say('Connect ChatGPT in Settings to sync history. Your saved chats are available offline.');
@@ -316,16 +379,21 @@ async function startup() {
 if (button) button.addEventListener('click', () => start({automatic: false}));
 
 window.addEventListener('chat-hub:chatgpt-connected', () => {
-  if (!configured || running || cooldownUntil > Date.now()) return;
-  const now = Date.now();
-  if (now - lastConnectionStart < AUTO_EVENT_DEBOUNCE_MS) return;
-  lastConnectionStart = now;
-  if (pendingConnection) {
-    pendingConnection = false;
-    start({automatic: false});
-  } else {
-    start({automatic: true});
-  }
+  void (async()=>{
+    const scope=await connectedScope();
+    if(!scope)return;
+    const now=Date.now(),sameScope=scope===lastConnectionScope;
+    lastConnectionScope=scope;
+    const debounced=sameScope&&now-lastConnectionStart<AUTO_EVENT_DEBOUNCE_MS;
+    if(!debounced)lastConnectionStart=now;
+    await syncPins({accountScope:scope});
+    if(debounced||running||cooldownUntil>Date.now())return;
+    if (!configured) return;
+    if (pendingConnection) {
+      pendingConnection = false;
+      await start({automatic: false});
+    } else await start({automatic: true});
+  })();
 });
 
 restoreCooldown();

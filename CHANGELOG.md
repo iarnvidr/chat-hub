@@ -10,6 +10,7 @@
 - Replaces the tag dialog with a hover editor offering content-derived suggestions and a distinct custom-tag option.
 - Selected chats and related previews read from the beginning in independently scrollable panes; long saved content loads progressively. Suggestion failures offer a retry instead of unrelated library tags.
 - Project assignment and rename use anchored hover controls with no local-only option. Fixes assignment for cached chats with legacy source-ID prefixes while preserving stored identities and account checks.
+- Consolidates row actions into one hover menu. Reads ChatGPT's current pins independently of history sync, reconciles complete account-bound snapshots, and displays passive pin markers on saved chats.
 - No live personal-chat mutations were performed during implementation checks. The existing live history/capture acceptance limitations remain.
 
 ## 0.2.1 — release candidate

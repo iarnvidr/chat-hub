@@ -4,7 +4,7 @@
 
 use super::authorized;
 use axum::{
-    extract::{rejection::QueryRejection, Path, Query, State},
+    extract::{rejection::QueryRejection, DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -756,6 +756,10 @@ pub(super) fn routes(
             "/api/v1/conversations/:id/state",
             get(get_conversation_state).patch(set_conversation_state),
         )
+        .route(
+            "/api/v1/chatgpt/pins/snapshot",
+            post(sync_chatgpt_pin_snapshot).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
         .route("/api/v1/projects", get(projects))
         .route("/api/v1/projects/name", patch(rename_project))
         .route(
@@ -1230,6 +1234,49 @@ async fn set_conversation_state(
         "library_revision": result.library_revision,
         "verified": true
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatgptPinSnapshotRequest {
+    receipt: crate::store::VerifiedChatgptPinSnapshotReceipt,
+}
+
+async fn sync_chatgpt_pin_snapshot(
+    State(s): State<ApiState>,
+    Json(request): Json<ChatgptPinSnapshotRequest>,
+) -> ApiResult {
+    if request.receipt.pinned_source_ids.len() > 1_000 {
+        return Err(invalid_request());
+    }
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let import_permit = s.import_ops.clone().try_acquire_owned().map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "The library is busy.",
+        )
+    })?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let summary = tokio::task::spawn_blocking(move || {
+        let _import_permit = import_permit;
+        let _db_permit = db_permit;
+        store
+            .lock()
+            .map_err(|_| unavailable())?
+            .apply_verified_chatgpt_pin_snapshot(&request.receipt)
+            .map_err(|error| match error {
+                crate::error::Error::Configuration(_) => invalid_request(),
+                _ => unavailable(),
+            })
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(serde_json::to_value(summary).map_err(|_| unavailable())?)
 }
 
 async fn chat_list(

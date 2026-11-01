@@ -1,10 +1,9 @@
 use crate::catalog::{
-    CatalogEdge, CatalogEntity, CatalogEntityDetail, CatalogEntityKind, CatalogEntityPage,
-    CatalogEntityGraph, CatalogEntityGraphEdge, CatalogEntityGraphNode, CatalogEntityGraphQuery,
+    CatalogEdge, CatalogEntity, CatalogEntityDetail, CatalogEntityGraph, CatalogEntityGraphEdge,
+    CatalogEntityGraphNode, CatalogEntityGraphQuery, CatalogEntityKind, CatalogEntityPage,
     CatalogEntityQuery, CatalogEntityReference, CatalogGraph, CatalogIndexStatus, CatalogNode,
     CatalogOverview, CatalogProvenanceCoverage, CatalogSourceStats, CatalogStats,
-    CatalogTagSuggestion, CatalogTagSuggestionList,
-    CATALOG_INDEX_VERSION,
+    CatalogTagSuggestion, CatalogTagSuggestionList, CATALOG_INDEX_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::store::Store;
@@ -168,35 +167,54 @@ impl Store {
         limit: usize,
     ) -> Result<CatalogTagSuggestionList> {
         if conversation_id.trim().is_empty() || conversation_id.len() > 256 || limit == 0 {
-            return Err(Error::Configuration("invalid tag suggestion request".into()));
+            return Err(Error::Configuration(
+                "invalid tag suggestion request".into(),
+            ));
         }
         let limit = limit.min(12);
         let tx = self.connection.unchecked_transaction()?;
         let library_revision = current_revision(&tx)?;
-        let Some((chat_id, title, project_label)) = tx.query_row(
-            "SELECT catalog_id,title,project_label FROM catalog_chats WHERE conversation_id=?1",
-            [conversation_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
-        ).optional()? else {
+        let Some((chat_id, title, project_label)) = tx
+            .query_row(
+                "SELECT catalog_id,title,project_label FROM catalog_chats WHERE conversation_id=?1",
+                [conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
             tx.commit()?;
-            return Ok(CatalogTagSuggestionList { library_revision, items: Vec::new() });
+            return Ok(CatalogTagSuggestionList {
+                library_revision,
+                items: Vec::new(),
+            });
         };
         let existing = {
             let mut statement = tx.prepare(
                 "SELECT name FROM tags t JOIN target_tags tt ON tt.name_key=t.name_key
-                 WHERE tt.target_kind='conversation' AND tt.target_id=?1 ORDER BY tt.ordinal"
+                 WHERE tt.target_kind='conversation' AND tt.target_id=?1 ORDER BY tt.ordinal",
             )?;
-            let rows = statement.query_map([conversation_id], |row| row.get::<_, String>(0))?
+            let rows = statement
+                .query_map([conversation_id], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<HashSet<_>, _>>()?
-                .into_iter().map(|name| name.to_lowercase()).collect::<HashSet<_>>()
-            ;
+                .into_iter()
+                .map(|name| name.to_lowercase())
+                .collect::<HashSet<_>>();
             rows
         };
         let mut suggestions = Vec::<CatalogTagSuggestion>::new();
         let mut seen = existing;
         let mut add = |name: String, reason: &str| {
             let normalized = name.trim();
-            if normalized.len() < 2 || normalized.len() > 64 || normalized.chars().any(char::is_control) {
+            if normalized.len() < 2
+                || normalized.len() > 64
+                || normalized.chars().any(char::is_control)
+            {
                 return;
             }
             let lower = normalized.to_lowercase();
@@ -207,7 +225,10 @@ impl Store {
             {
                 return;
             }
-            suggestions.push(CatalogTagSuggestion { name: normalized.to_owned(), reason: reason.to_owned() });
+            suggestions.push(CatalogTagSuggestion {
+                name: normalized.to_owned(),
+                reason: reason.to_owned(),
+            });
         };
         // Human-authored titles and project names are stronger tag candidates
         // than isolated tokens mined from message text.
@@ -222,23 +243,33 @@ impl Store {
                  WHERE r.conversation_id=?1 AND e.kind IN ('repository','pull_request','issue','domain')
                  ORDER BY CASE e.kind WHEN 'repository' THEN 0 WHEN 'pull_request' THEN 1 WHEN 'issue' THEN 2 ELSE 3 END,e.label COLLATE NOCASE LIMIT 24"
             )?;
-            let rows = statement.query_map([conversation_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            let rows = statement
+                .query_map([conversation_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
         for (label, kind) in entity_labels.iter().filter(|(_, kind)| kind != "domain") {
-            add(label.clone(), match kind.as_str() {
-                "repository" => "Repository mentioned in this chat",
-                "pull_request" => "Pull request mentioned in this chat",
-                _ => "Issue mentioned in this chat",
-            });
+            add(
+                label.clone(),
+                match kind.as_str() {
+                    "repository" => "Repository mentioned in this chat",
+                    "pull_request" => "Pull request mentioned in this chat",
+                    _ => "Issue mentioned in this chat",
+                },
+            );
         }
         for phrase in topic_phrases {
             add(phrase, "Repeated in this chat");
         }
         // Domains are useful context, but should never displace the chat's
         // topics with a dozen raw hostnames.
-        for (label, _) in entity_labels.iter().filter(|(_, kind)| kind == "domain").take(2) {
+        for (label, _) in entity_labels
+            .iter()
+            .filter(|(_, kind)| kind == "domain")
+            .take(2)
+        {
             add(label.clone(), "Referenced domain");
         }
         {
@@ -249,7 +280,11 @@ impl Store {
             )?;
             for term in statement.query_map([&chat_id], |row| row.get::<_, String>(0))? {
                 let term = term?;
-                if (term.chars().count() >= 5 || matches!(term.to_lowercase().as_str(), "rust" | "sql" | "sqlite" | "vr" | "ai"))
+                if (term.chars().count() >= 5
+                    || matches!(
+                        term.to_lowercase().as_str(),
+                        "rust" | "sql" | "sqlite" | "vr" | "ai"
+                    ))
                     && !is_generic_tag_suggestion(&term.to_lowercase())
                 {
                     add(term, "Discussed in this chat");
@@ -258,7 +293,10 @@ impl Store {
         }
         suggestions.truncate(limit);
         tx.commit()?;
-        Ok(CatalogTagSuggestionList { library_revision, items: suggestions })
+        Ok(CatalogTagSuggestionList {
+            library_revision,
+            items: suggestions,
+        })
     }
 
     /// Rebuild only derived catalog rows. It never changes source conversations,
@@ -582,7 +620,9 @@ impl Store {
             return Err(Error::Configuration("invalid catalog entity query".into()));
         }
         if limit == 0 {
-            return Err(Error::Configuration("entity graph limit must be positive".into()));
+            return Err(Error::Configuration(
+                "entity graph limit must be positive".into(),
+            ));
         }
         let limit = limit.min(MAX_CATEGORY_ENTITY_NODES);
         let tag_key = tag.map(crate::store::canonical_tag_key).transpose()?;
@@ -654,7 +694,10 @@ impl Store {
         }
         if !entities.is_empty() {
             let entity_ids = serde_json::to_string(
-                &entities.iter().map(|entity| entity.id.as_str()).collect::<Vec<_>>(),
+                &entities
+                    .iter()
+                    .map(|entity| entity.id.as_str())
+                    .collect::<Vec<_>>(),
             )
             .map_err(|error| Error::Configuration(error.to_string()))?;
             let project_predicate = project_filter_sql("c", "?2");
@@ -670,22 +713,40 @@ impl Store {
             );
             let mut statement = tx.prepare(&sql)?;
             let rows = statement.query_map(
-                params![entity_ids, project_key, conversation_id, tag_key.as_deref(), (MAX_CATEGORY_GRAPH_EDGES + 1) as i64],
-                |row| Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, i64>(8)?,
-                )),
+                params![
+                    entity_ids,
+                    project_key,
+                    conversation_id,
+                    tag_key.as_deref(),
+                    (MAX_CATEGORY_GRAPH_EDGES + 1) as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
             )?;
             let mut chat_ids = HashMap::<String, String>::new();
             for row in rows {
-                let (entity_id, catalog_id, conversation_id, provider, account_scope, source_id, title, relation, reference_count) = row?;
+                let (
+                    entity_id,
+                    catalog_id,
+                    conversation_id,
+                    provider,
+                    account_scope,
+                    source_id,
+                    title,
+                    relation,
+                    reference_count,
+                ) = row?;
                 if result.edges.len() >= MAX_CATEGORY_GRAPH_EDGES {
                     result.truncated = true;
                     continue;
@@ -952,12 +1013,7 @@ impl Store {
                 .collect::<Vec<_>>();
             let remaining = limit - neighbors.len();
             truncated |= ranked.len() > remaining;
-            ranked.sort_by(|left, right| {
-                right
-                    .1
-                    .cmp(&left.1)
-                    .then_with(|| left.0.cmp(&right.0))
-            });
+            ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
             for (catalog_id, _, edge) in ranked {
                 if seen.contains(&catalog_id) {
                     continue;
@@ -1281,33 +1337,111 @@ fn shared_entity_weight(kind: &str) -> i64 {
 fn is_generic_tag_suggestion(term: &str) -> bool {
     let normalized = term
         .chars()
-        .map(|character| if character.is_alphanumeric() { character } else { ' ' })
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
         .collect::<String>();
     let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
     matches!(
         normalized.as_str(),
-        "archive" | "archived" | "assistant" | "chat" | "chats" | "conversation"
-            | "conversations" | "message" | "messages" | "user" | "untitled"
-            | "actually" | "seems" | "perhaps" | "really" | "please" | "thanks" | "thank you"
-            | "something" | "anything" | "everything" | "people" | "things" | "using"
-            | "several" | "various" | "clearer" | "now" | "today" | "tomorrow" | "yesterday"
-            | "web" | "search" | "executive" | "conclusion" | "correctly" | "identifies"
-            | "important" | "interpretation" | "advance" | "registration" | "connecting"
-            | "communicating" | "activities" | "tool" | "tools" | "workflow" | "workflows"
-            | "procedure" | "procedures" | "step" | "steps" | "process" | "online"
-            | "internet" | "analysis" | "analyze" | "reasoning" | "summary" | "summarize"
-            | "recommendation" | "recommendations" | "output" | "generated" | "provided"
-            | "details" | "detail"
-            | "new chat" | "new conversation" | "untitled conversation" | "your conversation"
-            | "project name pending" | "assigned project" | "unnamed project" | "new project"
-            | "chatgpt" | "chatgpt conversation" | "openai" | "github com" | "www github com"
-            | "openai com" | "chatgpt com"
+        "archive"
+            | "archived"
+            | "assistant"
+            | "chat"
+            | "chats"
+            | "conversation"
+            | "conversations"
+            | "message"
+            | "messages"
+            | "user"
+            | "untitled"
+            | "actually"
+            | "seems"
+            | "perhaps"
+            | "really"
+            | "please"
+            | "thanks"
+            | "thank you"
+            | "something"
+            | "anything"
+            | "everything"
+            | "people"
+            | "things"
+            | "using"
+            | "several"
+            | "various"
+            | "clearer"
+            | "now"
+            | "today"
+            | "tomorrow"
+            | "yesterday"
+            | "web"
+            | "search"
+            | "executive"
+            | "conclusion"
+            | "correctly"
+            | "identifies"
+            | "important"
+            | "interpretation"
+            | "advance"
+            | "registration"
+            | "connecting"
+            | "communicating"
+            | "activities"
+            | "tool"
+            | "tools"
+            | "workflow"
+            | "workflows"
+            | "procedure"
+            | "procedures"
+            | "step"
+            | "steps"
+            | "process"
+            | "online"
+            | "internet"
+            | "analysis"
+            | "analyze"
+            | "reasoning"
+            | "summary"
+            | "summarize"
+            | "recommendation"
+            | "recommendations"
+            | "output"
+            | "generated"
+            | "provided"
+            | "details"
+            | "detail"
+            | "new chat"
+            | "new conversation"
+            | "untitled conversation"
+            | "your conversation"
+            | "project name pending"
+            | "assigned project"
+            | "unnamed project"
+            | "new project"
+            | "chatgpt"
+            | "chatgpt conversation"
+            | "openai"
+            | "github com"
+            | "www github com"
+            | "openai com"
+            | "chatgpt com"
     )
 }
 
 fn looks_like_opaque_identifier(value: &str) -> bool {
-    let compact = value.chars().filter(|character| *character != '-').collect::<String>();
-    compact.len() >= 8 && compact.chars().all(|character| character.is_ascii_hexdigit())
+    let compact = value
+        .chars()
+        .filter(|character| *character != '-')
+        .collect::<String>();
+    compact.len() >= 8
+        && compact
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
 }
 
 fn contains_opaque_identifier(value: &str) -> bool {
@@ -1318,33 +1452,199 @@ fn contains_opaque_identifier(value: &str) -> bool {
 
 fn extract_content_phrases(sample: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
-        "a", "about", "actually", "after", "again", "all", "also", "an", "and", "any",
-        "are", "as", "at", "be", "because", "been", "before", "but", "by", "can",
-        "could", "did", "do", "does", "for", "from", "get", "going", "good", "got",
-        "had", "has", "have", "here", "how", "i", "if", "in", "into", "is", "it",
-        "just", "know", "like", "let", "me", "more", "most", "much", "my", "need",
-        "no", "not", "of", "on", "one", "or", "our", "out", "over", "please", "really",
-        "said", "same", "seems", "she", "should", "so", "some", "such", "than", "that",
-        "the", "their", "them", "then", "there", "these", "they", "this", "those", "through",
-        "to", "too", "use", "used", "using", "very", "was", "we", "well", "were", "what",
-        "when", "where", "which", "who", "will", "with", "would", "yes", "you", "your",
-        "chatgpt", "assistant", "user", "conversation", "message", "answer", "response",
-        "thanks", "thank", "hello", "hi", "okay", "sure", "here's", "let's", "want", "make",
-        "help", "provide", "tell", "show", "look", "review", "consider", "include", "following",
-        "archive", "archived", "untitled", "source", "provider", "account", "timestamp", "created",
-        "updated", "true", "false", "null", "none", "json", "http", "https", "www",
-        "across", "consolidate", "project", "repeated",
-        "web", "search", "executive", "conclusion", "correctly", "identifies",
-        "important", "interpretation", "advance", "registration", "connecting",
-        "communicating", "activities", "tool", "tools", "workflow", "workflows",
-        "procedure", "procedures", "step", "steps", "process", "online", "internet",
-        "analysis", "analyze", "reasoning", "summary", "summarize", "recommendation",
-        "recommendations", "output", "generated", "provided", "details", "detail",
+        "a",
+        "about",
+        "actually",
+        "after",
+        "again",
+        "all",
+        "also",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "because",
+        "been",
+        "before",
+        "but",
+        "by",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "get",
+        "going",
+        "good",
+        "got",
+        "had",
+        "has",
+        "have",
+        "here",
+        "how",
+        "i",
+        "if",
+        "in",
+        "into",
+        "is",
+        "it",
+        "just",
+        "know",
+        "like",
+        "let",
+        "me",
+        "more",
+        "most",
+        "much",
+        "my",
+        "need",
+        "no",
+        "not",
+        "of",
+        "on",
+        "one",
+        "or",
+        "our",
+        "out",
+        "over",
+        "please",
+        "really",
+        "said",
+        "same",
+        "seems",
+        "she",
+        "should",
+        "so",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "to",
+        "too",
+        "use",
+        "used",
+        "using",
+        "very",
+        "was",
+        "we",
+        "well",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "will",
+        "with",
+        "would",
+        "yes",
+        "you",
+        "your",
+        "chatgpt",
+        "assistant",
+        "user",
+        "conversation",
+        "message",
+        "answer",
+        "response",
+        "thanks",
+        "thank",
+        "hello",
+        "hi",
+        "okay",
+        "sure",
+        "here's",
+        "let's",
+        "want",
+        "make",
+        "help",
+        "provide",
+        "tell",
+        "show",
+        "look",
+        "review",
+        "consider",
+        "include",
+        "following",
+        "archive",
+        "archived",
+        "untitled",
+        "source",
+        "provider",
+        "account",
+        "timestamp",
+        "created",
+        "updated",
+        "true",
+        "false",
+        "null",
+        "none",
+        "json",
+        "http",
+        "https",
+        "www",
+        "across",
+        "consolidate",
+        "project",
+        "repeated",
+        "web",
+        "search",
+        "executive",
+        "conclusion",
+        "correctly",
+        "identifies",
+        "important",
+        "interpretation",
+        "advance",
+        "registration",
+        "connecting",
+        "communicating",
+        "activities",
+        "tool",
+        "tools",
+        "workflow",
+        "workflows",
+        "procedure",
+        "procedures",
+        "step",
+        "steps",
+        "process",
+        "online",
+        "internet",
+        "analysis",
+        "analyze",
+        "reasoning",
+        "summary",
+        "summarize",
+        "recommendation",
+        "recommendations",
+        "output",
+        "generated",
+        "provided",
+        "details",
+        "detail",
     ];
     let mut counts = HashMap::<String, usize>::new();
     let mut scored = HashMap::<String, usize>::new();
     let mut tokens = Vec::<String>::new();
-    let flush = |tokens: &mut Vec<String>, counts: &mut HashMap<String, usize>, scored: &mut HashMap<String, usize>| {
+    let flush = |tokens: &mut Vec<String>,
+                 counts: &mut HashMap<String, usize>,
+                 scored: &mut HashMap<String, usize>| {
         if tokens.len() < 2 {
             tokens.clear();
             return;
@@ -1381,9 +1681,13 @@ fn extract_content_phrases(sample: &str) -> Vec<String> {
                 flush(&mut tokens, &mut counts, &mut scored);
                 continue;
             }
-            let segments = raw.split(['.', ';', '!', '?', ':', ',']).collect::<Vec<_>>();
+            let segments = raw
+                .split(['.', ';', '!', '?', ':', ','])
+                .collect::<Vec<_>>();
             for (segment_index, segment) in segments.iter().enumerate() {
-                for word in segment.split(|character: char| !character.is_alphanumeric() && character != '+' && character != '#') {
+                for word in segment.split(|character: char| {
+                    !character.is_alphanumeric() && character != '+' && character != '#'
+                }) {
                     let word = word.to_lowercase();
                     if word.is_empty() {
                         continue;
@@ -1411,13 +1715,19 @@ fn extract_content_phrases(sample: &str) -> Vec<String> {
     phrases.sort_by(|(left, left_count), (right, right_count)| {
         right_count
             .cmp(left_count)
-            .then_with(|| left.split_whitespace().count().cmp(&right.split_whitespace().count()))
+            .then_with(|| {
+                left.split_whitespace()
+                    .count()
+                    .cmp(&right.split_whitespace().count())
+            })
             .then_with(|| scored.get(right).cmp(&scored.get(left)))
             .then_with(|| left.cmp(right))
     });
     phrases
         .into_iter()
-        .filter(|(phrase, _)| !is_generic_tag_suggestion(phrase) && !contains_opaque_identifier(phrase))
+        .filter(|(phrase, _)| {
+            !is_generic_tag_suggestion(phrase) && !contains_opaque_identifier(phrase)
+        })
         .take(24)
         .map(|(phrase, _)| phrase)
         .collect()
@@ -1481,19 +1791,20 @@ fn add_shared_entity_candidates(
         let Some(&index) = by_catalog_id.get(catalog_id.as_str()) else {
             continue;
         };
-        let candidate = candidates
-            .entry(entity_id.clone())
-            .or_insert_with(|| SharedEntityCandidate {
-                entity_id,
-                kind,
-                label,
-                provider,
-                account_scope,
-                chat_indices: Vec::new(),
-                seen_chat_indices: HashSet::new(),
-                scope_chat_count: 0,
-                entity_chat_count: 0,
-            });
+        let candidate =
+            candidates
+                .entry(entity_id.clone())
+                .or_insert_with(|| SharedEntityCandidate {
+                    entity_id,
+                    kind,
+                    label,
+                    provider,
+                    account_scope,
+                    chat_indices: Vec::new(),
+                    seen_chat_indices: HashSet::new(),
+                    scope_chat_count: 0,
+                    entity_chat_count: 0,
+                });
         if candidate.seen_chat_indices.insert(index) {
             candidate.chat_indices.push(index);
         }
@@ -1569,8 +1880,7 @@ fn add_shared_entity_candidates(
         }
         let ubiquitous_domain_threshold =
             20_i64.max((candidate.scope_chat_count.saturating_mul(20) + 99) / 100);
-        !(candidate.kind == "domain"
-            && candidate.entity_chat_count >= ubiquitous_domain_threshold)
+        !(candidate.kind == "domain" && candidate.entity_chat_count >= ubiquitous_domain_threshold)
     });
     for candidate in candidates {
         let mut neighbors = candidate.chat_indices;
@@ -1581,8 +1891,10 @@ fn add_shared_entity_candidates(
             let pair_key = (left.min(right), left.max(right));
             if !pairs.insert(pair_key) {
                 if let Some(existing) = candidate_edges.iter_mut().find(|existing| {
-                    (existing.left.min(existing.right), existing.left.max(existing.right))
-                        == pair_key
+                    (
+                        existing.left.min(existing.right),
+                        existing.left.max(existing.right),
+                    ) == pair_key
                 }) {
                     if existing.edge.basis != "project" {
                         let weight = shared_entity_weight(&candidate.kind);
@@ -1998,20 +2310,24 @@ fn read_shared_entity_neighbors(
     for (_entity_id, kind, label, catalog_id, updated_at_ms, entity_chat_count, scope_chat_count) in
         rows.into_iter().take(MAX_NEIGHBOR_ENTITY_ROWS)
     {
-        let ubiquitous_domain_threshold = 20_i64.max((scope_chat_count.saturating_mul(20) + 99) / 100);
+        let ubiquitous_domain_threshold =
+            20_i64.max((scope_chat_count.saturating_mul(20) + 99) / 100);
         if entity_chat_count < 2
             || kind == "domain" && entity_chat_count >= ubiquitous_domain_threshold
         {
             continue;
         }
         let weight = shared_entity_weight(&kind);
-        let candidate = neighbors.entry(catalog_id.clone()).or_insert_with(|| SharedEntityNeighbor {
-            catalog_id,
-            updated_at_ms,
-            kind: kind.clone(),
-            evidence: Vec::new(),
-            score: weight,
-        });
+        let candidate =
+            neighbors
+                .entry(catalog_id.clone())
+                .or_insert_with(|| SharedEntityNeighbor {
+                    catalog_id,
+                    updated_at_ms,
+                    kind: kind.clone(),
+                    evidence: Vec::new(),
+                    score: weight,
+                });
         if weight > shared_entity_weight(&candidate.kind) {
             candidate.kind = kind;
             candidate.score = candidate.score.max(weight);
@@ -3543,28 +3859,81 @@ mod tests {
         );
         store.rebuild_catalog_index().unwrap();
         let suggestions = store.catalog_tag_suggestions(&conversation_id, 12).unwrap();
-        assert_eq!(suggestions.items.first().map(|item| item.name.as_str()), Some("Village research"),
-            "human-authored multiword title should lead suggestions: {:?}", suggestions.items);
+        assert_eq!(
+            suggestions.items.first().map(|item| item.name.as_str()),
+            Some("Village research"),
+            "human-authored multiword title should lead suggestions: {:?}",
+            suggestions.items
+        );
         assert_eq!(suggestions.items.first().unwrap().reason, "Chat title");
-        assert!(suggestions.items.iter().any(|item| item.name == "acme/graph-rust"),
-            "typed repository should be suggested: {:?}", suggestions.items);
-        assert!(suggestions.items.iter().any(|item| item.name == "schema migrations"),
-            "repeated multiword topic should be suggested: {:?}", suggestions.items);
-        assert!(suggestions.items.iter().any(|item| item.name == "rust sqlite"),
-            "short technical terms should survive as a phrase: {:?}", suggestions.items);
-        for noisy in ["web search", "executive conclusion", "correctly identifies", "important interpretation", "advance registration", "connecting homeowner", "communicating activities"] {
-            assert!(!suggestions.items.iter().any(|item| item.name == noisy),
-                "procedural filler should be suppressed ({noisy}): {:?}", suggestions.items);
+        assert!(
+            suggestions
+                .items
+                .iter()
+                .any(|item| item.name == "acme/graph-rust"),
+            "typed repository should be suggested: {:?}",
+            suggestions.items
+        );
+        assert!(
+            suggestions
+                .items
+                .iter()
+                .any(|item| item.name == "schema migrations"),
+            "repeated multiword topic should be suggested: {:?}",
+            suggestions.items
+        );
+        assert!(
+            suggestions
+                .items
+                .iter()
+                .any(|item| item.name == "rust sqlite"),
+            "short technical terms should survive as a phrase: {:?}",
+            suggestions.items
+        );
+        for noisy in [
+            "web search",
+            "executive conclusion",
+            "correctly identifies",
+            "important interpretation",
+            "advance registration",
+            "connecting homeowner",
+            "communicating activities",
+        ] {
+            assert!(
+                !suggestions.items.iter().any(|item| item.name == noisy),
+                "procedural filler should be suppressed ({noisy}): {:?}",
+                suggestions.items
+            );
         }
-        assert!(suggestions.items.iter().any(|item| item.name == "homeowner associations"),
-            "repeated substantive phrase should remain: {:?}", suggestions.items);
-        assert!(suggestions.items.iter().filter(|item| item.reason == "Referenced domain").count() <= 2,
-            "raw domains must not crowd out topics: {:?}", suggestions.items);
-        assert!(suggestions.items.iter().all(|item| {
-            !matches!(item.name.to_lowercase().as_str(), "archive" | "chat" | "message")
-                && !item.name.to_lowercase().contains("83eb910af65a")
-                && !matches!(item.name.to_lowercase().as_str(), "actually" | "seems")
-        }), "boilerplate and opaque IDs must not be suggested: {:?}", suggestions.items);
+        assert!(
+            suggestions
+                .items
+                .iter()
+                .any(|item| item.name == "homeowner associations"),
+            "repeated substantive phrase should remain: {:?}",
+            suggestions.items
+        );
+        assert!(
+            suggestions
+                .items
+                .iter()
+                .filter(|item| item.reason == "Referenced domain")
+                .count()
+                <= 2,
+            "raw domains must not crowd out topics: {:?}",
+            suggestions.items
+        );
+        assert!(
+            suggestions.items.iter().all(|item| {
+                !matches!(
+                    item.name.to_lowercase().as_str(),
+                    "archive" | "chat" | "message"
+                ) && !item.name.to_lowercase().contains("83eb910af65a")
+                    && !matches!(item.name.to_lowercase().as_str(), "actually" | "seems")
+            }),
+            "boilerplate and opaque IDs must not be suggested: {:?}",
+            suggestions.items
+        );
     }
 
     #[test]
@@ -4502,44 +4871,86 @@ mod tests {
             );
         }
         store.rebuild_catalog_index().unwrap();
-        let entity_page = store.catalog_entities("chatgpt", None, None, None, None, None, 100).unwrap();
-        assert!(entity_page.items.iter().any(|entity| entity.kind == CatalogEntityKind::Repository), "entity kinds: {:?}", entity_page.items.iter().map(|entity| entity.kind).collect::<Vec<_>>());
+        let entity_page = store
+            .catalog_entities("chatgpt", None, None, None, None, None, 100)
+            .unwrap();
+        assert!(
+            entity_page
+                .items
+                .iter()
+                .any(|entity| entity.kind == CatalogEntityKind::Repository),
+            "entity kinds: {:?}",
+            entity_page
+                .items
+                .iter()
+                .map(|entity| entity.kind)
+                .collect::<Vec<_>>()
+        );
         let graph = store.catalog_graph("chatgpt", None, 100).unwrap();
         let chat_scopes = graph
             .nodes
             .iter()
             .filter(|node| node.kind == "chat")
-            .map(|node| (node.id.as_str(), node.account_scope.as_deref().unwrap_or_default()))
+            .map(|node| {
+                (
+                    node.id.as_str(),
+                    node.account_scope.as_deref().unwrap_or_default(),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let entity_edges = graph
             .edges
             .iter()
             .filter(|edge| edge.basis == "shared_entity")
             .collect::<Vec<_>>();
-        assert!(entity_edges.iter().any(|edge| {
-            edge.evidence
-                .iter()
-                .any(|evidence| evidence.contains("shared-repo"))
-        }), "entity edges: {entity_edges:?}; all graph edges: {:?}", graph.edges);
+        assert!(
+            entity_edges.iter().any(|edge| {
+                edge.evidence
+                    .iter()
+                    .any(|evidence| evidence.contains("shared-repo"))
+            }),
+            "entity edges: {entity_edges:?}; all graph edges: {:?}",
+            graph.edges
+        );
         assert!(entity_edges.iter().all(|edge| {
             chat_scopes.get(edge.source.as_str()) == chat_scopes.get(edge.target.as_str())
         }));
         assert!(!entity_edges.iter().any(|edge| {
-            edge.evidence.iter().any(|evidence| evidence == "github.com")
+            edge.evidence
+                .iter()
+                .any(|evidence| evidence == "github.com")
                 && chat_scopes.get(edge.source.as_str()) == Some(&scope_a)
         }));
         let focus = focus_id.expect("focus chat ingested");
         let neighbor = neighbor_id.expect("neighbor chat ingested");
-        let neighborhood = store.catalog_neighborhood(&focus, "chatgpt", None, 5).unwrap();
-        let neighbor_catalog_id = neighborhood.nodes.iter()
+        let neighborhood = store
+            .catalog_neighborhood(&focus, "chatgpt", None, 5)
+            .unwrap();
+        let neighbor_catalog_id = neighborhood
+            .nodes
+            .iter()
             .find(|node| node.conversation_id.as_deref() == Some(neighbor.as_str()))
             .map(|node| node.id.as_str());
-        assert!(neighborhood.edges.iter().any(|edge| {
-            Some(edge.target.as_str()) == neighbor_catalog_id && edge.basis == "shared_entity"
-                && edge.evidence.iter().any(|item| item.contains("shared-repo"))
-        }), "focused neighborhood should include the shared repository: {:?}", neighborhood.edges);
-        assert!(!neighborhood.edges.iter().any(|edge| edge.target.contains("entity-b")),
-            "focused neighborhood must not cross account scope: {:?}", neighborhood.edges);
+        assert!(
+            neighborhood.edges.iter().any(|edge| {
+                Some(edge.target.as_str()) == neighbor_catalog_id
+                    && edge.basis == "shared_entity"
+                    && edge
+                        .evidence
+                        .iter()
+                        .any(|item| item.contains("shared-repo"))
+            }),
+            "focused neighborhood should include the shared repository: {:?}",
+            neighborhood.edges
+        );
+        assert!(
+            !neighborhood
+                .edges
+                .iter()
+                .any(|edge| edge.target.contains("entity-b")),
+            "focused neighborhood must not cross account scope: {:?}",
+            neighborhood.edges
+        );
     }
 
     #[test]

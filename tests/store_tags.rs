@@ -32,7 +32,7 @@ fn tags_persist_across_open_and_v12_migration_isolated_from_index() {
     let db = common::temp_dir("store-tags").join("library.sqlite");
     let path = db.to_str().unwrap();
     let mut store = Store::open(path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 13);
+    assert_eq!(store.schema_version().unwrap(), 14);
     let conversation_id = store.ingest_observation(&observation()).unwrap();
     store
         .set_target_tags(
@@ -47,7 +47,7 @@ fn tags_persist_across_open_and_v12_migration_isolated_from_index() {
     drop(store);
 
     let store = Store::open(path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 13);
+    assert_eq!(store.schema_version().unwrap(), 14);
     assert_eq!(
         store.target_tags("conversation", &conversation_id).unwrap(),
         ["Planning", "Reference"]
@@ -63,7 +63,7 @@ fn tags_persist_across_open_and_v12_migration_isolated_from_index() {
         .unwrap();
     drop(conn);
     let migrated = Store::open(path).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 13);
+    assert_eq!(migrated.schema_version().unwrap(), 14);
     assert!(migrated
         .target_tags("conversation", &conversation_id)
         .unwrap()

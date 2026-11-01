@@ -199,10 +199,8 @@ async fn entity_graph_returns_bounded_exact_file_references_with_chat_scope() {
     );
     let response = send(&app, "GET", &uri, true, Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), 512 * 1024).await.unwrap(),
-    )
-    .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 512 * 1024).await.unwrap()).unwrap();
     assert_eq!(body["total_entities"], 1);
     assert_eq!(body["conversation_id"], conversation_id);
     assert_eq!(body["nodes"].as_array().unwrap().len(), 2);
@@ -223,10 +221,9 @@ async fn entity_graph_returns_bounded_exact_file_references_with_chat_scope() {
     );
     let suggestions = send(&app, "GET", &suggestions_uri, true, Body::empty()).await;
     assert_eq!(suggestions.status(), StatusCode::OK);
-    let suggestions: Value = serde_json::from_slice(
-        &to_bytes(suggestions.into_body(), 64 * 1024).await.unwrap(),
-    )
-    .unwrap();
+    let suggestions: Value =
+        serde_json::from_slice(&to_bytes(suggestions.into_body(), 64 * 1024).await.unwrap())
+            .unwrap();
     assert!(suggestions["library_revision"].is_number());
     assert!(suggestions["items"].as_array().is_some());
 
@@ -239,10 +236,8 @@ async fn entity_graph_returns_bounded_exact_file_references_with_chat_scope() {
     )
     .await;
     assert_eq!(empty.status(), StatusCode::OK);
-    let empty: Value = serde_json::from_slice(
-        &to_bytes(empty.into_body(), 64 * 1024).await.unwrap(),
-    )
-    .unwrap();
+    let empty: Value =
+        serde_json::from_slice(&to_bytes(empty.into_body(), 64 * 1024).await.unwrap()).unwrap();
     assert_eq!(empty["total_entities"], 0);
     assert!(empty["nodes"].as_array().unwrap().is_empty());
 }

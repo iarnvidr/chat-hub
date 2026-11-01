@@ -193,3 +193,121 @@ async fn bounded_state_identity_does_not_hydrate_large_transcript() {
     assert_eq!(body["source_id"], "large-state-uuid");
     assert!(bytes.len() < 4096);
 }
+
+#[tokio::test]
+async fn pin_snapshot_requires_authentication_and_only_complete_verified_lists_apply() {
+    let scope = format!("chatgpt:observed:{}", "e".repeat(64));
+    let mut store = Store::in_memory().unwrap();
+    let source_id = "pin-snapshot-source";
+    let conversation_id = store
+        .ingest_observation(&Observation {
+            provider: "chatgpt".into(),
+            account_scope: scope.clone(),
+            source_id: source_id.into(),
+            title: "Pin snapshot route".into(),
+            url: None,
+            current_node: None,
+            graph: vec![],
+            raw_payload: Value::Null,
+            source_time: None,
+            observed_ms: 1,
+            parser: "test".into(),
+            completeness: "complete".into(),
+        })
+        .unwrap();
+    let app = server::router(store, "pin-token".into());
+    let state_uri = format!("/api/v1/conversations/{conversation_id}/state");
+    let receipt = json!({
+        "verified": true,
+        "conversation_id": conversation_id,
+        "source_conversation_id": source_id,
+        "scope": scope,
+        "target_provider": "chatgpt",
+        "target_scope": scope,
+        "pinned": true,
+    });
+    let saved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(&state_uri)
+                .header("authorization", "Bearer pin-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"pinned":true,"receipt":receipt}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), axum::http::StatusCode::OK);
+
+    let unauthenticated = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/chatgpt/pins/snapshot")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"receipt":{
+                "verified":true,"complete":true,"scope":format!("chatgpt:observed:{}", "e".repeat(64)),"pinned_source_ids":[]
+            }}).to_string()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(
+        unauthenticated.status(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+
+    let partial = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/chatgpt/pins/snapshot")
+            .header("authorization", "Bearer pin-token")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"receipt":{
+                "verified":true,"complete":false,"scope":format!("chatgpt:observed:{}", "e".repeat(64)),"pinned_source_ids":[]
+            }}).to_string()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(partial.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    let complete = app.clone().oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/chatgpt/pins/snapshot")
+            .header("authorization", "Bearer pin-token")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"receipt":{
+                "verified":true,"complete":true,"scope":format!("chatgpt:observed:{}", "e".repeat(64)),"pinned_source_ids":[]
+            }}).to_string()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(complete.status(), axum::http::StatusCode::OK);
+    let result: Value = serde_json::from_slice(
+        &axum::body::to_bytes(complete.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["verified"], true);
+    assert_eq!(result["pinned_count"], 0);
+    assert_eq!(result["matched_count"], 0);
+
+    let identity = app
+        .oneshot(
+            Request::builder()
+                .uri(&state_uri)
+                .header("authorization", "Bearer pin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let identity: Value = serde_json::from_slice(
+        &axum::body::to_bytes(identity.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(identity["pinned"], false);
+}

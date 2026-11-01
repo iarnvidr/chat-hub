@@ -2,6 +2,7 @@ const {test} = require('bun:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
+const ACCOUNT_A='chatgpt:observed:'+'a'.repeat(64),ACCOUNT_B='chatgpt:observed:'+'b'.repeat(64);
 
 function boot(invoke, {buttonPresent = true, storage = new Map(), initialTime = Date.now()} = {}) {
   const callbacks = new Map(), events = [], timers = new Map();
@@ -85,7 +86,7 @@ test('a signed-in session found at startup starts a background history sync', as
   const ui = boot(async command => {
     calls.push(command);
     if (command === 'chatgpt_history_status') return {state: 'completed', imported: 3, updated: 1, unchanged: 0};
-    if (command === 'get_chatgpt_connection') return {state: 'connected'};
+    if (command === 'get_chatgpt_connection') return {state: 'connected',account_scope:ACCOUNT_A};
     return {};
   });
   ui.events.push(...events);
@@ -96,12 +97,64 @@ test('a signed-in session found at startup starts a background history sync', as
   assert.equal(ui.events.includes('chat-hub:connect'), false);
 });
 
+test('connected startup syncs verified pins before history and refreshes matched rows after import', async () => {
+  const calls=[],ui=boot(async(command)=>{
+    calls.push(command);
+    if(command==='chatgpt_history_status')return {state:'completed',configured:true,imported:0,updated:0,unchanged:0};
+    if(command==='get_chatgpt_connection')return {state:'connected',account_scope:ACCOUNT_A};
+    if(command==='sync_chatgpt_pins')return {verified:true,pinned_count:4,matched_count:3,unknown_count:1,library_revision:9};
+    return {};
+  });
+  await ui.flush();
+  const firstPin=calls.indexOf('sync_chatgpt_pins'),history=calls.indexOf('sync_chatgpt_history');
+  assert.ok(firstPin>=0&&history>firstPin);
+  assert.equal(calls.filter(command=>command==='sync_chatgpt_pins').length,2);
+  assert.equal(ui.events.filter(name=>name==='chat-hub:pins-synced').length,2);
+  assert.equal(ui.events.filter(name=>name==='chat-hub:history-updated').length>=2,true);
+});
+
+test('verified pins remain refreshable when history sync fails with a rate limit', async () => {
+  const calls=[],ui=boot(async(command)=>{
+    calls.push(command);
+    if(command==='chatgpt_history_status')return {state:'completed',configured:true};
+    if(command==='get_chatgpt_connection')return {state:'connected',account_scope:ACCOUNT_A};
+    if(command==='sync_chatgpt_pins')return {verified:true,pinned_count:2,matched_count:2,unknown_count:0,library_revision:10};
+    if(command==='sync_chatgpt_history')throw Error('history_rate_limited');
+    return {};
+  });
+  await ui.flush();
+  assert.ok(calls.indexOf('sync_chatgpt_pins')<calls.indexOf('sync_chatgpt_history'));
+  assert.ok(ui.events.includes('chat-hub:pins-synced'));
+});
+
+test('pin cooldown is scoped to the connected account and survives history cooldown', async () => {
+  let activeScope=ACCOUNT_A,statusCalls=0,historyStarts=0;const pinScopes=[];
+  const ui=boot(async(command)=>{
+    if(command==='chatgpt_history_status')return statusCalls++===0?{state:'idle',configured:true}:
+      {state:'partial',error_code:'rate_limited',retry_after:60,message:'History paused.',imported:0};
+    if(command==='get_chatgpt_connection')return activeScope?{state:'connected',account_scope:activeScope}:{state:'not_open'};
+    if(command==='prepare_chatgpt_session')return true;
+    if(command==='sync_chatgpt_pins'){pinScopes.push(activeScope);return {verified:true,pinned_count:1,matched_count:1,unknown_count:0,library_revision:10+pinScopes.length};}
+    if(command==='sync_chatgpt_history'){historyStarts++;throw Error('history_rate_limited');}
+    return {};
+  });
+  activeScope=null;await ui.flush();
+  activeScope=ACCOUNT_A;await ui.dispatch('chat-hub:chatgpt-connected');await ui.flush();
+  assert.equal(historyStarts,1);assert.deepEqual(pinScopes,[ACCOUNT_A]);
+  activeScope=ACCOUNT_B;await ui.dispatch('chat-hub:chatgpt-connected');await ui.flush();
+  assert.deepEqual(pinScopes,[ACCOUNT_A,ACCOUNT_B]);
+  ui.advance(6_000);await ui.dispatch('chat-hub:chatgpt-connected');await ui.flush();
+  assert.deepEqual(pinScopes,[ACCOUNT_A,ACCOUNT_B]);
+  assert.equal(historyStarts,1);
+});
+
 test('a newly connected account automatically syncs without changing the active view', async () => {
-  const calls = [];
+  const calls = [];let connections=0;
   const ui = boot(async command => {
     calls.push(command);
     if (command === 'chatgpt_history_status') return {state: 'completed', imported: 2, updated: 0, unchanged: 0};
-    if (command === 'get_chatgpt_connection') return {state: 'not_open'};
+    if (command === 'get_chatgpt_connection') return connections++===0?{state:'not_open'}:{state:'connected',account_scope:ACCOUNT_A};
+    if (command === 'sync_chatgpt_pins') return {verified:true,pinned_count:1,matched_count:1,unknown_count:0,library_revision:4};
     return {};
   });
   await ui.flush();
@@ -116,9 +169,10 @@ test('a newly connected account automatically syncs without changing the active 
 });
 
 test('tab switches do not repeat a background history fetch for five minutes, while manual sync remains available', async () => {
-  let starts = 0;
+  let starts = 0,connections=0;
   const ui = boot(async command => {
-    if (command === 'get_chatgpt_connection') return {state: 'not_open'};
+    if (command === 'get_chatgpt_connection') return connections++===0?{state:'not_open'}:{state:'connected',account_scope:ACCOUNT_A};
+    if (command === 'sync_chatgpt_pins') return {verified:true,pinned_count:1,matched_count:1,unknown_count:0,library_revision:4};
     if (command === 'sync_chatgpt_history') {starts++; return {};}
     return {state: 'completed', imported: 0, updated: 0, unchanged: 4};
   });
@@ -139,7 +193,8 @@ test('explicit sync connects the app account and resumes fetching when sign-in c
   const calls = []; let connected = false;
   const ui = boot(async command => {
     calls.push(command);
-    if (command === 'get_chatgpt_connection') return {state: connected ? 'connected' : 'not_open'};
+    if (command === 'get_chatgpt_connection') return connected ? {state:'connected',account_scope:ACCOUNT_A} : {state: 'not_open'};
+    if (command === 'sync_chatgpt_pins') return {verified:true,pinned_count:1,matched_count:1,unknown_count:0,library_revision:4};
     if (command === 'sync_chatgpt_history' && !connected) throw Error('chatgpt_not_open');
     if (command === 'chatgpt_history_status') return connected
       ? {state: 'completed', imported: 2, updated: 0, unchanged: 0}
@@ -156,9 +211,10 @@ test('explicit sync connects the app account and resumes fetching when sign-in c
 });
 
 test('rate-limit cooldown waits quietly and resumes automatically after native deadline', async () => {
-  let starts = 0, statusCalls = 0;
+  let starts = 0, statusCalls = 0, connections = 0;
   const ui = boot(async command => {
-    if (command === 'get_chatgpt_connection') return {state: 'not_open'};
+    if (command === 'get_chatgpt_connection') return connections++===0?{state:'not_open'}:{state:'connected',account_scope:ACCOUNT_A};
+    if (command === 'sync_chatgpt_pins') return {verified:true,pinned_count:1,matched_count:1,unknown_count:0,library_revision:4};
     if (command === 'sync_chatgpt_history') {starts++; throw Error('history_rate_limited');}
     if (command === 'chatgpt_history_status' && statusCalls++ === 0)
       return {state: 'idle', configured: true};
@@ -318,8 +374,9 @@ test('a challenge pause survives restart and startup does not sync until manual 
 });
 
 test('background sign-in failures do not navigate away from the current view', async () => {
+  let connections=0;
   const ui = boot(async command => {
-    if (command === 'get_chatgpt_connection') return {state: 'not_open'};
+    if (command === 'get_chatgpt_connection') return connections++===0?{state:'not_open'}:{state:'connected',account_scope:ACCOUNT_A};
     if (command === 'sync_chatgpt_history') return {};
     return {state: 'failed', error_code: 'signed_out', message: 'Sign in to ChatGPT in this app.'};
   });
@@ -331,9 +388,13 @@ test('background sign-in failures do not navigate away from the current view', a
 });
 
 test('history status remains safe when the Settings subpage has no sync button mounted', async () => {
+  let connections=0;
   const ui = boot(async command => command === 'chatgpt_history_status'
     ? {state: 'idle', configured: true}
-    : {state: 'not_open'}, {buttonPresent: false});
+    : command==='get_chatgpt_connection'
+      ? connections++===0?{state:'not_open'}:{state:'connected',account_scope:ACCOUNT_A}
+      : command==='sync_chatgpt_pins'?{verified:true,pinned_count:0,matched_count:0,unknown_count:0,library_revision:4}
+        : {state: 'not_open'}, {buttonPresent: false});
   await ui.flush();
   await ui.dispatch('chat-hub:chatgpt-connected');
   await ui.flush();

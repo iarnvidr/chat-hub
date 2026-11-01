@@ -179,16 +179,18 @@ async fn entity_graph(
     let q = query(q)?;
     let source = q.source.unwrap_or_else(|| "all".into());
     validate_catalog_scope(&source, q.project_key.as_deref())?;
-    if q.conversation_id.as_deref().is_some_and(|value| !valid_id(value))
+    if q.conversation_id
+        .as_deref()
+        .is_some_and(|value| !valid_id(value))
         || q.query
             .as_deref()
             .is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control))
         || q.kind
             .as_deref()
             .is_some_and(|value| CatalogEntityKind::parse(value).is_none())
-        || q.artifact_state
-            .as_deref()
-            .is_some_and(|value| !matches!(value, "link_only" | "metadata_present" | "saved_locally"))
+        || q.artifact_state.as_deref().is_some_and(|value| {
+            !matches!(value, "link_only" | "metadata_present" | "saved_locally")
+        })
         || !(1..=40).contains(&q.limit.unwrap_or(40))
     {
         return Err(invalid_request());
