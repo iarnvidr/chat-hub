@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4 — release candidate
+
+- History sync commits active conversations before archived-list and project enrichment requests. It acknowledges each successfully fetched detail batch after local import, so later rate limits preserve saved progress.
+
 ## 0.2.3 — release candidate
 
 - New chats appear immediately in the sidebar, with a pending state until a saved conversation is available. Starting a chat resets incompatible sidebar filters; assigned provider IDs persist across restart and reconcile only with the same verified account.

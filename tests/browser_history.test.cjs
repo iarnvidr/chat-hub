@@ -132,6 +132,38 @@ test('waits for native ACK between bounded raw graph chunks', async () => {
   assert.equal(job.state.conversations, 101);
 });
 
+test('acknowledges each successful detail batch before a later batch can rate limit', async () => {
+  const graphs = Array.from({length: 20}, (_, i) => graph(`chat-${String(i).padStart(3, '0')}`));
+  let batches = 0;
+  const job = setup((url, options) => {
+    const path = new URL(url).pathname;
+    if (path === '/api/auth/session') return response(200, {accessToken: token});
+    if (path === '/backend-api/conversations') {
+      const archived = new URL(url).searchParams.get('is_archived') === 'true';
+      return archived ? response(200, {items: [], total: 0}) : response(200, {
+        items: graphs.map(item => ({id: item.id})), total: graphs.length,
+      });
+    }
+    if (path === '/backend-api/conversations/batch') {
+      batches++;
+      if (batches === 2) return response(429, {}, {'retry-after': '45'});
+      const ids = JSON.parse(options.body).conversation_ids;
+      return response(200, ids.map(id => graphs.find(item => item.id === id)).filter(Boolean));
+    }
+    throw new Error(`unexpected URL ${path}`);
+  });
+  await until(() => job.state.chunk !== null);
+  assert.equal(job.state.chunk.conversations.length, 10);
+  assert.equal(batches, 1);
+  job.state.ackSequence = 1;
+  await job.state.ready;
+  assert.equal(job.state.status, 'waiting');
+  assert.equal(job.state.error_code, 'rate_limited');
+  assert.equal(job.state.stage, 'detail');
+  assert.equal(job.state.conversations, 10);
+  assert.equal(batches, 2);
+});
+
 test('signed-out session fails without API history requests', async () => {
   const job = setup((url) => new URL(url).pathname === '/api/auth/session'
     ? response(200, {}) : response(500, {}));
@@ -151,11 +183,12 @@ test('project labels and membership travel separately without refetching or chan
     return normal(url, options);
   });
   await until(() => job.state.chunk !== null);
-  assert.equal(job.state.chunk.conversations.length, 0);
-  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.project_catalog)), [{id: 'project-a', title: 'Research'}]);
+  assert.equal(job.state.chunk.conversations.length, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversations[0])), original);
   job.state.ackSequence = 1;
   await until(() => job.state.chunk?.sequence === 2);
-  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversations[0])), original);
+  assert.equal(job.state.chunk.conversations.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.project_catalog)), [{id: 'project-a', title: 'Research'}]);
   job.state.ackSequence = 2;
   await until(() => job.state.chunk?.sequence === 3);
   assert.equal(job.state.chunk.conversations.length, 0);
@@ -167,7 +200,7 @@ test('project labels and membership travel separately without refetching or chan
   assert.equal(job.calls.filter(call => new URL(call.url).pathname === '/backend-api/conversations/batch').length, 1);
 });
 
-test('429 stops immediately and publishes bounded retry timing', async () => {
+test('active-list 429 stops immediately and publishes bounded retry timing', async () => {
   const job = setup((url) => {
     const path = new URL(url).pathname;
     if (path === '/api/auth/session') return response(200, {accessToken: token});
@@ -176,16 +209,19 @@ test('429 stops immediately and publishes bounded retry timing', async () => {
   await job.state.ready;
   assert.equal(job.state.status, 'waiting');
   assert.equal(job.state.error_code, 'rate_limited');
-  assert.equal(job.state.stage, 'project');
+  assert.equal(job.state.stage, 'list');
   assert.equal(job.state.http_status, 429);
   assert.equal(job.state.retry_after, 29);
-  assert.equal(job.calls.length, 2);
+  assert.deepEqual(job.calls.map(call => new URL(call.url).pathname), [
+    '/api/auth/session', '/backend-api/conversations',
+  ]);
 });
 
-test('visible sidebar titles are committed before the sidebar API can be rate limited', async () => {
+test('visible sidebar titles are committed after active chats and before sidebar API rate limiting', async () => {
   const job = setup((url) => {
     const path = new URL(url).pathname;
     if (path === '/api/auth/session') return response(200, {accessToken: token});
+    if (path === '/backend-api/conversations') return response(200, {items: [], total: 0});
     if (path === '/backend-api/gizmos/snorlax/sidebar') return response(429, {}, {'retry-after': '31'});
     throw new Error(`unexpected URL ${path}`);
   }, [
@@ -203,14 +239,71 @@ test('visible sidebar titles are committed before the sidebar API can be rate li
     {id: 'g-p-real-project', title: 'Visible project name'},
   ]);
   assert.deepEqual(job.calls.map(call => new URL(call.url).pathname), ['/api/auth/session'],
-    'visible DOM names are acknowledged before any ChatGPT API request');
+    'visible DOM names are acknowledged before the first ChatGPT API request');
   job.state.ackSequence = 1;
   await job.state.ready;
   assert.equal(job.state.status, 'waiting');
   assert.equal(job.state.stage, 'project');
   assert.equal(job.state.http_status, 429);
   assert.deepEqual(job.calls.map(call => new URL(call.url).pathname), [
-    '/api/auth/session', '/backend-api/gizmos/snorlax/sidebar',
+    '/api/auth/session', '/backend-api/conversations', '/backend-api/conversations',
+    '/backend-api/gizmos/snorlax/sidebar',
+  ]);
+});
+
+test('active chat is acknowledged before an archived-list 429', async () => {
+  const original = graph('active-chat');
+  const job = setup((url, options) => {
+    const path = new URL(url).pathname;
+    if (path === '/api/auth/session') return response(200, {accessToken: token});
+    if (path === '/backend-api/conversations') {
+      const archived = new URL(url).searchParams.get('is_archived') === 'true';
+      return archived
+        ? response(429, {}, {'retry-after': '45'})
+        : response(200, {items: [{id: original.id}], total: 1});
+    }
+    if (path === '/backend-api/conversations/batch') return response(200, [original]);
+    throw new Error(`unexpected URL ${path}`);
+  });
+  await until(() => job.state.chunk !== null);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversations)), [original]);
+  job.state.ackSequence = 1;
+  await job.state.ready;
+  assert.equal(job.state.status, 'waiting');
+  assert.equal(job.state.error_code, 'rate_limited');
+  assert.equal(job.state.stage, 'list');
+  assert.equal(job.state.conversations, 1);
+  assert.deepEqual(job.calls.map(call => new URL(call.url).pathname), [
+    '/api/auth/session', '/backend-api/conversations',
+    '/backend-api/conversations/batch', '/backend-api/conversations',
+  ]);
+});
+
+test('active chat is acknowledged before a project-sidebar 429', async () => {
+  const original = graph('active-chat');
+  const job = setup((url, options) => {
+    const path = new URL(url).pathname;
+    if (path === '/api/auth/session') return response(200, {accessToken: token});
+    if (path === '/backend-api/conversations') {
+      const archived = new URL(url).searchParams.get('is_archived') === 'true';
+      return response(200, archived ? {items: [], total: 0} : {items: [{id: original.id}], total: 1});
+    }
+    if (path === '/backend-api/conversations/batch') return response(200, [original]);
+    if (path === '/backend-api/gizmos/snorlax/sidebar') return response(429, {}, {'retry-after': '45'});
+    throw new Error(`unexpected URL ${path}`);
+  });
+  await until(() => job.state.chunk !== null);
+  assert.deepEqual(JSON.parse(JSON.stringify(job.state.chunk.conversations)), [original]);
+  job.state.ackSequence = 1;
+  await job.state.ready;
+  assert.equal(job.state.status, 'waiting');
+  assert.equal(job.state.error_code, 'rate_limited');
+  assert.equal(job.state.stage, 'project');
+  assert.equal(job.state.conversations, 1);
+  assert.deepEqual(job.calls.map(call => new URL(call.url).pathname), [
+    '/api/auth/session', '/backend-api/conversations',
+    '/backend-api/conversations/batch', '/backend-api/conversations',
+    '/backend-api/gizmos/snorlax/sidebar',
   ]);
 });
 
