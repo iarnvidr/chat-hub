@@ -41,3 +41,21 @@ test('highlighting treats input as text and escapes regular expression operators
   assert.deepEqual(nodes.filter(node => node.tag).map(node => [node.tag, node.textContent]), [['mark', 'C++']]);
   assert.equal(nodes[0].text, '<img onerror=alert(1)> ');
 });
+
+test('logical chat search retains the saved copy that owns each matching message', async () => {
+  const [{normalizeSearch},{groupSearchConversations:group,conversationOpenTarget}]=await Promise.all([
+    import('../desktop-ui/data.js'),import('../desktop-ui/search.js'),
+  ]);
+  const hits=normalizeSearch({items:[
+    {conversation:{id:'current',title:'Current title'},node_id:null,snippet:'title'},
+    {conversation:{id:'current',title:'Current title'},matched_conversation_id:'archive',node_id:'same-node',leaf_node_id:'old-leaf',message_id:'same-message',snippet:'older-only content'},
+    {conversation:{id:'current',title:'Current title'},node_id:'same-node',leaf_node_id:'new-leaf',message_id:'same-message',snippet:'current content'},
+  ]}).items;
+  const rows=group([...hits,hits[1]]);
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].id,'current','row actions retain the current identity');
+  assert.equal(rows[0].matching_hits.length,3,'equal node IDs in different saved copies stay distinct');
+  assert.equal(rows[0].matched_message_count,2);
+  assert.deepEqual(conversationOpenTarget(rows[0]),{id:'archive',leafNodeId:'old-leaf',anchorNodeId:'same-node'});
+  assert.equal(rows[0].snippet,'older-only content');
+});

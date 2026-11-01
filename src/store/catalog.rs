@@ -6,7 +6,7 @@ use crate::catalog::{
     CatalogTagSuggestion, CatalogTagSuggestionList, CATALOG_INDEX_VERSION,
 };
 use crate::error::{Error, Result};
-use crate::store::Store;
+use crate::store::{Store, CHAT_IDENTITY_CTES};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -521,7 +521,7 @@ impl Store {
         let where_sql = entity_filter_sql(source_filter)
             .replace("e.artifact_state=?4", "(e.artifact_state=?4 OR (?4='saved_locally' AND EXISTS(SELECT 1 FROM artifact_contents ac WHERE ac.entity_id=e.id)))");
         let count_sql = format!(
-            "SELECT count(DISTINCT e.id) FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql}"
+            "{CHAT_IDENTITY_CTES} SELECT count(DISTINCT e.id) FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql}"
         );
         let total: i64 = tx.query_row(
             &count_sql,
@@ -537,7 +537,7 @@ impl Store {
             |row| row.get(0),
         )?;
         let sql = format!(
-            "SELECT DISTINCT e.id,e.kind,e.label,e.canonical_url,e.domain,e.repository_id,e.filename,e.mime_type,e.provider_file_id,e.canonical_locator,e.artifact_state,e.content_saved,e.reference_count,(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='produces'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='attaches'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='mentions') FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql} ORDER BY e.id LIMIT ?8"
+            "{CHAT_IDENTITY_CTES} SELECT DISTINCT e.id,e.kind,e.label,e.canonical_url,e.domain,e.repository_id,e.filename,e.mime_type,e.provider_file_id,e.canonical_locator,e.artifact_state,e.content_saved,e.reference_count,(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='produces'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='attaches'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='mentions') FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql} ORDER BY e.id LIMIT ?8"
         );
         let mut statement = tx.prepare(&sql)?;
         let mut items = statement
@@ -568,9 +568,12 @@ impl Store {
         } else {
             None
         };
-        let coverage_project_filter = project_filter_sql("c", "?1");
+        let coverage_project_filter = format!(
+            "(?1 IS NULL OR (?1='{}' AND NOT EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id=coalesce(ca.canonical_conversation_id,c.conversation_id))) OR EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id=coalesce(ca.canonical_conversation_id,c.conversation_id) AND ep.project_key=?1))",
+            crate::store::NO_PROJECT_FILTER
+        );
         let coverage_sql = format!(
-            "SELECT EXISTS(SELECT 1 FROM catalog_scan_coverage x JOIN catalog_chats c ON c.conversation_id=x.conversation_id WHERE x.truncated=1 AND ({source_filter}) AND {coverage_project_filter} AND (?2 IS NULL OR c.conversation_id=?2))"
+            "{CHAT_IDENTITY_CTES} SELECT EXISTS(SELECT 1 FROM catalog_scan_coverage x JOIN catalog_chats c ON c.conversation_id=x.conversation_id LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=c.conversation_id WHERE x.truncated=1 AND ({source_filter}) AND {coverage_project_filter} AND (?2 IS NULL OR coalesce(ca.canonical_conversation_id,c.conversation_id)=?2))"
         );
         let coverage_truncated: bool = tx
             .query_row(
@@ -648,7 +651,7 @@ impl Store {
             "(e.artifact_state=?4 OR (?4='saved_locally' AND EXISTS(SELECT 1 FROM artifact_contents ac WHERE ac.entity_id=e.id)))",
         );
         let count_sql = format!(
-            "SELECT count(DISTINCT e.id) FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql}"
+            "{CHAT_IDENTITY_CTES} SELECT count(DISTINCT e.id) FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql}"
         );
         let filter_params = params![
             project_key,
@@ -661,7 +664,7 @@ impl Store {
         ];
         result.total_entities = tx.query_row(&count_sql, filter_params, |row| row.get(0))?;
         let entities_sql = format!(
-            "SELECT DISTINCT e.id,e.kind,e.label,e.canonical_url,e.domain,e.repository_id,e.filename,e.mime_type,e.provider_file_id,e.canonical_locator,e.artifact_state,e.content_saved,e.reference_count,(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='produces'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='attaches'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='mentions') FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql} ORDER BY e.kind,e.label COLLATE NOCASE,e.id LIMIT ?8"
+            "{CHAT_IDENTITY_CTES} SELECT DISTINCT e.id,e.kind,e.label,e.canonical_url,e.domain,e.repository_id,e.filename,e.mime_type,e.provider_file_id,e.canonical_locator,e.artifact_state,e.content_saved,e.reference_count,(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='produces'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='attaches'),(SELECT count(*) FROM catalog_entity_refs rr WHERE rr.entity_id=e.id AND rr.relation='mentions') FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE {where_sql} ORDER BY e.kind,e.label COLLATE NOCASE,e.id LIMIT ?8"
         );
         let mut statement = tx.prepare(&entities_sql)?;
         let mut entities = statement
@@ -700,16 +703,23 @@ impl Store {
                     .collect::<Vec<_>>(),
             )
             .map_err(|error| Error::Configuration(error.to_string()))?;
-            let project_predicate = project_filter_sql("c", "?2");
+            let logical_chat = "coalesce(ca.canonical_conversation_id,c.conversation_id)";
             let sql = format!(
-                "SELECT r.entity_id,c.catalog_id,c.conversation_id,c.provider,c.account_scope,c.source_id,c.title,r.relation,count(*)
+                "{CHAT_IDENTITY_CTES} SELECT r.entity_id,
+                        coalesce(canonical.catalog_id,c.catalog_id),{logical_chat},
+                        coalesce(canonical.provider,c.provider),coalesce(canonical.account_scope,c.account_scope),
+                        coalesce(canonical.source_id,c.source_id),coalesce(canonical.title,c.title),r.relation,count(*)
                  FROM catalog_entity_refs r JOIN catalog_chats c ON c.conversation_id=r.conversation_id
+                 LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=c.conversation_id
+                 LEFT JOIN catalog_chats canonical ON canonical.conversation_id=ca.canonical_conversation_id
                  WHERE r.entity_id IN (SELECT value FROM json_each(?1))
-                   AND ({source_filter}) AND {project_predicate}
-                   AND (?3 IS NULL OR c.conversation_id=?3)
-                   AND (?4 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=c.conversation_id AND tt.name_key=?4))
-                 GROUP BY r.entity_id,c.catalog_id,c.conversation_id,c.provider,c.account_scope,c.source_id,c.title,r.relation
-                 ORDER BY r.entity_id,c.updated_at_ms DESC NULLS LAST,c.catalog_id,r.relation LIMIT ?5"
+                   AND ({source_filter}) AND (?2 IS NULL OR (?2='{}' AND NOT EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id={logical_chat})) OR EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id={logical_chat} AND ep.project_key=?2))
+                   AND (?3 IS NULL OR {logical_chat}=?3)
+                   AND (?4 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id={logical_chat} AND tt.name_key=?4)
+                     OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id WHERE aliases.canonical_conversation_id={logical_chat} AND tt.name_key=?4))
+                 GROUP BY r.entity_id,coalesce(canonical.catalog_id,c.catalog_id),{logical_chat},coalesce(canonical.provider,c.provider),coalesce(canonical.account_scope,c.account_scope),coalesce(canonical.source_id,c.source_id),coalesce(canonical.title,c.title),r.relation
+                 ORDER BY r.entity_id,max(coalesce(canonical.updated_at_ms,c.updated_at_ms)) DESC NULLS LAST,coalesce(canonical.catalog_id,c.catalog_id),r.relation LIMIT ?5",
+                crate::store::NO_PROJECT_FILTER
             );
             let mut statement = tx.prepare(&sql)?;
             let rows = statement.query_map(
@@ -815,7 +825,7 @@ impl Store {
             return Ok(None);
         };
         apply_saved_artifact_state(&tx, &mut entity)?;
-        let mut statement = tx.prepare("SELECT conversation_id,source_id,title,provider,message_id,source_message_id,source_node_id,role,source_field,provenance,relation FROM catalog_entity_refs WHERE entity_id=?1 ORDER BY conversation_id,source_node_id LIMIT 101")?;
+        let mut statement = tx.prepare(&format!("{CHAT_IDENTITY_CTES} SELECT r.conversation_id,r.source_id,r.title,r.provider,r.message_id,r.source_message_id,r.source_node_id,r.role,r.source_field,r.provenance,r.relation,ca.canonical_conversation_id FROM catalog_entity_refs r LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=r.conversation_id WHERE r.entity_id=?1 ORDER BY r.conversation_id,r.source_node_id LIMIT 101"))?;
         let mut references = statement
             .query_map([id], |row| {
                 Ok(CatalogEntityReference {
@@ -830,6 +840,7 @@ impl Store {
                     source_field: row.get(8)?,
                     provenance: row.get(9)?,
                     relation: row.get(10)?,
+                    canonical_conversation_id: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1088,15 +1099,11 @@ fn read_global_relationship_map(
 
     // Project memberships are explicit. Link each chat to the next few recent
     // chats in that project/account, making a bounded chain instead of a clique.
-    let mut project_groups = BTreeMap::<(String, String, String), Vec<usize>>::new();
+    let mut project_groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, chat) in chats.iter().enumerate() {
         if let Some(project_key) = chat.project_key.as_deref() {
             project_groups
-                .entry((
-                    chat.provider.clone(),
-                    chat.account_scope.clone(),
-                    project_key.to_owned(),
-                ))
+                .entry(project_key.to_owned())
                 .or_default()
                 .push(index);
         }
@@ -2012,12 +2019,15 @@ fn read_chat_rows(
     tag_key: Option<&str>,
     limit: usize,
 ) -> Result<Vec<IndexedChat>> {
-    let project_filter = project_filter_sql("c", "?1");
+    let project_filter = catalog_project_filter_sql("c", "?1");
     let sql = format!(
-        "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
-         FROM catalog_chats c WHERE ({source_filter}) AND {project_filter}
-           AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2))
-         ORDER BY c.updated_at_ms DESC NULLS LAST,catalog_id LIMIT ?3"
+        "{} SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,effective_project_key AS project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
+         FROM catalog_identity_chats c
+         WHERE ({source_filter}) AND {project_filter}
+           AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2)
+             OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id WHERE aliases.canonical_conversation_id=c.conversation_id AND tt.name_key=?2))
+         ORDER BY c.updated_at_ms DESC NULLS LAST,catalog_id LIMIT ?3",
+        catalog_identity_ctes()
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(
@@ -2034,11 +2044,16 @@ fn read_chat_by_conversation(
     tag_key: Option<&str>,
     conversation_id: &str,
 ) -> Result<Option<IndexedChat>> {
-    let project_filter = project_filter_sql("c", "?2");
+    let project_filter = catalog_project_filter_sql("c", "?2");
     let sql = format!(
-        "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
-         FROM catalog_chats c WHERE c.conversation_id=?1 AND ({source_filter}) AND {project_filter}
-           AND (?3 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?3)) LIMIT 1"
+        "{} SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,effective_project_key AS project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
+         FROM catalog_identity_chats c
+         WHERE c.conversation_id=coalesce((SELECT canonical_conversation_id FROM conversation_aliases WHERE legacy_conversation_id=?1),?1)
+           AND ({source_filter}) AND {project_filter}
+           AND (?3 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?3)
+             OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id WHERE aliases.canonical_conversation_id=c.conversation_id AND tt.name_key=?3))
+         LIMIT 1",
+        catalog_identity_ctes()
     );
     Ok(conn
         .query_row(
@@ -2052,8 +2067,7 @@ fn read_chat_by_conversation(
 fn read_chat_by_catalog_id(conn: &Connection, catalog_id: &str) -> Result<Option<IndexedChat>> {
     Ok(conn
         .query_row(
-            "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
-             FROM catalog_chats WHERE catalog_id=?1",
+            &format!("{} SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,effective_project_key AS project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes FROM catalog_identity_chats WHERE conversation_id=coalesce((SELECT ca.canonical_conversation_id FROM catalog_chats physical JOIN conversation_aliases ca ON ca.legacy_conversation_id=physical.conversation_id WHERE physical.catalog_id=?1),(SELECT conversation_id FROM catalog_chats WHERE catalog_id=?1))", catalog_identity_ctes()),
             params![catalog_id],
             indexed_chat_from_row,
         )
@@ -2071,20 +2085,21 @@ fn read_project_neighbors(
     let Some(project_key) = focus.project_key.as_deref() else {
         return Ok(Vec::new());
     };
+    let project_filter_sql = catalog_project_filter_sql("c", "?3");
     let sql = format!(
-        "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
-         FROM catalog_chats c WHERE c.project_key=?1 AND c.catalog_id<>?2 AND c.provider=?3 AND c.account_scope=?4
-           AND ({source_filter}) AND (?5 IS NULL OR c.project_key=?5)
-           AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?6))
-         ORDER BY c.updated_at_ms DESC NULLS LAST,c.catalog_id LIMIT ?7"
+        "{} SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,effective_project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
+         FROM catalog_identity_chats c WHERE c.effective_project_key=?1 AND c.catalog_id<>?2
+           AND ({source_filter}) AND {project_filter_sql}
+           AND (?4 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?4)
+             OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id WHERE aliases.canonical_conversation_id=c.conversation_id AND tt.name_key=?4))
+         ORDER BY c.updated_at_ms DESC NULLS LAST,c.catalog_id LIMIT ?5",
+        catalog_identity_ctes()
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(
         params![
             project_key,
             focus.catalog_id,
-            focus.provider,
-            focus.account_scope,
             project_filter,
             tag_filter,
             limit as i64,
@@ -2110,12 +2125,14 @@ fn read_keyword_neighbors(
     focus: &IndexedChat,
     limit: usize,
 ) -> Result<Vec<KeywordCandidate>> {
-    let scope_project_filter = project_filter_sql("c", "?3");
-    let candidate_project_filter = project_filter_sql("c", "?5");
-    let evidence_project_filter = project_filter_sql("c2", "?5");
+    let scope_project_filter = catalog_project_filter_sql("c", "?3");
+    let candidate_project_filter = catalog_project_filter_sql("c", "?5");
+    let evidence_project_filter = catalog_project_filter_sql("c2", "?5");
     let scope_sql = format!(
-        "SELECT count(*) FROM catalog_chats c WHERE provider=?1 AND account_scope=?2 AND {scope_project_filter}
-           AND (?4 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?4))"
+        "{} SELECT count(DISTINCT c.conversation_id) FROM catalog_identity_chats c WHERE provider=?1 AND account_scope=?2 AND {scope_project_filter}
+           AND (?4 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?4)
+             OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id WHERE aliases.canonical_conversation_id=c.conversation_id AND tt.name_key=?4))",
+        catalog_identity_ctes()
     );
     let scope_chat_count: i64 = conn.query_row(
         &scope_sql,
@@ -2128,30 +2145,34 @@ fn read_keyword_neighbors(
         |row| row.get(0),
     )?;
     let sql = format!(
-        "SELECT c.catalog_id,c.updated_at_ms,group_concat(t.term || ':' || (
-             SELECT count(DISTINCT e2.source_id) FROM catalog_edges e2 JOIN catalog_chats c2 ON c2.catalog_id=e2.source_id
+        "{} SELECT c.catalog_id,c.updated_at_ms,group_concat(t.term || ':' || (
+             SELECT count(DISTINCT c2.conversation_id) FROM catalog_edges e2 JOIN catalog_identity_sources src2 ON src2.physical_catalog_id=e2.source_id JOIN catalog_identity_chats c2 ON c2.conversation_id=src2.logical_conversation_id
              WHERE e2.target_id=t.term_id AND e2.basis='shared_keyword' AND c2.provider=?3 AND c2.account_scope=?4
                AND {evidence_project_filter}
-               AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c2.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?6))
+                AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c2.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?6)
+                  OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id WHERE aliases.canonical_conversation_id=c2.conversation_id AND tt.name_key=?6))
          ),char(31))
          FROM catalog_edges f
          JOIN catalog_terms t ON t.term_id=f.target_id
          JOIN catalog_edges e ON e.target_id=t.term_id AND e.basis='shared_keyword'
-         JOIN catalog_chats c ON c.catalog_id=e.source_id
-         WHERE f.source_id=?1 AND f.basis='shared_keyword' AND c.catalog_id<>?2
+          JOIN catalog_identity_sources src ON src.physical_catalog_id=e.source_id
+          JOIN catalog_identity_chats c ON c.conversation_id=src.logical_conversation_id
+          WHERE f.source_id IN (SELECT physical_catalog_id FROM catalog_identity_sources WHERE logical_conversation_id=?1) AND f.basis='shared_keyword' AND c.conversation_id<>?2
            AND c.provider=?3 AND c.account_scope=?4 AND ({source_filter})
            AND {candidate_project_filter}
-           AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?6))
-         GROUP BY c.catalog_id
+            AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?6)
+              OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id WHERE aliases.canonical_conversation_id=c.conversation_id AND tt.name_key=?6))
+          GROUP BY c.catalog_id,c.conversation_id
          HAVING count(DISTINCT t.term_id)>=2
          ORDER BY sum(1000000.0 / t.chat_count) DESC,c.updated_at_ms DESC NULLS LAST,c.catalog_id
-         LIMIT ?7"
+          LIMIT ?7",
+        catalog_identity_ctes()
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(
         params![
-            focus.catalog_id,
-            focus.catalog_id,
+            focus.conversation_id,
+            focus.conversation_id,
             focus.provider,
             focus.account_scope,
             project_filter,
@@ -2231,13 +2252,13 @@ fn read_shared_entity_neighbors(
     if !entity_tables_exist(conn)? {
         return Ok((Vec::new(), false));
     }
-    let mut statement = conn.prepare(
-        "SELECT DISTINCT e.id,e.kind FROM catalog_entities e
+    let mut statement = conn.prepare(&format!(
+        "{CHAT_IDENTITY_CTES} SELECT DISTINCT e.id,e.kind FROM catalog_entities e
          JOIN catalog_entity_refs r ON r.entity_id=e.id
-         WHERE r.conversation_id=?1
+         WHERE (r.conversation_id=?1 OR r.conversation_id IN (SELECT legacy_conversation_id FROM conversation_aliases WHERE canonical_conversation_id=?1))
          ORDER BY CASE e.kind WHEN 'repository' THEN 1 WHEN 'pull_request' THEN 2 WHEN 'issue' THEN 3 WHEN 'file_artifact' THEN 4 WHEN 'link' THEN 5 WHEN 'domain' THEN 6 ELSE 7 END,e.reference_count DESC,e.id
-         LIMIT ?2",
-    )?;
+         LIMIT ?2"
+    ))?;
     let rows = statement.query_map(
         params![focus.conversation_id, (MAX_FOCUS_ENTITY_IDS + 1) as i64],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -2255,31 +2276,37 @@ fn read_shared_entity_neighbors(
             .collect::<Vec<_>>(),
     )
     .map_err(|error| Error::Configuration(error.to_string()))?;
-    let project_filter = project_filter_sql("c", "?4");
+    let project_filter = catalog_project_filter_sql("c", "?4");
     let sql = format!(
-        "WITH scoped_chats AS (
+        "{} , scoped_chats AS (
              SELECT c.conversation_id,c.catalog_id,c.provider,c.account_scope,c.updated_at_ms
-             FROM catalog_chats c
+             FROM catalog_identity_chats c
              WHERE ({source_filter}) AND c.provider=?2 AND c.account_scope=?3 AND {project_filter}
-               AND (?5 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=c.conversation_id AND tt.name_key=?5))
+               AND (?5 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=c.conversation_id AND tt.name_key=?5)
+                 OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id WHERE aliases.canonical_conversation_id=c.conversation_id AND tt.name_key=?5))
          ), scope_sizes AS (
              SELECT provider,account_scope,count(*) AS chat_count
              FROM scoped_chats GROUP BY provider,account_scope
          ), entity_sizes AS (
-             SELECT r.entity_id,count(DISTINCT r.conversation_id) AS entity_chat_count,ss.chat_count
-             FROM catalog_entity_refs r JOIN scoped_chats c ON c.conversation_id=r.conversation_id
+             SELECT r.entity_id,count(DISTINCT c.conversation_id) AS entity_chat_count,ss.chat_count
+             FROM catalog_entity_refs r JOIN catalog_chats physical ON physical.conversation_id=r.conversation_id
+             JOIN catalog_identity_sources src ON src.physical_catalog_id=physical.catalog_id
+             JOIN scoped_chats c ON c.catalog_id=src.logical_catalog_id
              JOIN scope_sizes ss ON ss.provider=c.provider AND ss.account_scope=c.account_scope
              WHERE r.entity_id IN (SELECT value FROM json_each(?1))
              GROUP BY r.entity_id,ss.chat_count
          )
          SELECT r.entity_id,e.kind,e.label,c.catalog_id,c.updated_at_ms,es.entity_chat_count,es.chat_count,count(*)
          FROM catalog_entity_refs r JOIN catalog_entities e ON e.id=r.entity_id
-         JOIN scoped_chats c ON c.conversation_id=r.conversation_id
+         JOIN catalog_chats physical ON physical.conversation_id=r.conversation_id
+         JOIN catalog_identity_sources src ON src.physical_catalog_id=physical.catalog_id
+         JOIN scoped_chats c ON c.catalog_id=src.logical_catalog_id
          JOIN entity_sizes es ON es.entity_id=r.entity_id
          WHERE r.entity_id IN (SELECT value FROM json_each(?1)) AND c.conversation_id<>?6
          GROUP BY r.entity_id,e.kind,e.label,c.catalog_id,c.updated_at_ms,es.entity_chat_count,es.chat_count
          ORDER BY CASE e.kind WHEN 'repository' THEN 1 WHEN 'pull_request' THEN 2 WHEN 'issue' THEN 3 WHEN 'file_artifact' THEN 4 WHEN 'link' THEN 5 WHEN 'domain' THEN 6 ELSE 7 END,c.updated_at_ms DESC NULLS LAST,c.catalog_id
-         LIMIT ?7"
+         LIMIT ?7",
+        catalog_identity_ctes()
     );
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(
@@ -2481,9 +2508,10 @@ fn read_tagged_chat_count(
     project_key: Option<&str>,
     tag_key: Option<&str>,
 ) -> Result<i64> {
-    let project_filter = project_filter_sql("c", "?1");
+    let project_filter = catalog_project_filter_sql("c", "?1");
     let sql = format!(
-        "SELECT count(*) FROM catalog_chats c WHERE ({source_filter}) AND {project_filter} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2))"
+        "{} SELECT count(DISTINCT c.conversation_id) FROM catalog_identity_chats c WHERE ({source_filter}) AND {project_filter} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2) OR EXISTS(SELECT 1 FROM conversation_aliases aliases JOIN target_tags tt ON tt.target_kind='conversation' AND tt.target_id=aliases.legacy_conversation_id JOIN tags t ON t.name_key=tt.name_key WHERE aliases.canonical_conversation_id=c.conversation_id AND t.name_key=?2))",
+        catalog_identity_ctes()
     );
     Ok(conn.query_row(&sql, params![project_key, tag_key], |row| row.get(0))?)
 }
@@ -2622,9 +2650,10 @@ fn validate_entity_filters(
 }
 
 fn entity_filter_sql(source: &str) -> String {
-    let project_filter = project_filter_sql("c", "?1");
+    let logical_chat = "coalesce((SELECT ca.canonical_conversation_id FROM conversation_aliases ca WHERE ca.legacy_conversation_id=r.conversation_id),r.conversation_id)";
     format!(
-        "({source}) AND {project_filter} AND (?2 IS NULL OR c.conversation_id=?2) AND (?3 IS NULL OR e.kind=?3) AND (?4 IS NULL OR e.artifact_state=?4) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=e.id AND tt.target_kind=CASE WHEN e.kind='file_artifact' THEN 'file' ELSE 'entity' END AND t.name_key=?5)) AND (?6 IS NULL OR instr(lower(e.label),lower(?6))>0 OR instr(lower(coalesce(e.canonical_url,'')),lower(?6))>0 OR instr(lower(coalesce(e.domain,'')),lower(?6))>0 OR instr(lower(coalesce(e.filename,'')),lower(?6))>0) AND (?7 IS NULL OR e.id>?7)"
+        "({source}) AND (?1 IS NULL OR (?1='{}' AND NOT EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id={logical_chat})) OR EXISTS(SELECT 1 FROM effective_projects ep WHERE ep.conversation_id={logical_chat} AND ep.project_key=?1)) AND (?2 IS NULL OR {logical_chat}=?2) AND (?3 IS NULL OR e.kind=?3) AND (?4 IS NULL OR e.artifact_state=?4) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=e.id AND tt.target_kind=CASE WHEN e.kind='file_artifact' THEN 'file' ELSE 'entity' END AND t.name_key=?5)) AND (?6 IS NULL OR instr(lower(e.label),lower(?6))>0 OR instr(lower(coalesce(e.canonical_url,'')),lower(?6))>0 OR instr(lower(coalesce(e.domain,'')),lower(?6))>0 OR instr(lower(coalesce(e.filename,'')),lower(?6))>0) AND (?7 IS NULL OR e.id>?7)",
+        crate::store::NO_PROJECT_FILTER
     )
 }
 
@@ -2632,6 +2661,70 @@ fn project_filter_sql(alias: &str, parameter: &str) -> String {
     format!(
         "({parameter} IS NULL OR ({parameter}='{}' AND {alias}.project_key IS NULL) OR {alias}.project_key={parameter})",
         crate::store::NO_PROJECT_FILTER
+    )
+}
+
+fn catalog_project_filter_sql(alias: &str, parameter: &str) -> String {
+    format!(
+        "({parameter} IS NULL OR ({parameter}='{}' AND {alias}.effective_project_key IS NULL) OR {alias}.effective_project_key={parameter})",
+        crate::store::NO_PROJECT_FILTER
+    )
+}
+
+fn catalog_identity_ctes() -> String {
+    format!(
+        "{CHAT_IDENTITY_CTES}, catalog_identity_chats_ranked AS (
+            SELECT coalesce(current.catalog_id,c.catalog_id) AS catalog_id,
+                   coalesce(ca.canonical_conversation_id,c.conversation_id) AS conversation_id,
+                   coalesce(canonical.provider,current.provider,c.provider) AS provider,
+                   coalesce(canonical.account_scope,current.account_scope,c.account_scope) AS account_scope,
+                   coalesce(canonical.source_id,current.source_id,c.source_id) AS source_id,
+                   coalesce(canonical.title,current.title,c.title) AS title,
+                   coalesce(canonical.updated_at_ms,current.updated_at_ms,c.updated_at_ms) AS updated_at_ms,
+                   ep.project_key AS effective_project_key,
+                   CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name)
+                        WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title)
+                        WHEN trim(coalesce((SELECT lp.local_name FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=ep.project_key AND trim(coalesce(lp.local_name,''))<>'' ORDER BY lp.project_key LIMIT 1),''))<>'' THEN (SELECT trim(lp.local_name) FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=ep.project_key AND trim(coalesce(lp.local_name,''))<>'' ORDER BY lp.project_key LIMIT 1)
+                        WHEN trim(coalesce((SELECT lp.title FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=ep.project_key AND trim(coalesce(lp.title,''))<>'' ORDER BY lp.project_key LIMIT 1),''))<>'' THEN (SELECT trim(lp.title) FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=ep.project_key AND trim(coalesce(lp.title,''))<>'' ORDER BY lp.project_key LIMIT 1) END AS project_label,
+                   CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local'
+                        WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream'
+                        WHEN EXISTS(SELECT 1 FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=ep.project_key AND trim(coalesce(lp.local_name,''))<>'' ) THEN 'local'
+                        WHEN EXISTS(SELECT 1 FROM project_aliases pa JOIN projects lp ON lp.project_key=pa.legacy_project_key WHERE pa.canonical_project_key=ep.project_key AND trim(coalesce(lp.title,''))<>'' ) THEN 'upstream' END AS project_label_source,
+                   coalesce(current.graph_node_count,c.graph_node_count) AS graph_node_count,
+                   coalesce(current.message_count,c.message_count) AS message_count,
+                   coalesce(current.branch_count,c.branch_count) AS branch_count,
+                   coalesce(current.source_time,c.source_time) AS source_time,
+                   coalesce(current.observed_ms,c.observed_ms) AS observed_ms,
+                   coalesce(current.parser,c.parser) AS parser,
+                   coalesce(current.completeness,c.completeness) AS completeness,
+                   coalesce(current.sample_bytes,c.sample_bytes) AS sample_bytes,
+                   row_number() OVER (
+                       PARTITION BY coalesce(ca.canonical_conversation_id,c.conversation_id)
+                       ORDER BY CASE WHEN c.conversation_id=coalesce(ca.canonical_conversation_id,c.conversation_id) THEN 0 ELSE 1 END,
+                                c.updated_at_ms DESC NULLS LAST,c.catalog_id
+                   ) AS identity_rank
+            FROM catalog_chats c
+            LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=c.conversation_id
+            LEFT JOIN catalog_chats current ON current.conversation_id=ca.canonical_conversation_id
+            LEFT JOIN conversations canonical ON canonical.id=coalesce(ca.canonical_conversation_id,c.conversation_id)
+            LEFT JOIN effective_projects ep ON ep.conversation_id=coalesce(ca.canonical_conversation_id,c.conversation_id)
+            LEFT JOIN projects p ON p.project_key=ep.project_key
+            WHERE ca.legacy_conversation_id IS NULL OR current.catalog_id IS NULL
+        ), catalog_identity_chats AS (
+            SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,
+                   effective_project_key,project_label,project_label_source,graph_node_count,message_count,
+                   branch_count,source_time,observed_ms,parser,completeness,sample_bytes
+            FROM catalog_identity_chats_ranked
+            WHERE identity_rank=1
+        ), catalog_identity_sources AS (
+            SELECT physical.catalog_id AS physical_catalog_id,
+                   logical.catalog_id AS logical_catalog_id,
+                   logical.conversation_id AS logical_conversation_id
+            FROM catalog_chats physical
+            LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=physical.conversation_id
+            JOIN catalog_identity_chats logical
+              ON logical.conversation_id=coalesce(ca.canonical_conversation_id,physical.conversation_id)
+        )"
     )
 }
 
@@ -2690,16 +2783,17 @@ fn read_stats(
     source_filter: &str,
     project_key: Option<&str>,
 ) -> Result<CatalogStats> {
-    let project_filter = project_filter_sql("c", "?1");
+    let project_filter = catalog_project_filter_sql("c", "?1");
     let sql = format!(
-        "SELECT count(*),coalesce(sum(c.graph_node_count),0),coalesce(sum(c.message_count),0),coalesce(sum(c.branch_count),0),max(c.updated_at_ms),
+        "{} SELECT count(DISTINCT c.conversation_id),coalesce(sum(c.graph_node_count),0),coalesce(sum(c.message_count),0),coalesce(sum(c.branch_count),0),max(c.updated_at_ms),
                 coalesce(sum(c.source_time IS NOT NULL AND trim(c.source_time)<>''),0),
                 coalesce(sum(c.parser IS NOT NULL AND trim(c.parser)<>''),0),
                 coalesce(sum(c.completeness IS NOT NULL AND trim(c.completeness)<>''),0),
                 coalesce(sum(c.completeness='cached_transcript'),0),
                 coalesce(sum(c.completeness<>'cached_transcript' AND c.graph_node_count>0),0),
-                count(DISTINCT c.project_key)
-         FROM catalog_chats c WHERE ({source_filter}) AND {project_filter}"
+                count(DISTINCT c.effective_project_key)
+         FROM catalog_identity_chats c WHERE ({source_filter}) AND {project_filter}",
+        catalog_identity_ctes()
     );
     let (
         chats,
@@ -2729,15 +2823,17 @@ fn read_stats(
         ))
     })?;
     let shared_keyword_sql = format!(
-        "SELECT count(DISTINCT e.target_id) FROM catalog_edges e JOIN catalog_chats c ON c.catalog_id=e.source_id
+        "{} SELECT count(DISTINCT e.target_id) FROM catalog_edges e JOIN catalog_identity_sources src ON src.physical_catalog_id=e.source_id JOIN catalog_identity_chats c ON c.catalog_id=src.logical_catalog_id
          WHERE e.basis='shared_keyword' AND ({source_filter}) AND {project_filter}"
+        , catalog_identity_ctes()
     );
     let shared_keywords: i64 =
         conn.query_row(&shared_keyword_sql, params![project_key], |row| row.get(0))?;
     let source_sql = format!(
-        "SELECT c.provider,count(*),coalesce(sum(c.message_count),0),coalesce(sum(c.graph_node_count),0),coalesce(sum(c.branch_count),0)
-         FROM catalog_chats c WHERE ({source_filter}) AND {project_filter}
+        "{} SELECT c.provider,count(DISTINCT c.conversation_id),coalesce(sum(c.message_count),0),coalesce(sum(c.graph_node_count),0),coalesce(sum(c.branch_count),0)
+         FROM catalog_identity_chats c WHERE ({source_filter}) AND {project_filter}
          GROUP BY c.provider ORDER BY c.provider"
+        , catalog_identity_ctes()
     );
     let mut statement = conn.prepare(&source_sql)?;
     let source_coverage = statement
@@ -3717,7 +3813,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{GraphNode, Observation, ProjectMembership};
+    use crate::store::{GraphNode, Observation, PageScope, ProjectMembership};
     use serde_json::{json, Value};
 
     fn graph_node(id: &str, parent: Option<&str>, role: &str, content: &str) -> GraphNode {
@@ -3730,6 +3826,337 @@ mod tests {
             create_time: None,
             parts: vec![Value::String(content.into())],
         }
+    }
+
+    #[test]
+    fn graph_folds_verified_archives_but_links_a_legacy_only_project_chat() {
+        let mut store = Store::in_memory().unwrap();
+        let account = format!("chatgpt:observed:{}", "d".repeat(64));
+        let shared = "12345678-1234-4abc-8def-1234567890ab";
+        let legacy_only = "87654321-4321-4abc-8def-1234567890ab";
+        let direct_id = ingest(
+            &mut store,
+            "chatgpt",
+            &account,
+            shared,
+            "Current full history",
+            vec![graph_node(
+                "direct-root",
+                None,
+                "user",
+                "distinct direct context",
+            )],
+            "complete",
+        );
+        let cached_id = ingest(
+            &mut store,
+            "paseo-chatgpt",
+            "paseo-cache:owner",
+            &format!("conversation:{shared}"),
+            "Cached archive copy",
+            vec![graph_node(
+                "cached-root",
+                None,
+                "user",
+                "different archived context",
+            )],
+            "cached_transcript",
+        );
+        let third_id = ingest(
+            &mut store,
+            "paseo-chatgpt",
+            "paseo-cache:owner",
+            legacy_only,
+            "Legacy only project chat",
+            vec![graph_node(
+                "third-root",
+                None,
+                "user",
+                "unique third context",
+            )],
+            "cached_transcript",
+        );
+        assert_ne!(direct_id, cached_id);
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES
+             ('current-project','chatgpt',?1,'g-p-shared','Village research'),
+             ('legacy-project','paseo-chatgpt','paseo-cache:owner','g-p-shared','Cached name')",
+                params![account],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO conversation_projects(conversation_id,project_key) VALUES
+             (?1,'current-project'),(?2,'legacy-project'),(?3,'legacy-project')",
+                params![direct_id, cached_id, third_id],
+            )
+            .unwrap();
+        store.rebuild_catalog_index().unwrap();
+
+        let graph = store.catalog_graph("chatgpt", None, 100).unwrap();
+        let chats = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "chat")
+            .collect::<Vec<_>>();
+        assert_eq!(chats.len(), 2);
+        assert!(chats
+            .iter()
+            .any(|node| node.conversation_id.as_deref() == Some(direct_id.as_str())));
+        assert!(chats
+            .iter()
+            .any(|node| node.conversation_id.as_deref() == Some(third_id.as_str())));
+        assert!(!chats
+            .iter()
+            .any(|node| node.conversation_id.as_deref() == Some(cached_id.as_str())));
+        assert!(
+            graph.edges.iter().any(|edge| {
+                edge.basis == "project"
+                    && chats.iter().any(|node| node.id == edge.source)
+                    && chats.iter().any(|node| node.id == edge.target)
+            }),
+            "validated shared project identity links the legacy-only third chat"
+        );
+    }
+
+    #[test]
+    fn old_only_search_hit_keeps_physical_anchor_and_uses_canonical_summary_tag_and_archive() {
+        let mut store = Store::in_memory().unwrap();
+        let account = format!("chatgpt:observed:{}", "e".repeat(64));
+        let uuid = "12345678-1234-4abc-8def-1234567890ab";
+        let direct_id = ingest(
+            &mut store,
+            "chatgpt",
+            &account,
+            uuid,
+            "Current full transcript",
+            vec![graph_node(
+                "current-root",
+                None,
+                "user",
+                "present day material",
+            )],
+            "complete",
+        );
+        let legacy_match_id = ingest(
+            &mut store,
+            "paseo-chatgpt",
+            "paseo-cache:old-a",
+            &format!("conversation:{uuid}"),
+            "Old cache match",
+            vec![graph_node(
+                "legacy-only-node",
+                None,
+                "user",
+                "vaultonlyphrase appears only here",
+            )],
+            "cached_transcript",
+        );
+        let legacy_tag_id = ingest(
+            &mut store,
+            "paseo-chatgpt",
+            "paseo-cache:old-b",
+            uuid,
+            "Other old cache copy",
+            vec![graph_node(
+                "other-cache-node",
+                None,
+                "user",
+                "unrelated cached material",
+            )],
+            "cached_transcript",
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO tags(name_key,name) VALUES('needle','Needle')",
+                [],
+            )
+            .unwrap();
+        store.connection.execute(
+            "INSERT INTO target_tags(target_kind,target_id,name_key,ordinal) VALUES('conversation',?1,'needle',0)",
+            [&legacy_tag_id],
+        ).unwrap();
+
+        let scope = PageScope {
+            source: "chatgpt",
+            project_key: None,
+            tag: Some("needle"),
+        };
+        let active = store
+            .source_search_page_snapshot_with_tag_and_archive_state(
+                "vaultonlyphrase",
+                20,
+                None,
+                None,
+                scope,
+                "active",
+            )
+            .unwrap();
+        assert_eq!(active.hits.len(), 1);
+        let hit = &active.hits[0];
+        assert_eq!(hit["conversation"]["id"], direct_id);
+        assert_eq!(hit["matched_conversation_id"], legacy_match_id);
+        assert_eq!(hit["node_id"], "legacy-only-node");
+        assert_eq!(hit["leaf_node_id"], "legacy-only-node");
+
+        store.connection.execute(
+            "INSERT INTO conversation_local_state(conversation_id,pinned,archived,updated_at_ms) VALUES(?1,0,1,2)",
+            [&direct_id],
+        ).unwrap();
+        let active_after_archive = store
+            .source_search_page_snapshot_with_tag_and_archive_state(
+                "vaultonlyphrase",
+                20,
+                None,
+                None,
+                scope,
+                "active",
+            )
+            .unwrap();
+        assert!(active_after_archive.hits.is_empty());
+        let archived = store
+            .source_search_page_snapshot_with_tag_and_archive_state(
+                "vaultonlyphrase",
+                20,
+                None,
+                None,
+                scope,
+                "archived",
+            )
+            .unwrap();
+        assert_eq!(archived.hits.len(), 1);
+        assert_eq!(archived.hits[0]["matched_conversation_id"], legacy_match_id);
+    }
+
+    #[test]
+    fn entity_reference_keeps_physical_source_and_adds_canonical_chat_identity() {
+        let mut store = Store::in_memory().unwrap();
+        let account = format!("chatgpt:observed:{}", "9".repeat(64));
+        let uuid = "12345678-1234-4abc-8def-1234567890ab";
+        let direct_id = ingest(
+            &mut store,
+            "chatgpt",
+            &account,
+            uuid,
+            "Direct full chat",
+            vec![graph_node(
+                "direct-node",
+                None,
+                "user",
+                "ordinary discussion",
+            )],
+            "complete",
+        );
+        let legacy_id = ingest(
+            &mut store,
+            "paseo-chatgpt",
+            "paseo-cache:entity",
+            &format!("conversation:{uuid}"),
+            "Legacy entity source",
+            vec![graph_node(
+                "legacy-physical-node",
+                None,
+                "user",
+                "Reference https://github.com/acme/private-repo/issues/11",
+            )],
+            "cached_transcript",
+        );
+        store.rebuild_catalog_index().unwrap();
+        let entity_id: String = store.connection.query_row(
+            "SELECT e.id FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id WHERE r.conversation_id=?1 AND e.kind='repository' LIMIT 1",
+            [&legacy_id],
+            |row| row.get(0),
+        ).unwrap();
+        let detail = store.catalog_entity(&entity_id).unwrap().unwrap();
+        let reference = detail
+            .references
+            .iter()
+            .find(|reference| reference.conversation_id == legacy_id)
+            .unwrap();
+        assert_eq!(
+            reference.canonical_conversation_id.as_deref(),
+            Some(direct_id.as_str())
+        );
+        assert_eq!(
+            reference.source_node_id.as_deref(),
+            Some("legacy-physical-node")
+        );
+        assert_eq!(reference.conversation_id, legacy_id);
+    }
+
+    #[test]
+    fn partial_catalog_index_uses_one_fallback_and_canonical_account_metadata() {
+        let mut store = Store::in_memory().unwrap();
+        let account_a = format!("chatgpt:observed:{}", "a".repeat(64));
+        let account_b = format!("chatgpt:observed:{}", "b".repeat(64));
+        let uuid_a = "12345678-1234-4abc-8def-1234567890ab";
+        let uuid_b = "87654321-4321-4abc-8def-1234567890ab";
+
+        let mut canonical_ids = Vec::new();
+        for (account, uuid, suffix) in [(&account_a, uuid_a, "a"), (&account_b, uuid_b, "b")] {
+            let canonical_id = ingest(
+                &mut store,
+                "chatgpt",
+                account,
+                uuid,
+                "Canonical chat",
+                vec![graph_node("root", None, "user", "Current")],
+                "complete",
+            );
+            canonical_ids.push(canonical_id);
+            for copy in ["first", "second"] {
+                ingest(
+                    &mut store,
+                    "paseo-chatgpt",
+                    &format!("paseo-cache:shared-{copy}"),
+                    &format!("conversation:{uuid}"),
+                    &format!("Archive {suffix} {copy}"),
+                    vec![graph_node(
+                        &format!("legacy-{suffix}-{copy}"),
+                        None,
+                        "user",
+                        "same shared repository topic",
+                    )],
+                    "cached_transcript",
+                );
+            }
+        }
+        store.rebuild_catalog_index().unwrap();
+
+        store
+            .connection
+            .execute(
+                "DELETE FROM catalog_chats WHERE conversation_id IN (?1,?2)",
+                params![canonical_ids[0], canonical_ids[1]],
+            )
+            .unwrap();
+
+        let logical_rows = read_chat_rows(&store.connection, "1=1", None, None, 20).unwrap();
+        assert_eq!(logical_rows.len(), 2);
+        assert!(logical_rows.iter().any(
+            |chat| chat.conversation_id == canonical_ids[0] && chat.account_scope == account_a
+        ));
+        assert!(logical_rows.iter().any(
+            |chat| chat.conversation_id == canonical_ids[1] && chat.account_scope == account_b
+        ));
+
+        let physical_sources_a: i64 = store
+            .connection
+            .query_row(
+                &format!(
+                    "{} SELECT count(*) FROM catalog_identity_sources WHERE logical_conversation_id=?1",
+                    catalog_identity_ctes()
+                ),
+                [&canonical_ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(physical_sources_a, 2);
     }
 
     fn ingest(
