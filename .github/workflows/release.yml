@@ -241,7 +241,7 @@ jobs:
       - name: Download exact release review artifact from this workflow run
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run download "$GITHUB_RUN_ID" --name "release-review-${{ inputs.tag }}" --dir release-assets
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "release-review-${{ inputs.tag }}" --dir release-assets
       - name: Verify transformed archive and launch without signing or publication credentials
         run: |
           (cd release-assets && shasum -a 256 -c SHA256SUMS)
@@ -262,7 +262,7 @@ jobs:
       - name: Download exact release review artifact from this workflow run
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run download "$GITHUB_RUN_ID" --name "release-review-${{ inputs.tag }}" --dir release-assets
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "release-review-${{ inputs.tag }}" --dir release-assets
       - name: Upload only reviewed DMG and updater assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -271,8 +271,8 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          gh release view "$INPUT_TAG" >/dev/null
+          gh release view "$INPUT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           dmg="release-assets/Chat_Hub_${INPUT_VERSION}_macos-arm64.dmg"
           assets=("$dmg" release-assets/latest.json 'release-assets/Chat-Hub.app.tar.gz')
           for file in "${assets[@]}"; do test -s "$file"; done
-          gh release upload "$INPUT_TAG" "${assets[@]}" --clobber
+          gh release upload "$INPUT_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
