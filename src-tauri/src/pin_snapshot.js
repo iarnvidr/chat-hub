@@ -85,7 +85,7 @@ function (key, nonce, expectedScope) {
       const actualScope = "chatgpt:observed:" + Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
       if (actualScope !== expectedScope) throw fail("account_changed");
       const headers = { Authorization: `Bearer ${token}`, "ChatGPT-Account-Id": account };
-      const payload = await request("/backend-api/pins?item_type=conversation&limit=1000", { headers });
+      const payload = await request("/backend-api/pins?item_type=conversation", { headers });
       let rows;
       if (Array.isArray(payload)) rows = payload;
       else if (plain(payload)) {

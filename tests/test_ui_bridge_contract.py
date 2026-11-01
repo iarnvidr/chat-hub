@@ -156,7 +156,7 @@ class UiBridgeContract(unittest.TestCase):
             self.assertIn("sync_chatgpt_pins", handler)
         worker = (ROOT / "src-tauri/src/pin_snapshot.js").read_text()
         provider = (ROOT / "src-tauri/src/provider_view.rs").read_text()
-        self.assertIn("/backend-api/pins?item_type=conversation&limit=1000", worker)
+        self.assertIn("/backend-api/pins?item_type=conversation", worker)
         self.assertNotRegex(worker, r"method:\s*['\"](?:POST|DELETE)['\"]")
         self.assertIn("payload[key] !== rows.length", worker)
         self.assertIn("pin_snapshot_cooldown_remaining(expected_scope)", provider)

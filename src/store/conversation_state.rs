@@ -295,9 +295,7 @@ impl Store {
 
         let cache_id = "lower(CASE WHEN substr(c.source_id,1,13)='conversation:' THEN substr(c.source_id,14) ELSE c.source_id END)";
         changed += tx.execute(
-            &format!(
-                "UPDATE conversation_local_state SET pinned=0,updated_at_ms=?2 WHERE pinned=1 AND pinned_scope=?1 AND conversation_id IN (SELECT c.id FROM conversations c WHERE c.provider='paseo-chatgpt' AND c.account_scope LIKE 'paseo-cache:%')"
-            ),
+            "UPDATE conversation_local_state SET pinned=0,updated_at_ms=?2 WHERE pinned=1 AND pinned_scope=?1 AND conversation_id IN (SELECT c.id FROM conversations c WHERE c.provider='paseo-chatgpt' AND c.account_scope LIKE 'paseo-cache:%')",
             params![receipt.scope, now],
         )?;
 
