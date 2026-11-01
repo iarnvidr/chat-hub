@@ -5,6 +5,11 @@
 - Adds a No project filter across chats, search and the indexed overview.
 - Replaces the full-row hover with a compact action rail, an inline project picker, pin/unpin, archive/restore, tags and copy-link actions. Keyboard and reduced-motion interactions are supported.
 - Pin and archive changes use ChatGPT's signed-in session and require verified readback before updating the local library. Archived chats have a separate filter; pins sort before other chats across database pages.
+- Keeps repositories, pull requests, issues, domains and files in the interactive graph, with a separate List mode. Shared indexed references now contribute to chat connections, with common domains suppressed.
+- Adds scrollable graph inspectors, clickable labels, temporary side-by-side saved-chat previews and compact hover actions. Graph motion is finite and respects reduced motion.
+- Replaces the tag dialog with a hover editor offering content-derived suggestions and a distinct custom-tag option.
+- Selected chats and related previews read from the beginning in independently scrollable panes; long saved content loads progressively. Suggestion failures offer a retry instead of unrelated library tags.
+- Project assignment and rename use anchored hover controls with no local-only option. Fixes assignment for cached chats with legacy source-ID prefixes while preserving stored identities and account checks.
 - No live personal-chat mutations were performed during implementation checks. The existing live history/capture acceptance limitations remain.
 
 ## 0.2.1 — release candidate

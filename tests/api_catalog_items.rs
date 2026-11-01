@@ -190,6 +190,64 @@ async fn authenticated_file_save_lists_downloads_and_projects_metadata_only() {
 }
 
 #[tokio::test]
+async fn entity_graph_returns_bounded_exact_file_references_with_chat_scope() {
+    let (app, conversation_id, entity_id) = seeded_app();
+    let encoded_conversation_id: String =
+        url::form_urlencoded::byte_serialize(conversation_id.as_bytes()).collect();
+    let uri = format!(
+        "/api/v1/catalog/entity-graph?source=chatgpt&conversation_id={encoded_conversation_id}&kind=file_artifact&limit=40"
+    );
+    let response = send(&app, "GET", &uri, true, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 512 * 1024).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["total_entities"], 1);
+    assert_eq!(body["conversation_id"], conversation_id);
+    assert_eq!(body["nodes"].as_array().unwrap().len(), 2);
+    let entity = body["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == entity_id)
+        .unwrap();
+    assert_eq!(entity["kind"], "file_artifact");
+    assert_eq!(entity["entity"]["artifact_state"], "link_only");
+    assert_eq!(body["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(body["edges"][0]["basis"], "entity_reference");
+    assert_eq!(body["edges"][0]["relation"], "mentions");
+
+    let suggestions_uri = format!(
+        "/api/v1/catalog/tag-suggestions?conversation_id={encoded_conversation_id}&limit=12"
+    );
+    let suggestions = send(&app, "GET", &suggestions_uri, true, Body::empty()).await;
+    assert_eq!(suggestions.status(), StatusCode::OK);
+    let suggestions: Value = serde_json::from_slice(
+        &to_bytes(suggestions.into_body(), 64 * 1024).await.unwrap(),
+    )
+    .unwrap();
+    assert!(suggestions["library_revision"].is_number());
+    assert!(suggestions["items"].as_array().is_some());
+
+    let empty = send(
+        &app,
+        "GET",
+        "/api/v1/catalog/entity-graph?source=chatgpt&conversation_id=missing&kind=file_artifact",
+        true,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    let empty: Value = serde_json::from_slice(
+        &to_bytes(empty.into_body(), 64 * 1024).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(empty["total_entities"], 0);
+    assert!(empty["nodes"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn verified_title_commit_targets_an_exact_legacy_paseo_project_row() {
     let mut store = Store::in_memory().unwrap();
     store

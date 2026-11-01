@@ -1,117 +1,104 @@
+import {bindProjectHoverIntent,createProjectHover} from './project-hover.js';
+
 const $ = id => document.getElementById(id);
-const renameDialog = $('project-editor'), assignDialog = $('chat-project-editor');
-let projects = [], editingProject, editingChat, returnToChat = false, busy = false;
 const invoke = (command, args) => window.ChatHub.invoke(command, args);
-const label = (project, index = 0) => project.display_name || project.title || `Unnamed project ${index + 1}`;
-function projectProvider(project) {
+let projects = [], renameBusy = false, renameRequest = 0;
+
+function projectParts(project) {
   try {
     const key = project?.project_key;
-    return typeof key === 'string' && key.startsWith('project:') ? JSON.parse(key.slice(8))?.[0] : null;
+    return typeof key === 'string' && key.startsWith('project:') ? JSON.parse(key.slice(8)) : null;
   } catch (_) { return null; }
 }
-const upstreamRenameAvailable = project => ['chatgpt','paseo-chatgpt'].includes(projectProvider(project));
-function errorMessage(error) {
+function projectCanBeRenamed(project) {
+  const parts = projectParts(project);
+  return Array.isArray(parts) && ['chatgpt','paseo-chatgpt'].includes(parts[0]) &&
+    typeof parts[1] === 'string' && parts[1] !== '' && typeof parts[2] === 'string' && parts[2] !== '';
+}
+function errorMessage(error, action = 'rename') {
   const code = String(error?.code || error?.message || error);
-  if (/rate_limit/.test(code)) return 'ChatGPT is limiting requests. Wait before trying again. Nothing has been changed locally.';
-  if (/signed_out|login_required|not_open|not_ready/.test(code)) return 'Connect ChatGPT in Settings, then try again.';
-  if (/account|scope_mismatch/.test(code)) return 'The connected ChatGPT account does not match this project or conversation.';
-  if (/project_shape_unavailable/.test(code)) return 'ChatGPT returned an unrecognized project record. Nothing was renamed.';
-  if (/verification_failed|project_rename_failed|update_unconfirmed/.test(code)) return 'ChatGPT did not confirm the new name. Chat Hub was not updated.';
-  if (/invalid|name/.test(code)) return 'Enter a project name of up to 120 characters.';
-  if (/not_found/.test(code)) return 'This project or conversation is unavailable in the connected account.';
-  return 'ChatGPT did not confirm the update. The saved project assignment or name has not changed.';
+  if (/rate_limit|cooldown/.test(code)) return 'ChatGPT is limiting requests. Wait before trying again.';
+  if (/signed_out|login_required|not_open|not_ready|loading/.test(code)) return 'Connect ChatGPT in Settings, then try again.';
+  if (/account|scope_mismatch/.test(code)) return 'The connected ChatGPT account does not match this project or chat.';
+  if (/project_shape_unavailable/.test(code)) return 'ChatGPT returned an unrecognized project record. Nothing was changed.';
+  if (/verification_failed|project_rename_failed|update_unconfirmed/.test(code)) return 'ChatGPT did not confirm the change. Chat Hub was not updated.';
+  if (/invalid_name|name_too_long/.test(code)) return 'Project names must be between 1 and 120 characters.';
+  if (/invalid|project_not_available|not_found/.test(code)) return action === 'assign'
+    ? 'That project is not available to this chat in the connected account.'
+    : 'This project is unavailable in the connected ChatGPT account.';
+  return action === 'assign'
+    ? 'ChatGPT did not confirm the project assignment. The saved assignment has not changed.'
+    : 'ChatGPT did not confirm the new name. The saved project name has not changed.';
 }
 async function loadProjects() {
   const result = await invoke('list_projects', {source:'chatgpt'});
   if (!Array.isArray(result?.projects)) throw Error('project_list_unavailable');
-  projects = result.projects; return projects;
+  projects = result.projects;
+  return projects;
 }
-async function openDialog(dialog) {
-  returnToChat = !document.body.classList.contains('settings-open');
-  window.dispatchEvent(new Event('chat-hub:open-settings'));
-  await new Promise(resolve => requestAnimationFrame(resolve));
-  dialog.showModal();
+function verifyRename(result) {
+  if (!result || result.scope !== 'upstream' || result.verified !== true || !Number.isSafeInteger(result.library_revision)) {
+    throw Error('update_unconfirmed');
+  }
 }
-function closeDialog(dialog) {
-  if (busy) return;
-  dialog.close();
-  if (returnToChat) window.dispatchEvent(new Event('chat-hub:close-settings'));
-}
-function beginBusy(value) {
-  busy = value;
-  for (const id of ['project-editor-save','project-editor-cancel','chat-project-save','chat-project-cancel']) $(id).disabled = value;
-}
-function verifyReceipt(result, scope) {
-  if (!result || typeof result !== 'object' || !Number.isSafeInteger(result.library_revision)) throw Error('update_unconfirmed');
-  if (scope === 'upstream' && (result.scope !== 'upstream' || result.verified !== true)) throw Error('update_unconfirmed');
-}
-$('project-filter').addEventListener('change', () => { $('edit-project-name').disabled = !$('project-filter').value || $('project-filter').value === '__none__'; });
-$('edit-project-name').addEventListener('click', async () => {
-  try {
-    await loadProjects(); editingProject = projects.find(project => project.project_key === $('project-filter').value);
-    if (!editingProject) return;
-    $('project-name-input').value = editingProject.display_name || editingProject.title || '';
-    const upstreamOption = $('project-edit-scope').querySelector('option[value="upstream"]');
-    upstreamOption.disabled = !upstreamRenameAvailable(editingProject);
-    $('project-edit-scope').value = upstreamRenameAvailable(editingProject) && editingProject.name_source !== 'local' ? 'upstream' : 'local';
-    $('project-editor-status').textContent = '';
-    $('project-editor-save').textContent = $('project-edit-scope').value === 'local' ? 'Save local label' : 'Rename in ChatGPT';
-    $('project-editor-description').textContent = $('project-edit-scope').value === 'local'
-      ? 'Only changes the label in this library. Leave blank to use the ChatGPT name.'
-      : 'Changes the name in ChatGPT and Chat Hub. It also clears this project’s saved local label.';
-    await openDialog(renameDialog); $('project-name-input').focus();
-  } catch (error) { $('app-status').textContent = errorMessage(error); }
+
+const editor = createProjectHover({document, window, className:'project-rename-hover'});
+$('project-filter').addEventListener('change', () => {
+  $('edit-project-name').disabled = !$('project-filter').value || $('project-filter').value === '__none__';
 });
-$('project-edit-scope').addEventListener('change', () => {
-  const local = $('project-edit-scope').value === 'local';
-  $('project-editor-save').textContent = local ? 'Save local label' : 'Rename in ChatGPT';
-  $('project-editor-description').textContent = local ? 'Only changes the label in this library. Leave blank to use the ChatGPT name.' : 'Changes the name in ChatGPT and Chat Hub. It also clears this project’s saved local label.';
-});
-$('project-editor-cancel').addEventListener('click', () => closeDialog(renameDialog));
-$('project-editor-form').addEventListener('submit', async event => {
-  event.preventDefault(); if (busy || !editingProject) return;
-  const name = $('project-name-input').value.trim(), scope = $('project-edit-scope').value;
-  if (scope === 'upstream' && !name) { $('project-editor-status').textContent = 'Enter a project name.'; return; }
-  beginBusy(true); $('project-editor-status').textContent = scope === 'upstream' ? 'Updating ChatGPT…' : 'Saving local label…';
-  try {
-    const result = await invoke('rename_project', {projectKey:editingProject.project_key, name:name || null, scope});
-    verifyReceipt(result, scope); beginBusy(false); closeDialog(renameDialog);
-    window.dispatchEvent(new Event('chat-hub:history-updated'));
-    $('app-status').textContent = scope === 'upstream' ? 'Project renamed in ChatGPT.' : 'Local project label saved.';
-  } catch (error) { $('project-editor-status').textContent = errorMessage(error); }
-  finally { beginBusy(false); }
-});
-window.addEventListener('chat-hub:edit-chat-project', async event => {
-  editingChat = event.detail; if (!editingChat?.id) return;
+$('edit-project-name').addEventListener('click', async event => {
+  if (renameBusy) return;
+  const request = ++renameRequest;
   try {
     await loadProjects();
-    const select = $('chat-project-choice'); select.replaceChildren();
-    const none = document.createElement('option'); none.value = ''; none.textContent = 'No project'; select.append(none);
-    projects.forEach((project, index) => {
-      const option = document.createElement('option'); option.value = project.project_key; option.textContent = label(project,index);
-      option.selected = option.value === editingChat.project?.project_key; select.append(option);
+    if(request!==renameRequest)return;
+    const editingProject = projects.find(project => project.project_key === $('project-filter').value);
+    if (!editingProject) return;
+    if (!projectCanBeRenamed(editingProject)) throw Error('project_not_available');
+    editor.open(event.currentTarget, panel => {
+      const form = document.createElement('form');
+      form.className = 'project-rename-form';
+      const title = document.createElement('strong'); title.textContent = 'Rename in ChatGPT';
+      const help = document.createElement('p'); help.textContent = 'This changes the ChatGPT project and its name in Chat Hub.';
+      const input = document.createElement('input'); input.type='text'; input.maxLength=120; input.required=true;
+      input.autocomplete='off'; input.setAttribute('aria-label','Project name');
+      input.value = editingProject.display_name || editingProject.title || '';
+      const status = document.createElement('p'); status.className='project-hover-status'; status.setAttribute('role','status'); status.setAttribute('aria-live','polite');
+      const actions = document.createElement('div'); actions.className='project-hover-actions';
+      const cancel = document.createElement('button'); cancel.type='button'; cancel.textContent='Cancel'; cancel.addEventListener('click',()=>editor.close());
+      const save = document.createElement('button'); save.type='submit'; save.className='primary'; save.textContent='Rename';
+      actions.append(cancel,save); form.append(title,help,input,status,actions);
+      form.addEventListener('submit', async submit => {
+        submit.preventDefault(); if (renameBusy) return;
+        const name = input.value.trim();
+        if (!name || name.length > 120) { status.textContent='Enter a project name of up to 120 characters.'; input.focus(); return; }
+        renameBusy = true; input.disabled = cancel.disabled = save.disabled = true; status.textContent='Updating ChatGPT…';
+        try {
+          const result = await invoke('rename_project', {projectKey:editingProject.project_key,name,scope:'upstream'});
+          verifyRename(result); editor.close();
+          window.dispatchEvent(new Event('chat-hub:history-updated'));
+          $('app-status').textContent='Project renamed in ChatGPT.';
+        } catch (error) { status.textContent=errorMessage(error); }
+        finally { renameBusy=false; input.disabled=cancel.disabled=save.disabled=false; }
+      });
+      panel.append(form);
+      if(event.isTrusted)requestAnimationFrame(()=>{if(!editor.panel.hidden){input.focus();input.select();}});
     });
-    $('chat-project-title').textContent = editingChat.title || 'Conversation'; $('chat-project-status').textContent = '';
-    $('chat-project-scope').value = 'upstream'; $('chat-project-save').textContent = 'Update in ChatGPT';
-    await openDialog(assignDialog);
-  } catch (error) { $('app-status').textContent = errorMessage(error); }
+  } catch (error) { $('app-status').textContent=errorMessage(error); }
 });
-$('chat-project-scope').addEventListener('change', () => {
-  $('chat-project-save').textContent = $('chat-project-scope').value === 'local' ? 'Save locally' : 'Update in ChatGPT';
+bindProjectHoverIntent($('edit-project-name'),{
+  onOpen:()=>$('edit-project-name').click(),
+  onLeave:()=>{++renameRequest;editor.deferClose();}
 });
-$('chat-project-cancel').addEventListener('click', () => closeDialog(assignDialog));
-$('chat-project-form').addEventListener('submit', async event => {
-  event.preventDefault(); if (busy || !editingChat) return;
-  const scope = $('chat-project-scope').value; beginBusy(true);
-  $('chat-project-status').textContent = scope === 'upstream' ? 'Updating and checking ChatGPT…' : 'Saving assignment…';
-  try {
-    const result = await invoke('set_conversation_project', {conversationId:editingChat.id, projectKey:$('chat-project-choice').value || null, scope});
-    verifyReceipt(result, scope); beginBusy(false); closeDialog(assignDialog);
-    window.dispatchEvent(new Event('chat-hub:history-updated'));
-    $('app-status').textContent = scope === 'upstream' ? 'Project assignment updated in ChatGPT.' : 'Project assignment saved locally.';
-  } catch (error) { $('chat-project-status').textContent = errorMessage(error); }
-  finally { beginBusy(false); }
+
+window.addEventListener('chat-hub:edit-chat-project', event => {
+  const chat = event.detail;
+  if (!chat?.id) return;
+  window.dispatchEvent(new CustomEvent('chat-hub:open-project-picker', {
+    detail:{chat, anchor:$('set-chat-project'), focus:false}
+  }));
 });
-for (const dialog of [renameDialog,assignDialog]) dialog.addEventListener('cancel', event => {
-  event.preventDefault(); closeDialog(dialog);
+bindProjectHoverIntent($('set-chat-project'),{
+  onOpen:()=>$('set-chat-project').click(),
+  onLeave:()=>window.dispatchEvent(new Event('chat-hub:close-project-picker'))
 });

@@ -17,9 +17,10 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
   const node=(tag,text,cls)=>{const n=doc.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
   function icon(kind){const svg=doc.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');const path=doc.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d',paths[kind]||paths.more);svg.append(path);return svg;}
   const menu=node('div',undefined,'thread-menu');menu.id='thread-actions-menu';menu.hidden=true;menu.setAttribute('role','menu');doc.body.append(menu);
-  const pending=new Set();let target=null,trigger=null,view='actions',generation=0,busy=false;
+  const pending=new Set();let target=null,trigger=null,view='actions',generation=0,busy=false,hoverPicker=false,hoverCloseTimer=0;
   function close(restoreFocus=true){
     if(menu.hidden)return;
+    clearTimeout(hoverCloseTimer);hoverPicker=false;
     const prior=trigger;++generation;menu.hidden=true;menu.replaceChildren();target=null;trigger=null;view='actions';
     prior?.setAttribute('aria-expanded','false');
     if(restoreFocus&&prior?.isConnected)prior.focus();
@@ -65,7 +66,7 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
         item(chat.archived?'Restore from archive':'Archive','archive',()=>mutate(chat,{archived:!chat.archived}),{action:'archive'}));
       menu.append(node('div',undefined,'thread-menu-separator'));
     }
-    menu.append(item('Tags','tag',()=>{close(false);win.dispatchEvent(new CustomEvent('chat-hub:edit-tags',{detail:{targetKind:'conversation',targetId:chat.id,title:chat.title}}));}));
+    menu.append(item('Tags','tag',()=>{const anchor=trigger;close(false);win.dispatchEvent(new CustomEvent('chat-hub:edit-tags',{detail:{targetKind:'conversation',targetId:chat.id,title:chat.title,anchor}}));}));
     const id=chatgptConversationId(chat);
     if(id)menu.append(item('Copy ChatGPT link','link',async()=>{try{await win.navigator.clipboard.writeText(`https://chatgpt.com/c/${id}`);close();doc.getElementById('app-status').textContent='ChatGPT link copied.';}catch{status('The link could not be copied.');}},{action:'copy-link'}));
     position();
@@ -79,7 +80,16 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
       menu.querySelector('.thread-menu-status')?.remove();
       const search=node('input');search.type='search';search.placeholder='Find a project…';search.setAttribute('aria-label','Find a project');search.className='thread-project-search';menu.append(search);
       const list=node('div',undefined,'thread-project-options');menu.append(list);
-      const choices=[{project_key:null,display_name:'No project'},...result.projects];
+       const choices=[{project_key:null,display_name:'No project'},...result.projects.filter(project=>{
+         try{
+           const parts=JSON.parse(String(project.project_key||'').slice('project:'.length));
+           return String(project.project_key||'').startsWith('project:') &&
+             ['chatgpt','paseo-chatgpt'].includes(parts?.[0]) &&
+             (parts?.[0]===chat.provider || (parts?.[0]==='paseo-chatgpt'&&chat.provider==='chatgpt')) &&
+             typeof parts?.[1]==='string' && parts[1]!=='' && typeof parts?.[2]==='string' && parts[2]!=='' &&
+             (typeof chat.account_scope!=='string' || !chat.account_scope || parts[1]===chat.account_scope || project.account_scope===chat.account_scope);
+         }catch{return false;}
+       })];
       function draw(){
         list.replaceChildren();const query=search.value.trim().toLocaleLowerCase();
         for(const project of choices){const label=project.display_name||project.title||'Project name pending';if(query&&!label.toLocaleLowerCase().includes(query))continue;
@@ -87,7 +97,7 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
         }
         if(!list.childElementCount)list.append(node('p','No projects match.','thread-menu-status'));position();
       }
-      search.addEventListener('input',draw);draw();search.focus();
+       search.addEventListener('input',draw);draw();if(!hoverPicker)search.focus();
     }catch(error){if(token===generation&&target===chat)status(actionError(error));}
   }
   async function move(chat,projectKey){
@@ -100,6 +110,22 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
     if(target?.id===chat.id&&trigger===button&&!menu.hidden){close();return;}
     close(false);target=chat;trigger=button;menu.hidden=false;button.setAttribute('aria-expanded','true');actions();menu.querySelector('button:not(:disabled)')?.focus();
   }
+  win.addEventListener('chat-hub:open-project-picker',event=>{
+    const chat=event.detail?.chat,button=event.detail?.anchor;
+    if(!chatgptConversationId(chat)||!button)return;
+    close(false);target=chat;trigger=button;hoverPicker=event.detail?.focus===false;
+    menu.hidden=false;button.setAttribute('aria-expanded','true');projects();
+  });
+  win.addEventListener('chat-hub:close-project-picker',()=>{
+    if(view==='projects'&&hoverPicker)close(false);
+  });
+  menu.addEventListener('pointerenter',()=>{clearTimeout(hoverCloseTimer);});
+  menu.addEventListener('pointerleave',()=>{
+    if(!hoverPicker)return;
+    clearTimeout(hoverCloseTimer);hoverCloseTimer=win.setTimeout(()=>{
+      if(!menu.matches(':hover')&&!trigger?.matches(':hover'))close(false);
+    },280);
+  });
   function wrap(chat,primary){
     const row=node('div',undefined,'conversation-row');row.dataset.id=chat.id;row.dataset.pinned=String(Boolean(chat.pinned));row.classList.toggle('selected',primary.classList.contains('selected'));
     const rail=node('div',undefined,'thread-action-rail');rail.setAttribute('role','group');rail.setAttribute('aria-label','Chat actions');

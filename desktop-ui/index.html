@@ -13,6 +13,8 @@
   <link rel="stylesheet" href="./library-items.css">
   <link rel="stylesheet" href="./classified-terminal.css">
   <link rel="stylesheet" href="./row-actions.css">
+  <link rel="stylesheet" href="./tag-hover.css">
+  <link rel="stylesheet" href="./project-hover.css">
 </head>
 <body>
   <div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
@@ -69,9 +71,6 @@
     </div>
   </div>
   <div id="app-status" class="app-status" role="status" aria-live="polite"></div>
-  <dialog id="tags-editor"><form id="tags-editor-form"><h2>Tags</h2><p id="tags-editor-target"></p><div id="tags-editor-chips" class="tag-chips"></div><label for="tag-name-input">Add a tag</label><div class="tag-add-row"><input id="tag-name-input" maxlength="80" list="tag-suggestions" autocomplete="off" placeholder="e.g. research"><button id="add-tag" type="button">Add</button></div><datalist id="tag-suggestions"></datalist><p id="tags-editor-status" role="status" aria-live="polite"></p><div class="actions"><button id="tags-editor-cancel" type="button">Cancel</button><button id="tags-editor-save" class="primary" type="submit">Save tags</button></div></form></dialog>
-  <dialog id="project-editor"><form id="project-editor-form"><h2 id="project-editor-title">Rename project</h2><label for="project-name-input">Project name</label><input id="project-name-input" name="name" maxlength="120" autocomplete="off"><label for="project-edit-scope">Apply to</label><select id="project-edit-scope"><option value="upstream" selected>ChatGPT</option><option value="local">Local label only</option></select><p id="project-editor-description">Updates the project name in your connected ChatGPT account.</p><p id="project-editor-status" role="status" aria-live="polite"></p><div class="actions"><button id="project-editor-cancel" type="button">Cancel</button><button id="project-editor-save" class="primary" type="submit">Rename in ChatGPT</button></div></form></dialog>
-  <dialog id="chat-project-editor"><form id="chat-project-form"><h2>Set project</h2><p id="chat-project-title"></p><label for="chat-project-choice">Project</label><select id="chat-project-choice"><option value="">No project</option></select><label for="chat-project-scope">Apply to</label><select id="chat-project-scope"><option value="upstream" selected>ChatGPT</option><option value="local">Local library only</option></select><p id="chat-project-status" role="status" aria-live="polite"></p><div class="actions"><button id="chat-project-cancel" type="button">Cancel</button><button id="chat-project-save" class="primary" type="submit">Update in ChatGPT</button></div></form></dialog>
   <script type="module" src="./disclosure-menus.js"></script>
   <script type="module" src="./app.js"></script>
   <script type="module" src="./restore.js"></script>

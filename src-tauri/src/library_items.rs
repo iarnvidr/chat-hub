@@ -104,6 +104,57 @@ pub async fn catalog_entities(
     q.push(("limit", limit.unwrap_or(40).to_string()));
     get(&s, &["catalog", "entities"], &q).await
 }
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri exposes the category graph's explicit query filters.
+pub async fn catalog_entity_graph(
+    window: tauri::Webview,
+    s: State<'_, AppState>,
+    source: Option<String>,
+    project_key: Option<String>,
+    conversation_id: Option<String>,
+    tag: Option<String>,
+    query: Option<String>,
+    kind: Option<String>,
+    artifact_state: Option<String>,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    authorize_local_main(&window)?;
+    let mut q = scope(source, project_key);
+    for (k, v) in [
+        ("conversation_id", conversation_id),
+        ("tag", tag),
+        ("query", query),
+        ("kind", kind),
+        ("artifact_state", artifact_state),
+    ] {
+        if let Some(v) = v {
+            q.push((k, v));
+        }
+    }
+    q.push(("limit", limit.unwrap_or(40).clamp(1, 40).to_string()));
+    get(&s, &["catalog", "entity-graph"], &q).await
+}
+
+#[tauri::command]
+pub async fn catalog_tag_suggestions(
+    window: tauri::Webview,
+    s: State<'_, AppState>,
+    conversation_id: String,
+    limit: Option<usize>,
+) -> Result<Value, String> {
+    authorize_local_main(&window)?;
+    get(
+        &s,
+        &["catalog", "tag-suggestions"],
+        &[
+            ("conversation_id", conversation_id),
+            ("limit", limit.unwrap_or(12).clamp(1, 12).to_string()),
+        ],
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn catalog_entity(
     window: tauri::Webview,

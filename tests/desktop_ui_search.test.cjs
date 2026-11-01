@@ -17,6 +17,23 @@ test('search presents one chat with a message target and combines hits across pa
   assert.equal(rows[0].matched_message_count, 2);
   assert.equal(rows[0].matching_hits.length, 3);
 });
+test('server search envelopes are normalized and list-mode grouping keeps exact open anchors',async()=>{
+  const [{normalizeSearch},{groupSearchConversations:group,conversationOpenTarget}]=await Promise.all([
+    import('../desktop-ui/data.js'),import('../desktop-ui/search.js'),
+  ]);
+  const page={next_cursor:'next',items:[
+    {conversation:{id:'a',title:'Matched'},node_id:'node-a',leaf_node_id:'leaf-a',message_id:'msg-a',snippet:'first'},
+    {conversation:{id:'a',title:'Matched'},node_id:'node-b',leaf_node_id:'leaf-b',message_id:'msg-b',snippet:'second'},
+  ]};
+  const rows=group(normalizeSearch(page).items);
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].id,'a');
+  assert.equal(rows[0].search_node_id,'node-a');
+  assert.equal(rows[0].search_leaf_node_id,'leaf-a');
+  assert.equal(rows[0].matching_hits.length,2);
+  assert.deepEqual(conversationOpenTarget(rows[0]),{id:'a',leafNodeId:'leaf-a',anchorNodeId:'node-a'});
+  assert.equal(page.next_cursor,'next','pagination cursor remains the API hit cursor');
+});
 test('highlighting treats input as text and escapes regular expression operators', async () => {
   const {appendSearchHighlight: highlight} = await load();
   const nodes = [], doc = {createTextNode: text => ({text}), createElement: tag => ({tag, textContent: ''})};

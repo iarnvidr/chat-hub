@@ -1,13 +1,19 @@
-import {prepareConnections, messageGraph} from './graph-model.js';
+import {prepareConnections, prepareEntityConnections, messageGraph} from './graph-model.js';
 import {createGraphView} from './graph-view.js';
 import {entityGraph,entityKinds} from './entity-model.js';
 import {normalizeSearch} from './data.js';
 import {groupSearchConversations} from './search.js';
 import {createMapSearch} from './map-search.js';
+import {normalizeOverviewMode,overviewModeForAction} from './overview-mode.js';
+import {orderedMessages} from './render.js';
+import {createHoverPreview} from './graph-interactions.js';
+import {createTranscriptPager} from './saved-transcript.js';
 
 const $ = id => document.getElementById(id);
 const panel = $('library-overview');
 let request = 0, rebuilding, refreshTimer, graph, messageDetail, entityDetail, focusId,selectionRequest=0;
+const DISPLAY_MODE_KEY='chat-hub.overview-display-mode';
+let displayMode=(()=>{try{return normalizeOverviewMode(localStorage.getItem(DISPLAY_MODE_KEY));}catch{return 'graph';}})();
 const native = () => typeof window.__TAURI_INTERNALS__?.invoke === 'function';
 const invoke = (command, args = {}) => window.ChatHub.invoke(command, args);
 const filters = () => ({source: $('history-source').value, projectKey: $('project-filter').value || null,tag:$('tag-filter').value||null});
@@ -15,6 +21,38 @@ const element = (tag, text, cls) => {
   const node = document.createElement(tag); if (text !== undefined) node.textContent = text;
   if (cls) node.className = cls; return node;
 };
+const hoverPreview=element('aside',undefined,'graph-hover-preview');
+hoverPreview.hidden=true;hoverPreview.tabIndex=0;hoverPreview.setAttribute('aria-label','Saved chat preview');
+$('overview-map').append(hoverPreview);
+let previewRows=[];
+let hoverPreviewPager,selectedTranscriptPager;
+const previewController=createHoverPreview({
+  load:({conversationId})=>invoke('get_conversation',{id:conversationId}),
+  show:(target,detail,error)=>showRelatedPreview(target,detail,error),
+  hide:()=>{hoverPreviewPager?.destroy();hoverPreviewPager=null;hoverPreview.hidden=true;hoverPreview.replaceChildren();},
+});
+function showRelatedPreview(target,detail,error){
+  hoverPreviewPager?.destroy();hoverPreviewPager=null;hoverPreview.replaceChildren();hoverPreview.hidden=false;hoverPreview.scrollTop=0;
+  const mapRect=$('overview-map').getBoundingClientRect(),rowRect=target.anchor?.getBoundingClientRect();
+  const inspectorRect=$('graph-inspector').getBoundingClientRect();
+  const available=inspectorRect.left-mapRect.left-14;
+  const width=Math.min(370,available);
+  if(width<180){hoverPreview.hidden=true;return;}
+  const left=Math.max(8,inspectorRect.left-mapRect.left-width-8);
+  const height=Math.min(520,Math.max(160,mapRect.height-20));
+  const top=Math.max(8,Math.min(mapRect.height-height-8,(rowRect?.top-mapRect.top||10)-10));
+  hoverPreview.style.left=`${left}px`;hoverPreview.style.top=`${top}px`;hoverPreview.style.width=`${width}px`;hoverPreview.style.height=`${height}px`;
+  hoverPreview.append(element('h3',target.title||target.label||'Saved chat'));
+  if(error||!detail?.conversation){hoverPreview.append(element('p','A preview is unavailable for this saved chat.'));return;}
+  const provenance=element('p','Saved locally · preview begins at the start','graph-preview-note');hoverPreview.append(provenance);
+  try{
+    const body=element('div',undefined,'graph-preview-messages');body.tabIndex=0;body.setAttribute('role','region');body.setAttribute('aria-label','Saved chat preview content');
+    hoverPreview.append(body);
+    hoverPreviewPager=createTranscriptPager(body,orderedMessages(detail),{batchSize:2,disableLinks:true});
+  }catch{
+    hoverPreview.append(element('p','This saved chat is too large or incomplete to preview here.'));
+  }
+}
 const view = createGraphView($('graph-canvas'), (node, open) => {
   if (open) return openNode(node);
   showSelection(node);
@@ -40,17 +78,44 @@ function enter() {
   document.body.classList.add('overview-open', 'mobile-reader'); panel.hidden = false;
   $('show-overview').setAttribute('aria-pressed', 'true');
 }
+function applyChatDisplayMode(){
+  if($('overview-kind').value!=='chats')return;
+  const list=displayMode==='list';
+  $('overview-map').hidden=list;
+  $('graph-caption').hidden=list;
+  $('overview-recent-section').hidden=false;
+  $('overview-recent-section').open=list;
+  $('overview-recent-title').textContent=list?'Saved chats':'Chats in this map';
+  panel.classList.toggle('overview-list-mode',list);
+}
+export function setOverviewDisplayMode(value){
+  if(!['graph','list'].includes(value))return;
+  displayMode=overviewModeForAction(value==='list'?'show-list':'show-graph',displayMode);
+  try{localStorage.setItem(DISPLAY_MODE_KEY,value);}catch{}
+  applyChatDisplayMode();
+  if($('overview-kind').value==='chats')window.dispatchEvent(new Event(value==='list'?'chat-hub:show-chat-list':'chat-hub:show-chat-graph'));
+}
+export function getOverviewDisplayMode(){return displayMode;}
+export function forceOverviewGraph(){
+  displayMode=overviewModeForAction('graph-drilldown',displayMode);
+  try{localStorage.setItem(DISPLAY_MODE_KEY,displayMode);}catch{}
+  applyChatDisplayMode();
+  window.dispatchEvent(new Event('chat-hub:force-overview-graph'));
+}
 export function showOverview(focus = true) {
-  focusId = null; messageDetail = null; entityDetail=null; panel.classList.remove('message-mode', 'connections-mode', 'selection-open','entity-mode');
+  focusId = null; messageDetail = null; entityDetail=null; panel.classList.remove('message-mode', 'connections-mode', 'selection-open','entity-mode','entity-category-mode');
   window.dispatchEvent(new Event('chat-hub:show-chat-map'));
   $('overview-title').textContent = 'Library map';
   $('overview-back').hidden = $('overview-read-chat').hidden = true;
   $('overview-stats').hidden = false;
   $('overview-recent-title').textContent = 'Chats in this map';
-  enter(); refresh(true); if (focus) panel.focus();
+  enter(); applyChatDisplayMode();
+  if(displayMode==='list')window.dispatchEvent(new Event('chat-hub:show-chat-list'));
+  else refresh(true);
+  if (focus) panel.focus();
 }
 async function focusChat(id) {
-  focusId = id; messageDetail = null; entityDetail=null;window.dispatchEvent(new Event('chat-hub:show-chat-map'));panel.classList.remove('message-mode','entity-mode'); panel.classList.add('connections-mode');
+  forceOverviewGraph();focusId = id; messageDetail = null; entityDetail=null;window.dispatchEvent(new Event('chat-hub:show-chat-map'));panel.classList.remove('message-mode','entity-mode','entity-category-mode'); panel.classList.add('connections-mode');
   $('overview-title').textContent = 'Chat connections';
   $('overview-stats').hidden = false; $('overview-back').hidden = false;
   $('overview-read-chat').hidden = true;
@@ -83,6 +148,7 @@ async function rebuild(manual = false) {
 }
 async function refresh(allowRebuild = false) {
   if (!native() || messageDetail || entityDetail || $('overview-kind').value!=='chats') return;
+  if(displayMode==='list'){window.dispatchEvent(new Event('chat-hub:show-chat-list'));return;}
   const token = ++request, args = filters(), requestedFocus = focusId;
   const project = $('project-filter').selectedOptions?.[0]?.textContent || 'All projects';
   $('overview-scope').textContent = `${args.source === 'codex' ? 'Codex' : 'Chat'} · ${project}${args.tag?` · #${args.tag}`:''}`;
@@ -98,7 +164,7 @@ async function refresh(allowRebuild = false) {
     const data = await invoke('catalog_graph', {...args, focusId:requestedFocus, limit:100});
     if (token !== request || messageDetail) return;
     if (!Array.isArray(data?.nodes) || !Array.isArray(data?.edges)) throw Error('invalid_catalog_graph');
-    graph = prepareConnections(data); renderStats(overview.stats);$('overview-stats').hidden=!!args.tag; renderGraph();
+    graph = prepareConnections(data); renderStats(overview.stats);$('overview-stats').hidden=!!args.tag; renderGraph();applyChatDisplayMode();
     $('overview-recent-title').textContent = `${graph.nodes.length} chats in this map`;
     renderList(graph.nodes.filter(node => node.kind === 'chat'));
     const focused = graph.nodes.find(node => node.id === graph.focus_id);
@@ -122,10 +188,14 @@ function renderList(nodes) {
   }
 }
 function renderGraph() {
+  selectedTranscriptPager?.destroy();selectedTranscriptPager=null;
+  panel.classList.remove('chat-selection-open');
+  for(const unbind of previewRows.splice(0))unbind();previewController.close();
   panel.classList.remove('selection-open');
   $('map-search').value='';mapSearch.reset();
-  $('graph-selection').replaceChildren(element('h2', messageDetail ? 'Explore a message' : 'Explore a chat'),
-    element('p', messageDetail ? 'Select a message to read it on its original branch.' : 'Select a chat to find related conversations. Select a line to see the connection.'));
+  const category=panel.classList.contains('entity-category-mode');
+  $('graph-selection').replaceChildren(element('h2', messageDetail ? 'Explore a message' : category?'Explore an indexed item':'Explore a chat'),
+    element('p', messageDetail ? 'Select a message to read it on its original branch.' : category?'Select an item to inspect its source chats. Select a line for its reference.':'Select a chat to find related conversations. Select a line to see the connection.'));
   view.render(graph, Boolean(messageDetail));
 }
 function appendAction(root, text, action) {
@@ -134,7 +204,7 @@ function appendAction(root, text, action) {
 function showEdge(edge) {
   ++selectionRequest;
   panel.classList.add('selection-open');
-  const root = $('graph-selection'); root.replaceChildren(element('h2', edge.basis === 'entity_reference'?'Saved reference':edge.basis === 'project' ? 'Same project' : edge.basis === 'parent' ? 'Message sequence' : 'Shared topics'));
+  const root = $('graph-selection'); root.replaceChildren(element('h2', edge.basis === 'entity_reference'?'Saved reference':edge.basis === 'shared_entity'?'Shared indexed item':edge.basis === 'project' ? 'Same project' : edge.basis === 'parent' ? 'Message sequence' : 'Shared topics'));
   const names = [edge.source, edge.target].map(id => graph.nodes.find(node => node.id === id)?.label || 'Chat');
   root.append(element('p', names.join(' ↔ ')), element('p', edge.reason || 'Original stored parent relationship.'));
   if (edge.evidence?.length) root.append(element('p', `Evidence: ${edge.evidence.join(', ')}`));
@@ -145,29 +215,64 @@ function showEdge(edge) {
 }
 function showSelection(node) {
   const token=++selectionRequest;
+  selectedTranscriptPager?.destroy();selectedTranscriptPager=null;
+  panel.classList.remove('chat-selection-open');
+  $('graph-inspector').scrollTop=0;
+  for(const unbind of previewRows.splice(0))unbind();
+  previewController.close();
   panel.classList.add('selection-open');
-  const root = $('graph-selection'); root.replaceChildren(element('h2', node.label));
-  if(node.entity_id&&entityDetail?.entity?.id===node.entity_id){showEntitySelection(root,entityDetail,token);return;}
+  const root = $('graph-selection'); root.classList.remove('chat-inspector');root.scrollTop=0;root.replaceChildren(element('h2', node.label));
+  if(node.entity_id){
+    if(entityDetail?.entity?.id===node.entity_id){showEntitySelection(root,entityDetail,token);return;}
+    root.append(element('p','Loading saved references…'));
+    invoke('catalog_entity',{id:node.entity_id}).then(detail=>{
+      if(token!==selectionRequest)return;
+      entityDetail=detail;showSelection(node);
+    }).catch(()=>{if(token===selectionRequest)root.replaceChildren(element('h2',node.label),element('p','This indexed item could not be opened. Try again after the current library task.'));});
+    return;
+  }
+  entityDetail=null;
   if (node.kind === 'chat') {
+    panel.classList.add('chat-selection-open');root.classList.add('chat-inspector');
     root.append(element('p', node.cached_archive ? 'Saved transcript. Original message boundaries and branches are unavailable.' : node.message_count===undefined?'Saved conversation':`${node.message_count || 0} stored messages · ${node.branch_count || 0} branch points`));
-    appendAction(root, 'Open chat', () => openNode(node));
-    if(node.snippet)root.append(element('p',node.snippet));
-    appendAction(root,'Edit tags',()=>window.dispatchEvent(new CustomEvent('chat-hub:edit-tags',{detail:{targetKind:'conversation',targetId:node.conversation_id,title:node.label}})));
-    if (node.conversation_id !== focusId) appendAction(root, 'Explore all connections', () => focusChat(node.conversation_id));
-    appendAction(root, 'Message graph', async () => {
-      try { showMessages(await invoke('get_conversation', {id:node.conversation_id})); }
-      catch { state('This message graph could not open. Try reading the saved conversation.'); }
+    const actions=element('div',undefined,'inspector-actions');
+    const addCompactAction=(label,action,attrs={})=>{const button=element('button',label);button.type='button';button.setAttribute('aria-label',attrs.aria||label);button.addEventListener('click',action);actions.append(button);return button;};
+    addCompactAction('Open',()=>openNode(node),{aria:'Open saved chat'});
+    const tagsButton=addCompactAction('Tags',()=>dispatchHoverTags(node,tagsButton),{aria:'Edit chat tags'});
+    const hoverTags=()=>dispatchHoverTags(node,tagsButton);
+    tagsButton.addEventListener('pointerenter',hoverTags);tagsButton.addEventListener('focus',hoverTags);
+    root.append(actions);
+    if (node.conversation_id !== focusId) addCompactAction('Explore', () => focusChat(node.conversation_id),{aria:'Explore all chat connections'});
+    const transcriptSection=element('section',undefined,'inspector-transcript-section');
+    transcriptSection.append(element('h3','Saved conversation · beginning'));
+    const transcript=element('div',undefined,'inspector-transcript-scroll saved-transcript-scroll');
+    transcript.tabIndex=0;transcript.setAttribute('role','region');transcript.setAttribute('aria-label',`Saved conversation: ${node.label}`);
+    transcript.append(element('p','Loading saved messages…','saved-transcript-status'));transcriptSection.append(transcript);root.append(transcriptSection);
+    const connectionsSection=element('section',undefined,'inspector-connections-section');connectionsSection.append(element('h3','Related chats'));
+    const connectionList=element('div',undefined,'inspector-connections-scroll');connectionList.tabIndex=0;connectionList.setAttribute('role','region');connectionList.setAttribute('aria-label','Related saved chats');
+    connectionsSection.append(connectionList);root.append(connectionsSection);
+    const detailPromise=invoke('get_conversation',{id:node.conversation_id}).then(detail=>{
+      if(token!==selectionRequest)return null;
+      transcript.replaceChildren();
+      const messages=orderedMessages(detail);
+      selectedTranscriptPager=createTranscriptPager(transcript,messages,{batchSize:4});
+      return detail;
+    }).catch(()=>{
+      if(token===selectionRequest){transcript.replaceChildren(element('p','Saved messages could not be loaded. This conversation may exceed the detail size limit.','saved-transcript-status'));}
+      return null;
     });
+    addCompactAction('Messages', async () => {const detail=await detailPromise;if(detail)showMessages(detail);},{aria:'Open message graph'});
     const connections = graph.edges.filter(edge => edge.source === node.id || edge.target === node.id);
-    if (!connections.length) root.append(element('p', 'No strong connections found in this scope. Try All projects, or explore another chat.'));
+    if (!connections.length) connectionList.append(element('p', 'No strong connections found in this scope. Try All projects, or explore another chat.'));
     for (const edge of connections) {
       const other = graph.nodes.find(item => item.id === (edge.source === node.id ? edge.target : edge.source));
       if (!other) continue;
       const entry = element('div', undefined, 'connection-evidence');
       appendAction(entry, other.label, () => view.select(other.id));
       entry.append(element('p', edge.reason || 'Same project'));
-      if (edge.basis === 'shared_keyword' && edge.evidence?.length) entry.append(element('p', edge.evidence.join(' · ')));
-      root.append(entry);
+      if (['shared_keyword','shared_entity'].includes(edge.basis) && edge.evidence?.length) entry.append(element('p', edge.evidence.join(' · ')));
+       if(other.conversation_id)previewRows.push(previewController.bind(entry,hoverPreview,{conversationId:other.conversation_id,title:other.label}));
+       connectionList.append(entry);
     }
   } else if (node.kind === 'message') {
     root.append(element('p', node.excerpt || 'Context node without message text.'));
@@ -178,6 +283,7 @@ function showSelection(node) {
     });
   }
 }
+function dispatchHoverTags(node,anchor){window.dispatchEvent(new CustomEvent('chat-hub:hover-tags',{detail:{targetKind:'conversation',targetId:node.conversation_id,title:node.label,anchor,keywords:node.keywords||[],entities:node.entities||[]}}));}
 function showEntitySelection(root,detail,token){
   const item=detail.entity,kind=item.kind==='file_artifact'?'file':'entity';
   root.append(element('p',`${entityKinds[item.kind]||'Indexed item'} · ${item.reference_count||detail.references.length} references`));
@@ -185,7 +291,11 @@ function showEntitySelection(root,detail,token){
   invoke('get_target_tags',{targetKind:kind,targetId:item.id}).then(result=>{if(token!==selectionRequest)return;
     for(const name of result.tags||[])tagRoot.append(element('span',name,'tag-chip'));
   }).catch(()=>{});
-  appendAction(root,'Edit tags',()=>window.dispatchEvent(new CustomEvent('chat-hub:edit-tags',{detail:{targetKind:kind,targetId:item.id,title:item.label}})));
+  const tagAction=element('button','Tags');tagAction.type='button';tagAction.setAttribute('aria-label','Edit item tags');
+  const suggestionConversationIds=[...new Set(detail.references.map(reference=>reference.conversation_id).filter(Boolean))].slice(0,2);
+  const hoverTags=()=>window.dispatchEvent(new CustomEvent('chat-hub:hover-tags',{detail:{targetKind:kind,targetId:item.id,title:item.label,anchor:tagAction,suggestionConversationIds}}));
+  for(const event of ['pointerenter','focus','click'])tagAction.addEventListener(event,hoverTags);
+  root.append(tagAction);
   if(item.kind==='file_artifact'){
     root.append(element('span',item.content_saved?'Saved locally':item.artifact_state==='metadata_present'?'Content not saved':'File link only','entity-file-state'));
     if(item.content_saved){
@@ -209,6 +319,7 @@ function showEntitySelection(root,detail,token){
     const entry=element('div',undefined,'entity-reference');
     appendAction(entry,ref.title||'Open saved chat',()=>openChat(ref.conversation_id,undefined,ref.node_id||undefined));
     entry.append(element('small',ref.relation==='produces'?'Produced here':ref.relation==='attaches'?'Attached here':'Mentioned here'));root.append(entry);
+    if(ref.conversation_id)previewRows.push(previewController.bind(entry,hoverPreview,{conversationId:ref.conversation_id,title:ref.title||'Saved chat'}));
     if(seen.size>=20)break;
   }
   if(detail.references_truncated)root.append(element('p','More source references are stored in the index.'));
@@ -222,16 +333,31 @@ async function fileAction(command,args){
 }
 export function showEntityGraph(detail){
   if(!detail?.entity?.id)return;messageDetail=null;entityDetail=detail;focusId=null;++request;enter();
-  panel.classList.remove('message-mode','connections-mode');panel.classList.add('entity-mode');
+  panel.classList.remove('message-mode','connections-mode','entity-category-mode');panel.classList.add('entity-mode');
   $('overview-title').textContent=detail.entity.label;$('overview-scope').textContent='Indexed references · saved on this Mac';
   $('overview-stats').hidden=true;$('overview-read-chat').hidden=true;$('overview-back').hidden=false;
   graph=entityGraph(detail);renderGraph();renderList(graph.nodes.filter(n=>n.kind==='chat'));
   $('overview-recent-title').textContent='Source chats';$('graph-caption').textContent=`${graph.nodes.length-1} source chats · select a chat or reference to inspect it.`;
   showSelection(graph.nodes[0]);state('');
 }
+export function showCatalogEntityGraph(data,label){
+  if(!Array.isArray(data?.nodes)||!Array.isArray(data?.edges))throw Error('Invalid category graph');
+  messageDetail=null;entityDetail=null;focusId=null;++request;++selectionRequest;enter();
+  panel.classList.remove('message-mode','connections-mode','entity-mode','selection-open');
+  panel.classList.add('entity-category-mode');
+  $('overview-title').textContent=label||'Indexed items';
+  $('overview-scope').textContent='Indexed items · exact saved references';
+  $('overview-stats').hidden=true;$('overview-read-chat').hidden=true;$('overview-back').hidden=true;
+  graph=prepareEntityConnections(data);renderGraph();renderList(graph.nodes);
+  $('overview-recent-title').textContent='Items in this graph';
+  const total=Number.isSafeInteger(data.total_entities)?data.total_entities:graph.nodes.filter(node=>node.entity_id).length;
+  const shown=graph.nodes.filter(node=>node.entity_id).length;
+  $('graph-caption').textContent=`${total} indexed items · showing ${shown} items and ${graph.nodes.filter(node=>node.kind==='chat').length} source chats · ${graph.edges.length} saved references${graph.truncated?' in this bounded view':''}. Select an item to inspect it; select a chat to open it.`;
+  state('');
+}
 function showMessages(detail) {
   if (!detail?.conversation?.id) return;
-  window.dispatchEvent(new Event('chat-hub:show-chat-map'));entityDetail=null;messageDetail = detail; ++request; enter(); panel.classList.remove('connections-mode','entity-mode'); panel.classList.add('message-mode');
+  forceOverviewGraph();window.dispatchEvent(new Event('chat-hub:show-chat-map'));entityDetail=null;messageDetail = detail; ++request; enter(); panel.classList.remove('connections-mode','entity-mode','entity-category-mode'); panel.classList.add('message-mode');
   $('overview-title').textContent = detail.conversation.title || 'Message graph';
   $('overview-scope').textContent = 'Message graph · original stored relationships';
   $('overview-back').hidden = $('overview-read-chat').hidden = false;
@@ -250,6 +376,7 @@ $('graph-zoom-in').addEventListener('click', () => view.zoom(1.25));
 $('graph-zoom-out').addEventListener('click', () => view.zoom(.8));
 $('graph-reset').addEventListener('click', () => view.fit());
 $('graph-inspector-close').addEventListener('click', () => panel.classList.remove('selection-open'));
+$('graph-inspector').addEventListener('wheel',event=>event.stopPropagation(),{passive:true});
 $('map-search').addEventListener('input', () => {
   mapSearch.update($('map-search').value);
 });

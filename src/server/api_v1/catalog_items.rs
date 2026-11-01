@@ -1,12 +1,18 @@
 //! Authenticated local catalog, tag, and saved-file operations.
 use super::*;
-use crate::{artifacts::MAX_ARTIFACT_BYTES, catalog::CatalogEntityKind, store::Store};
+use crate::{
+    artifacts::MAX_ARTIFACT_BYTES,
+    catalog::{CatalogEntityGraphQuery, CatalogEntityKind},
+    store::Store,
+};
 use axum::extract::DefaultBodyLimit;
 
 pub(super) fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/v1/catalog/entities", get(entities))
         .route("/api/v1/catalog/entities/:id", get(entity))
+        .route("/api/v1/catalog/entity-graph", get(entity_graph))
+        .route("/api/v1/catalog/tag-suggestions", get(tag_suggestions))
         .route("/api/v1/tags", get(tags))
         .route("/api/v1/tags/assignments", get(target_tags).put(set_tags))
         .route("/api/v1/tags/targets", get(tagged_targets))
@@ -151,6 +157,78 @@ async fn entity(State(s): State<ApiState>, Path(id): Path<String>) -> ApiResult 
             .await?
             .ok_or_else(missing)?,
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntityGraphQuery {
+    source: Option<String>,
+    project_key: Option<String>,
+    conversation_id: Option<String>,
+    tag: Option<String>,
+    query: Option<String>,
+    kind: Option<String>,
+    artifact_state: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn entity_graph(
+    State(s): State<ApiState>,
+    q: Result<Query<EntityGraphQuery>, QueryRejection>,
+) -> ApiResult {
+    let q = query(q)?;
+    let source = q.source.unwrap_or_else(|| "all".into());
+    validate_catalog_scope(&source, q.project_key.as_deref())?;
+    if q.conversation_id.as_deref().is_some_and(|value| !valid_id(value))
+        || q.query
+            .as_deref()
+            .is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control))
+        || q.kind
+            .as_deref()
+            .is_some_and(|value| CatalogEntityKind::parse(value).is_none())
+        || q.artifact_state
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "link_only" | "metadata_present" | "saved_locally"))
+        || !(1..=40).contains(&q.limit.unwrap_or(40))
+    {
+        return Err(invalid_request());
+    }
+    let graph = store_op(&s, move |store| {
+        store.catalog_entity_graph(CatalogEntityGraphQuery {
+            source: &source,
+            project_key: q.project_key.as_deref(),
+            conversation_id: q.conversation_id.as_deref(),
+            tag: q.tag.as_deref(),
+            query: q.query.as_deref(),
+            kind: q.kind.as_deref().and_then(CatalogEntityKind::parse),
+            artifact_state: q.artifact_state.as_deref(),
+            limit: q.limit.unwrap_or(40),
+        })
+    })
+    .await?;
+    as_json(graph)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TagSuggestionQuery {
+    conversation_id: String,
+    limit: Option<usize>,
+}
+
+async fn tag_suggestions(
+    State(s): State<ApiState>,
+    q: Result<Query<TagSuggestionQuery>, QueryRejection>,
+) -> ApiResult {
+    let q = query(q)?;
+    if !valid_id(&q.conversation_id) || !(1..=12).contains(&q.limit.unwrap_or(12)) {
+        return Err(invalid_request());
+    }
+    let suggestions = store_op(&s, move |store| {
+        store.catalog_tag_suggestions(&q.conversation_id, q.limit.unwrap_or(12))
+    })
+    .await?;
+    as_json(suggestions)
 }
 
 #[derive(Deserialize)]

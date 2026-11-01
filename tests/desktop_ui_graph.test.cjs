@@ -52,6 +52,20 @@ test('map clusters and node degrees reflect declared connections only', async ()
   assert.ok(graph.nodes.every(n=>n.degree===1));assert.equal(graph.nodes.filter(n=>n.hub).length,2);
 });
 
+test('shared indexed entities contribute an explicit chat-to-chat graph edge',async()=>{
+  const {prepareConnections}=await load();
+  const graph=prepareConnections({nodes:[
+    {id:'chat:a',kind:'chat',label:'First'},
+    {id:'chat:b',kind:'chat',label:'Second'},
+  ],edges:[
+    {source:'chat:a',target:'chat:b',basis:'shared_entity',reason:'Both reference the same repository',evidence:['Muninn']}],
+  });
+  assert.equal(graph.edges.length,1);
+  assert.equal(graph.edges[0].basis,'shared_entity');
+  assert.deepEqual(graph.edges[0].evidence,['Muninn']);
+  assert.ok(graph.nodes.every(node=>node.degree===1));
+});
+
 test('message graph preserves null context, branches and exact navigation anchors', async () => {
   const {messageGraph} = await load();
   const detail={nodes:[{id:'b',parent_id:'root',message_id:'mb'},{id:'a',parent_id:'root',message_id:'ma'},{id:'root',parent_id:null,message_id:null}],

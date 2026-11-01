@@ -687,9 +687,14 @@ impl Store {
         else {
             return Err(Error::Configuration("unknown conversation".into()));
         };
-        if !is_chatgpt_provider(&conversation_provider)
-            || !valid_upstream_conversation_id(&conversation_source_id)
-        {
+        let Some(upstream_conversation_id) =
+            normalized_upstream_conversation_id(&conversation_source_id)
+        else {
+            return Err(Error::Configuration(
+                "conversation is not an upstream ChatGPT record".into(),
+            ));
+        };
+        if !is_chatgpt_provider(&conversation_provider) {
             return Err(Error::Configuration(
                 "conversation is not an upstream ChatGPT record".into(),
             ));
@@ -751,7 +756,7 @@ impl Store {
             "conversation_id": conversation_id,
             "conversation_provider": conversation_provider,
             "conversation_scope": conversation_scope,
-            "conversation_source_id": conversation_source_id,
+            "conversation_source_id": upstream_conversation_id,
             "project_key": project_key,
             "project_provider": project_provider,
             "project_scope": project_scope,
@@ -2004,14 +2009,20 @@ fn is_chatgpt_provider(provider: &str) -> bool {
 }
 
 fn valid_upstream_conversation_id(id: &str) -> bool {
-    id.len() == 36
+    normalized_upstream_conversation_id(id).is_some()
+}
+
+fn normalized_upstream_conversation_id(id: &str) -> Option<&str> {
+    let id = id.strip_prefix("conversation:").unwrap_or(id);
+    (id.len() == 36
         && id.bytes().enumerate().all(|(index, byte)| {
             if [8, 13, 18, 23].contains(&index) {
                 byte == b'-'
             } else {
                 byte.is_ascii_hexdigit()
             }
-        })
+        }))
+    .then_some(id)
 }
 
 fn valid_upstream_project_id(id: &str) -> bool {
@@ -2837,8 +2848,8 @@ mod project_and_search_tests {
         let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
         let project_id = format!("g-p-{}", "a".repeat(32));
         store.connection.execute(
-            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Legacy chat','paseo-chatgpt','paseo-cache:owner',?1,1)",
-            [conversation_id],
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Legacy chat','paseo-chatgpt','paseo-cache:owner',?2,1)",
+            params![conversation_id, format!("conversation:{conversation_id}")],
         ).unwrap();
         store.connection.execute(
             "INSERT INTO projects(project_key,provider,account_scope,source_id,title,local_name) VALUES('current-project','chatgpt','chatgpt:observed:'||?1,?2,'Old title','Local name')",
@@ -2868,6 +2879,15 @@ mod project_and_search_tests {
             )
             .unwrap();
         assert_eq!(persisted_scope, "paseo-cache:owner");
+        let persisted_source_id: String = store
+            .connection
+            .query_row(
+                "SELECT source_id FROM conversations WHERE id=?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_source_id, format!("conversation:{conversation_id}"));
         let upstream_title: String = store
             .connection
             .query_row(
@@ -2891,6 +2911,12 @@ mod project_and_search_tests {
                 .unwrap(),
             0
         );
+        let nested_prefix_id = "123e4567-e89b-12d3-a456-426614174001";
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Bad cached source','paseo-chatgpt','paseo-cache:owner',?2,1)",
+            params![nested_prefix_id, format!("conversation:conversation:{nested_prefix_id}")],
+        ).unwrap();
+        assert!(store.project_assignment_context(nested_prefix_id, None).is_err());
     }
 
     #[test]

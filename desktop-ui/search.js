@@ -21,6 +21,14 @@ export function groupSearchConversations(hits) {
   return [...groups.values()];
 }
 
+export function conversationOpenTarget(result) {
+  if(!result||typeof result.id!=='string')throw new Error('Invalid conversation search result');
+  const target={id:result.id};
+  if(typeof result.search_leaf_node_id==='string')target.leafNodeId=result.search_leaf_node_id;
+  if(typeof result.search_node_id==='string')target.anchorNodeId=result.search_node_id;
+  return target;
+}
+
 export function appendSearchHighlight(parent, text, query, doc = document) {
   text = String(text ?? '');
   const terms = [...new Set(String(query).trim().split(/\s+/).filter(term => /[\p{L}\p{N}]/u.test(term)))];

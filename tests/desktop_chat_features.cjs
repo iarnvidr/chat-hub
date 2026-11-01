@@ -89,7 +89,7 @@ const server = http.createServer((request, response) => {
     await page.locator('#source-codex').click();
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_conversations' && args.source === 'codex'));
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_projects' && args.source === 'codex'));
-    assert.equal(await page.locator('#project-filter option').nth(1).innerText(), 'Codex Project (2)');
+    assert.equal(await page.locator('#project-filter option[value="codex-project:key"]').innerText(), 'Codex Project (2)');
     await page.locator('#project-options button[data-project-key="codex-project:key"]').click();
     await page.waitForFunction(() => window.__calls.some(([name, args]) => name === 'list_conversations' && args.projectKey === 'codex-project:key'));
     assert.equal(await page.locator('#source-codex').getAttribute('aria-pressed'), 'true');

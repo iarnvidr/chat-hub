@@ -20,9 +20,13 @@ The local index also extracts repositories, pull requests, issues, domains, link
 
 Local tags are stored independently of the derived index and survive rebuilds. The desktop uses the classified terminal palette, distinct speaker styles and stable graph positions. Cmd/Ctrl+W closes the selected tab and does nothing when no tabs are open. Native menu shortcuts also work while the embedded ChatGPT view has focus. Cmd/Ctrl+T opens a new chat; Ctrl+Tab cycles tabs and Cmd/Ctrl+1–9 selects tabs (9 selects the last).
 
+The overview keeps repositories, PRs, issues, domains and files in Graph mode, with List available separately. Shared references contribute to chat connections; common domains do not connect the entire library. Select a dot or its label to inspect connections in a scrollable panel. Hover a related chat for a temporary saved-copy preview beside the panel, without opening a tab. Compact hover actions open the chat or its message graph. The Tags hover editor suggests tags from indexed content and includes a distinct custom-tag option. Hover controls also support focus and click, and graph motion respects reduced motion.
+
 Projects expand inline in the sidebar, with the selected project retained when collapsed. Settings → Appearance offers five saved color schemes: Classified amber, Phosphor, Arctic, Violet and Field notes. Color changes also update the graph without losing its position.
 
 The No project filter selects unassigned conversations before pagination, including search and overview results. Each chat row has a compact action rail for pinning and a menu for project assignment, pin/unpin, archive/restore, tags and copying its ChatGPT link. Project, pin and archive changes use the signed-in ChatGPT session and require readback before the local library changes. Archived chats have a separate list filter; pinned chats sort before other chats across database pages. These upstream actions have contract and fake-provider tests; no personal-chat mutations were performed as development checks.
+
+Set project and project rename open anchored hover controls, with keyboard focus and click support. There is no local-only project-editing choice. Existing cached IDs are normalized only for the verified ChatGPT request; the stored conversation identity remains intact.
 
 ## Build and run
 

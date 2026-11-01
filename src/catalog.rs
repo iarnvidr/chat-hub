@@ -154,6 +154,73 @@ pub struct CatalogEntityPage {
     pub items: Vec<CatalogEntity>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CatalogEntityGraphNode {
+    pub id: String,
+    /// `chat` for source conversations; entity kind strings for indexed items.
+    pub kind: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity: Option<CatalogEntity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CatalogEntityGraphEdge {
+    pub source: String,
+    pub target: String,
+    pub basis: String,
+    pub relation: String,
+    pub reference_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CatalogEntityGraph {
+    pub index: CatalogIndexStatus,
+    pub source: String,
+    pub project_key: Option<String>,
+    pub conversation_id: Option<String>,
+    pub tag: Option<String>,
+    pub query: Option<String>,
+    pub kind: Option<String>,
+    pub artifact_state: Option<String>,
+    pub total_entities: i64,
+    pub truncated: bool,
+    pub nodes: Vec<CatalogEntityGraphNode>,
+    pub edges: Vec<CatalogEntityGraphEdge>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CatalogTagSuggestion {
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CatalogTagSuggestionList {
+    pub library_revision: i64,
+    pub items: Vec<CatalogTagSuggestion>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CatalogEntityGraphQuery<'a> {
+    pub source: &'a str,
+    pub project_key: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
+    pub tag: Option<&'a str>,
+    pub query: Option<&'a str>,
+    pub kind: Option<CatalogEntityKind>,
+    pub artifact_state: Option<&'a str>,
+    pub limit: usize,
+}
+
 /// Store-level filters for a whole-index entity page. Query matching is applied
 /// before total counts and keyset pagination.
 #[derive(Clone, Copy, Debug, Default)]
@@ -205,7 +272,8 @@ pub struct CatalogNode {
 pub struct CatalogEdge {
     pub source: String,
     pub target: String,
-    /// Relationship basis: `project` or `shared_keyword`.
+    /// Relationship basis: explicit project membership, shared keywords, or a
+    /// shared typed catalog entity.
     pub basis: String,
     /// Plain-language basis and bounded evidence for the connection.
     pub reason: Option<String>,
