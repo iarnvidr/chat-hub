@@ -327,9 +327,10 @@ fn read_target_tags_for_ids(
     let mut statement = connection.prepare(
         "SELECT t.name FROM (SELECT x.name_key,min(CAST(ids.key AS INTEGER)) AS target_order,min(x.ordinal) AS tag_order FROM json_each(?1) ids JOIN target_tags x ON x.target_id=ids.value AND x.target_kind=?2 GROUP BY x.name_key) picked JOIN tags t ON t.name_key=picked.name_key ORDER BY picked.target_order,picked.tag_order,picked.name_key",
     )?;
-    Ok(statement
+    let names = statement
         .query_map(params![json_ids, target_kind], |row| row.get(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(names)
 }
 
 fn read_target_tags(
