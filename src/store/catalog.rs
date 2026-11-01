@@ -3828,7 +3828,12 @@ mod tests {
             &account,
             shared,
             "Current full history",
-            vec![graph_node("direct-root", None, "user", "distinct direct context")],
+            vec![graph_node(
+                "direct-root",
+                None,
+                "user",
+                "distinct direct context",
+            )],
             "complete",
         );
         let cached_id = ingest(
@@ -3837,7 +3842,12 @@ mod tests {
             "paseo-cache:owner",
             &format!("conversation:{shared}"),
             "Cached archive copy",
-            vec![graph_node("cached-root", None, "user", "different archived context")],
+            vec![graph_node(
+                "cached-root",
+                None,
+                "user",
+                "different archived context",
+            )],
             "cached_transcript",
         );
         let third_id = ingest(
@@ -3846,35 +3856,59 @@ mod tests {
             "paseo-cache:owner",
             legacy_only,
             "Legacy only project chat",
-            vec![graph_node("third-root", None, "user", "unique third context")],
+            vec![graph_node(
+                "third-root",
+                None,
+                "user",
+                "unique third context",
+            )],
             "cached_transcript",
         );
         assert_ne!(direct_id, cached_id);
 
-        store.connection.execute(
-            "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES
+        store
+            .connection
+            .execute(
+                "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES
              ('current-project','chatgpt',?1,'g-p-shared','Village research'),
              ('legacy-project','paseo-chatgpt','paseo-cache:owner','g-p-shared','Cached name')",
-            params![account],
-        ).unwrap();
-        store.connection.execute(
-            "INSERT INTO conversation_projects(conversation_id,project_key) VALUES
+                params![account],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO conversation_projects(conversation_id,project_key) VALUES
              (?1,'current-project'),(?2,'legacy-project'),(?3,'legacy-project')",
-            params![direct_id, cached_id, third_id],
-        ).unwrap();
+                params![direct_id, cached_id, third_id],
+            )
+            .unwrap();
         store.rebuild_catalog_index().unwrap();
 
         let graph = store.catalog_graph("chatgpt", None, 100).unwrap();
-        let chats = graph.nodes.iter().filter(|node| node.kind == "chat").collect::<Vec<_>>();
+        let chats = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "chat")
+            .collect::<Vec<_>>();
         assert_eq!(chats.len(), 2);
-        assert!(chats.iter().any(|node| node.conversation_id.as_deref() == Some(direct_id.as_str())));
-        assert!(chats.iter().any(|node| node.conversation_id.as_deref() == Some(third_id.as_str())));
-        assert!(!chats.iter().any(|node| node.conversation_id.as_deref() == Some(cached_id.as_str())));
-        assert!(graph.edges.iter().any(|edge| {
-            edge.basis == "project"
-                && chats.iter().any(|node| node.id == edge.source)
-                && chats.iter().any(|node| node.id == edge.target)
-        }), "validated shared project identity links the legacy-only third chat");
+        assert!(chats
+            .iter()
+            .any(|node| node.conversation_id.as_deref() == Some(direct_id.as_str())));
+        assert!(chats
+            .iter()
+            .any(|node| node.conversation_id.as_deref() == Some(third_id.as_str())));
+        assert!(!chats
+            .iter()
+            .any(|node| node.conversation_id.as_deref() == Some(cached_id.as_str())));
+        assert!(
+            graph.edges.iter().any(|edge| {
+                edge.basis == "project"
+                    && chats.iter().any(|node| node.id == edge.source)
+                    && chats.iter().any(|node| node.id == edge.target)
+            }),
+            "validated shared project identity links the legacy-only third chat"
+        );
     }
 
     #[test]
@@ -3888,7 +3922,12 @@ mod tests {
             &account,
             uuid,
             "Current full transcript",
-            vec![graph_node("current-root", None, "user", "present day material")],
+            vec![graph_node(
+                "current-root",
+                None,
+                "user",
+                "present day material",
+            )],
             "complete",
         );
         let legacy_match_id = ingest(
@@ -3897,7 +3936,12 @@ mod tests {
             "paseo-cache:old-a",
             &format!("conversation:{uuid}"),
             "Old cache match",
-            vec![graph_node("legacy-only-node", None, "user", "vaultonlyphrase appears only here")],
+            vec![graph_node(
+                "legacy-only-node",
+                None,
+                "user",
+                "vaultonlyphrase appears only here",
+            )],
             "cached_transcript",
         );
         let legacy_tag_id = ingest(
@@ -3906,19 +3950,41 @@ mod tests {
             "paseo-cache:old-b",
             uuid,
             "Other old cache copy",
-            vec![graph_node("other-cache-node", None, "user", "unrelated cached material")],
+            vec![graph_node(
+                "other-cache-node",
+                None,
+                "user",
+                "unrelated cached material",
+            )],
             "cached_transcript",
         );
-        store.connection.execute("INSERT INTO tags(name_key,name) VALUES('needle','Needle')", []).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO tags(name_key,name) VALUES('needle','Needle')",
+                [],
+            )
+            .unwrap();
         store.connection.execute(
             "INSERT INTO target_tags(target_kind,target_id,name_key,ordinal) VALUES('conversation',?1,'needle',0)",
             [&legacy_tag_id],
         ).unwrap();
 
-        let scope = PageScope { source: "chatgpt", project_key: None, tag: Some("needle") };
-        let active = store.source_search_page_snapshot_with_tag_and_archive_state(
-            "vaultonlyphrase", 20, None, None, scope, "active",
-        ).unwrap();
+        let scope = PageScope {
+            source: "chatgpt",
+            project_key: None,
+            tag: Some("needle"),
+        };
+        let active = store
+            .source_search_page_snapshot_with_tag_and_archive_state(
+                "vaultonlyphrase",
+                20,
+                None,
+                None,
+                scope,
+                "active",
+            )
+            .unwrap();
         assert_eq!(active.hits.len(), 1);
         let hit = &active.hits[0];
         assert_eq!(hit["conversation"]["id"], direct_id);
@@ -3930,13 +3996,27 @@ mod tests {
             "INSERT INTO conversation_local_state(conversation_id,pinned,archived,updated_at_ms) VALUES(?1,0,1,2)",
             [&direct_id],
         ).unwrap();
-        let active_after_archive = store.source_search_page_snapshot_with_tag_and_archive_state(
-            "vaultonlyphrase", 20, None, None, scope, "active",
-        ).unwrap();
+        let active_after_archive = store
+            .source_search_page_snapshot_with_tag_and_archive_state(
+                "vaultonlyphrase",
+                20,
+                None,
+                None,
+                scope,
+                "active",
+            )
+            .unwrap();
         assert!(active_after_archive.hits.is_empty());
-        let archived = store.source_search_page_snapshot_with_tag_and_archive_state(
-            "vaultonlyphrase", 20, None, None, scope, "archived",
-        ).unwrap();
+        let archived = store
+            .source_search_page_snapshot_with_tag_and_archive_state(
+                "vaultonlyphrase",
+                20,
+                None,
+                None,
+                scope,
+                "archived",
+            )
+            .unwrap();
         assert_eq!(archived.hits.len(), 1);
         assert_eq!(archived.hits[0]["matched_conversation_id"], legacy_match_id);
     }
@@ -3952,7 +4032,12 @@ mod tests {
             &account,
             uuid,
             "Direct full chat",
-            vec![graph_node("direct-node", None, "user", "ordinary discussion")],
+            vec![graph_node(
+                "direct-node",
+                None,
+                "user",
+                "ordinary discussion",
+            )],
             "complete",
         );
         let legacy_id = ingest(
@@ -3976,9 +4061,19 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         let detail = store.catalog_entity(&entity_id).unwrap().unwrap();
-        let reference = detail.references.iter().find(|reference| reference.conversation_id == legacy_id).unwrap();
-        assert_eq!(reference.canonical_conversation_id.as_deref(), Some(direct_id.as_str()));
-        assert_eq!(reference.source_node_id.as_deref(), Some("legacy-physical-node"));
+        let reference = detail
+            .references
+            .iter()
+            .find(|reference| reference.conversation_id == legacy_id)
+            .unwrap();
+        assert_eq!(
+            reference.canonical_conversation_id.as_deref(),
+            Some(direct_id.as_str())
+        );
+        assert_eq!(
+            reference.source_node_id.as_deref(),
+            Some("legacy-physical-node")
+        );
         assert_eq!(reference.conversation_id, legacy_id);
     }
 

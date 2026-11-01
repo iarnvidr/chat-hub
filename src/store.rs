@@ -2495,16 +2495,35 @@ mod identity_tests {
             [],
         ).unwrap();
 
-        let active = store.list_page_snapshot_scoped(20, None, None, "all", None, None, "active").unwrap();
-        let active_ids = active.items.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>();
+        let active = store
+            .list_page_snapshot_scoped(20, None, None, "all", None, None, "active")
+            .unwrap();
+        let active_ids = active
+            .items
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(active_ids.len(), 3);
         assert!(!active_ids.contains(&"cache-a"));
         assert!(!active_ids.contains(&"cache-b"));
-        assert!(active_ids.contains(&"ambiguous-cache"), "multiple observed accounts keep the cache row distinct");
+        assert!(
+            active_ids.contains(&"ambiguous-cache"),
+            "multiple observed accounts keep the cache row distinct"
+        );
 
-        let archived = store.list_page_snapshot_scoped(20, None, None, "all", None, None, "archived").unwrap();
-        let archived_ids = archived.items.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>();
-        assert_eq!(archived_ids, ["direct"], "the old active cache copy must not resurrect the archived current chat");
+        let archived = store
+            .list_page_snapshot_scoped(20, None, None, "all", None, None, "archived")
+            .unwrap();
+        let archived_ids = archived
+            .items
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            archived_ids,
+            ["direct"],
+            "the old active cache copy must not resurrect the archived current chat"
+        );
     }
 
     #[test]
@@ -2523,47 +2542,71 @@ mod identity_tests {
              ('legacy-only','Legacy only','paseo-chatgpt','paseo-cache:owner',?4,5)",
             params![account, shared_uuid, moved_uuid, legacy_only_uuid],
         ).unwrap();
-        store.connection.execute(
-            "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES
+        store
+            .connection
+            .execute(
+                "INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES
              ('current-project','chatgpt',?1,'g-p-same','Current title'),
              ('legacy-project','paseo-chatgpt','paseo-cache:owner','g-p-same','Cached title'),
              ('other-project','chatgpt',?1,'g-p-other','Other project'),
              ('same-title-other-id','chatgpt',?1,'g-p-different','Current title')",
-            params![account],
-        ).unwrap();
-        store.connection.execute(
-            "INSERT INTO conversation_projects(conversation_id,project_key) VALUES
+                params![account],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO conversation_projects(conversation_id,project_key) VALUES
              ('direct','current-project'),('cache','legacy-project'),
              ('moved-direct','other-project'),('moved-cache','legacy-project'),
              ('legacy-only','legacy-project')",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
 
         let projects = store.projects_snapshot("chatgpt").unwrap().projects;
         assert_eq!(projects.len(), 3);
-        let folded = projects.iter().find(|p| p["project_key"] == "current-project").unwrap();
+        let folded = projects
+            .iter()
+            .find(|p| p["project_key"] == "current-project")
+            .unwrap();
         assert_eq!(folded["conversation_count"], 2);
         assert_eq!(folded["title"], "Current title");
-        let other = projects.iter().find(|p| p["project_key"] == "other-project").unwrap();
+        let other = projects
+            .iter()
+            .find(|p| p["project_key"] == "other-project")
+            .unwrap();
         assert_eq!(other["conversation_count"], 1);
         assert!(projects.iter().any(|p| p["project_key"] == "same-title-other-id"));
         assert!(!projects.iter().any(|p| p["project_key"] == "legacy-project"));
 
-        let page = store.list_page_snapshot_scoped(
-            20,
-            None,
-            None,
-            "chatgpt",
-            Some("current-project"),
-            None,
-            "active",
-        ).unwrap();
-        let ids = page.items.iter().map(|item| item["id"].as_str().unwrap()).collect::<Vec<_>>();
+        let page = store
+            .list_page_snapshot_scoped(
+                20,
+                None,
+                None,
+                "chatgpt",
+                Some("current-project"),
+                None,
+                "active",
+            )
+            .unwrap();
+        let ids = page
+            .items
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"direct"));
         assert!(ids.contains(&"legacy-only"));
-        assert!(!ids.contains(&"moved-direct"), "a stale archive membership cannot override a current move");
-        assert!(!ids.contains(&"cache"), "the stale archive membership is represented by the canonical row");
+        assert!(
+            !ids.contains(&"moved-direct"),
+            "a stale archive membership cannot override a current move"
+        );
+        assert!(
+            !ids.contains(&"cache"),
+            "the stale archive membership is represented by the canonical row"
+        );
     }
 
     #[test]
@@ -2573,30 +2616,34 @@ mod identity_tests {
         let extra_hyphen = "-2345678-1234-4abc-8def-1234567890ab";
         let double_prefix = "87654321-4321-4abc-8def-1234567890ab";
         let case_prefix = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        store.connection.execute(
-            "INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES
+        store
+            .connection
+            .execute(
+                "INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES
              ('direct-hyphen','Direct','chatgpt',?1,?2),
              ('cache-hyphen','Cache','paseo-chatgpt','paseo-cache:one',?2),
              ('direct-double','Direct','chatgpt',?1,?3),
              ('cache-double','Cache','paseo-chatgpt','paseo-cache:two',?4),
              ('direct-case','Direct','chatgpt',?1,?5),
              ('cache-case','Cache','paseo-chatgpt','paseo-cache:three',?6)",
-            params![
-                account,
-                extra_hyphen,
-                double_prefix,
-                format!("conversation:conversation:{double_prefix}"),
-                case_prefix,
-                format!("Conversation:{case_prefix}"),
-            ],
-        ).unwrap();
-        let aliases: i64 = store.connection.query_row(
-            &format!(
-                "{CHAT_IDENTITY_CTES} SELECT count(*) FROM conversation_aliases"
-            ),
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                params![
+                    account,
+                    extra_hyphen,
+                    double_prefix,
+                    format!("conversation:conversation:{double_prefix}"),
+                    case_prefix,
+                    format!("Conversation:{case_prefix}"),
+                ],
+            )
+            .unwrap();
+        let aliases: i64 = store
+            .connection
+            .query_row(
+                &format!("{CHAT_IDENTITY_CTES} SELECT count(*) FROM conversation_aliases"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(aliases, 0);
     }
 }

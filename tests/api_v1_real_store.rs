@@ -145,7 +145,10 @@ async fn aliased_search_paginates_by_saved_source_and_opens_its_original_message
         assert_eq!(hit["conversation"]["id"], current_id);
         assert_eq!(hit["conversation"]["title"], "Current title");
         let source = hit["matched_conversation_id"].as_str().unwrap();
-        assert!(seen.insert(source.to_owned()), "a saved hit must not repeat across pages");
+        assert!(
+            seen.insert(source.to_owned()),
+            "a saved hit must not repeat across pages"
+        );
         let (_, node) = saved.iter().find(|(id, _)| id == source).unwrap();
         assert_eq!(hit["node_id"], *node);
         assert_eq!(hit["leaf_node_id"], *node);
@@ -156,7 +159,10 @@ async fn aliased_search_paginates_by_saved_source_and_opens_its_original_message
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{detail}");
-        assert_eq!(detail["messages"][0]["content"], "identityneedle older-only text");
+        assert_eq!(
+            detail["messages"][0]["content"],
+            "identityneedle older-only text"
+        );
         if page == 0 {
             let cursor = result["next_cursor"].as_str().unwrap();
             uri = format!("/api/v1/chat/search?q=identityneedle&limit=1&cursor={cursor}");

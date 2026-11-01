@@ -383,19 +383,28 @@ mod tests {
         let mut store = Store::in_memory().unwrap();
         let current_scope = format!("chatgpt:observed:{}", "a".repeat(64));
         let uuid = "12345678-1234-4abc-8def-1234567890ab";
-        store.connection.execute(
-            "INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES
+        store
+            .connection
+            .execute(
+                "INSERT INTO conversations(id,title,provider,account_scope,source_id) VALUES
              ('direct','Current','chatgpt',?1,?2),
              ('cache-a','Archive A','paseo-chatgpt','paseo-cache:owner-a',?2),
              ('cache-b','Archive B','paseo-chatgpt','paseo-cache:owner-b',?3)",
-            params![current_scope, uuid, format!("conversation:{uuid}")],
-        ).unwrap();
+                params![current_scope, uuid, format!("conversation:{uuid}")],
+            )
+            .unwrap();
         for (key, name, id) in [
             ("current", "Current", "direct"),
             ("legacy-a", "Legacy A", "cache-a"),
             ("legacy-b", "Legacy B", "cache-b"),
         ] {
-            store.connection.execute("INSERT INTO tags(name_key,name) VALUES(?1,?2)", params![key, name]).unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO tags(name_key,name) VALUES(?1,?2)",
+                    params![key, name],
+                )
+                .unwrap();
             store.connection.execute(
                 "INSERT INTO target_tags(target_kind,target_id,name_key,ordinal) VALUES('conversation',?1,?2,0)",
                 params![id, key],
@@ -406,15 +415,15 @@ mod tests {
         let from_second_alias = store.target_tags("conversation", "cache-b").unwrap();
         assert_eq!(from_second_alias, from_first_alias);
 
-        store.set_target_tags(
-            "conversation",
-            "cache-a",
-            &["Kept".to_owned()],
-        ).unwrap();
+        store
+            .set_target_tags("conversation", "cache-a", &["Kept".to_owned()])
+            .unwrap();
         for id in ["direct", "cache-a", "cache-b"] {
             assert_eq!(store.target_tags("conversation", id).unwrap(), ["Kept"]);
         }
-        let page = store.tagged_targets_snapshot(Some("conversation"), "kept", 10, None).unwrap();
+        let page = store
+            .tagged_targets_snapshot(Some("conversation"), "kept", 10, None)
+            .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].target_id, "direct");
     }
