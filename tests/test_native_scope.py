@@ -15,6 +15,8 @@ class NativeScopeTests(unittest.TestCase):
                      '.github/workflows/check.yml', '.github/workflows/accept-native.yml',
                      'ci/actions/macos-native-build/action.yml',
                      'ci/actions/gha-artifact-upload/main.go',
+                     'crates/chat-hub-model/src/store.rs',
+                     'crates/chat-hub-formats/Cargo.toml',
                      'Cargo.lock', 'tests/native/launch.sh'):
             with self.subTest(path=path):
                 self.assertTrue(native_scope.requires_native([path]))

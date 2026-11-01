@@ -14,7 +14,6 @@ if root == repo or repo in root.parents:
 manifest = root / "src-tauri/Cargo.toml"
 root_manifest = root / "Cargo.toml"
 config = root / "src-tauri/tauri.conf.json"
-lock = root / "src-tauri/Cargo.lock"
 root_lock = root / "Cargo.lock"
 s = manifest.read_text()
 rs = root_manifest.read_text()
@@ -27,15 +26,10 @@ manifest.write_text(s)
 cfg = json.loads(config.read_text())
 cfg["version"] = version
 config.write_text(json.dumps(cfg, indent=2) + "\n")
-# Regenerate both workspace lockfiles in this disposable copy. Both packages
-# are path dependencies, so changing either version invalidates locked records.
-for lockfile in (root_lock, lock):
-    if not lockfile.is_file():
-        raise SystemExit(f"missing lockfile in disposable fixture: {lockfile}")
-    subprocess.run(["cargo", "generate-lockfile", "--offline", "--manifest-path", str(manifest)], check=True, stdout=subprocess.DEVNULL)
-    # One generation updates the selected workspace lock; keep the other
-    # lockfile coherent too where this repository maintains both.
-    break
+# Both app packages share one workspace lockfile. Stable leaf crate versions
+# remain independent when the disposable fixture changes the app version.
+if not root_lock.is_file():
+    raise SystemExit(f"missing workspace lockfile in disposable fixture: {root_lock}")
 subprocess.run(["cargo", "generate-lockfile", "--offline", "--manifest-path", str(root / "Cargo.toml")], check=True, stdout=subprocess.DEVNULL)
 # The subsequent production build validates the complete graph with --locked.
 # metadata without --no-deps downloads target-specific package metadata, so keep

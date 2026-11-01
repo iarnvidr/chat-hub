@@ -32,6 +32,8 @@ Set project and project rename open anchored hover controls, with keyboard focus
 
 ## Build and run
 
+The Rust packages share one Cargo workspace and root lockfile. Stable conversation/catalog types live in `crates/chat-hub-model`; bounded import parsing and transcript decoding live in `crates/chat-hub-formats`. Their versions are independent of app releases. See [workspace and compiled-output reuse](docs/workspace-builds.md) for the CI build layout and cache policy.
+
 Requires stable Rust, rustfmt, and Clippy.
 
 Install or update the Rust CLI locally:

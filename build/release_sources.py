@@ -14,7 +14,7 @@ EXCLUDED_DIRS = {".git", "target", ".tools", "__pycache__", ".pytest_cache", ".m
 
 def _source_files(root):
     """Enumerate allowlisted source inputs without following symlinks."""
-    roots = ["src", "src-tauri", "desktop-ui", "build", "ci/actions", ".github/workflows"]
+    roots = ["src", "src-tauri", "crates", "desktop-ui", "build", "ci/actions", ".github/workflows"]
     root_files = ["Cargo.toml", "Cargo.lock", "LICENSE", "NOTICE", "rust-toolchain", "rust-toolchain.toml", "rust-toolchain.yaml", "README.md"]
     candidates = set(root_files)
     for directory in roots:

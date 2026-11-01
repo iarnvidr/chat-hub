@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "src-tauri", "crates/chat-hub-model", "crates/chat-hub-formats"]
+default-members = [".", "crates/chat-hub-model", "crates/chat-hub-formats"]
+resolver = "2"
+
 [package]
 name = "chat-hub"
 version = "0.2.3"
@@ -12,6 +17,8 @@ name = "chat-hub"
 path = "src/main.rs"
 
 [dependencies]
+chat-hub-model = { path = "crates/chat-hub-model", version = "0.1.0" }
+chat-hub-formats = { path = "crates/chat-hub-formats", version = "0.1.0" }
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
