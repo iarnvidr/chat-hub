@@ -6,3 +6,7 @@ The original `checks --source .` and `linux-checks --source .` entrypoints remai
 registry access. GitHub uses `cached-checks` with a read-only protected-main compiler cache; the
 main-only `seed-linux-cache` entrypoint publishes only after a repeated leaf-crate build proves an
 sccache hit.
+The dedicated package keeps at most six versions after cleanup: the newest Linux/macOS
+entries plus recent fallbacks. Concurrent platform publishers may briefly add extra versions;
+each publish prunes again, and an uncertain listing or failed preflight deletion blocks that
+cache push rather than allowing history to keep growing. Cache retention never gates builds.

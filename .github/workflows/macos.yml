@@ -77,9 +77,6 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 60
-    concurrency:
-      group: chat-hub-sccache-macos-${{ github.repository }}
-      cancel-in-progress: false
     outputs:
       transport_digest: ${{ steps.native-build.outputs.digest }}
     permissions:

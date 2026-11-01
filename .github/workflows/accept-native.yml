@@ -34,9 +34,6 @@ jobs:
   native-build:
     runs-on: macos-15
     timeout-minutes: 60
-    concurrency:
-      group: chat-hub-sccache-macos-${{ github.repository }}
-      cancel-in-progress: false
     outputs:
       transport_digest: ${{ steps.native-build.outputs.digest }}
     permissions:
@@ -79,9 +76,6 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    concurrency:
-      group: chat-hub-sccache-linux-${{ github.repository }}
-      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -96,6 +90,7 @@ jobs:
           git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA" '+refs/heads/*:refs/remotes/origin/*'
           git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
       - name: Seed and verify Linux compiler cache on protected main
+        continue-on-error: true
         uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
         env:
           GH_TOKEN: ${{ github.token }}

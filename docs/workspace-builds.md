@@ -22,3 +22,13 @@ All builds, tests and packaging for this work run in GitHub Actions. The source 
 Changing core service code leaves stable leaf source and versions unchanged. Compatible compiler outputs can be reused; a changed leaf invalidates its dependents. The final app still needs linking, and release optimization can do additional work.
 
 Compiler caches and finished release artifacts serve different purposes. A cache speeds compilation and may be discarded or evicted; correctness checks must still pass when it is missing. The app/CLI artifacts and release evidence remain tied to their exact reviewed source and workflow run. A cached library is not evidence that a new source revision passed its required checks.
+
+## GitHub Actions compiler cache
+
+The hosted Linux and Apple Silicon builds use checksum-pinned sccache binaries. sccache stores compiler results rather than the complete Cargo target tree. Its object keys account for the compiler invocation, source, dependencies and build options. The outer cache bucket separates platform/SDK compatibility and does not invalidate all stable objects whenever the app version or lockfile changes.
+
+Protected-main builds publish a dedicated compiler-cache package in GHCR. Pull requests have package-read permission and restore only that main-authored cache into a fresh job directory. Registry credentials use temporary isolated configuration and are removed before Cargo runs. No Node action or Node runtime is introduced.
+
+Each runner's object cache is limited to 1 GiB. Publication checks the dedicated cache package's version capacity before pushing and targets six retained snapshots, protecting the newest Linux and macOS versions plus recent fallbacks. Concurrent publishers can briefly exceed that target; post-publication pruning removes extras. Uncertain listing or failed preflight pruning skips publication. Release packages and their evidence are outside this cleanup policy.
+
+The first PR can have no compatible main cache yet. The Linux job therefore also builds the two leaf crates, removes their Cargo outputs and repeats that build, requiring an increase in Rust compiler-cache hits. This verifies actual reuse within hosted CI. Cross-run restore/publication becomes exercised after a protected-main seed; cache statistics are recorded in workflow output and native job summaries.

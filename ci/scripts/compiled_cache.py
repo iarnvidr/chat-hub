@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -21,6 +22,19 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+
+try:
+    import cache_retention
+except ModuleNotFoundError as exc:
+    if exc.name != "cache_retention":
+        raise
+    retention_path = pathlib.Path(__file__).with_name("cache_retention.py")
+    retention_spec = importlib.util.spec_from_file_location("cache_retention", retention_path)
+    if retention_spec is None or retention_spec.loader is None:
+        raise ImportError("cache retention helper is unavailable") from exc
+    cache_retention = importlib.util.module_from_spec(retention_spec)
+    sys.modules[retention_spec.name] = cache_retention
+    retention_spec.loader.exec_module(cache_retention)
 
 
 SCHEMA = 1
@@ -137,10 +151,22 @@ def registry_image(repository: str) -> str:
 
 
 def cache_tag(contract: dict[str, object]) -> str:
-    compiler = contract["compiler"]
-    platform_id = re.sub(r"[^a-z0-9-]+", "-", compiler["platform_id"].lower()).strip("-")
-    target = re.sub(r"[^a-z0-9-]+", "-", str(contract["target"]).lower()).strip("-")
-    return f"cargo-sccache-v{SCHEMA}-{platform_id}-{target}"
+    compatibility = contract.get("compatibility")
+    if not isinstance(compatibility, dict) or not isinstance(compatibility.get("platform_id"), str):
+        raise CacheError("compiler cache platform metadata is missing")
+    platform_id = compatibility["platform_id"].lower()
+    if platform_id.startswith("macos-"):
+        platform = "macos"
+    elif platform_id.startswith("linux-"):
+        platform = "linux"
+    else:
+        raise CacheError("unsupported platform tag family")
+    # Keep stable, short OS prefixes for retention and hash the exact compiler
+    # compatibility contract so SDK/target changes remain distinct versions.
+    tag = f"{cache_retention.TAG_PREFIX}{platform}-{contract_key(contract)[:20]}"
+    if len(tag) > 128:
+        raise CacheError("compiler cache tag exceeds registry limit")
+    return tag
 
 
 def safe_append_env(path_text: str, values: dict[str, str]) -> None:
@@ -301,7 +327,7 @@ def set_up(args: argparse.Namespace) -> None:
         marker_path.write_text("enabled\n", encoding="ascii")
         marker_path.chmod(0o600)
         outcome = "ready; cache lookup follows"
-    except (OSError, CacheError, subprocess.SubprocessError) as exc:
+    except (OSError, CacheError, subprocess.SubprocessError, KeyError, TypeError) as exc:
         marker_path.unlink(missing_ok=True)
         state["enabled"] = False
         state["reason"] = str(exc)[:120]
@@ -335,7 +361,8 @@ def read_state(state_dir: pathlib.Path) -> dict[str, object]:
     return value
 
 
-def run_oras(oras: str, args: list[str], *, token: str | None = None, config: pathlib.Path) -> str:
+def run_oras(oras: str, args: list[str], *, token: str | None = None, config: pathlib.Path,
+             cwd: pathlib.Path | None = None) -> str:
     env = dict(os.environ)
     env.pop("GH_TOKEN", None)
     env["DOCKER_CONFIG"] = str(config)
@@ -345,13 +372,14 @@ def run_oras(oras: str, args: list[str], *, token: str | None = None, config: pa
     try:
         result = subprocess.run([oras, *args], input=(token + "\n") if token else None,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                env=env, timeout=300, check=True)
+                                env=env, timeout=300, check=True, cwd=cwd)
     except (OSError, subprocess.SubprocessError) as exc:
         raise CacheError("OCI cache operation failed") from exc
     return result.stdout
 
 
-def authenticate_and_call(oras: str, image: str, operation: list[str], summary: str | None) -> str:
+def authenticate_and_call(oras: str, image: str, operation: list[str], summary: str | None,
+                          *, cwd: pathlib.Path | None = None) -> str:
     token = os.environ.get("GH_TOKEN", "")
     actor = os.environ.get("GITHUB_ACTOR", "")
     if not token or not actor:
@@ -361,7 +389,7 @@ def authenticate_and_call(oras: str, image: str, operation: list[str], summary: 
         run_oras(oras, ["login", "ghcr.io", "--username", actor, "--password-stdin"],
                  token=token, config=config)
         try:
-            output = run_oras(oras, operation, config=config)
+            output = run_oras(oras, operation, config=config, cwd=cwd)
         finally:
             try:
                 run_oras(oras, ["logout", "ghcr.io"], config=config)
@@ -680,18 +708,30 @@ def publish_cache(args: argparse.Namespace) -> None:
         with tempfile.TemporaryDirectory(prefix="chat-hub-cache-publish-") as temp:
             bundle = pathlib.Path(temp) / "chat-hub-sccache-cache.tar.gz"
             cache_bytes = create_bundle(state, repository, bundle)
+            retention = cache_retention.preflight_publish(repository)
             image = str(state["image"])
             tag = str(state["tag"])
-            output = authenticate_and_call(args.oras, image,
+            oras = args.oras or state.get("oras")
+            if not isinstance(oras, str) or not oras:
+                raise CacheError("pinned ORAS client is unavailable")
+            output = authenticate_and_call(oras, image,
                 ["push", f"{image}:{tag}", "--artifact-type", "application/vnd.chat-hub.sccache-cache.v1",
                  "--annotation", f"org.opencontainers.image.revision={os.environ.get('GITHUB_SHA','')}",
+                 "--annotation", f"org.opencontainers.image.source=https://github.com/{repository.lower()}",
                  "chat-hub-sccache-cache.tar.gz:application/vnd.chat-hub.sccache-cache.v1.tar+gzip",
                  "--format", "json"],
-                args.summary)
+                args.summary, cwd=bundle.parent)
             digest_match = re.search(r"sha256:[a-f0-9]{64}", output)
-            outcome = f"published trusted-main cache ({cache_bytes} bytes; {digest_match.group(0) if digest_match else 'digest recorded by registry'})"
-    except (OSError, CacheError, tarfile.TarError, KeyError, TypeError):
-        outcome = "cache publish failed; required native build result remains unchanged"
+            try:
+                after_retention = cache_retention.prune_after_publish(repository)
+                retention_status = f"post-push versions {after_retention['remaining']}"
+            except cache_retention.RetentionError:
+                retention_status = "post-push cleanup pending; next publish is preflight-gated"
+            outcome = (f"published trusted-main cache ({cache_bytes} bytes; "
+                       f"preflight {retention['before']}→{retention['remaining']}; {retention_status}; "
+                       f"{digest_match.group(0) if digest_match else 'digest recorded by registry'})")
+    except (OSError, CacheError, cache_retention.RetentionError, tarfile.TarError, KeyError, TypeError):
+        outcome = "cache publish or safe-retention preflight failed; required native build result remains unchanged"
     write_summary(args.summary, outcome, contract if isinstance(contract, dict) else None)
 
 

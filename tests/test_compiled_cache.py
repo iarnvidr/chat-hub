@@ -1,10 +1,13 @@
 import io
+import importlib.util
 import json
+import os
 import pathlib
 import sys
 import tarfile
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -47,6 +50,53 @@ class CompiledCacheContractTests(unittest.TestCase):
         self.assertEqual(compiled_cache.rust_hits_from_stats(stats), 3)
         with self.assertRaises(compiled_cache.CacheError):
             compiled_cache.rust_hits_from_stats({"cache_hits": {"counts": {"Rust": "three"}}})
+
+    def test_tag_and_summary_use_compatibility_contract_shape(self):
+        tag = compiled_cache.cache_tag(self.contract)
+        self.assertRegex(tag, r"^cargo-sccache-v1-macos-[a-f0-9]{20}$")
+        self.assertLessEqual(len(tag), 128)
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            summary = root / "summary.md"
+            args = SimpleNamespace(root=str(root), platform="macos-arm64", platform_id="macos-15-arm64",
+                                   target="aarch64-apple-darwin", cache_dir=str(root / "cache"),
+                                   state_dir=str(root / "state"), github_env=None,
+                                   repository="example/chat-hub", summary=str(summary))
+            with mock.patch.dict("os.environ", {}, clear=True), \
+                 mock.patch.object(compiled_cache, "contract_for", return_value=self.contract), \
+                 mock.patch.object(compiled_cache, "install_sccache", return_value=root / "sccache"):
+                compiled_cache.set_up(args)
+            state = compiled_cache.read_state(pathlib.Path(args.state_dir))
+            self.assertTrue(state["enabled"])
+            self.assertRegex(state["tag"], r"^cargo-sccache-v1-macos-[a-f0-9]{20}$")
+            self.assertIn("Contract:", summary.read_text())
+
+    def test_prepare_and_report_summaries_remain_nonfatal_when_cache_setup_is_disabled(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            summary = root / "summary.md"
+            args = SimpleNamespace(root=str(root), platform="macos-arm64", platform_id="macos-15-arm64",
+                                   target="aarch64-apple-darwin", cache_dir=str(root / "cache"),
+                                   state_dir=str(root / "state"), github_env=None,
+                                   repository="example/chat-hub", summary=str(summary))
+            with mock.patch.dict("os.environ", {}, clear=True), \
+                 mock.patch.object(compiled_cache, "contract_for", side_effect=compiled_cache.CacheError("unavailable")):
+                compiled_cache.set_up(args)
+            state = compiled_cache.read_state(pathlib.Path(args.state_dir))
+            self.assertFalse(state["enabled"])
+            compiled_cache.report(SimpleNamespace(state_dir=args.state_dir, summary=str(summary)))
+            self.assertIn("without cache", summary.read_text())
+
+    def test_sibling_retention_import_works_under_isolated_module_loading(self):
+        path = ROOT / "ci/scripts/compiled_cache.py"
+        spec = importlib.util.spec_from_file_location("compiled_cache_isolated", path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        restricted_path = [entry for entry in sys.path if pathlib.Path(entry or ".").resolve() != path.parent]
+        with mock.patch.object(sys, "path", restricted_path), mock.patch.dict(sys.modules, {"cache_retention": None}):
+            spec.loader.exec_module(module)
+        self.assertEqual(module.cache_retention.platform_prefix("linux"), "cargo-sccache-v1-linux-")
 
 
 class CompiledCacheArchiveTests(unittest.TestCase):
@@ -149,6 +199,58 @@ class TrustedWriterTests(unittest.TestCase):
         self.assertIn("if: github.ref == 'refs/heads/main'", seed_job)
         self.assertIn("packages: write", seed_job)
         self.assertIn("seed-linux-cache", seed_job)
+
+    def test_dagger_removes_cache_secret_before_any_cargo_command(self):
+        dagger_source = (ROOT / "ci/dagger/check/main.go").read_text()
+        cargo_start = dagger_source.index('WithExec([]string{"cargo", "fmt"')
+        pull_secret_removal = dagger_source.index('.WithoutSecretVariable("GH_TOKEN")')
+        guard = dagger_source.index('test -z \\\"${GH_TOKEN+x}\\\"')
+        self.assertLess(pull_secret_removal, cargo_start)
+        self.assertLess(guard, cargo_start)
+        self.assertIn('.WithoutEnvVariable("GH_TOKEN")', dagger_source[pull_secret_removal:cargo_start])
+
+
+class CachePublisherTests(unittest.TestCase):
+    def test_linux_publish_uses_prepared_oras_and_staged_bundle_working_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            summary = root / "summary.md"
+            state = {
+                "enabled": True,
+                "repository": "example/chat-hub",
+                "contract": {"compatibility": {"schema": 1, "target": "x86_64-unknown-linux-gnu"},
+                             "provenance": {}},
+                "contract_key": "a" * 64,
+                "image": "ghcr.io/example/chat-hub-rust-cache-chat-hub",
+                "tag": "cargo-sccache-v1-linux-" + "b" * 20,
+                "oras": "/pinned/linux/oras",
+                "cache_dir": str(root / "cache"),
+            }
+            args = SimpleNamespace(state_dir=str(root / "state"), summary=str(summary), oras="")
+
+            def write_bundle(_state, _repository, destination):
+                destination.write_bytes(b"fixture archive")
+                return len(b"fixture archive")
+
+            def staged_push(oras, image, operation, _summary, *, cwd=None):
+                self.assertEqual(oras, state["oras"])
+                self.assertEqual(image, state["image"])
+                self.assertIsNotNone(cwd)
+                archive_ref = next(item for item in operation if item.startswith("chat-hub-sccache-cache.tar.gz:"))
+                self.assertTrue((cwd / archive_ref.split(":", 1)[0]).is_file())
+                return "sha256:" + "c" * 64
+
+            env = {"GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "push",
+                   "GITHUB_RUN_ID": "123", "GITHUB_REPOSITORY": "example/chat-hub", "GITHUB_SHA": "d" * 40}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(compiled_cache, "read_state", return_value=state), \
+                 mock.patch.object(compiled_cache, "report"), \
+                 mock.patch.object(compiled_cache, "create_bundle", side_effect=write_bundle), \
+                 mock.patch.object(compiled_cache.cache_retention, "preflight_publish", return_value={"before": 0, "deleted": 0, "remaining": 0}), \
+                 mock.patch.object(compiled_cache.cache_retention, "prune_after_publish", return_value={"before": 1, "deleted": 0, "remaining": 1}), \
+                 mock.patch.object(compiled_cache, "authenticate_and_call", side_effect=staged_push):
+                compiled_cache.publish_cache(args)
+            self.assertIn("published trusted-main cache", summary.read_text())
 
 
 if __name__ == "__main__":

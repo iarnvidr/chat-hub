@@ -154,6 +154,7 @@ func (m *ChatHubCi) linuxChecks(ctx context.Context, source *dagger.Directory, c
 		}
 		rust = rust.WithSecretVariable("GH_TOKEN", registryToken).
 			WithExec([]string{"python3", "ci/scripts/compiled_cache.py", "pull", "--state-dir", rustCacheState}).
+			WithoutSecretVariable("GH_TOKEN").
 			WithoutEnvVariable("GH_TOKEN")
 	}
 	if cacheMode != "off" {
@@ -162,6 +163,7 @@ func (m *ChatHubCi) linuxChecks(ctx context.Context, source *dagger.Directory, c
 			WithEnvVariable("CARGO_INCREMENTAL", "0")
 	}
 	rust = rust.
+		WithExec([]string{"sh", "-ec", "test -z \"${GH_TOKEN+x}\""}).
 		WithExec([]string{"cargo", "fmt", "--all", "--", "--check"}).
 		WithExec([]string{"cargo", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"}).
 		WithExec([]string{"cargo", "test", "--locked", "--all-targets"})
@@ -187,6 +189,7 @@ func (m *ChatHubCi) linuxChecks(ctx context.Context, source *dagger.Directory, c
 		}
 		published, err := rust.WithSecretVariable("GH_TOKEN", registryToken).
 			WithExec([]string{"python3", "ci/scripts/compiled_cache.py", "publish", "--state-dir", rustCacheState}).
+			WithoutSecretVariable("GH_TOKEN").
 			WithoutEnvVariable("GH_TOKEN").Stdout(ctx)
 		if err != nil {
 			return "", fmt.Errorf("publish Rust compiler cache: %w", err)
