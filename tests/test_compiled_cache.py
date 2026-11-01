@@ -58,6 +58,15 @@ class CompiledCacheContractTests(unittest.TestCase):
         installer_step = installer_step.split("    - name: Restore protected-main compiler cache\n", 1)[0]
         self.assertIn("      env:\n        GH_TOKEN: ${{ inputs.github-token }}\n", installer_step)
 
+    def test_composite_reuses_only_existing_pinned_oras_after_download_failure(self):
+        action = (ROOT / "ci/actions/cargo-sccache-cache/action.yml").read_text()
+        installer_step = action.split("    - name: Install pinned ORAS client\n", 1)[1]
+        installer_step = installer_step.split("    - name: Restore protected-main compiler cache\n", 1)[0]
+        self.assertIn('elif [[ -x "$RUNNER_TEMP/chat-hub-oras/oras" ]]', installer_step)
+        self.assertIn("grep -Eq '^Version:[[:space:]]+1\\.2\\.3([[:space:]]|$)'", installer_step)
+        self.assertIn('echo "path=$RUNNER_TEMP/chat-hub-oras/oras" >> "$GITHUB_OUTPUT"', installer_step)
+        self.assertIn('echo "path=" >> "$GITHUB_OUTPUT"', installer_step)
+
     def test_rustc_wrapper_preserves_hyphenated_cargo_env_and_exact_arguments(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
