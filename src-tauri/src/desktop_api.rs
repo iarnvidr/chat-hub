@@ -76,6 +76,7 @@ fn safe_import_api_code(body: &[u8]) -> String {
             | "payload_too_large"
             | "unsupported_media_type"
             | "service_unavailable"
+            | "busy"
             | "import_busy"
             | "unauthorized"
             | "forbidden"
@@ -92,6 +93,16 @@ fn sanitized_import_http_error(status: u16, body: &[u8]) -> String {
         "history_import_http_{status}_{}",
         safe_import_api_code(body)
     )
+}
+
+fn local_busy_retry_delay(elapsed: Duration, retry_after: Option<u64>) -> Option<Duration> {
+    let seconds = retry_after.unwrap_or(1).max(1);
+    if seconds > 30 {
+        return None;
+    }
+    let delay = Duration::from_secs(seconds);
+    (elapsed < Duration::from_secs(30) && elapsed.saturating_add(delay) <= Duration::from_secs(30))
+        .then_some(delay)
 }
 
 async fn bounded_error_body(response: &mut reqwest::Response) -> Option<Vec<u8>> {
@@ -158,20 +169,42 @@ async fn import_from(
             }
         })?;
     let u = url(base, &["api", "v1", "imports", source], &[])?;
-    let r = c
-        .post(u)
-        .bearer_auth(token)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(data)
-        .send()
-        .await
-        .map_err(|_| {
-            if source == "chatgpt-history" {
-                "history_import_transport_failed"
-            } else {
-                "Import may have partially completed. Retry the same file safely."
-            }
-        })?;
+    let mut busy_started = None;
+    let r = loop {
+        let response = c
+            .post(u.clone())
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(data.clone())
+            .send()
+            .await
+            .map_err(|_| {
+                if source == "chatgpt-history" {
+                    "history_import_transport_failed"
+                } else {
+                    "Import may have partially completed. Retry the same file safely."
+                }
+            })?;
+        if source != "chatgpt-history" || response.status().as_u16() != 503 {
+            break response;
+        }
+        let mut response = response;
+        let body = bounded_error_body(&mut response).await.unwrap_or_default();
+        if safe_import_api_code(&body) != "busy" {
+            return Err(sanitized_import_http_error(503, &body));
+        }
+        let started = *busy_started.get_or_insert_with(std::time::Instant::now);
+        let elapsed = started.elapsed();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let Some(delay) = local_busy_retry_delay(elapsed, retry_after) else {
+            return Err("history_import_http_503_busy".into());
+        };
+        tokio::time::sleep(delay).await;
+    };
     if !r.status().is_success() {
         if source == "chatgpt-history" {
             let status = r.status().as_u16();
@@ -908,10 +941,12 @@ pub async fn detail(
 
 #[cfg(test)]
 mod source_list_tests {
+    use std::time::Duration;
+
     use super::{
         catalog_url, conversation_state_url, list_url_for_scope, list_url_for_scope_and_tag,
-        list_url_for_scope_tag_archive, list_url_for_source, sanitized_import_http_error,
-        MAX_ERROR_RESPONSE,
+        list_url_for_scope_tag_archive, list_url_for_source, local_busy_retry_delay,
+        sanitized_import_http_error, MAX_ERROR_RESPONSE,
     };
 
     #[test]
@@ -1117,5 +1152,26 @@ mod source_list_tests {
             sanitized_import_http_error(400, &vec![b'x'; MAX_ERROR_RESPONSE + 1]),
             "history_import_http_400_unknown"
         );
+    }
+
+    #[test]
+    fn local_import_busy_retry_is_bounded_and_honors_retry_after() {
+        assert_eq!(
+            local_busy_retry_delay(Duration::ZERO, None),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            local_busy_retry_delay(Duration::from_secs(2), Some(10)),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            local_busy_retry_delay(Duration::from_secs(25), Some(10)),
+            None
+        );
+        assert_eq!(
+            local_busy_retry_delay(Duration::from_secs(31), Some(1)),
+            None
+        );
+        assert_eq!(local_busy_retry_delay(Duration::ZERO, Some(3600)), None);
     }
 }

@@ -149,6 +149,7 @@ fn safe_import_diagnostic(value: &str) -> Option<String> {
                 | "payload_too_large"
                 | "unsupported_media_type"
                 | "service_unavailable"
+                | "busy"
                 | "import_busy"
                 | "unauthorized"
                 | "forbidden"
@@ -760,6 +761,10 @@ mod tests {
         assert_eq!(
             safe_import_diagnostic("history_import_receipt_invalid").as_deref(),
             Some("history_import_receipt_invalid")
+        );
+        assert_eq!(
+            safe_import_diagnostic("history_import_http_503_busy").as_deref(),
+            Some("history_import_http_503_busy")
         );
         assert_eq!(
             safe_import_diagnostic("PRIVATE_TRANSCRIPT").as_deref(),

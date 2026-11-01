@@ -5,6 +5,7 @@
 - New chats appear immediately in the sidebar, with a pending state until a saved conversation is available. Starting a chat resets incompatible sidebar filters; assigned provider IDs persist across restart and reconcile only with the same verified account.
 - Captures the current ChatGPT `/backend-api/f/conversation` send route and bounded `delta_encoding: v1` streams. Completed captures preserve the prompt, response and conversation identity while removing resume-token credentials from the retained raw stream.
 - History imports keep valid chats and continue after item-level failures. Bulk project metadata skips missing same-account records without creating dangling links; diagnostics retain safe status codes for import failures.
+- A busy local library no longer drops a history batch: the same chunk retries within a bounded deadline. An unchanged ChatGPT pin refresh no longer invalidates the library index.
 
 ## 0.2.2 — release candidate
 
