@@ -43,6 +43,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      packages: read
     steps:
       - name: Fetch exact workflow revision
         run: |
@@ -51,15 +52,34 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           git -C "$GITHUB_WORKSPACE" fetch --no-tags origin "$GITHUB_SHA"
           git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+      - name: Restore read-only trusted-main Rust compiler cache
+        uses: ./ci/actions/cargo-sccache-cache
+        with:
+          mode: restore
+          github-token: ${{ github.token }}
+          platform-id: macos-15-arm64
+          platform: macos-arm64
+          target: aarch64-apple-darwin
       - id: native-build
         name: Build and smoke without package publication
         uses: ./ci/actions/macos-native-build
         with:
           publish-transport: 'false'
+      - name: Record compiler cache hits (no PR cache writes)
+        if: always()
+        uses: ./ci/actions/cargo-sccache-cache
+        with:
+          mode: report
+          platform-id: macos-15-arm64
+          platform: macos-arm64
+          target: aarch64-apple-darwin
   package-main:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 60
+    concurrency:
+      group: chat-hub-sccache-macos-${{ github.repository }}
+      cancel-in-progress: false
     outputs:
       transport_digest: ${{ steps.native-build.outputs.digest }}
     permissions:
@@ -75,11 +95,29 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA" '+refs/heads/*:refs/remotes/origin/*'
           git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+      - name: Restore trusted-main Rust compiler cache
+        uses: ./ci/actions/cargo-sccache-cache
+        with:
+          mode: restore
+          github-token: ${{ github.token }}
+          platform-id: macos-15-arm64
+          platform: macos-arm64
+          target: aarch64-apple-darwin
       - id: native-build
         name: Build, smoke, and publish trusted-main transport
         uses: ./ci/actions/macos-native-build
         with:
           publish-transport: 'true'
+      - name: Publish bounded Rust compiler cache for protected main
+        if: success()
+        continue-on-error: true
+        uses: ./ci/actions/cargo-sccache-cache
+        with:
+          mode: publish
+          github-token: ${{ github.token }}
+          platform-id: macos-15-arm64
+          platform: macos-arm64
+          target: aarch64-apple-darwin
   artifact-transfer:
     needs: package-main
     if: needs.package-main.result == 'success'
