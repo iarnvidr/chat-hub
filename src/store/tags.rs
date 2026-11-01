@@ -324,7 +324,13 @@ fn read_target_tags_for_ids(
     let json_ids = serde_json::to_string(target_ids)
         .map_err(|error| Error::Configuration(error.to_string()))?;
     let mut statement = connection.prepare(
-        "SELECT t.name FROM (SELECT x.name_key,min(CAST(ids.key AS INTEGER)) AS target_order,min(x.ordinal) AS tag_order FROM json_each(?1) ids JOIN target_tags x ON x.target_id=ids.value AND x.target_kind=?2 GROUP BY x.name_key) picked JOIN tags t ON t.name_key=picked.name_key ORDER BY picked.target_order,picked.tag_order,picked.name_key",
+        "WITH ranked AS (
+             SELECT x.name_key,CAST(ids.key AS INTEGER) AS target_order,x.ordinal,
+                    row_number() OVER (PARTITION BY x.name_key ORDER BY CAST(ids.key AS INTEGER),x.ordinal) AS tag_rank
+             FROM json_each(?1) ids JOIN target_tags x ON x.target_id=ids.value AND x.target_kind=?2
+         )
+         SELECT t.name FROM ranked JOIN tags t ON t.name_key=ranked.name_key
+         WHERE tag_rank=1 ORDER BY target_order,ordinal,ranked.name_key",
     )?;
     let names = statement
         .query_map(params![json_ids, target_kind], |row| row.get(0))?
@@ -409,8 +415,13 @@ mod tests {
                 params![id, key],
             ).unwrap();
         }
+        let sql = "INSERT INTO tags(name_key,name) VALUES('zeta','Zeta');
+             UPDATE target_tags SET ordinal=1 WHERE target_id='direct' AND name_key='current';
+             INSERT INTO target_tags(target_kind,target_id,name_key,ordinal) VALUES
+             ('conversation','direct','zeta',0),('conversation','cache-a','current',0);";
+        store.connection.execute_batch(sql).unwrap();
         let from_first_alias = store.target_tags("conversation", "cache-a").unwrap();
-        assert_eq!(from_first_alias, ["Current", "Legacy A", "Legacy B"]);
+        assert_eq!(from_first_alias, ["Zeta", "Current", "Legacy A", "Legacy B"]);
         let from_second_alias = store.target_tags("conversation", "cache-b").unwrap();
         assert_eq!(from_second_alias, from_first_alias);
 
