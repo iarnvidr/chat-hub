@@ -51,6 +51,57 @@ class CompiledCacheContractTests(unittest.TestCase):
         with self.assertRaises(compiled_cache.CacheError):
             compiled_cache.rust_hits_from_stats({"cache_hits": {"counts": {"Rust": "three"}}})
 
+    def test_rustc_wrapper_preserves_hyphenated_cargo_env_and_exact_arguments(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            wrapper = root / "rustc-cache-wrapper"
+            binary = root / "fake-sccache"
+            marker = root / "sccache-enabled"
+            binary.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "print(json.dumps({'args':sys.argv[1:],"
+                "'cargo_bin':os.environ.get('CARGO_BIN_EXE_chat-hub')}))\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o755)
+            marker.write_text("enabled\n", encoding="ascii")
+            compiled_cache.write_rustc_wrapper(wrapper, binary, marker)
+
+            compiler_args = ["/fixture/rustc", "--arg with spaces", 'quote"inside']
+            env = os.environ.copy()
+            env["CARGO_BIN_EXE_chat-hub"] = "/fixture/path with spaces/chat-hub"
+            result = subprocess.run([str(wrapper), *compiler_args], env=env,
+                                    check=True, capture_output=True, text=True)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["cargo_bin"], env["CARGO_BIN_EXE_chat-hub"])
+            self.assertEqual(payload["args"], compiler_args)
+
+    def test_rustc_wrapper_falls_back_to_compiler_without_cache_marker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            wrapper = root / "rustc-cache-wrapper"
+            compiler = root / "fake-rustc"
+            compiler.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "print(json.dumps({'args':sys.argv[1:],"
+                "'cargo_bin':os.environ.get('CARGO_BIN_EXE_chat-hub')}))\n",
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+            compiled_cache.write_rustc_wrapper(wrapper, root / "missing-sccache",
+                                                root / "missing-marker")
+
+            compiler_args = [str(compiler), "--crate-name", "chat-hub"]
+            env = os.environ.copy()
+            env["CARGO_BIN_EXE_chat-hub"] = "fixture-value"
+            result = subprocess.run([str(wrapper), *compiler_args], env=env,
+                                    check=True, capture_output=True, text=True)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["cargo_bin"], "fixture-value")
+            self.assertEqual(payload["args"], compiler_args[1:])
+
     def test_tag_and_summary_use_compatibility_contract_shape(self):
         tag = compiled_cache.cache_tag(self.contract)
         self.assertRegex(tag, r"^cargo-sccache-v1-macos-[a-f0-9]{20}$")

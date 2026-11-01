@@ -13,7 +13,6 @@ import pathlib
 import platform
 import re
 import shutil
-import shlex
 import stat
 import subprocess
 import sys
@@ -287,6 +286,32 @@ def install_linux_oras(destination: pathlib.Path) -> pathlib.Path:
     return binary
 
 
+def write_rustc_wrapper(wrapper_path: pathlib.Path, binary_path: pathlib.Path,
+                        marker_path: pathlib.Path) -> None:
+    """Write an exec-only wrapper that preserves Cargo's full environment.
+
+    Cargo exposes integration-test paths under names such as
+    ``CARGO_BIN_EXE_chat-hub``. POSIX shells may discard environment names
+    that are not shell identifiers, so the wrapper must not pass through a
+    shell before invoking sccache or rustc.
+    """
+    wrapper_path.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        f"binary = {str(binary_path)!r}\n"
+        f"marker = {str(marker_path)!r}\n"
+        "args = sys.argv[1:]\n"
+        "if not args:\n"
+        "    raise SystemExit('rustc cache wrapper received no compiler')\n"
+        "if os.path.isfile(marker) and os.access(binary, os.X_OK):\n"
+        "    os.execv(binary, [binary, *args])\n"
+        "os.execvp(args[0], args)\n",
+        encoding="utf-8",
+    )
+    wrapper_path.chmod(0o755)
+
+
 def set_up(args: argparse.Namespace) -> None:
     root = pathlib.Path(args.root).resolve()
     state_dir = pathlib.Path(args.state_dir).resolve()
@@ -298,13 +323,7 @@ def set_up(args: argparse.Namespace) -> None:
     wrapper_path = binary_dir / "rustc-cache-wrapper"
     marker_path = binary_dir / "sccache-enabled"
     marker_path.unlink(missing_ok=True)
-    wrapper_path.write_text(
-        "#!/bin/sh\n"
-        f"if [ -x {shlex.quote(str(binary_path))} ] && [ -f {shlex.quote(str(marker_path))} ]; then\n"
-        f"  exec {shlex.quote(str(binary_path))} \"$@\"\n"
-        "fi\n"
-        "exec \"$@\"\n", encoding="utf-8")
-    wrapper_path.chmod(0o755)
+    write_rustc_wrapper(wrapper_path, binary_path, marker_path)
     cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     state_file = state_dir / "state.json"
     state: dict[str, object] = {"enabled": False, "platform": args.platform,
