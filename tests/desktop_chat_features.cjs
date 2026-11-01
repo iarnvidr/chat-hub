@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 
 const root = path.resolve(__dirname, '..');
 const UUID = '123e4567-e89b-12d3-a456-426614174000';
+const LIVE_UUID = '223e4567-e89b-12d3-a456-426614174001';
 const SCOPE = 'chatgpt:observed:' + 'a'.repeat(64);
 const mime = {'.html':'text/html', '.js':'text/javascript', '.css':'text/css', '.json':'application/json'};
 const server = http.createServer((request, response) => {
@@ -27,8 +28,10 @@ const server = http.createServer((request, response) => {
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(({conversationId, scope}) => {
-      const summary = {id: `chatgpt:${conversationId}`, provider: 'chatgpt', account_scope: scope,
-        source_id: conversationId, title: 'Amber project notes', message_count: 2,
+      const capturedId = localStorage.getItem('fixture-capture-id') || conversationId;
+      window.__providerConversationId = localStorage.getItem('fixture-provider-id') || conversationId;
+      const summary = {id: `chatgpt:${capturedId}`, provider: 'chatgpt', account_scope: scope,
+        source_id: capturedId, title: 'Amber project notes', message_count: 2,
         project: {title: 'Chat Project'}};
       const detail = {
         conversation: {...summary}, selection: {selected_node_id: 'answer', thread_complete: true},
@@ -54,7 +57,7 @@ const server = http.createServer((request, response) => {
           if (args.query) return {items: queryHits, next_cursor: null, library_revision: 3};
           const isCodex = args.source === 'codex';
           const item = {...summary, id: isCodex ? 'codex:fixture' : summary.id,
-            provider: isCodex ? 'codex_local' : 'chatgpt', source_id: isCodex ? 'thread-fixture' : conversationId,
+            provider: isCodex ? 'codex_local' : 'chatgpt', source_id: isCodex ? 'thread-fixture' : capturedId,
             title: isCodex ? 'Codex fixture' : summary.title,
             project: {title: isCodex ? 'Codex Project' : 'Chat Project'}};
           return {items: [item], next_cursor: null, library_revision: 3};
@@ -69,7 +72,7 @@ const server = http.createServer((request, response) => {
         if (command === 'service_info') return {};
         if (command === 'chatgpt_history_status') return {state: 'idle'};
         if (command === 'get_chatgpt_connection') return {state: 'connected', account_scope: scope};
-        if (command === 'set_provider_view') return {state: 'ready', conversation_id: conversationId};
+        if (command === 'set_provider_view') return {state: 'ready', conversation_id: window.__providerConversationId};
         if (command === 'open_provider_conversation') return {state: 'ready'};
         return {};
       }};
@@ -112,8 +115,57 @@ const server = http.createServer((request, response) => {
     assert.equal(await page.locator('.search-match-count').innerText(), '2 matching messages');
     assert.equal(await page.locator('button.conversation-item strong mark').count(), 1);
     assert.equal(await page.locator('button.conversation-item .search-snippet mark').count(), 1);
+
+    // Starting a fresh live chat clears every library filter so its pending row
+    // is immediately visible, selected, and removable until the provider assigns an ID.
+    await page.evaluate(() => { window.__providerConversationId = null; });
+    await page.locator('#project-disclosure summary').click();
+    await page.locator('#project-options button[data-project-key="chat-project:key"]').click();
+    await page.locator('#tag-filter').evaluate(select => {
+      const option = document.createElement('option'); option.value = 'fixture-tag'; option.textContent = 'Fixture tag';
+      select.append(option); select.value = option.value; select.dispatchEvent(new Event('change', {bubbles: true}));
+    });
+    await page.locator('#show-archived').click();
+    assert.equal(await page.locator('#search').inputValue(), 'amber');
+    assert.equal(await page.locator('#project-filter').inputValue(), 'chat-project:key');
+    assert.equal(await page.locator('#tag-filter').inputValue(), 'fixture-tag');
+    assert.equal(await page.locator('#show-archived').getAttribute('aria-pressed'), 'true');
+    await page.locator('#show-chatgpt').click();
+    const pendingRow = page.locator('button.conversation-item.pending-conversation');
+    await pendingRow.waitFor({state: 'visible'});
+    assert.equal(await pendingRow.getAttribute('aria-label'), 'New ChatGPT conversation, not saved to the library yet');
+    assert.equal(await pendingRow.evaluate(node => node.classList.contains('selected')), true);
+    assert.equal(await page.locator('#search').inputValue(), '');
+    assert.equal(await page.locator('#project-filter').inputValue(), '');
+    assert.equal(await page.locator('#tag-filter').inputValue(), '');
+    assert.equal(await page.locator('#show-archived').getAttribute('aria-pressed'), 'false');
+    await page.locator('#provider-back').click();
+    await pendingRow.waitFor({state: 'visible'});
+    await page.locator('#conversation-tabs .conversation-tab.active .close-tab').click();
+    await pendingRow.waitFor({state: 'detached'});
+
+    // Once the live page reports an ID and observed account scope, the pending
+    // row survives restart; exact-scope history capture replaces it without a duplicate.
+    await page.evaluate(id => { window.__providerConversationId = id; }, LIVE_UUID);
+    await page.locator('#show-chatgpt').click();
+    await page.locator('button.conversation-item.pending-conversation').waitFor({state: 'visible'});
+    await page.waitForFunction(({key, id, scope}) => {
+      const rows = JSON.parse(localStorage.getItem(key) || '[]');
+      return rows.some(row => row.source_id === id && row.account_scope === scope);
+    }, {key: 'chat-hub.pending-chatgpt-conversations.v1', id: LIVE_UUID, scope: SCOPE});
+    await page.locator('#provider-back').click();
+    await page.evaluate(id => localStorage.setItem('fixture-provider-id', id), LIVE_UUID);
+    await page.reload();
+    await page.locator('button.conversation-item.pending-conversation').waitFor({state: 'visible'});
+    assert.equal(await page.locator('button.conversation-item.pending-conversation').count(), 1);
+    await page.evaluate(id => localStorage.setItem('fixture-capture-id', id), LIVE_UUID);
+    await page.reload();
+    await page.waitForFunction(id => [...document.querySelectorAll('button.conversation-item')]
+      .some(button => button.textContent.includes('Amber project notes') && !button.classList.contains('pending-conversation')), LIVE_UUID);
+    assert.equal(await page.locator('button.conversation-item.pending-conversation').count(), 0);
+    assert.equal(await page.locator('button.conversation-item').count(), 1);
     assert.deepEqual(errors, []);
-    console.log('PASS chat/codex sources, project filter, direct continuation, grouped search and highlights');
+    console.log('PASS chat/codex sources, project filter, direct continuation, grouped search, highlights and durable pending-chat reconciliation');
   } finally {
     await browser.close();
     await new Promise(resolve => server.close(resolve));
