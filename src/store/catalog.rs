@@ -2673,14 +2673,14 @@ fn catalog_project_filter_sql(alias: &str, parameter: &str) -> String {
 
 fn catalog_identity_ctes() -> String {
     format!(
-        "{CHAT_IDENTITY_CTES}, catalog_identity_chats AS (
+        "{CHAT_IDENTITY_CTES}, catalog_identity_chats_ranked AS (
             SELECT coalesce(current.catalog_id,c.catalog_id) AS catalog_id,
                    coalesce(ca.canonical_conversation_id,c.conversation_id) AS conversation_id,
-                   coalesce(current.provider,c.provider) AS provider,
-                   coalesce(current.account_scope,c.account_scope) AS account_scope,
-                   coalesce(current.source_id,c.source_id) AS source_id,
-                   coalesce(current.title,c.title) AS title,
-                   coalesce(current.updated_at_ms,c.updated_at_ms) AS updated_at_ms,
+                   coalesce(canonical.provider,current.provider,c.provider) AS provider,
+                   coalesce(canonical.account_scope,current.account_scope,c.account_scope) AS account_scope,
+                   coalesce(canonical.source_id,current.source_id,c.source_id) AS source_id,
+                   coalesce(canonical.title,current.title,c.title) AS title,
+                   coalesce(canonical.updated_at_ms,current.updated_at_ms,c.updated_at_ms) AS updated_at_ms,
                    ep.project_key AS effective_project_key,
                    CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name)
                         WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title)
@@ -2697,13 +2697,25 @@ fn catalog_identity_ctes() -> String {
                    coalesce(current.observed_ms,c.observed_ms) AS observed_ms,
                    coalesce(current.parser,c.parser) AS parser,
                    coalesce(current.completeness,c.completeness) AS completeness,
-                   coalesce(current.sample_bytes,c.sample_bytes) AS sample_bytes
+                   coalesce(current.sample_bytes,c.sample_bytes) AS sample_bytes,
+                   row_number() OVER (
+                       PARTITION BY coalesce(ca.canonical_conversation_id,c.conversation_id)
+                       ORDER BY CASE WHEN c.conversation_id=coalesce(ca.canonical_conversation_id,c.conversation_id) THEN 0 ELSE 1 END,
+                                c.updated_at_ms DESC NULLS LAST,c.catalog_id
+                   ) AS identity_rank
             FROM catalog_chats c
             LEFT JOIN conversation_aliases ca ON ca.legacy_conversation_id=c.conversation_id
             LEFT JOIN catalog_chats current ON current.conversation_id=ca.canonical_conversation_id
+            LEFT JOIN conversations canonical ON canonical.id=coalesce(ca.canonical_conversation_id,c.conversation_id)
             LEFT JOIN effective_projects ep ON ep.conversation_id=coalesce(ca.canonical_conversation_id,c.conversation_id)
             LEFT JOIN projects p ON p.project_key=ep.project_key
             WHERE ca.legacy_conversation_id IS NULL OR current.catalog_id IS NULL
+        ), catalog_identity_chats AS (
+            SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,
+                   effective_project_key,project_label,project_label_source,graph_node_count,message_count,
+                   branch_count,source_time,observed_ms,parser,completeness,sample_bytes
+            FROM catalog_identity_chats_ranked
+            WHERE identity_rank=1
         ), catalog_identity_sources AS (
             SELECT physical.catalog_id AS physical_catalog_id,
                    logical.catalog_id AS logical_catalog_id,
@@ -4075,6 +4087,76 @@ mod tests {
             Some("legacy-physical-node")
         );
         assert_eq!(reference.conversation_id, legacy_id);
+    }
+
+    #[test]
+    fn partial_catalog_index_uses_one_fallback_and_canonical_account_metadata() {
+        let mut store = Store::in_memory().unwrap();
+        let account_a = format!("chatgpt:observed:{}", "a".repeat(64));
+        let account_b = format!("chatgpt:observed:{}", "b".repeat(64));
+        let uuid_a = "12345678-1234-4abc-8def-1234567890ab";
+        let uuid_b = "87654321-4321-4abc-8def-1234567890ab";
+
+        let mut canonical_ids = Vec::new();
+        for (account, uuid, suffix) in [(&account_a, uuid_a, "a"), (&account_b, uuid_b, "b")] {
+            let canonical_id = ingest(
+                &mut store,
+                "chatgpt",
+                account,
+                uuid,
+                "Canonical chat",
+                vec![graph_node("root", None, "user", "Current")],
+                "complete",
+            );
+            canonical_ids.push(canonical_id);
+            for copy in ["first", "second"] {
+                ingest(
+                    &mut store,
+                    "paseo-chatgpt",
+                    &format!("paseo-cache:shared-{copy}"),
+                    &format!("conversation:{uuid}"),
+                    &format!("Archive {suffix} {copy}"),
+                    vec![graph_node(
+                        &format!("legacy-{suffix}-{copy}"),
+                        None,
+                        "user",
+                        "same shared repository topic",
+                    )],
+                    "cached_transcript",
+                );
+            }
+        }
+        store.rebuild_catalog_index().unwrap();
+
+        store
+            .connection
+            .execute(
+                "DELETE FROM catalog_chats WHERE conversation_id IN (?1,?2)",
+                params![canonical_ids[0], canonical_ids[1]],
+            )
+            .unwrap();
+
+        let logical_rows = read_chat_rows(&store.connection, "1=1", None, None, 20).unwrap();
+        assert_eq!(logical_rows.len(), 2);
+        assert!(logical_rows
+            .iter()
+            .any(|chat| chat.conversation_id == canonical_ids[0] && chat.account_scope == account_a));
+        assert!(logical_rows
+            .iter()
+            .any(|chat| chat.conversation_id == canonical_ids[1] && chat.account_scope == account_b));
+
+        let physical_sources_a: i64 = store
+            .connection
+            .query_row(
+                &format!(
+                    "{} SELECT count(*) FROM catalog_identity_sources WHERE logical_conversation_id=?1",
+                    catalog_identity_ctes()
+                ),
+                [&canonical_ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(physical_sources_a, 2);
     }
 
     fn ingest(

@@ -311,9 +311,8 @@ fn conversation_identity_ids(
     );
     ids.sort();
     ids.dedup();
-    if let Some(position) = ids.iter().position(|id| id == &canonical) {
-        ids.swap(0, position);
-    }
+    ids.retain(|id| id != &canonical);
+    ids.insert(0, canonical);
     Ok(ids)
 }
 
