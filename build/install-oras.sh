@@ -18,9 +18,28 @@ case "$(uname -s)/$(uname -m)" in
     ;;
 esac
 
+binary="$destination/oras"
+binary_digest_file="$destination/.oras.sha256"
+if [[ -x "$binary" && -f "$binary_digest_file" ]]; then
+  IFS= read -r recorded_digest < "$binary_digest_file" || recorded_digest=
+  if [[ "$recorded_digest" =~ ^[a-f0-9]{64}$ ]]; then
+    actual_digest="$(shasum -a 256 "$binary" | awk '{print $1}')"
+    if [[ "$actual_digest" == "$recorded_digest" ]] && \
+       "$binary" version 2>/dev/null | grep -Eq '^Version:[[:space:]]+1\.2\.3([[:space:]]|$)'; then
+      echo "$binary"
+      exit 0
+    fi
+  fi
+fi
+
 rm -f "$destination/$archive"
 gh release download v1.2.3 --repo oras-project/oras --pattern "$archive" --dir "$destination"
 (cd "$destination" && printf '%s  %s\n' "$expected" "$archive" | shasum -a 256 -c >&2)
 tar -xzf "$destination/$archive" -C "$destination" oras
-chmod 0755 "$destination/oras"
-echo "$destination/oras"
+chmod 0755 "$binary"
+binary_digest="$(shasum -a 256 "$binary" | awk '{print $1}')"
+[[ "$binary_digest" =~ ^[a-f0-9]{64}$ ]]
+printf '%s\n' "$binary_digest" > "$binary_digest_file"
+chmod 0600 "$binary_digest_file"
+"$binary" version 2>/dev/null | grep -Eq '^Version:[[:space:]]+1\.2\.3([[:space:]]|$)'
+echo "$binary"

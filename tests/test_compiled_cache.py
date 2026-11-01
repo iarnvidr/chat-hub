@@ -58,6 +58,27 @@ class CompiledCacheContractTests(unittest.TestCase):
         installer_step = installer_step.split("    - name: Restore protected-main compiler cache\n", 1)[0]
         self.assertIn("      env:\n        GH_TOKEN: ${{ inputs.github-token }}\n", installer_step)
 
+    def test_composite_retries_with_verified_shared_oras_and_passes_selected_path(self):
+        action = (ROOT / "ci/actions/cargo-sccache-cache/action.yml").read_text()
+        installer_step = action.split("    - name: Install pinned ORAS client\n", 1)[1]
+        installer_step = installer_step.split("    - name: Restore protected-main compiler cache\n", 1)[0]
+        self.assertIn('cache_dir="$RUNNER_TEMP/chat-hub-oras"', installer_step)
+        self.assertIn('shared_dir="$RUNNER_TEMP/oras"', installer_step)
+        self.assertIn('elif path="$(bash "$installer" "$shared_dir"', installer_step)
+        self.assertIn('echo "path=$path" >> "$GITHUB_OUTPUT"', installer_step)
+        self.assertIn('ORAS installer diagnostic (sanitized)', installer_step)
+        self.assertIn('echo "path=" >> "$GITHUB_OUTPUT"', installer_step)
+        self.assertIn('--oras "${{ steps.oras.outputs.path }}"', action)
+
+    def test_pinned_oras_installer_reuses_only_binary_matching_verified_digest(self):
+        installer = (ROOT / "build/install-oras.sh").read_text()
+        self.assertIn('binary_digest_file="$destination/.oras.sha256"', installer)
+        self.assertIn('actual_digest="$(shasum -a 256 "$binary" | awk', installer)
+        self.assertIn('[[ "$actual_digest" == "$recorded_digest" ]]', installer)
+        self.assertIn("grep -Eq '^Version:[[:space:]]+1\\.2\\.3([[:space:]]|$)'", installer)
+        self.assertLess(installer.index('shasum -a 256 -c'), installer.index('tar -xzf'))
+        self.assertLess(installer.index('tar -xzf'), installer.index('printf \'%s\\n\' "$binary_digest"'))
+
     def test_rustc_wrapper_preserves_hyphenated_cargo_env_and_exact_arguments(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)

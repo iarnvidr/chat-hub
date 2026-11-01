@@ -41,11 +41,36 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -u
-        if path="$(bash "$GITHUB_WORKSPACE/build/install-oras.sh" "$RUNNER_TEMP/chat-hub-oras" 2>/dev/null)"; then
+        installer="$GITHUB_WORKSPACE/build/install-oras.sh"
+        cache_dir="$RUNNER_TEMP/chat-hub-oras"
+        shared_dir="$RUNNER_TEMP/oras"
+        cache_error="$RUNNER_TEMP/chat-hub-oras-install.stderr"
+        shared_error="$RUNNER_TEMP/oras-install.stderr"
+        if path="$(bash "$installer" "$cache_dir" 2>"$cache_error")"; then
           echo "path=$path" >> "$GITHUB_OUTPUT"
+        elif path="$(bash "$installer" "$shared_dir" 2>"$shared_error")"; then
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "Reused the previously checksum-verified ORAS 1.2.3 binary from the package transport installer." >> "$GITHUB_STEP_SUMMARY"
         else
+          install_status=$?
           echo "path=" >> "$GITHUB_OUTPUT"
-          echo "Pinned ORAS unavailable; compile cache transfer will be skipped." >> "$GITHUB_STEP_SUMMARY"
+          echo "Pinned ORAS unavailable (cache destination and shared runner destination failed; final installer exit $install_status). Cache transfer will be skipped." >> "$GITHUB_STEP_SUMMARY"
+          python3 - "$cache_error" "$shared_error" <<'PY'
+        import os, re, sys
+        token = os.environ.get("GH_TOKEN", "")
+        lines = []
+        for name in sys.argv[1:]:
+            try:
+                value = open(name, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            if token:
+                value = value.replace(token, "[redacted]")
+            value = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", value)
+            value = re.sub(r"(?i)(token|access_token|authorization)=([^\s&]+)", r"\1=[redacted]", value)
+            lines.extend(line.strip() for line in value.splitlines() if line.strip())
+        print("ORAS installer diagnostic (sanitized): " + (" | ".join(lines[-3:])[:600] if lines else "(no stderr)"))
+        PY
         fi
     - name: Restore protected-main compiler cache
       if: ${{ inputs.mode == 'restore' }}
