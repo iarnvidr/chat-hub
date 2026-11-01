@@ -1,9 +1,9 @@
 //! SQLite-backed normalized conversation graph store.
 use crate::error::{Error, Result};
 pub use chat_hub_model::{
-    DetailSnapshot, GraphNode, IngestOutcome, LibrarySnapshot, ListKey, ListPageSnapshot, Observation,
-    PageScope, ProjectMembership, ProjectRenameSnapshot, ProjectSnapshot, ProjectTitle, SearchKey,
-    SearchPageSnapshot, SearchSnapshot, TagSnapshot, TaggedTargetSnapshot,
+    DetailSnapshot, GraphNode, IngestOutcome, LibrarySnapshot, ListKey, ListPageSnapshot,
+    Observation, PageScope, ProjectMembership, ProjectRenameSnapshot, ProjectSnapshot,
+    ProjectTitle, SearchKey, SearchPageSnapshot, SearchSnapshot, TagSnapshot, TaggedTargetSnapshot,
     TaggedTargetsPage,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};

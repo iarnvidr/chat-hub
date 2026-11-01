@@ -140,12 +140,9 @@ pub fn paseo_cached_transcript(doc: &Value) -> Option<PaseoCachedTranscript> {
             .ok()
             .filter(|value| value.is_finite())
             .or_else(|| {
-                time::OffsetDateTime::parse(
-                    updated,
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .ok()
-                .map(|value| value.unix_timestamp_nanos() as f64 / 1_000_000_000.0)
+                time::OffsetDateTime::parse(updated, &time::format_description::well_known::Rfc3339)
+                    .ok()
+                    .map(|value| value.unix_timestamp_nanos() as f64 / 1_000_000_000.0)
             });
         if let Some(value) = seconds.and_then(serde_json::Number::from_f64) {
             graph["update_time"] = Value::Number(value);
@@ -168,7 +165,12 @@ mod tests {
         assert_eq!(parse_export(br#"[{"id":"one"}]"#).unwrap().len(), 1);
         assert_eq!(parse_export(br#"{"conversations":[]}"#).unwrap().len(), 0);
         assert_eq!(parse_export(b"PK\x03\x04").unwrap_err().code, "invalid_request");
-        assert_eq!(read_input(vec![0; MAX_BYTES + 1].as_slice()).unwrap_err().code, "payload_too_large");
+        assert_eq!(
+            read_input(vec![0; MAX_BYTES + 1].as_slice())
+                .unwrap_err()
+                .code,
+            "payload_too_large"
+        );
         let entries = serde_json::to_vec(&vec![json!({}); MAX_ENTRIES + 1]).unwrap();
         assert_eq!(parse_export(&entries).unwrap_err().code, "invalid_request");
     }
@@ -179,8 +181,20 @@ mod tests {
             "text":"User: arbitrary text\nAssistant: not parsed as roles","updated":"1700000000"});
         let decoded = paseo_cached_transcript(&source).unwrap();
         assert_eq!(decoded.source, "chatgpt");
-        assert_eq!(decoded.graph["mapping"]["paseo-cached-transcript"]["message"]["author"]["role"], "archive");
-        assert_eq!(decoded.graph["mapping"]["paseo-cached-transcript"]["message"]["content"]["parts"][0], source["text"]);
-        assert!(paseo_cached_transcript(&json!({"kind":"conversation","source":"unknown","id":"x","text":"x"})).is_none());
+        assert_eq!(
+            decoded.graph["mapping"]["paseo-cached-transcript"]["message"]["author"]["role"],
+            "archive"
+        );
+        assert_eq!(
+            decoded.graph["mapping"]["paseo-cached-transcript"]["message"]["content"]["parts"][0],
+            source["text"]
+        );
+        assert!(paseo_cached_transcript(&json!({
+            "kind": "conversation",
+            "source": "unknown",
+            "id": "x",
+            "text": "x"
+        }))
+        .is_none());
     }
 }

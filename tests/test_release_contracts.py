@@ -99,6 +99,7 @@ class ReleaseContracts(unittest.TestCase):
                 "desktop-ui": ["index.html"], "build": ["build-native-macos.sh"],
                 "ci/actions/macos-native-build": ["action.yml"],
                 "ci/actions/gha-artifact-upload": ["action.yml", "main.go"],
+                "ci/scripts": ["compiled_cache.py"],
                 ".github/workflows": ["macos.yml", "accept-native.yml"],
             }.items():
                 for name in files:
@@ -125,6 +126,7 @@ class ReleaseContracts(unittest.TestCase):
                 "ci/actions/macos-native-build/action.yml",
                 "ci/actions/gha-artifact-upload/action.yml",
                 "ci/actions/gha-artifact-upload/main.go",
+                "ci/scripts/compiled_cache.py",
                 ".github/workflows/macos.yml", ".github/workflows/accept-native.yml",
                 "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
                 "LICENSE", "NOTICE",

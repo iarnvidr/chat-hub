@@ -13,6 +13,8 @@ The leaf crates have no dependency on the database, service, network or desktop.
 
 The default workspace members are the core and leaf crates. Linux core checks cover those members; Apple Silicon validation also covers the desktop. Formatting covers the complete workspace. Native packaging resolves its bundle under the workspace target directory, including a caller-supplied `CARGO_TARGET_DIR`.
 
+The workspace root owns the release profile. Its existing LTO, code-generation and stripping settings now apply to the desktop as well as the core; the hosted native package and smoke checks validate that resulting app.
+
 All builds, tests and packaging for this work run in GitHub Actions. The source extraction does not change import limits, ZIP rejection, transcript roles, database schema or data locations. Corresponding-source bundles include the new crates, and native-change scope detection includes `crates/**`.
 
 ## Reuse expectations
