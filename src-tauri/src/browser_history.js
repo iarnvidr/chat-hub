@@ -345,11 +345,12 @@
         const projectId = projectForId.get(item.id) || item.row.gizmo_id || graph.gizmo_id;
         if (validId(projectId)) pendingProjects.set(item.id, projectId);
       }
-      if (pending.length >= SOFT_COUNT || pendingBytes >= SOFT_EXPORT) {
-        await sendChunk(pending, pendingProjects); pending = []; pendingBytes = 0; pendingProjects = new Map();
+      // ACK each successful detail batch before making another provider request.
+      if (pending.length) {
+        await sendChunk(pending, pendingProjects);
+        pending = []; pendingBytes = 0; pendingProjects = new Map();
       }
     }
-    if (pending.length) await sendChunk(pending, pendingProjects);
   }
   async function run() {
     try {
@@ -374,14 +375,39 @@
       accountScope = 'chatgpt:observed:' + await sha256(JSON.stringify([
         'chatgpt-request-identity-v1', accountId, userId]));
       owner = (await sha256(accountId + ':' + claims.sub)).slice(0, 24);
-      // Use only visible same-origin project links already rendered by ChatGPT.
-      // This read-only fallback is acknowledged before any history API request;
-      // the authenticated sidebar response below remains canonical when present.
+      // Snapshot visible project labels now, but prioritize saving ordinary chats.
+      // Acknowledge them before the first provider API request so a list 429
+      // does not discard names already visible in the signed-in page.
       for (const [id, title] of visibleSidebarProjectTitles()) projectCatalog.set(id, title);
       await sendProjectCatalog();
-      // Project names are useful even when conversation listing is throttled.
-      // Read the authenticated sidebar first, persist only its bounded names,
-      // then continue with conversations and project membership enrichment.
+      state.stage = 'list';
+      const rows = new Map();
+      const activeRows = await pages('conversations', {offset: 0, limit: 100, order: 'updated',
+        is_archived: 'false', hide_snorlax: 'false'}, false, 'list');
+      for (const row of activeRows) {
+        const id = providerId(row);
+        if (id) rows.set(id, row);
+      }
+      state.listed = rows.size;
+      await deliverGraphs(rows, new Map());
+
+      // Commit active chats before archive or project endpoints can rate limit.
+      state.stage = 'list';
+      const archivedRows = await pages('conversations', {offset: 0, limit: 100, order: 'updated',
+        is_archived: 'true', hide_snorlax: 'false'}, false, 'list');
+      const newArchivedRows = new Map();
+      for (const row of archivedRows) {
+        const id = providerId(row);
+        if (id && !rows.has(id)) {
+          rows.set(id, row);
+          newArchivedRows.set(id, row);
+        }
+      }
+      state.listed = rows.size;
+      await deliverGraphs(newArchivedRows, new Map());
+
+      // Sidebar names and project membership are enrichment; ordinary active and
+      // archived conversation graphs have already been acknowledged locally.
       state.stage = 'project';
       const projects = await pages('gizmos/snorlax/sidebar', {
         conversations_per_gizmo: 0, limit: 20, owned_only: 'false'}, true, 'project');
@@ -392,18 +418,6 @@
         if (gizmo.title) projectCatalog.set(gizmo.id, gizmo.title);
       }
       if (JSON.stringify([...projectCatalog]) !== catalogBeforeApi) await sendProjectCatalog();
-      state.stage = 'list';
-      const rows = new Map();
-      for (const archived of [false, true]) {
-        const listed = await pages('conversations', {offset: 0, limit: 100, order: 'updated',
-          is_archived: String(archived), hide_snorlax: 'false'}, false, 'list');
-        for (const row of listed) {
-          const id = providerId(row);
-          if (id) rows.set(id, row);
-        }
-      }
-      state.listed = rows.size;
-      await deliverGraphs(rows, new Map());
       // Membership is supplemental. Sidebar titles were already acknowledged;
       // a later project-conversation 429 must not discard those names.
       state.stage = 'project';
