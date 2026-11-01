@@ -2475,7 +2475,7 @@ mod identity_tests {
 
     #[test]
     fn archive_aliases_fold_only_for_one_observed_account_and_current_archive_state_wins() {
-        let mut store = Store::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let account_a = format!("chatgpt:observed:{}", "a".repeat(64));
         let account_b = format!("chatgpt:observed:{}", "b".repeat(64));
         let shared_uuid = "12345678-1234-4abc-8def-1234567890ab";
@@ -2528,7 +2528,7 @@ mod identity_tests {
 
     #[test]
     fn project_facets_fold_only_overlapping_project_ids_and_keep_legacy_only_chats() {
-        let mut store = Store::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let account = format!("chatgpt:observed:{}", "c".repeat(64));
         let shared_uuid = "12345678-1234-4abc-8def-1234567890ab";
         let moved_uuid = "11111111-2222-4abc-8def-1234567890ab";
