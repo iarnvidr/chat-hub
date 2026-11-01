@@ -365,18 +365,20 @@ fn populated_backup_is_a_consistent_snapshot_during_wal_writes() {
             while !stop.load(Ordering::Acquire) {
                 seq += 1;
                 let title = format!("pair-{seq}");
-                writer
-                    .ingest_observation(&observation(
-                        "paired",
-                        &title,
-                        vec![node(
-                            "n",
-                            None,
-                            vec![json!(format!("wal snapshot marker revision-{seq}"))],
-                        )],
-                        Some("n"),
-                    ))
-                    .unwrap();
+                let mut update = observation(
+                    "paired",
+                    &title,
+                    vec![node(
+                        "n",
+                        None,
+                        vec![json!(format!("wal snapshot marker revision-{seq}"))],
+                    )],
+                    Some("n"),
+                );
+                // Every fixture write must be newer, including pair-10 after
+                // pair-9; equal timestamps intentionally use payload ordering.
+                update.observed_ms = 10 + i64::try_from(seq).unwrap();
+                writer.ingest_observation(&update).unwrap();
                 commits.fetch_add(1, Ordering::Release);
                 thread::yield_now();
             }
