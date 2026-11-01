@@ -8,6 +8,26 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  oras-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch exact workflow revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+      - name: Diagnose repeated pinned ORAS installation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 build/diagnose-oras-install.py "$GITHUB_WORKSPACE/build/install-oras.sh" "$RUNNER_TEMP/chat-hub-oras-diagnostic"
   scope:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
