@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+const MAX_ERROR_RESPONSE: usize = 4 * 1024;
 pub const MAX_IMPORT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_IMPORT_CONVERSATIONS: usize = 10_000;
 pub const MAX_IMPORT_ERRORS: usize = 100;
@@ -57,6 +58,63 @@ pub fn validate_receipt(r: &ImportReceipt, count: u64) -> Result<(), String> {
     }
     Ok(())
 }
+
+fn safe_import_api_code(body: &[u8]) -> String {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return "unknown".into();
+    };
+    let code = value
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str);
+    match code {
+        Some(
+            "invalid_request"
+            | "invalid_json"
+            | "invalid_export"
+            | "invalid_item"
+            | "too_many_conversations"
+            | "payload_too_large"
+            | "unsupported_media_type"
+            | "service_unavailable"
+            | "busy"
+            | "import_busy"
+            | "unauthorized"
+            | "forbidden"
+            | "internal_error"
+            | "store_failed"
+            | "response_too_large",
+        ) => code.unwrap_or("unknown").to_owned(),
+        _ => "unknown".into(),
+    }
+}
+
+fn sanitized_import_http_error(status: u16, body: &[u8]) -> String {
+    format!(
+        "history_import_http_{status}_{}",
+        safe_import_api_code(body)
+    )
+}
+
+fn local_busy_retry_delay(elapsed: Duration, retry_after: Option<u64>) -> Option<Duration> {
+    let seconds = retry_after.unwrap_or(1).max(1);
+    if seconds > 30 {
+        return None;
+    }
+    let delay = Duration::from_secs(seconds);
+    (elapsed < Duration::from_secs(30) && elapsed.saturating_add(delay) <= Duration::from_secs(30))
+        .then_some(delay)
+}
+
+async fn bounded_error_body(response: &mut reqwest::Response) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().saturating_add(chunk.len()) > MAX_ERROR_RESPONSE {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
+}
 pub async fn import(
     base: &str,
     token: &str,
@@ -103,29 +161,92 @@ async fn import_from(
             },
         ))
         .build()
-        .map_err(|_| "Desktop API unavailable")?;
+        .map_err(|_| {
+            if source == "chatgpt-history" {
+                "history_import_client_unavailable"
+            } else {
+                "Desktop API unavailable"
+            }
+        })?;
     let u = url(base, &["api", "v1", "imports", source], &[])?;
-    let r = c
-        .post(u)
-        .bearer_auth(token)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(data)
-        .send()
-        .await
-        .map_err(|_| "Import may have partially completed. Retry the same file safely.")?;
+    let mut busy_started = None;
+    let r = loop {
+        let response = c
+            .post(u.clone())
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(data.clone())
+            .send()
+            .await
+            .map_err(|_| {
+                if source == "chatgpt-history" {
+                    "history_import_transport_failed"
+                } else {
+                    "Import may have partially completed. Retry the same file safely."
+                }
+            })?;
+        if source != "chatgpt-history" || response.status().as_u16() != 503 {
+            break response;
+        }
+        let mut response = response;
+        let body = bounded_error_body(&mut response).await.unwrap_or_default();
+        if safe_import_api_code(&body) != "busy" {
+            return Err(sanitized_import_http_error(503, &body));
+        }
+        let started = *busy_started.get_or_insert_with(std::time::Instant::now);
+        let elapsed = started.elapsed();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let Some(delay) = local_busy_retry_delay(elapsed, retry_after) else {
+            return Err("history_import_http_503_busy".into());
+        };
+        tokio::time::sleep(delay).await;
+    };
     if !r.status().is_success() {
+        if source == "chatgpt-history" {
+            let status = r.status().as_u16();
+            let mut response = r;
+            let body = bounded_error_body(&mut response).await;
+            let code = body.as_deref().unwrap_or_default();
+            return Err(sanitized_import_http_error(status, code));
+        }
         return Err("Desktop API unavailable".into());
     }
     let mut body = Vec::new();
     let mut response = r;
-    while let Some(chunk) = response.chunk().await.map_err(|_| "invalid_response")? {
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        if source == "chatgpt-history" {
+            "history_import_response_read_failed"
+        } else {
+            "invalid_response"
+        }
+    })? {
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE {
-            return Err("response_too_large".into());
+            return Err(if source == "chatgpt-history" {
+                "history_import_response_too_large".into()
+            } else {
+                "response_too_large".into()
+            });
         }
         body.extend_from_slice(&chunk);
     }
-    let receipt: ImportReceipt = serde_json::from_slice(&body).map_err(|_| "invalid_response")?;
-    validate_receipt(&receipt, count)?;
+    let receipt: ImportReceipt = serde_json::from_slice(&body).map_err(|_| {
+        if source == "chatgpt-history" {
+            "history_import_receipt_invalid"
+        } else {
+            "invalid_response"
+        }
+    })?;
+    validate_receipt(&receipt, count).map_err(|_| {
+        if source == "chatgpt-history" {
+            "history_import_receipt_invalid"
+        } else {
+            "invalid_response"
+        }
+    })?;
     Ok(receipt)
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -820,9 +941,12 @@ pub async fn detail(
 
 #[cfg(test)]
 mod source_list_tests {
+    use std::time::Duration;
+
     use super::{
         catalog_url, conversation_state_url, list_url_for_scope, list_url_for_scope_and_tag,
-        list_url_for_scope_tag_archive, list_url_for_source,
+        list_url_for_scope_tag_archive, list_url_for_source, local_busy_retry_delay,
+        sanitized_import_http_error, MAX_ERROR_RESPONSE,
     };
 
     #[test]
@@ -1007,5 +1131,47 @@ mod source_list_tests {
         assert_eq!(endpoint.path(), format!("/api/v1/conversations/{id}/state"));
         assert!(conversation_state_url("http://127.0.0.1:8000", "").is_err());
         assert!(conversation_state_url("http://127.0.0.1:8000", &"x".repeat(1025)).is_err());
+    }
+
+    #[test]
+    fn history_import_http_diagnostic_keeps_only_status_and_allowlisted_code() {
+        let error = sanitized_import_http_error(
+            400,
+            br#"{"error":{"code":"invalid_request","message":"PRIVATE_TRANSCRIPT text"}}"#,
+        );
+        assert_eq!(error, "history_import_http_400_invalid_request");
+        assert!(!error.contains("PRIVATE_TRANSCRIPT"));
+        assert_eq!(
+            sanitized_import_http_error(
+                422,
+                br#"{"error":{"code":"private_secret","message":"PRIVATE_TRANSCRIPT"}}"#
+            ),
+            "history_import_http_422_unknown"
+        );
+        assert_eq!(
+            sanitized_import_http_error(400, &vec![b'x'; MAX_ERROR_RESPONSE + 1]),
+            "history_import_http_400_unknown"
+        );
+    }
+
+    #[test]
+    fn local_import_busy_retry_is_bounded_and_honors_retry_after() {
+        assert_eq!(
+            local_busy_retry_delay(Duration::ZERO, None),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            local_busy_retry_delay(Duration::from_secs(2), Some(10)),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            local_busy_retry_delay(Duration::from_secs(25), Some(10)),
+            None
+        );
+        assert_eq!(
+            local_busy_retry_delay(Duration::from_secs(31), Some(1)),
+            None
+        );
+        assert_eq!(local_busy_retry_delay(Duration::ZERO, Some(3600)), None);
     }
 }

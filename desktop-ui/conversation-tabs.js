@@ -9,7 +9,7 @@ export function findCapturedChatRecord(items, sourceConversationId, accountScope
   return matches.length === 1 ? {...matches[0]} : null;
 }
 
-export function createConversationTabs({container, onSelect, onEmpty, doc=globalThis.document}) {
+export function createConversationTabs({container, onSelect, onEmpty, onClose=()=>{}, doc=globalThis.document}) {
   const tabs = new Map();
   let selected = null;
   function render(focusSelected = false) {
@@ -55,7 +55,9 @@ export function createConversationTabs({container, onSelect, onEmpty, doc=global
     const ids = [...tabs.keys()], index = ids.indexOf(id);
     if (index < 0) return false;
     const wasSelected = selected === id;
+    const closing={...tabs.get(id)};
     tabs.delete(id);
+    onClose(closing);
     if (wasSelected) {
       selected = ids[index + 1] || ids[index - 1] || null;
       if (selected) onSelect({...tabs.get(selected)}); else onEmpty();

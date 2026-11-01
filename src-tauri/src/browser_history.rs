@@ -123,6 +123,46 @@ fn lower_hex(value: &str, exact_len: usize) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn safe_import_diagnostic(value: &str) -> Option<String> {
+    if matches!(
+        value,
+        "history_import_client_unavailable"
+            | "history_import_transport_failed"
+            | "history_import_response_read_failed"
+            | "history_import_response_too_large"
+            | "history_import_receipt_invalid"
+    ) {
+        return Some(value.to_owned());
+    }
+    let rest = value.strip_prefix("history_import_http_")?;
+    let (status, code) = rest.split_once('_')?;
+    let status = status.parse::<u16>().ok()?;
+    if !(400..=599).contains(&status)
+        || !matches!(
+            code,
+            "unknown"
+                | "invalid_request"
+                | "invalid_json"
+                | "invalid_export"
+                | "invalid_item"
+                | "too_many_conversations"
+                | "payload_too_large"
+                | "unsupported_media_type"
+                | "service_unavailable"
+                | "busy"
+                | "import_busy"
+                | "unauthorized"
+                | "forbidden"
+                | "internal_error"
+                | "store_failed"
+                | "response_too_large"
+        )
+    {
+        return None;
+    }
+    Some(format!("history_import_http_{status}_{code}"))
+}
+
 fn validate_chunk(value: &Value) -> Result<ChunkMeta, String> {
     const FIELDS: &[&str] = &[
         "sequence",
@@ -624,10 +664,11 @@ pub fn run(
                 std::thread::sleep(POLL_PAUSE);
                 continue;
             }
-            if on_chunk(&bytes, meta.conversations as u64).is_err() {
+            if let Err(error) = on_chunk(&bytes, meta.conversations as u64) {
                 set_cancelled(&view, &key_json);
                 cleanup(&view, &key_json);
-                return Err("browser_history_import_failed".into());
+                return Err(safe_import_diagnostic(&error)
+                    .unwrap_or_else(|| "browser_history_import_failed".into()));
             }
             imported_conversations =
                 match imported_conversations.checked_add(meta.conversations as u64) {
@@ -678,8 +719,8 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_chunk, parse_bool_callback, parse_callback, validate_chunk, validate_status_shape,
-        AckedChunk, ChunkAction, MAX_CALLBACK_BYTES,
+        classify_chunk, parse_bool_callback, parse_callback, safe_import_diagnostic,
+        validate_chunk, validate_status_shape, AckedChunk, ChunkAction, MAX_CALLBACK_BYTES,
     };
     use ring::digest::{digest, SHA256};
     use serde_json::{json, Value};
@@ -709,6 +750,30 @@ mod tests {
         assert_eq!(parse_bool_callback("true"), Some(true));
         assert_eq!(parse_bool_callback(r#""false""#), Some(false));
         assert_eq!(parse_bool_callback("null"), None);
+    }
+
+    #[test]
+    fn callback_import_failure_preserves_only_safe_diagnostic_codes() {
+        assert_eq!(
+            safe_import_diagnostic("history_import_http_400_invalid_request").as_deref(),
+            Some("history_import_http_400_invalid_request")
+        );
+        assert_eq!(
+            safe_import_diagnostic("history_import_receipt_invalid").as_deref(),
+            Some("history_import_receipt_invalid")
+        );
+        assert_eq!(
+            safe_import_diagnostic("history_import_http_503_busy").as_deref(),
+            Some("history_import_http_503_busy")
+        );
+        assert_eq!(
+            safe_import_diagnostic("PRIVATE_TRANSCRIPT").as_deref(),
+            None
+        );
+        assert_eq!(
+            safe_import_diagnostic("history_import_http_400_private_secret").as_deref(),
+            None
+        );
     }
 
     #[test]

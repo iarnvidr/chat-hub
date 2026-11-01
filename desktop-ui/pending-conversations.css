@@ -1,0 +1,10 @@
+.conversation-item.pending-conversation {
+  border: 1px dashed color-mix(in srgb, var(--accent, #dfad54) 42%, transparent);
+  background: color-mix(in srgb, var(--surface, #171612) 84%, var(--accent, #dfad54));
+}
+.pending-conversation .pending-conversation-status,
+.conversation-item.pending-conversation > span {
+  color: var(--muted, #b8ac91);
+  font: 10px var(--mono, monospace);
+  letter-spacing: .02em;
+}

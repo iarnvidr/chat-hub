@@ -294,11 +294,6 @@ impl Store {
         )?;
 
         let cache_id = "lower(CASE WHEN substr(c.source_id,1,13)='conversation:' THEN substr(c.source_id,14) ELSE c.source_id END)";
-        changed += tx.execute(
-            "UPDATE conversation_local_state SET pinned=0,updated_at_ms=?2 WHERE pinned=1 AND pinned_scope=?1 AND conversation_id IN (SELECT c.id FROM conversations c WHERE c.provider='paseo-chatgpt' AND c.account_scope LIKE 'paseo-cache:%')",
-            params![receipt.scope, now],
-        )?;
-
         let has_direct_sql = format!(
             "SELECT EXISTS(SELECT 1 FROM conversations c WHERE c.provider='chatgpt' AND c.account_scope=?2 AND {direct_id}=?1)"
         );
@@ -308,6 +303,14 @@ impl Store {
         let upsert_cached_sql = "INSERT INTO conversation_local_state(conversation_id,pinned,archived,pinned_scope,updated_at_ms) VALUES(?1,1,coalesce((SELECT archived FROM conversation_local_state WHERE conversation_id=?1),0),?2,?3) ON CONFLICT(conversation_id) DO UPDATE SET pinned=1,pinned_scope=excluded.pinned_scope,updated_at_ms=excluded.updated_at_ms WHERE pinned<>1 OR pinned_scope IS NOT excluded.pinned_scope";
         let mut matched_count = direct_matched;
         let mut unknown_count = 0_usize;
+        // Keep unchanged, uniquely matched legacy pins in place. Clear only rows
+        // absent from this complete snapshot or made ambiguous by duplicate IDs.
+        changed += tx.execute(
+            &format!(
+                "UPDATE conversation_local_state SET pinned=0,updated_at_ms=?3 WHERE pinned=1 AND pinned_scope=?1 AND conversation_id IN (SELECT c.id FROM conversations c WHERE c.provider='paseo-chatgpt' AND c.account_scope LIKE 'paseo-cache:%') AND NOT EXISTS(SELECT 1 FROM conversations c JOIN json_each(?2) ids ON ids.value={cache_id} WHERE c.id=conversation_local_state.conversation_id AND (SELECT count(*) FROM conversations matched WHERE matched.provider='paseo-chatgpt' AND matched.account_scope LIKE 'paseo-cache:%' AND lower(CASE WHEN substr(matched.source_id,1,13)='conversation:' THEN substr(matched.source_id,14) ELSE matched.source_id END)=ids.value)=1)"
+            ),
+            params![receipt.scope, ids_json, now],
+        )?;
         {
             let mut direct = tx.prepare(&has_direct_sql)?;
             let mut cached = tx.prepare(&cached_rows_sql)?;
@@ -474,6 +477,11 @@ mod tests {
         assert!(pinned(&store, "other-account"));
         assert!(pinned(&store, "legacy-c"));
         assert!(pinned(&store, "legacy-d"));
+
+        let repeated = store
+            .apply_verified_chatgpt_pin_snapshot(&receipt(SCOPE_A, true, &[ID_A, ID_C]))
+            .unwrap();
+        assert_eq!(repeated.library_revision, result.library_revision);
 
         store
             .apply_verified_chatgpt_pin_snapshot(&receipt(SCOPE_A, true, &[]))

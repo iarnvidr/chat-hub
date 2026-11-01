@@ -66,6 +66,37 @@ fn fetched_graph_and_live_snapshot_share_account_identity_without_losing_branche
 }
 
 #[test]
+fn failed_graph_does_not_discard_valid_chunk_or_block_other_project_mappings() {
+    let mut store = Store::in_memory().unwrap();
+    let scope = format!("chatgpt:observed:{}", "c".repeat(64));
+    let good = graph();
+    let good_id = good["id"].as_str().unwrap();
+    let bad_id = "broken-conversation";
+    let body = json!({
+        "format":"chat-hub-history-v1",
+        "account_scope":scope,
+        "conversations":[
+            good,
+            {"id":bad_id,"conversation_id":bad_id,"mapping":"malformed"}
+        ],
+        "project_catalog":[{"id":"project-1","title":"Project one"}],
+        "conversation_projects":[
+            {"conversation_id":good_id,"project_id":"project-1"},
+            {"conversation_id":bad_id,"project_id":"project-1"}
+        ]
+    });
+
+    let receipt =
+        importer::import_chatgpt_history(&mut store, &serde_json::to_vec(&body).unwrap()).unwrap();
+    assert_eq!(receipt.imported, 1);
+    assert_eq!(receipt.failed, 1);
+    let projects = store.projects_snapshot("chatgpt").unwrap();
+    assert_eq!(projects.projects.len(), 1);
+    assert_eq!(projects.projects[0]["conversation_count"], 1);
+    assert!(store.read(bad_id).unwrap().is_none());
+}
+
+#[test]
 fn direct_accounts_are_isolated_and_generic_files_cannot_select_their_scope() {
     let mut store = Store::in_memory().unwrap();
     let doc = graph();
