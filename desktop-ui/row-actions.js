@@ -12,6 +12,37 @@ export function actionError(error) {
   return 'This change could not be confirmed with ChatGPT. Try again.';
 }
 
+const observedChatgptScope = value => typeof value === 'string' && /^chatgpt:observed:[0-9a-f]{64}$/.test(value);
+
+function chatgptProjectIdentity(projectKey) {
+  if (typeof projectKey !== 'string' || !projectKey.startsWith('project:')) return null;
+  try {
+    const parts = JSON.parse(projectKey.slice('project:'.length));
+    if (!Array.isArray(parts) || parts.length !== 3) return null;
+    const [provider, accountScope, projectId] = parts;
+    if (!['chatgpt', 'paseo-chatgpt'].includes(provider) ||
+        typeof accountScope !== 'string' ||
+        !(observedChatgptScope(accountScope) || /^paseo-cache:[A-Za-z0-9:_-]{1,256}$/.test(accountScope)) ||
+        typeof projectId !== 'string' || !/^g-p-[A-Za-z0-9_-]{1,128}$/.test(projectId)) return null;
+    return {provider, accountScope, projectId};
+  } catch {
+    return null;
+  }
+}
+
+function projectPickerScope(chat) {
+  if (observedChatgptScope(chat?.account_scope)) return chat.account_scope;
+  if (!['chatgpt', 'paseo-chatgpt'].includes(chat?.provider) ||
+      typeof chat.account_scope !== 'string' || !/^paseo-cache:[A-Za-z0-9:_-]{1,256}$/.test(chat.account_scope)) return null;
+  const currentProject = chatgptProjectIdentity(chat.project?.project_key);
+  if (currentProject?.provider === 'chatgpt' && observedChatgptScope(currentProject.accountScope) &&
+      (typeof chat.project.project_id !== 'string' || chat.project.project_id === currentProject.projectId) &&
+      (typeof chat.project.account_scope !== 'string' || chat.project.account_scope === currentProject.accountScope)) {
+    return currentProject.accountScope;
+  }
+  return chat.account_scope;
+}
+
 export function createRowActions({invoke,onChanged=()=>{},doc=document,win=window}) {
   const paths={pin:'M12 17v5M8 3h8v6l3 4v3H5v-3l3-4V3Z',more:'M5 12h.01M12 12h.01M19 12h.01',folder:'M3 7V4h6l3 3h9v13H3V7Z',archive:'M3 4h18v4H3zM5 8v12h14V8M10 12h4',tag:'M20 13l-7 7L3 10V3h7l10 10ZM7 7h.01',link:'M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-2 2M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l2-2',back:'m14 5-7 7 7 7',check:'m5 12 4 4L19 6'};
   const node=(tag,text,cls)=>{const n=doc.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
@@ -81,16 +112,17 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
       menu.querySelector('.thread-menu-status')?.remove();
       const search=node('input');search.type='search';search.placeholder='Find a project…';search.setAttribute('aria-label','Find a project');search.className='thread-project-search';menu.append(search);
       const list=node('div',undefined,'thread-project-options');menu.append(list);
-       const choices=[{project_key:null,display_name:'No project'},...result.projects.filter(project=>{
-         try{
-           const parts=JSON.parse(String(project.project_key||'').slice('project:'.length));
-           return String(project.project_key||'').startsWith('project:') &&
-             ['chatgpt','paseo-chatgpt'].includes(parts?.[0]) &&
-             (parts?.[0]===chat.provider || (parts?.[0]==='paseo-chatgpt'&&chat.provider==='chatgpt')) &&
-             typeof parts?.[1]==='string' && parts[1]!=='' && typeof parts?.[2]==='string' && parts[2]!=='' &&
-             (typeof chat.account_scope!=='string' || !chat.account_scope || parts[1]===chat.account_scope || project.account_scope===chat.account_scope);
-         }catch{return false;}
-       })];
+        const pickerScope=projectPickerScope(chat);
+        const choices=[{project_key:null,display_name:'No project'},...result.projects.filter(project=>{
+          const identity=chatgptProjectIdentity(project?.project_key);
+          if(!identity||!pickerScope)return false;
+          const compatibleProvider=observedChatgptScope(identity.accountScope)
+            ? identity.provider==='chatgpt'||(identity.provider==='paseo-chatgpt'&&chat.provider==='chatgpt')
+            : /^paseo-cache:/.test(identity.accountScope)&&identity.provider==='paseo-chatgpt'&&['chatgpt','paseo-chatgpt'].includes(chat.provider);
+          if(!compatibleProvider)return false;
+          if(identity.accountScope!==pickerScope)return false;
+          return typeof project.account_scope!=='string'||project.account_scope===identity.accountScope;
+        })];
       function draw(){
         list.replaceChildren();const query=search.value.trim().toLocaleLowerCase();
         for(const project of choices){const label=project.display_name||project.title||'Project name pending';if(query&&!label.toLocaleLowerCase().includes(query))continue;
