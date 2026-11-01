@@ -17,7 +17,7 @@ class Element {
   getAttribute(name) { return this.attributes[name] ?? null; }
   addEventListener(type, handler) { (this.events[type] ??= []).push(handler); }
   async fire(type, extra = {}) { const event = {type, target: this, preventDefault() { this.prevented = true; }, ...extra}; for (const handler of this.events[type] || []) await handler(event); return event; }
-  focus() { this.doc.activeElement = this; }
+  focus() { this.doc.activeElement = this; for (const handler of this.events.focus || []) handler({type: 'focus', target: this}); }
   contains(target) { return target === this || this.children.some(child => child.contains(target)); }
   matches(selector) {
     if (selector === 'button:not(:disabled)') return this.tagName === 'BUTTON' && !this.disabled;
@@ -138,4 +138,59 @@ test('closing while project data is loading prevents a stale picker from reopeni
   await request;
   assert.equal(ui.menu.hidden, true);
   assert.equal(ui.menu.children.length, 0);
+});
+
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+test('reader project picker opens after hover delay and stays open while pointer travels to panel', async () => {
+  const ui = await setup(async command => command === 'list_projects' ? {projects: []} : {});
+  ui.picker.bind(ui.anchor, () => chat);
+  await ui.anchor.fire('pointerenter');
+  await pause(40);
+  assert.equal(ui.menu.hidden, true, 'short hover must not open the picker');
+  await pause(190);
+  assert.equal(ui.menu.hidden, false, 'sustained hover opens the picker');
+
+  await ui.anchor.fire('pointerleave');
+  await pause(60);
+  await ui.menu.fire('pointerenter');
+  await pause(150);
+  assert.equal(ui.menu.hidden, false, 'entering the panel cancels delayed close');
+  await ui.menu.fire('pointerleave');
+  await pause(220);
+  assert.equal(ui.menu.hidden, true, 'leaving both anchor and panel closes it');
+});
+
+test('reader project picker opens for keyboard focus, handles Escape, and click does not dismiss a hovered panel', async () => {
+  const ui = await setup(async command => command === 'list_projects' ? {projects: []} : {});
+  ui.picker.bind(ui.anchor, () => chat);
+  await ui.anchor.fire('focus');
+  assert.equal(ui.menu.hidden, false);
+  await ui.anchor.fire('click');
+  assert.equal(ui.menu.hidden, false, 'clicking an already open anchor should keep the picker open');
+  let escaped;
+  ui.menu.addEventListener('keydown', event => { escaped = event; });
+  await ui.menu.fire('keydown', {key: 'Escape'});
+  assert.equal(escaped.prevented, true);
+  assert.equal(ui.menu.hidden, true);
+  assert.equal(ui.doc.activeElement, ui.anchor, 'Escape returns focus to the anchor');
+});
+
+test('leaving before hover delay cancels opening and late project loads cannot revive a closed panel', async () => {
+  let finish;
+  const ui = await setup(() => new Promise(resolve => { finish = resolve; }));
+  ui.picker.bind(ui.anchor, () => chat);
+  await ui.anchor.fire('pointerenter');
+  await ui.anchor.fire('pointerleave');
+  await pause(220);
+  assert.equal(ui.menu.hidden, true, 'brief pointer pass does not open');
+
+  await ui.anchor.fire('focus');
+  assert.equal(ui.menu.hidden, false);
+  await ui.menu.fire('pointerleave');
+  await pause(220);
+  assert.equal(ui.menu.hidden, true);
+  finish({projects: []});
+  await pause(0);
+  assert.equal(ui.menu.hidden, true, 'late async result must not reopen a closed picker');
 });

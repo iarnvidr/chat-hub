@@ -28,9 +28,11 @@ export function createProjectHoverPicker({invoke, onChanged = () => {}, doc = do
   menu.setAttribute('role', 'menu');
   doc.body.append(menu);
 
-  let target = null, trigger = null, generation = 0, busy = false;
+  let target = null, trigger = null, generation = 0, busy = false, openTimer, closeTimer, suppressFocusOpen = false;
 
   function close(restoreFocus = true) {
+    clearTimeout(openTimer);
+    clearTimeout(closeTimer);
     if (menu.hidden) return;
     const prior = trigger;
     ++generation;
@@ -39,7 +41,48 @@ export function createProjectHoverPicker({invoke, onChanged = () => {}, doc = do
     target = null;
     trigger = null;
     prior?.setAttribute('aria-expanded', 'false');
-    if (restoreFocus && prior?.isConnected) prior.focus();
+    if (restoreFocus) restoreAnchorFocus(prior);
+  }
+
+  function restoreAnchorFocus(anchor) {
+    if (!anchor?.isConnected) return;
+    suppressFocusOpen = true;
+    anchor.focus();
+    suppressFocusOpen = false;
+  }
+
+  function keep() { clearTimeout(closeTimer); }
+
+  function leave() {
+    clearTimeout(openTimer);
+    clearTimeout(closeTimer);
+    closeTimer = setTimeout(() => close(false), 180);
+  }
+
+  function bind(anchor, getChat) {
+    anchor.setAttribute('aria-haspopup', 'menu');
+    anchor.setAttribute('aria-expanded', 'false');
+    anchor.addEventListener('pointerenter', () => {
+      keep();
+      if (!menu.hidden && trigger === anchor) return;
+      clearTimeout(openTimer);
+      openTimer = setTimeout(() => open(getChat(), anchor), 200);
+    });
+    anchor.addEventListener('pointerleave', leave);
+    anchor.addEventListener('focus', () => {
+      if (suppressFocusOpen) return;
+      keep();
+      if (menu.hidden || trigger !== anchor) open(getChat(), anchor);
+    });
+    anchor.addEventListener('blur', () => {
+      setTimeout(() => {
+        if (!menu.contains(doc.activeElement) && doc.activeElement !== anchor) leave();
+      }, 0);
+    });
+    anchor.addEventListener('click', () => {
+      keep();
+      if (menu.hidden) open(getChat(), anchor);
+    });
   }
 
   function position() {
@@ -175,7 +218,7 @@ export function createProjectHoverPicker({invoke, onChanged = () => {}, doc = do
 
   menu.addEventListener('keydown', event => {
     if (event.key === 'Escape') { event.preventDefault(); close(); return; }
-    if (event.key === 'Tab') { const prior = trigger; close(false); prior?.focus(); return; }
+    if (event.key === 'Tab') { const prior = trigger; close(false); restoreAnchorFocus(prior); return; }
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
     if (event.target?.tagName === 'INPUT' && !['ArrowDown', 'ArrowUp'].includes(event.key)) return;
     const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
@@ -186,6 +229,14 @@ export function createProjectHoverPicker({invoke, onChanged = () => {}, doc = do
       : (index + (event.key === 'ArrowUp' ? -1 : 1) + buttons.length) % buttons.length;
     buttons[index].focus();
   });
+  menu.addEventListener('pointerenter', keep);
+  menu.addEventListener('pointerleave', leave);
+  menu.addEventListener('focusin', keep);
+  menu.addEventListener('focusout', () => {
+    setTimeout(() => {
+      if (!menu.contains(doc.activeElement) && doc.activeElement !== trigger) leave();
+    }, 0);
+  });
   doc.addEventListener('pointerdown', event => {
     if (!menu.hidden && !menu.contains(event.target) && !trigger?.contains(event.target)) close(false);
   }, true);
@@ -194,5 +245,5 @@ export function createProjectHoverPicker({invoke, onChanged = () => {}, doc = do
   }, true);
   win.addEventListener('resize', () => close(false));
 
-  return {open, close, menu};
+  return {open, close, bind, menu};
 }

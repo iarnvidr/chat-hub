@@ -71,6 +71,7 @@ const conversationTabs = createConversationTabs({
   },
   onEmpty: () => {
     ++readerToken; selected = null; conversation = null;
+    window.dispatchEvent(new CustomEvent('chat-hub:reader-project-context', {detail: null}));
     $('reader').hidden = true; $('reader-empty').hidden = false;
     $('messages').replaceChildren(); drawList();
     window.dispatchEvent(new Event('chat-hub:show-local'));
@@ -182,6 +183,7 @@ async function rereadSelected() {
       conversationTabs.update(tab.id, {title, leafNodeId: tab.branchReset ? null : (tab.leafNodeId ?? detail.selection?.selected_node_id)});
       if (conversation?.id === id) conversation = {...detail.conversation, ...detail,
         selected_node_id: detail.selection?.selected_node_id};
+      if (conversation?.id === id) window.dispatchEvent(new CustomEvent('chat-hub:reader-project-context', {detail: detail.conversation}));
     } catch { /* A background refresh must not take focus away from the live ChatGPT view. */ }
     return;
   }
@@ -250,9 +252,6 @@ $('show-message-graph').addEventListener('click', () => {
 $('show-chat-connections').addEventListener('click', () => {
   if (conversation?.conversation) window.dispatchEvent(new CustomEvent('chat-hub:show-chat-connections', {detail: conversation.conversation}));
 });
-$('set-chat-project').addEventListener('click', () => {
-  if (conversation?.conversation) window.dispatchEvent(new CustomEvent('chat-hub:edit-chat-project', {detail: conversation.conversation}));
-});
 function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   const focus = options.focus !== false;
   if (focus) window.dispatchEvent(new Event('chat-hub:show-local'));
@@ -261,6 +260,7 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
   const token = ++readerToken;
   lastConversationButton = [...document.querySelectorAll('.conversation-item')].find(b => b.classList.contains('selected')) || document.activeElement;
   selected = id;
+  window.dispatchEvent(new CustomEvent('chat-hub:reader-project-context', {detail: null}));
   window.dispatchEvent(new CustomEvent('chat-hub:conversation-loading',{detail:{id}}));
   document.body.classList.add('mobile-reader');
   $('reader-empty').hidden = true;
@@ -276,6 +276,7 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
     if (c?.conversation?.id !== id) throw Error('not_found');
     if(anchorNodeId&&!leafNodeId){const leaf=branchForAnchor(c,anchorNodeId);if(leaf&&leaf!==c.selection?.selected_node_id){conversationTabs.update(options.tabId||id,{leafNodeId:leaf,anchorNodeId});openConversation(id,leaf,anchorNodeId,{...options,selectTab:false});return;}}
     conversation = {...c.conversation, ...c, selected_node_id: c.selection?.selected_node_id};
+    window.dispatchEvent(new CustomEvent('chat-hub:reader-project-context', {detail: c.conversation}));
     $('continue-chatgpt').hidden = !chatgptConversationId(c.conversation);
     $('set-chat-project').hidden = !chatgptConversationId(c.conversation);
     $('title').textContent = c.conversation?.title ?? 'Untitled conversation';

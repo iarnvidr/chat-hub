@@ -92,8 +92,11 @@ const projectPicker = createProjectHoverPicker({
   doc: document,
   win: window,
 });
-window.addEventListener('chat-hub:edit-chat-project', event => {
-  projectPicker.open(event.detail, $('set-chat-project'));
+let readerProjectChat = null;
+projectPicker.bind($('set-chat-project'), () => readerProjectChat);
+window.addEventListener('chat-hub:reader-project-context', event => {
+  readerProjectChat = event.detail?.id ? event.detail : null;
+  projectPicker.close(false);
 });
 renameDialog.addEventListener('cancel', event => {
   event.preventDefault(); closeDialog(renameDialog);
