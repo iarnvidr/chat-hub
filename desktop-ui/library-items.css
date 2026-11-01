@@ -4,7 +4,11 @@
 .tag-chip button{padding:0;border:0;background:transparent;font-size:15px;line-height:1;min-height:18px;min-width:18px}.tag-add-row{display:flex;gap:8px}.tag-add-row input{flex:1;min-width:0}.tag-add-row button{flex:none}
 .reader-labels{display:flex;align-items:center;gap:7px;padding:8px 0;border-bottom:1px solid var(--border)}.reader-labels .tag-chips{margin-right:auto}.reader-labels button{font-size:11px;padding:4px 8px}
 #overview-kind,#artifact-state-filter{min-height:30px;max-width:170px;background:var(--surface);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;padding:4px 8px}
+#overview-display-mode{display:inline-flex;align-items:center;gap:2px;padding:2px;border:1px solid var(--border);border-radius:4px;background:var(--surface);flex:none}
+#overview-display-mode button{min-height:25px;padding:3px 9px;border:0;border-radius:2px;background:transparent;color:var(--muted);font-size:11px}
+#overview-display-mode button[aria-pressed="true"]{background:var(--canvas);color:var(--accent)}
 #overview-kind{flex:none}#artifact-state-filter{margin-left:auto}.entity-list-open .map-search-wrap,.entity-list-open .graph-legend,.entity-list-open #graph-controls,.entity-mode .graph-legend{display:none}
+.category-graph-open .map-search-wrap,.category-graph-open .graph-legend{display:none}
 #catalog-search{flex:none;width:100%;max-width:440px;min-height:30px;margin:8px 0 0;padding:5px 9px;background:var(--surface);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:12px}
 #catalog-items-panel{flex:1;min-height:0;overflow:auto;padding:2px 0 12px}#catalog-items-state{font-size:12px;color:var(--muted);line-height:1.6;padding:8px 0}#catalog-items-state:empty{display:none}
 .catalog-item{display:flex;align-items:center;justify-content:space-between;gap:16px;width:100%;text-align:left;background:transparent;border:0;border-bottom:1px solid var(--border);border-radius:0;padding:13px 9px}

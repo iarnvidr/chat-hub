@@ -1,9 +1,28 @@
 export function prepareConnections(graph) {
-  const nodes = (graph.nodes || []).filter(node => ['chat','project'].includes(node.kind)).slice(0, 100)
+  return prepareNetwork(graph, ['chat','project'], ['project','shared_keyword','shared_entity'], 100, 240);
+}
+
+const ENTITY_KINDS = ['repository','pull_request','issue','domain','link','file_artifact'];
+export function prepareEntityConnections(graph) {
+  const normalized = (graph.nodes || []).map(node => {
+    const kind = node.kind === 'entity' ? (node.entity_kind || node.entity?.kind) : node.kind;
+    return ENTITY_KINDS.includes(kind) ? {...node,kind,entity_id:node.entity_id||node.id} : node;
+  });
+  const edges=(graph.edges||[]).map(edge=>{
+    if(edge.basis!=='entity_reference'||edge.reason)return edge;
+    const count=Number.isSafeInteger(edge.reference_count)&&edge.reference_count>0?edge.reference_count:1;
+    const relation=edge.relation==='produces'?'Produced':edge.relation==='attaches'?'Attached':'Referenced';
+    return {...edge,reason:`${relation} in ${count} saved reference${count===1?'':'s'}`};
+  });
+  return prepareNetwork({...graph,nodes:normalized,edges}, ['chat',...ENTITY_KINDS], ['entity_reference'], 300, 700);
+}
+
+function prepareNetwork(graph, nodeKinds, edgeBases, maxNodes, maxEdges) {
+  const nodes = (graph.nodes || []).filter(node => nodeKinds.includes(node.kind)).slice(0, maxNodes)
     .map(node => ({...node}));
   const ids = new Set(nodes.map(node => node.id));
   const edges = (graph.edges || []).filter(edge => ids.has(edge.source) && ids.has(edge.target)
-    && ['project','shared_keyword'].includes(edge.basis)).slice(0, 240).map(edge => ({...edge}));
+    && edgeBases.includes(edge.basis)).slice(0, maxEdges).map(edge => ({...edge}));
   const adjacency = new Map(nodes.map(node => [node.id, new Set()]));
   for (const edge of edges) {adjacency.get(edge.source).add(edge.target);adjacency.get(edge.target).add(edge.source);}
   let cluster = 0; const visited = new Set();
@@ -27,7 +46,8 @@ export function prepareConnections(graph) {
     }
     cluster++;
   }
-  return {nodes, edges, focus_id:graph.focus_id || null, clusters:cluster, unmapped_count:graph.unmapped_count || 0};
+  return {nodes, edges, focus_id:graph.focus_id || null, clusters:cluster, unmapped_count:graph.unmapped_count || 0,
+    truncated:graph.truncated===true || (graph.nodes||[]).length>nodes.length};
 }
 
 export function messageGraph(detail, limit = 240) {

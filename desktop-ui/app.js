@@ -6,9 +6,11 @@ import {installTabShortcuts} from './tab-shortcuts.js';
 import {chatgptConversationId} from './continuation.js';
 import {groupSearchConversations, appendSearchHighlight} from './search.js';
 import {branchForAnchor} from './entity-model.js';
+import {createRowActions} from './row-actions.js';
+import {appendPinMarker} from './pin-marker.js';
 const $=id=>document.getElementById(id),native=typeof window.__TAURI_INTERNALS__?.invoke==='function';const invoke=(...args)=>window.__TAURI_INTERNALS__.invoke(...args);window.ChatHub={invoke};const fixture=!native&&['localhost','127.0.0.1'].includes(location.hostname)&&new URLSearchParams(location.search).get('fixture')==='demo';
 const adapter=fixture?fixtureAdapter():{
-  async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value,projectKey:$('project-filter').value||null,tag:$('tag-filter').value||null});},
+  async listConversations(query,cursor){return invoke('list_conversations',{query,cursor,source:$('history-source').value,projectKey:$('project-filter').value||null,tag:$('tag-filter').value||null,archiveState:$('show-archived').getAttribute('aria-pressed')==='true'?'archived':'active'});},
   async getConversation(id,leafNodeId){return invoke('get_conversation',leafNodeId!==undefined?{id,leafNodeId}:{id});},
   async importChatgptExport(){return invoke('import_chatgpt_export');}
 };
@@ -17,11 +19,13 @@ function providerLabel(provider) {
   return {'chatgpt':'ChatGPT', 'paseo-chatgpt':'ChatGPT · imported', 'paseo-codex_local':'Codex local · imported', 'paseo-codex_cloud':'Codex cloud · imported'}[provider] || provider || 'Unknown provider';
 }
 const projectNames = new Map();
+const rowActions = createRowActions({invoke, onChanged: () => window.dispatchEvent(new Event('chat-hub:history-updated'))});
 function projectLabel(project) {
   return project.display_name || project.title || projectNames.get(project.project_key) || 'Project name pending';
 }
 function drawList() {
   const box = $('conversation-list');
+  rowActions.close(false);
   box.replaceChildren();
   $('load-more').hidden = !cursor;
   const displayed = queryValue ? groupSearchConversations(items) : items;
@@ -30,10 +34,11 @@ function drawList() {
     const button = document.createElement('button');
     button.className = 'conversation-item' + (c.id === selected ? ' selected' : '');
     button.type = 'button';
-    button.title = c.title || 'Untitled conversation';
+    button.setAttribute('aria-label',c.title || 'Untitled conversation');
     const title = document.createElement('strong'), metadata = document.createElement('span');
     if (queryValue) appendSearchHighlight(title, c.title ?? 'Untitled conversation', queryValue);
     else title.textContent = c.title ?? 'Untitled conversation';
+    appendPinMarker(title,c.pinned === true);
     metadata.textContent = providerLabel(c.provider);
     metadata.hidden = $('history-source').value === 'chatgpt';
     if (!c.provider?.startsWith('paseo-') && Number.isFinite(c.message_count)) metadata.textContent += ` · ${c.message_count} messages`;
@@ -41,7 +46,7 @@ function drawList() {
     if (c.project) {
       const project = document.createElement('span'); project.className = 'project-label';
       project.textContent = projectLabel(c.project);
-      project.title = c.project.title || 'Project name has not synced yet'; button.append(project);
+      button.append(project);
     }
     if (c.search_hit) {
       const snippet = document.createElement('span');
@@ -52,7 +57,7 @@ function drawList() {
       }
     }
     button.addEventListener('click', () => openConversation(c.id, c.search_leaf_node_id, c.search_node_id));
-    box.append(button);
+    box.append(rowActions.wrap(c,button));
   }
   if (!items.length && !$('list-state').textContent.includes('failed')) showError('No conversations found.');
 }
@@ -206,6 +211,12 @@ for (const [id, source] of [['source-chat', 'chatgpt'], ['source-codex', 'codex'
 }
 $('history-source').addEventListener('change', () => loadList($('search').value, true));
 $('project-filter').addEventListener('change', () => loadList($('search').value, true));
+$('show-archived').addEventListener('click',()=>{
+  const archived=$('show-archived').getAttribute('aria-pressed')!=='true';
+  $('show-archived').setAttribute('aria-pressed',String(archived));
+  $('chat-list-label').textContent=archived?'Archived chats':'Chats';
+  loadList($('search').value,true);
+});
 let projectsRequest = 0;
 async function loadProjects() {
   if (!native) return;
@@ -217,6 +228,7 @@ async function loadProjects() {
     projectNames.clear();
     select.replaceChildren();
     const all = document.createElement('option'); all.value = ''; all.textContent = 'All projects'; select.append(all);
+    const none = document.createElement('option'); none.value = '__none__'; none.textContent = 'No project'; select.append(none);
     for (const [index, project] of response.projects.entries()) {
       const option = document.createElement('option'); option.value = project.project_key;
       const label = project.display_name || project.title || `Unnamed project ${index + 1}`;
@@ -224,8 +236,8 @@ async function loadProjects() {
       option.textContent = `${label} (${project.conversation_count})`;
       option.selected = option.value === selectedProject; select.append(option);
     }
-    if (selectedProject && response.projects.some(project => project.project_key === selectedProject)) select.value = selectedProject;
-    $('edit-project-name').disabled = !select.value;
+    if (selectedProject === '__none__' || response.projects.some(project => project.project_key === selectedProject)) select.value = selectedProject;
+    $('edit-project-name').disabled = !select.value || select.value === '__none__';
     drawList();
     if (conversation?.conversation?.project) $('reader-project').textContent = projectLabel(conversation.conversation.project);
   } catch { /* Saved chats remain usable while project metadata is unavailable. */ }

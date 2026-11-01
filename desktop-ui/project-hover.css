@@ -1,0 +1,18 @@
+.project-rename-hover {
+  position: fixed;
+  z-index: 130;
+  max-width: calc(100vw - 20px);
+  padding: 14px;
+  border: 1px solid var(--border, #57452a);
+  border-radius: 8px;
+  background: var(--surface, #171612);
+  color: var(--text, #eee5cf);
+  box-shadow: 0 12px 32px #0009;
+}
+.project-rename-hover[hidden] { display: none; }
+.project-rename-form { display: grid; gap: 10px; }
+.project-rename-form strong { color: var(--accent, #dfad54); font: 600 12px var(--mono, monospace); }
+.project-rename-form p { margin: 0; color: var(--muted, #b8ac91); font-size: 12px; }
+.project-rename-form input { width: 100%; min-width: 0; }
+.project-hover-status { min-height: 1.2em; }
+.project-hover-actions { display: flex; justify-content: flex-end; gap: 8px; }

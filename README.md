@@ -1,6 +1,6 @@
 # Chat Hub
 
-Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.1; a version bump is not a release or release acceptance.
+Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.2; a version bump is not a release or release acceptance.
 
 Provider capture is disabled by default. No real provider account, provider traffic capture, or production ingestion path has been accepted. The selective CONNECT proxy intercepts only the exact host `chatgpt.com`; subdomains, authentication/sign-in hosts and other hosts tunnel without TLS decryption. The per-install CA is not automatically added to system trust. Linux proxy checks use synthetic traffic and do not establish real-provider behavior.
 
@@ -20,7 +20,13 @@ The local index also extracts repositories, pull requests, issues, domains, link
 
 Local tags are stored independently of the derived index and survive rebuilds. The desktop uses the classified terminal palette, distinct speaker styles and stable graph positions. Cmd/Ctrl+W closes the selected tab and does nothing when no tabs are open. Native menu shortcuts also work while the embedded ChatGPT view has focus. Cmd/Ctrl+T opens a new chat; Ctrl+Tab cycles tabs and Cmd/Ctrl+1–9 selects tabs (9 selects the last).
 
+The overview keeps repositories, PRs, issues, domains and files in Graph mode, with List available separately. Shared references contribute to chat connections; common domains do not connect the entire library. Select a dot or its label to inspect connections in a scrollable panel. Hover a related chat for a temporary saved-copy preview beside the panel, without opening a tab. Compact hover actions open the chat or its message graph. The Tags hover editor suggests tags from indexed content and includes a distinct custom-tag option. Hover controls also support focus and click, and graph motion respects reduced motion.
+
 Projects expand inline in the sidebar, with the selected project retained when collapsed. Settings → Appearance offers five saved color schemes: Classified amber, Phosphor, Arctic, Violet and Field notes. Color changes also update the graph without losing its position.
+
+The No project filter selects unassigned conversations before pagination, including search and overview results. Each chat row has one hover menu for project assignment, pin/unpin, archive/restore, tags and copying its ChatGPT link. Project, pin and archive changes use the signed-in ChatGPT session and require readback before the local library changes. Archived chats have a separate list filter. ChatGPT pins refresh independently of history fetching when the connected account is available; verified saved pins have a passive marker and sort before other chats across database pages. These upstream actions have contract and fake-provider tests; no personal-chat mutations were performed as development checks.
+
+Set project and project rename open anchored hover controls, with keyboard focus and click support. There is no local-only project-editing choice. Existing cached IDs are normalized only for the verified ChatGPT request; the stored conversation identity remains intact.
 
 ## Build and run
 

@@ -148,6 +148,14 @@ impl Store {
         writer.write_all(b",")?;
         write_rows(&tx, writer, "target_tags", "SELECT target_kind,target_id,name_key,ordinal FROM target_tags ORDER BY target_kind,target_id,ordinal", &["target_kind","target_id","name_key","ordinal"])?;
         writer.write_all(b",")?;
+        write_rows(
+            &tx,
+            writer,
+            "conversation_state",
+            "SELECT conversation_id,pinned,archived,updated_at_ms FROM conversation_local_state ORDER BY conversation_id",
+            &["conversation_id", "pinned", "archived", "updated_at_ms"],
+        )?;
+        writer.write_all(b",")?;
         write_artifact_metadata(&tx, writer)?;
         writer.write_all(b"}\n")?;
         tx.commit()?;

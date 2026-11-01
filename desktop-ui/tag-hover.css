@@ -1,0 +1,10 @@
+.tag-hover-panel{position:fixed;z-index:85;overflow:auto;overscroll-behavior:contain;padding:12px;background:var(--surface-2);color:var(--text);border:1px solid var(--border-strong);border-radius:5px;box-shadow:0 8px 25px #0004;animation:tag-hover-enter .18s ease-out}
+.tag-hover-panel header{margin-bottom:10px}.tag-hover-panel header strong{font:12px var(--mono);display:block}.tag-hover-panel header span{display:block;margin-top:4px;font-size:11px;line-height:1.5;color:var(--muted)}
+.tag-choice-group{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}.tag-hover-panel .tag-choice{min-height:30px;padding:4px 9px;border:1px solid var(--border-strong);border-radius:3px;background:transparent;color:var(--text);font:11px/1.5 var(--mono);overflow-wrap:anywhere;max-width:100%;text-align:left;transition:background .18s,border-color .18s,color .18s}
+.tag-hover-panel .tag-choice:hover{background:var(--accent-soft);color:var(--accent-bright);border-color:var(--accent)}
+.tag-hover-panel .tag-choice.is-selected{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-bright)}
+.tag-hover-panel .tag-choice-custom{display:block;width:100%;margin-top:10px;border-style:dashed;background:var(--surface-3);color:var(--accent-bright)}
+.tag-custom-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;margin-top:10px}.tag-custom-form label{grid-column:1/-1;font-size:11px;color:var(--muted)}.tag-custom-form input{min-width:0;padding:5px 8px;border:1px solid var(--border-strong);border-radius:3px;background:var(--surface-3);color:var(--text)}.tag-custom-form button{font-size:11px;min-height:30px}
+.tag-hover-status,.tag-hover-empty{font:10px/1.6 var(--mono);color:var(--muted);margin:8px 0 0}.tag-hover-status:empty{display:none}
+@keyframes tag-hover-enter{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){.tag-hover-panel{animation:none}.tag-hover-panel .tag-choice{transition:none}}

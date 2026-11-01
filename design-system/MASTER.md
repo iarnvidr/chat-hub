@@ -25,3 +25,14 @@ The workspace borrows its visual language from Muninn and the esbenthomsen.com c
 - Use amber for the active source/action and role markers, not as a general fill color. Entity kinds can use low-contrast amber/stone variations; shape and labels remain the primary distinctions.
 - Archive text must stay comfortable to read: body size around 14px, line height about 1.65, constrained reading width, and readable links, tables, lists, blockquotes, and fenced code.
 - Keep visible keyboard focus, accessible labels, and reduced-motion behavior. No browser tests or driver launches for visual changes; validate pure renderer behavior with Bun tests and native builds.
+
+## Graph interactions
+
+- Graph is the initial overview mode for chats and indexed entity categories. List is an explicit alternative. Selecting an entity opens an inspector without replacing the category graph.
+- Dots and labels share the same selection behavior. Inspector scrolling stays within the panel. Keep actions compact at its top and reveal them on hover or focus; expose them directly on touch screens.
+- Related-chat hover previews appear beside the inspector after a short intent delay and close after pointer/focus leaves the row and preview. Never navigate, create a tab, or load the live provider during preview. Discard stale responses immediately when switching targets.
+- Both the selected chat and its hover preview start at the first saved message, retain independent scroll positions only while viewing that chat, and render more content as the reader scrolls. Never crop each message into a fixed-height box or stringify an author object as a label.
+- Tag editing uses suggested chips derived from indexed content, applied-tag state, and a visually distinct custom-tag action. Save explicit changes while preserving unrelated current tags.
+- Project assignment and rename use anchored hover controls with focus/click support. Keep changes synced to ChatGPT and show verified results; omit scope dropdowns and local-only choices.
+- Keep all chat-row actions in one hover menu in the separated right-hand area. ChatGPT pin state appears as a passive title marker; do not add a second pin button alongside the menu.
+- Graph motion settles in a finite transition around 220 ms. Preserve positions during style changes and remove animation for reduced-motion preferences.

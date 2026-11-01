@@ -74,6 +74,10 @@ const server=http.createServer((req,res)=>{
         if(command==='list_conversations')return {items:chats.map(chat=>({id:chat.conversation_id,title:chat.label,provider:'chatgpt',message_count:chat.message_count})),next_cursor:null,library_revision:1};
          if(command==='catalog_overview')return {index:{stale:false,index_version:2},stats:{chats:80,projects:5,messages:1600,branch_points:112}};
         if(command==='catalog_graph')return args.focusId?focusedGraph:defaultGraph;
+        if(command==='get_conversation'){
+          const messages=Array.from({length:20},(_,index)=>({id:`m-${index}`,author:{role:index%2?'assistant':'user'},content:`Message ${index+1} begins here.\n\n`+'Saved conversation text with enough paragraphs to read and scroll.\n\n'.repeat(35)}));
+          return {conversation:{id:args.id,title:'Saved fixture'},selection:{selected_node_id:'n-19'},thread_node_ids:messages.map((_,index)=>`n-${index}`),nodes:messages.map((message,index)=>({id:`n-${index}`,parent_id:index?`n-${index-1}`:null,message_id:message.id})),messages};
+        }
         if(command==='list_projects')return {projects:[{project_key:'project:design',title:'Design research',conversation_count:8}]};
         if(command==='update_status')return {version:'fixture',message:'Ready'};
         if(command==='service_info')return {};
@@ -106,7 +110,7 @@ const server=http.createServer((req,res)=>{
     }
     await page.setViewportSize({width:1280,height:900});await page.waitForTimeout(100);
     assert.deepEqual(await page.evaluate(()=>window.__nonFiniteCanvasCalls),[], 'Cytoscape layout uses only finite drawing coordinates');
-    assert.equal(await page.locator('#graph-canvas').getAttribute('role'),'img');
+    assert.equal(await page.locator('#graph-canvas').getAttribute('role'),'application');
     assert.match(await page.locator('#graph-canvas').getAttribute('aria-label'),/Connected chat map/);
     assert.equal(await page.locator('#overview-recent .overview-chat').count(),80);
     assert.match(await page.locator('#graph-caption').innerText(),/80 chats · 160 connections · 5 clusters/);
@@ -116,11 +120,31 @@ const server=http.createServer((req,res)=>{
     await page.locator('#map-search').press('Enter');
     await page.locator('#graph-inspector').waitFor({state:'visible'});
     assert.match(await page.locator('#graph-selection h2').innerText(),/Design research conversation 1/);
-    await page.getByRole('button',{name:'Explore all connections',exact:true}).click();
+    const transcript=page.locator('.inspector-transcript-scroll');
+    await transcript.locator('.saved-turn').first().waitFor({state:'visible'});
+    assert.match(await transcript.innerText(),/Message 1 begins here/);
+    assert.doesNotMatch(await transcript.innerText(),/\[object Object\]/);
+    assert.equal(await transcript.evaluate(element=>element.scrollTop),0);
+    assert.ok(await transcript.evaluate(element=>element.clientHeight>30&&element.scrollHeight>element.clientHeight),'selected chat has a bounded scroll pane');
+    await transcript.hover();await page.mouse.wheel(0,350);
+    await page.waitForFunction(()=>document.querySelector('.inspector-transcript-scroll').scrollTop>0);
+    await page.locator('#graph-inspector').hover();
+    await page.getByRole('button',{name:'Explore all chat connections',exact:true}).click();
     await page.waitForFunction(()=>window.__calls.some(call=>call.command==='catalog_graph'&&call.args.focusId==='local-0'));
     await page.waitForFunction(()=>document.querySelector('#graph-selection').innerText.includes('Shares 2 indexed keywords'));
     assert.match(await page.locator('#graph-selection').innerText(),/Shares 2 indexed keywords/);
     assert.match(await page.locator('#graph-selection').innerText(),/Design research conversation 2/);
+    await page.locator('.connection-evidence').first().hover();
+    const preview=page.locator('.graph-hover-preview');await preview.waitFor({state:'visible'});
+    const previewBody=preview.locator('.graph-preview-messages');
+    assert.match(await previewBody.innerText(),/Message 1 begins here/);
+    assert.ok(await previewBody.evaluate(element=>element.clientHeight>30&&element.scrollHeight>element.clientHeight),'hover preview has a bounded scroll pane');
+    const previewBounds=await preview.boundingBox(),inspectorBounds=await page.locator('#graph-inspector').boundingBox(),mapBounds=await page.locator('#overview-map').boundingBox();
+    assert.ok(previewBounds.x+previewBounds.width<=inspectorBounds.x,'preview stays beside the inspector');
+    assert.ok(previewBounds.y+previewBounds.height<=mapBounds.y+mapBounds.height,'preview stays inside the graph');
+    await previewBody.hover();await page.mouse.wheel(0,300);
+    await page.waitForFunction(()=>document.querySelector('.graph-preview-messages').scrollTop>0);
+    await page.locator('#map-search').hover();await preview.waitFor({state:'hidden'});
     const focusedCanvas=await page.locator('#graph-canvas canvas').evaluateAll(canvases=>canvases.some(canvas=>canvas.width>0&&canvas.height>0));
     assert.equal(focusedCanvas,true,'focused neighborhood remains rendered');
 

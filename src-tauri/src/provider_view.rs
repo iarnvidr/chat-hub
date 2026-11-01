@@ -2,6 +2,7 @@
 use ring::rand::SecureRandom;
 use serde::Serialize;
 use std::{
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -82,6 +83,31 @@ pub struct ProjectRenameOutcome {
     pub retry_after: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ConversationActionOutcome {
+    pub state: String,
+    pub verified: bool,
+    pub conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatgptPinSnapshotOutcome {
+    pub complete: bool,
+    pub account_scope: String,
+    pub pinned_ids: Vec<String>,
+    pub error_code: Option<String>,
+    pub retry_after: Option<u64>,
+    pub http_status: Option<u16>,
+}
+
 impl ChatGptConnectionStatus {
     fn new(state: ChatGptConnectionState) -> Self {
         let message = match state {
@@ -123,6 +149,249 @@ enum AssignmentPoll {
 enum RenamePoll {
     Pending,
     Complete(ProjectRenameOutcome),
+}
+
+enum ActionPoll {
+    Pending,
+    Complete(ConversationActionOutcome),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PinSnapshotPoll {
+    Pending,
+    Complete(Vec<String>),
+    Failed {
+        error_code: String,
+        retry_after: Option<u64>,
+        http_status: Option<u16>,
+    },
+}
+
+fn parse_pin_snapshot_callback(
+    raw: &str,
+    expected_nonce: &str,
+    expected_scope: &str,
+) -> Option<PinSnapshotPoll> {
+    const MAX_CALLBACK_BYTES: usize = 64 * 1024;
+    const MAX_PINNED_IDS: usize = 1_000;
+    if raw.len() > MAX_CALLBACK_BYTES {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    for _ in 0..3 {
+        let Some(nested) = value.as_str() else { break };
+        if nested.len() > MAX_CALLBACK_BYTES {
+            return None;
+        }
+        value = serde_json::from_str(nested).ok()?;
+    }
+    let object = value.as_object()?;
+    if object.get("nonce")?.as_str()? != expected_nonce
+        || object.get("cancelled")?.as_bool()? != false
+    {
+        return None;
+    }
+    match object.get("state")?.as_str()? {
+        "running" if object.len() == 3 => Some(PinSnapshotPoll::Pending),
+        "complete" if object.len() == 6 => {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "nonce" | "state" | "cancelled" | "complete" | "account_scope" | "pinned_ids"
+                )
+            }) || object.get("complete")?.as_bool()? != true
+                || object.get("account_scope")?.as_str()? != expected_scope
+            {
+                return None;
+            }
+            let ids = object.get("pinned_ids")?.as_array()?;
+            if ids.len() > MAX_PINNED_IDS {
+                return None;
+            }
+            let mut seen = HashSet::with_capacity(ids.len());
+            let mut pinned_ids = Vec::with_capacity(ids.len());
+            for value in ids {
+                let id = value.as_str()?;
+                if !valid_conversation_id(id)
+                    || id.bytes().any(|byte| byte.is_ascii_uppercase())
+                    || !seen.insert(id)
+                {
+                    return None;
+                }
+                pinned_ids.push(id.to_owned());
+            }
+            Some(PinSnapshotPoll::Complete(pinned_ids))
+        }
+        "failed" if (4..=6).contains(&object.len()) => {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "nonce" | "state" | "cancelled" | "error_code" | "retry_after" | "http_status"
+                )
+            }) {
+                return None;
+            }
+            let error_code = object.get("error_code")?.as_str()?;
+            if !matches!(
+                error_code,
+                "invalid_request"
+                    | "signed_out"
+                    | "account_unavailable"
+                    | "account_changed"
+                    | "rate_limited"
+                    | "request_failed"
+                    | "invalid_pin_list"
+                    | "incomplete_pin_list"
+                    | "pin_list_too_large"
+                    | "cancelled"
+            ) {
+                return None;
+            }
+            let retry_after = if error_code == "rate_limited" {
+                let retry = object.get("retry_after")?.as_u64()?;
+                if !(1..=31_536_001).contains(&retry) {
+                    return None;
+                }
+                Some(retry)
+            } else if object.contains_key("retry_after") {
+                return None;
+            } else {
+                None
+            };
+            let http_status = if let Some(value) = object.get("http_status") {
+                if error_code != "request_failed" || retry_after.is_some() {
+                    return None;
+                }
+                let status = value.as_u64()?;
+                if !(400..=599).contains(&status) {
+                    return None;
+                }
+                Some(status as u16)
+            } else {
+                None
+            };
+            Some(PinSnapshotPoll::Failed {
+                error_code: error_code.into(),
+                retry_after,
+                http_status,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_conversation_action_callback(
+    raw: &str,
+    expected_nonce: &str,
+    conversation_id: &str,
+    action: &str,
+    desired: bool,
+) -> Option<ActionPoll> {
+    if raw.len() > 8 * 1024 {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    for _ in 0..3 {
+        let Some(nested) = value.as_str() else { break };
+        if nested.len() > 8 * 1024 {
+            return None;
+        }
+        value = serde_json::from_str(nested).ok()?;
+    }
+    let object = value.as_object()?;
+    if object.get("nonce")?.as_str()? != expected_nonce {
+        return None;
+    }
+    match object.get("state")?.as_str()? {
+        "running" if object.len() == 3 && object.get("cancelled")?.as_bool()? == false => {
+            Some(ActionPoll::Pending)
+        }
+        "applied" => {
+            let state_key = if action == "archive" {
+                "archived"
+            } else {
+                "pinned"
+            };
+            if object.len() != 6
+                || object.get("cancelled")?.as_bool()? != false
+                || object.get("verified")?.as_bool()? != true
+                || object.get("conversation_id")?.as_str()? != conversation_id
+                || object.get(state_key)?.as_bool()? != desired
+                || object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "nonce"
+                            | "state"
+                            | "cancelled"
+                            | "verified"
+                            | "conversation_id"
+                            | "archived"
+                            | "pinned"
+                    )
+                })
+                || object.contains_key(if action == "archive" {
+                    "pinned"
+                } else {
+                    "archived"
+                })
+            {
+                return None;
+            }
+            Some(ActionPoll::Complete(ConversationActionOutcome {
+                state: "applied".into(),
+                verified: true,
+                conversation_id: conversation_id.to_owned(),
+                archived: (action == "archive").then_some(desired),
+                pinned: (action == "pin").then_some(desired),
+                error_code: None,
+                retry_after: None,
+            }))
+        }
+        "failed" if (4..=5).contains(&object.len()) => {
+            if object.get("cancelled")?.as_bool()? != false
+                || object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "nonce" | "state" | "cancelled" | "error_code" | "retry_after"
+                    )
+                })
+            {
+                return None;
+            }
+            let error_code = object.get("error_code")?.as_str()?;
+            if !matches!(
+                error_code,
+                "cancelled"
+                    | "invalid_request"
+                    | "signed_out"
+                    | "account_unavailable"
+                    | "account_changed"
+                    | "conversation_unavailable"
+                    | "request_failed"
+                    | "rate_limited"
+                    | "verification_failed"
+            ) {
+                return None;
+            }
+            let retry_after = match object.get("retry_after") {
+                None => None,
+                Some(value) => Some(value.as_u64()?),
+            };
+            if retry_after.is_some_and(|value| !(1..=31_536_001).contains(&value)) {
+                return None;
+            }
+            Some(ActionPoll::Complete(ConversationActionOutcome {
+                state: "failed".into(),
+                verified: false,
+                conversation_id: conversation_id.to_owned(),
+                archived: None,
+                pinned: None,
+                error_code: Some(error_code.into()),
+                retry_after,
+            }))
+        }
+        _ => None,
+    }
 }
 
 fn parse_project_rename_callback(raw: &str, expected_nonce: &str) -> Option<RenamePoll> {
@@ -470,6 +739,28 @@ fn should_prepare_session(navigated: bool) -> bool {
     !navigated
 }
 
+fn pin_cooldown_remaining(
+    deadlines: &mut HashMap<String, Instant>,
+    expected_scope: &str,
+    now: Instant,
+) -> Option<Duration> {
+    deadlines.retain(|_, deadline| *deadline > now);
+    deadlines
+        .get(expected_scope)
+        .map(|deadline| deadline.saturating_duration_since(now))
+}
+
+fn extend_pin_cooldown(
+    deadlines: &mut HashMap<String, Instant>,
+    expected_scope: &str,
+    deadline: Instant,
+) {
+    deadlines
+        .entry(expected_scope.to_owned())
+        .and_modify(|existing| *existing = (*existing).max(deadline))
+        .or_insert(deadline);
+}
+
 struct Inner {
     webview: Webview<Wry>,
     navigated: bool,
@@ -480,6 +771,7 @@ struct Inner {
 pub struct ProviderViewState {
     inner: Mutex<Inner>,
     page: Arc<Mutex<PageMetadata>>,
+    pin_snapshot_cooldowns: Mutex<HashMap<String, Instant>>,
     proxy_enabled: bool,
     direct_smoke_enabled: bool,
 }
@@ -597,6 +889,164 @@ impl ProviderViewState {
         }
     }
 
+    /// Read a complete, account-bound pin listing without changing provider
+    /// state. The returned identifiers are kept inside the native process.
+    pub async fn read_chatgpt_pin_snapshot(
+        &self,
+        expected_scope: &str,
+    ) -> Result<ChatgptPinSnapshotOutcome, String> {
+        if !valid_observed_scope(expected_scope) {
+            return Err("invalid_request".into());
+        }
+        if self
+            .pin_snapshot_cooldown_remaining(expected_scope)?
+            .is_some()
+        {
+            return Err("chatgpt_pin_rate_limited".into());
+        }
+        let (webview, loaded) = self
+            .inner
+            .lock()
+            .map_err(|_| "provider_unavailable".to_string())
+            .map(|inner| (inner.webview.clone(), inner.loaded))?;
+        let generation = {
+            let page = self
+                .page
+                .lock()
+                .map_err(|_| "provider_unavailable".to_string())?;
+            if !page.exact_origin {
+                return Err("chatgpt_not_open".into());
+            }
+            if page.account_scope.as_deref() != Some(expected_scope) {
+                return Err("chatgpt_account_changed".into());
+            }
+            page.navigation_generation
+        };
+        if !loaded {
+            return Err("chatgpt_loading".into());
+        }
+        let nonce = fresh_probe_nonce().ok_or_else(|| "provider_unavailable".to_string())?;
+        let key = format!("__chatHubPinSnapshot_{nonce}");
+        let key_json = serde_json::to_string(&key).map_err(|_| "provider_unavailable")?;
+        let nonce_json = serde_json::to_string(&nonce).map_err(|_| "provider_unavailable")?;
+        let scope_json = serde_json::to_string(expected_scope).map_err(|_| "invalid_request")?;
+        let script = format!(
+            "({})( {key_json}, {nonce_json}, {scope_json} )",
+            include_str!("pin_snapshot.js")
+        );
+        webview
+            .eval(&script)
+            .map_err(|_| "provider_unavailable".to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                cleanup_probe(&webview, &key_json);
+                return Err("pin_snapshot_timeout".into());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let tx = Mutex::new(Some(tx));
+            if webview
+                .eval_with_callback(
+                    format!("JSON.stringify(window[{key_json}]||null)"),
+                    move |value| {
+                        if let Ok(mut slot) = tx.lock() {
+                            if let Some(tx) = slot.take() {
+                                let _ = tx.send(value);
+                            }
+                        }
+                    },
+                )
+                .is_err()
+            {
+                cleanup_probe(&webview, &key_json);
+                return Err("provider_unavailable".into());
+            }
+            match tokio::time::timeout(Duration::from_secs(2), rx).await {
+                Ok(Ok(raw)) => match parse_pin_snapshot_callback(&raw, &nonce, expected_scope) {
+                    Some(PinSnapshotPoll::Pending) => {}
+                    Some(PinSnapshotPoll::Complete(pinned_ids)) => {
+                        let same_page = self.page.lock().ok().is_some_and(|page| {
+                            page.navigation_generation == generation
+                                && page.exact_origin
+                                && page.account_scope.as_deref() == Some(expected_scope)
+                        });
+                        cleanup_probe(&webview, &key_json);
+                        return if same_page {
+                            Ok(ChatgptPinSnapshotOutcome {
+                                complete: true,
+                                account_scope: expected_scope.to_owned(),
+                                pinned_ids,
+                                error_code: None,
+                                retry_after: None,
+                                http_status: None,
+                            })
+                        } else {
+                            Err("chatgpt_page_changed".into())
+                        };
+                    }
+                    Some(PinSnapshotPoll::Failed {
+                        error_code,
+                        retry_after,
+                        http_status,
+                    }) => {
+                        if error_code == "rate_limited" {
+                            self.note_pin_snapshot_rate_limit(expected_scope, retry_after)?;
+                        }
+                        cleanup_probe(&webview, &key_json);
+                        return Ok(ChatgptPinSnapshotOutcome {
+                            complete: false,
+                            account_scope: expected_scope.to_owned(),
+                            pinned_ids: Vec::new(),
+                            error_code: Some(error_code),
+                            retry_after,
+                            http_status,
+                        });
+                    }
+                    None => {
+                        cleanup_probe(&webview, &key_json);
+                        return Err("provider_unavailable".into());
+                    }
+                },
+                Ok(Err(_)) => {
+                    cleanup_probe(&webview, &key_json);
+                    return Err("provider_unavailable".into());
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn pin_snapshot_cooldown_remaining(
+        &self,
+        expected_scope: &str,
+    ) -> Result<Option<Duration>, String> {
+        let now = Instant::now();
+        let mut deadlines = self
+            .pin_snapshot_cooldowns
+            .lock()
+            .map_err(|_| "provider_unavailable".to_string())?;
+        Ok(pin_cooldown_remaining(&mut deadlines, expected_scope, now))
+    }
+
+    fn note_pin_snapshot_rate_limit(
+        &self,
+        expected_scope: &str,
+        retry_after: Option<u64>,
+    ) -> Result<(), String> {
+        let seconds = retry_after.unwrap_or(60).max(1);
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(seconds))
+            .unwrap_or_else(|| now + Duration::from_secs(31_536_001));
+        let mut deadlines = self
+            .pin_snapshot_cooldowns
+            .lock()
+            .map_err(|_| "provider_unavailable".to_string())?;
+        extend_pin_cooldown(&mut deadlines, expected_scope, deadline);
+        Ok(())
+    }
+
     /// Rename one existing ChatGPT project using the captured project PATCH
     /// shape. The page verifies the account and reads back the changed record.
     pub async fn rename_project(
@@ -683,6 +1133,123 @@ impl ProviderViewState {
                 Ok(Ok(raw)) => match parse_project_rename_callback(&raw, &nonce) {
                     Some(RenamePoll::Pending) => {}
                     Some(RenamePoll::Complete(outcome)) => {
+                        let same_page = self.page.lock().ok().is_some_and(|page| {
+                            page.navigation_generation == generation
+                                && page.exact_origin
+                                && page.account_scope.as_deref() == Some(expected_scope)
+                        });
+                        cleanup_probe(&webview, &key_json);
+                        return if same_page {
+                            Ok(outcome)
+                        } else {
+                            Err("chatgpt_page_changed".into())
+                        };
+                    }
+                    None => {
+                        cleanup_probe(&webview, &key_json);
+                        return Err("provider_unavailable".into());
+                    }
+                },
+                Ok(Err(_)) => {
+                    cleanup_probe(&webview, &key_json);
+                    return Err("provider_unavailable".into());
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Apply a user-requested pin or archive mutation and require provider
+    /// readback before returning a commit receipt to the local store.
+    pub async fn set_conversation_state(
+        &self,
+        conversation_id: &str,
+        action: &str,
+        desired: bool,
+        expected_scope: &str,
+    ) -> Result<ConversationActionOutcome, String> {
+        if !valid_conversation_id(conversation_id)
+            || !valid_observed_scope(expected_scope)
+            || !matches!(action, "archive" | "pin")
+        {
+            return Err("invalid_conversation_action".into());
+        }
+        let (webview, loaded) = self
+            .inner
+            .lock()
+            .map_err(|_| "provider_unavailable".to_string())
+            .map(|inner| (inner.webview.clone(), inner.loaded))?;
+        let generation = {
+            let page = self
+                .page
+                .lock()
+                .map_err(|_| "provider_unavailable".to_string())?;
+            if !page.exact_origin {
+                return Err("chatgpt_not_open".into());
+            }
+            if page.account_scope.as_deref() != Some(expected_scope) {
+                return Err("chatgpt_account_changed".into());
+            }
+            page.navigation_generation
+        };
+        if !loaded {
+            return Err("chatgpt_loading".into());
+        }
+        let nonce = fresh_probe_nonce().ok_or_else(|| "provider_unavailable".to_string())?;
+        let key = format!("__chatHubConversationAction_{nonce}");
+        let key_json = serde_json::to_string(&key).map_err(|_| "provider_unavailable")?;
+        let nonce_json = serde_json::to_string(&nonce).map_err(|_| "provider_unavailable")?;
+        let scope_json =
+            serde_json::to_string(expected_scope).map_err(|_| "invalid_conversation_action")?;
+        let id_json =
+            serde_json::to_string(conversation_id).map_err(|_| "invalid_conversation_action")?;
+        let action_json =
+            serde_json::to_string(action).map_err(|_| "invalid_conversation_action")?;
+        let desired_json =
+            serde_json::to_string(&desired).map_err(|_| "invalid_conversation_action")?;
+        let script = format!(
+            "({})({key_json},{nonce_json},{scope_json},{id_json},{action_json},{desired_json})",
+            include_str!("conversation_actions.js")
+        );
+        webview
+            .eval(&script)
+            .map_err(|_| "provider_unavailable".to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                cleanup_probe(&webview, &key_json);
+                return Err("conversation_action_timeout".into());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let tx = Mutex::new(Some(tx));
+            if webview
+                .eval_with_callback(
+                    format!("JSON.stringify(window[{key_json}]||null)"),
+                    move |value| {
+                        if let Ok(mut slot) = tx.lock() {
+                            if let Some(tx) = slot.take() {
+                                let _ = tx.send(value);
+                            }
+                        }
+                    },
+                )
+                .is_err()
+            {
+                cleanup_probe(&webview, &key_json);
+                return Err("provider_unavailable".into());
+            }
+            match tokio::time::timeout(remaining.min(Duration::from_secs(2)), rx).await {
+                Ok(Ok(raw)) => match parse_conversation_action_callback(
+                    &raw,
+                    &nonce,
+                    conversation_id,
+                    action,
+                    desired,
+                ) {
+                    Some(ActionPoll::Pending) => {}
+                    Some(ActionPoll::Complete(outcome)) => {
                         let same_page = self.page.lock().ok().is_some_and(|page| {
                             page.navigation_generation == generation
                                 && page.exact_origin
@@ -851,6 +1418,7 @@ impl ProviderViewState {
                 visible: false,
             }),
             page,
+            pin_snapshot_cooldowns: Mutex::new(HashMap::new()),
             proxy_enabled,
             direct_smoke_enabled,
         });
@@ -1063,11 +1631,135 @@ impl ProviderViewState {
 mod target_url_tests {
     use super::{
         allowed_provider_navigation, current_chatgpt_conversation_id, exact_chatgpt_origin,
-        page_metadata_script, parse_assignment_callback, parse_page_metadata_callback,
-        parse_probe_callback, parse_project_rename_callback, should_prepare_session, target_url,
-        valid_observed_scope, AssignmentPoll, ChatGptConnectionState, ProbePoll,
-        ProjectRenameOutcome, RenamePoll,
+        extend_pin_cooldown, page_metadata_script, parse_assignment_callback,
+        parse_conversation_action_callback, parse_page_metadata_callback,
+        parse_pin_snapshot_callback, parse_probe_callback, parse_project_rename_callback,
+        pin_cooldown_remaining, should_prepare_session, target_url, valid_observed_scope,
+        ActionPoll, AssignmentPoll, ChatGptConnectionState, ConversationActionOutcome,
+        PinSnapshotPoll, ProbePoll, ProjectRenameOutcome, RenamePoll,
     };
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn conversation_action_callbacks_bind_nonce_target_and_verified_state() {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let applied = serde_json::json!({
+            "nonce":"n1", "state":"applied", "cancelled":false,
+            "verified":true, "conversation_id":id, "pinned":true
+        });
+        assert!(matches!(
+            parse_conversation_action_callback(&applied.to_string(), "n1", id, "pin", true),
+            Some(ActionPoll::Complete(ConversationActionOutcome {
+                pinned: Some(true),
+                ..
+            }))
+        ));
+        let failed = serde_json::json!({
+            "nonce":"n1", "state":"failed", "cancelled":false,
+            "error_code":"rate_limited", "retry_after":30
+        });
+        assert!(
+            matches!(parse_conversation_action_callback(&failed.to_string(), "n1", id, "archive", false), Some(ActionPoll::Complete(ConversationActionOutcome { error_code: Some(code), retry_after: Some(30), .. })) if code == "rate_limited")
+        );
+        let long_cooldown = serde_json::json!({
+            "nonce":"n1", "state":"failed", "cancelled":false,
+            "error_code":"rate_limited", "retry_after":31_536_001
+        });
+        assert!(matches!(
+            parse_conversation_action_callback(&long_cooldown.to_string(), "n1", id, "pin", true),
+            Some(ActionPoll::Complete(ConversationActionOutcome {
+                retry_after: Some(31_536_001),
+                ..
+            }))
+        ));
+        for invalid in [
+            serde_json::json!({"nonce":"other", "state":"applied", "cancelled":false,"verified":true,"conversation_id":id,"pinned":true}),
+            serde_json::json!({"nonce":"n1", "state":"applied", "cancelled":false,"verified":true,"conversation_id":"123e4567-e89b-12d3-a456-426614174001","pinned":true}),
+            serde_json::json!({"nonce":"n1", "state":"applied", "cancelled":false,"verified":true,"conversation_id":id,"pinned":false}),
+            serde_json::json!({"nonce":"n1", "state":"applied", "cancelled":false,"verified":true,"conversation_id":id,"pinned":true,"archived":false}),
+        ] {
+            assert!(parse_conversation_action_callback(
+                &invalid.to_string(),
+                "n1",
+                id,
+                "pin",
+                true
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn pin_snapshot_callback_requires_complete_nonce_and_current_scope() {
+        let scope = format!("chatgpt:observed:{}", "a".repeat(64));
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let complete = serde_json::json!({
+            "nonce":"pins-1", "state":"complete", "cancelled":false,
+            "complete":true, "account_scope":scope, "pinned_ids":[id]
+        });
+        assert_eq!(
+            parse_pin_snapshot_callback(&complete.to_string(), "pins-1", &scope),
+            Some(PinSnapshotPoll::Complete(vec![id.to_owned()]))
+        );
+        let empty = serde_json::json!({
+            "nonce":"pins-1", "state":"complete", "cancelled":false,
+            "complete":true, "account_scope":scope, "pinned_ids":[]
+        });
+        assert_eq!(
+            parse_pin_snapshot_callback(&empty.to_string(), "pins-1", &scope),
+            Some(PinSnapshotPoll::Complete(Vec::new()))
+        );
+        let failed = serde_json::json!({
+            "nonce":"pins-1", "state":"failed", "cancelled":false,
+            "error_code":"rate_limited", "retry_after":3600
+        });
+        assert!(matches!(
+            parse_pin_snapshot_callback(&failed.to_string(), "pins-1", &scope),
+            Some(PinSnapshotPoll::Failed { error_code, retry_after: Some(3600), .. }) if error_code == "rate_limited"
+        ));
+        let rejected_status = serde_json::json!({
+            "nonce":"pins-1", "state":"failed", "cancelled":false,
+            "error_code":"request_failed", "http_status":422
+        });
+        assert!(matches!(
+            parse_pin_snapshot_callback(&rejected_status.to_string(), "pins-1", &scope),
+            Some(PinSnapshotPoll::Failed { error_code, http_status: Some(422), retry_after: None }) if error_code == "request_failed"
+        ));
+        for invalid in [
+            serde_json::json!({"nonce":"wrong","state":"complete","cancelled":false,"complete":true,"account_scope":scope,"pinned_ids":[id]}),
+            serde_json::json!({"nonce":"pins-1","state":"complete","cancelled":false,"complete":false,"account_scope":scope,"pinned_ids":[id]}),
+            serde_json::json!({"nonce":"pins-1","state":"complete","cancelled":false,"complete":true,"account_scope":"chatgpt:observed:{}","pinned_ids":[id]}),
+            serde_json::json!({"nonce":"pins-1","state":"complete","cancelled":false,"complete":true,"account_scope":scope,"pinned_ids":[id,id]}),
+            serde_json::json!({"nonce":"pins-1","state":"complete","cancelled":false,"complete":true,"account_scope":scope,"pinned_ids":["123E4567-E89B-12D3-A456-426614174000"]}),
+            serde_json::json!({"nonce":"pins-1","state":"complete","cancelled":false,"complete":true,"account_scope":scope,"pinned_ids":[],"token":"secret"}),
+            serde_json::json!({"nonce":"pins-1","state":"failed","cancelled":false,"error_code":"request_failed","http_status":200}),
+            serde_json::json!({"nonce":"pins-1","state":"failed","cancelled":false,"error_code":"rate_limited","retry_after":60,"http_status":429}),
+        ] {
+            assert!(parse_pin_snapshot_callback(&invalid.to_string(), "pins-1", &scope).is_none());
+        }
+    }
+
+    #[test]
+    fn pin_cooldown_is_scope_bound_and_never_shortened() {
+        let now = Instant::now();
+        let scope_a = format!("chatgpt:observed:{}", "a".repeat(64));
+        let scope_b = format!("chatgpt:observed:{}", "b".repeat(64));
+        let mut deadlines = HashMap::new();
+        extend_pin_cooldown(&mut deadlines, &scope_a, now + Duration::from_secs(3600));
+        extend_pin_cooldown(&mut deadlines, &scope_a, now + Duration::from_secs(30));
+        assert_eq!(
+            pin_cooldown_remaining(&mut deadlines, &scope_a, now),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(pin_cooldown_remaining(&mut deadlines, &scope_b, now), None);
+        assert_eq!(
+            pin_cooldown_remaining(&mut deadlines, &scope_a, now + Duration::from_secs(3601)),
+            None
+        );
+    }
 
     #[test]
     fn accepts_only_chatgpt_root_or_uuid_conversation() {

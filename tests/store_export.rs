@@ -1,13 +1,15 @@
 mod common;
 
-use chat_hub::store::{GraphNode, Observation, Store};
+use chat_hub::store::{
+    ConversationStateChange, GraphNode, Observation, Store, VerifiedConversationStateReceipt,
+};
 use serde_json::{json, Value};
 use std::io::{self, Write};
 
 fn observation() -> Observation {
     Observation {
-        provider: "provider".into(),
-        account_scope: "acct".into(),
+        provider: "chatgpt".into(),
+        account_scope: format!("chatgpt:observed:{}", "e".repeat(64)),
         source_id: "origin".into(),
         title: "wide".into(),
         url: Some("https://example.invalid".into()),
@@ -45,6 +47,30 @@ fn deterministic_lossless_streamed_rows_and_no_clobber() {
     store
         .set_target_tags("entity", "entity:repository-digest", &["Research".into()])
         .unwrap();
+    let state_scope = store
+        .conversation_state_identity(&conversation_id)
+        .unwrap()
+        .unwrap()
+        .account_scope;
+    store
+        .commit_verified_conversation_state(
+            &conversation_id,
+            &VerifiedConversationStateReceipt {
+                verified: true,
+                conversation_id: conversation_id.clone(),
+                source_conversation_id: "origin".into(),
+                scope: state_scope.clone(),
+                target_provider: "chatgpt".into(),
+                target_scope: state_scope,
+                archived: Some(false),
+                pinned: Some(true),
+            },
+            ConversationStateChange {
+                archived: Some(false),
+                pinned: Some(true),
+            },
+        )
+        .unwrap();
     let mut a = Vec::new();
     let meta = store.write_library_json(&mut a).unwrap();
     let mut b = Vec::new();
@@ -57,6 +83,9 @@ fn deterministic_lossless_streamed_rows_and_no_clobber() {
     assert_eq!(doc["tags"].as_array().unwrap().len(), 2);
     assert_eq!(doc["target_tags"].as_array().unwrap().len(), 3);
     assert_eq!(doc["target_tags"][0]["target_kind"], "conversation");
+    assert_eq!(doc["conversation_state"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["conversation_state"][0]["pinned"], 1);
+    assert_eq!(doc["conversation_state"][0]["archived"], 0);
     assert!(doc["nodes"][0]["parts_json"]
         .as_str()
         .unwrap()

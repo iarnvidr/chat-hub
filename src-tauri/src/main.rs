@@ -422,13 +422,18 @@ async fn list_conversations(
     source: Option<String>,
     project_key: Option<String>,
     tag: Option<String>,
+    archive_state: Option<String>,
 ) -> Result<desktop_api::Page, String> {
     authorize_local_main(&window)?;
     match source.as_deref() {
         None | Some("all") | Some("chatgpt") | Some("codex") => {}
         _ => return Err("invalid_source".into()),
     }
-    desktop_api::list_in_scope_with_tag(
+    match archive_state.as_deref() {
+        None | Some("active") | Some("archived") | Some("all") => {}
+        _ => return Err("invalid_archive_state".into()),
+    }
+    desktop_api::list_in_scope_with_tag_and_archive(
         &s.api,
         &s.token,
         &query,
@@ -436,6 +441,7 @@ async fn list_conversations(
         source.as_deref(),
         project_key.as_deref(),
         tag.as_deref(),
+        archive_state.as_deref(),
     )
     .await
 }
@@ -1235,6 +1241,181 @@ async fn set_conversation_project(
 }
 
 #[tauri::command]
+async fn set_conversation_state(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    provider: State<'_, ProviderViewState>,
+    history: State<'_, chatgpt_history::ChatgptHistoryState>,
+    conversation_id: String,
+    archived: Option<bool>,
+    pinned: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    if archived.is_some() == pinned.is_some() {
+        return Err("invalid_conversation_action".into());
+    }
+    let _permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    let identity =
+        desktop_api::conversation_state_identity(&state.api, &state.token, &conversation_id)
+            .await?;
+    let target_provider = identity
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "conversation_unavailable".to_string())?;
+    let target_scope = identity
+        .get("account_scope")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "conversation_unavailable".to_string())?;
+    let source_id = identity
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "conversation_unavailable".to_string())?;
+    if !matches!(target_provider, "chatgpt" | "paseo-chatgpt")
+        || target_scope.is_empty()
+        || target_scope.len() > 256
+        || target_scope.chars().any(char::is_control)
+    {
+        return Err("chatgpt_conversation_required".into());
+    }
+    let source_conversation_id = source_id.strip_prefix("conversation:").unwrap_or(source_id);
+    if provider_view::target_url(Some(source_conversation_id)).is_err() {
+        return Err("conversation_unavailable".into());
+    }
+    let action = if archived.is_some() { "archive" } else { "pin" };
+    let desired = archived.or(pinned).expect("one state change validated");
+    let retry_after = history.snapshot()?.retry_after.unwrap_or(0);
+    if retry_after > 0 {
+        return Err("chatgpt_rate_limited".into());
+    }
+    let connection = provider.chatgpt_connection().await;
+    if connection.state != provider_view::ChatGptConnectionState::Connected {
+        return Err(match connection.state {
+            provider_view::ChatGptConnectionState::SignedOut => "chatgpt_signed_out",
+            provider_view::ChatGptConnectionState::Loading => "chatgpt_loading",
+            provider_view::ChatGptConnectionState::NotOpen => "chatgpt_not_open",
+            _ => "chatgpt_unavailable",
+        }
+        .into());
+    }
+    let observed_scope = connection
+        .account_scope
+        .as_deref()
+        .ok_or_else(|| "chatgpt_account_unavailable".to_string())?;
+    if target_provider == "chatgpt" && target_scope != observed_scope {
+        return Err("chatgpt_account_mismatch".into());
+    }
+    if target_provider == "paseo-chatgpt" && !target_scope.starts_with("paseo-cache:") {
+        return Err("conversation_unavailable".into());
+    }
+    let outcome = provider
+        .set_conversation_state(source_conversation_id, action, desired, observed_scope)
+        .await?;
+    if outcome.error_code.as_deref() == Some("rate_limited") {
+        history.note_provider_rate_limit(outcome.retry_after);
+        return Err("chatgpt_rate_limited".into());
+    }
+    if outcome.state != "applied" || !outcome.verified {
+        return Err(outcome
+            .error_code
+            .unwrap_or_else(|| "chatgpt_action_failed".into()));
+    }
+    let receipt = serde_json::json!({
+        "verified":outcome.verified,
+        "conversation_id":conversation_id,
+        "source_conversation_id":source_id,
+        "scope":observed_scope,
+        "target_provider":target_provider,
+        "target_scope":target_scope,
+        "archived":outcome.archived,
+        "pinned":outcome.pinned,
+    });
+    let result = desktop_api::commit_conversation_state(
+        &state.api,
+        &state.token,
+        &conversation_id,
+        &receipt,
+        archived,
+        pinned,
+    )
+    .await?;
+    let _ = app.emit("library-changed", ());
+    Ok(result)
+}
+
+#[tauri::command]
+async fn sync_chatgpt_pins(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    provider: State<'_, ProviderViewState>,
+    history: State<'_, chatgpt_history::ChatgptHistoryState>,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    let _permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    let connection = provider.chatgpt_connection().await;
+    if connection.state != provider_view::ChatGptConnectionState::Connected {
+        return Err(match connection.state {
+            provider_view::ChatGptConnectionState::SignedOut => "chatgpt_signed_out",
+            provider_view::ChatGptConnectionState::Loading => "chatgpt_loading",
+            provider_view::ChatGptConnectionState::NotOpen => "chatgpt_not_open",
+            _ => "chatgpt_unavailable",
+        }
+        .into());
+    }
+    let observed_scope = connection
+        .account_scope
+        .as_deref()
+        .ok_or_else(|| "chatgpt_account_unavailable".to_string())?;
+    let outcome = provider.read_chatgpt_pin_snapshot(observed_scope).await?;
+    eprintln!(
+        "ChatGPT pin snapshot completed={} code={} http_status={} count={} retry_after={}",
+        outcome.complete,
+        outcome.error_code.as_deref().unwrap_or("none"),
+        outcome.http_status.unwrap_or(0),
+        outcome.pinned_ids.len(),
+        outcome.retry_after.unwrap_or(0),
+    );
+    if outcome.error_code.as_deref() == Some("rate_limited") {
+        history.note_provider_rate_limit(outcome.retry_after);
+        return Err("chatgpt_rate_limited".into());
+    }
+    if !outcome.complete || outcome.account_scope != observed_scope {
+        return Err(outcome
+            .error_code
+            .unwrap_or_else(|| "pin_snapshot_incomplete".into()));
+    }
+    let receipt = serde_json::json!({
+        "verified": true,
+        "complete": true,
+        "scope": observed_scope,
+        "pinned_source_ids": outcome.pinned_ids,
+    });
+    let result = desktop_api::sync_chatgpt_pin_snapshot(&state.api, &state.token, &receipt).await?;
+    if result.get("verified").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("pin_snapshot_commit_unverified".into());
+    }
+    eprintln!(
+        "ChatGPT pin snapshot committed pinned={} matched={} unknown={}",
+        result
+            .get("pinned_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        result
+            .get("matched_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        result
+            .get("unknown_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    );
+    let _ = app.emit("chatgpt-pins-updated", ());
+    let _ = app.emit("library-changed", ());
+    Ok(result)
+}
+
+#[tauri::command]
 fn prepare_chatgpt_session(
     window: tauri::Webview,
     state: State<'_, ProviderViewState>,
@@ -1600,6 +1781,8 @@ fn main() {
             catalog_graph,
             rebuild_catalog_index,
             library_items::catalog_entities,
+            library_items::catalog_entity_graph,
+            library_items::catalog_tag_suggestions,
             library_items::catalog_entity,
             library_items::list_local_tags,
             library_items::get_target_tags,
@@ -1625,6 +1808,8 @@ fn main() {
             get_chatgpt_connection,
             inspect_project_client,
             set_conversation_project,
+            set_conversation_state,
+            sync_chatgpt_pins,
             prepare_chatgpt_session,
             sync_chatgpt_history,
             chatgpt_history_status,
@@ -1670,6 +1855,8 @@ fn main() {
             catalog_graph,
             rebuild_catalog_index,
             library_items::catalog_entities,
+            library_items::catalog_entity_graph,
+            library_items::catalog_tag_suggestions,
             library_items::catalog_entity,
             library_items::list_local_tags,
             library_items::get_target_tags,
@@ -1695,6 +1882,8 @@ fn main() {
             get_chatgpt_connection,
             inspect_project_client,
             set_conversation_project,
+            set_conversation_state,
+            sync_chatgpt_pins,
             prepare_chatgpt_session,
             sync_chatgpt_history,
             chatgpt_history_status,

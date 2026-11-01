@@ -1,13 +1,23 @@
 import cytoscape from './vendor/cytoscape.esm.min.mjs';
 import {MapViewState,mapKey} from './map-state.js';
 
+export function runFiniteGraphLayout(cy, messageMode, onComplete) {
+  const layout=cy.layout(messageMode
+    ? {name:'breadthfirst',directed:true,padding:45,spacingFactor:1.4,avoidOverlap:true,nodeDimensionsIncludeLabels:true,animate:false}
+    : {name:'cose',animate:false,randomize:false,padding:42,nodeRepulsion:()=>11000,idealEdgeLength:()=>85,
+      edgeElasticity:()=>90,gravity:.7,componentSpacing:90,numIter:350,nodeDimensionsIncludeLabels:false});
+  layout.one('layoutstop',onComplete);
+  layout.run();
+  return layout;
+}
+
 export function createGraphView(container, onNode, onEdge) {
   let css=getComputedStyle(document.documentElement);const color=(name,fallback)=>css.getPropertyValue(name).trim()||fallback;
   const theme={canvas:color('--canvas','#0e0f12'),text:color('--text','#e6e9ec'),muted:color('--muted','#9aa3ac'),accent:color('--accent','#d2a24c'),mono:color('--mono','monospace')};
   const palette=[theme.accent,'#a99c84','#c4b597','#8b9294','#d6c292','#b09362','#a4a39b','#c3b084'];
   const kindColors={repository:color('--map-repository',theme.accent),pull_request:color('--map-pr',theme.accent),issue:color('--map-issue','#b07f28'),domain:color('--map-domain',theme.muted),file_artifact:color('--map-file',theme.muted)};
   const views=new MapViewState();let currentKey,layoutReady=false;
-  let cy, resizeFrame, labelFrame, renderFrame, updateLabels=()=>{};
+  let cy, resizeFrame, labelFrame, enterTimer, updateLabels=()=>{};
   const measure=document.createElement('canvas').getContext('2d');if(measure)measure.font=`11px ${theme.mono}`;
   const tooltip=document.createElement('div');tooltip.className='map-tooltip';tooltip.hidden=true;
   const observer=new ResizeObserver(()=>{
@@ -28,7 +38,7 @@ export function createGraphView(container, onNode, onEdge) {
     for(const key of ['canvas','text','muted','accent','mono'])theme[key]=color(`--${key}`,theme[key]);
     palette[0]=theme.accent;
     Object.assign(kindColors,{repository:color('--map-repository',theme.accent),pull_request:color('--map-pr',theme.accent),issue:color('--map-issue',theme.accent),domain:color('--map-domain',theme.muted),file_artifact:color('--map-file',theme.muted)});
-    cancelAnimationFrame(renderFrame);cancelAnimationFrame(labelFrame);
+    cancelAnimationFrame(labelFrame);clearTimeout(enterTimer);
     if(cy&&layoutReady)views.save(currentKey,{positions:Object.fromEntries(cy.nodes().map(n=>[n.id(),n.position()])),zoom:cy.zoom(),pan:cy.pan(),width:cy.width(),height:cy.height()});
     currentKey=mapKey(graph,messageMode);const prior=views.get(currentKey);layoutReady=false;
     cy?.destroy();cy=undefined;container.replaceChildren();tooltip.hidden=true;
@@ -48,7 +58,7 @@ export function createGraphView(container, onNode, onEdge) {
           'background-color':'data(color)','border-width':1.5,'border-color':theme.canvas,
           label:'',color:theme.muted,'font-family':theme.mono,'font-size':11,
           'text-valign':'bottom','text-halign':'center','text-margin-y':7,'text-wrap':'ellipsis','text-max-width':135,
-          'text-outline-color':theme.canvas,'text-outline-width':2,'min-zoomed-font-size':0,'overlay-padding':8}},
+           'text-outline-color':theme.canvas,'text-outline-width':2,'min-zoomed-font-size':0,'overlay-padding':8,'text-events':'yes'}},
         {selector:'node.repository',style:{shape:'diamond',width:25,height:25}},
         {selector:'node.pull_request',style:{shape:'hexagon',width:23,height:20}},
         {selector:'node.issue',style:{shape:'triangle',width:23,height:22}},
@@ -62,6 +72,7 @@ export function createGraphView(container, onNode, onEdge) {
         {selector:'edge',style:{width:1,'line-color':theme.muted,'curve-style':'bezier',opacity:.32,'overlay-padding':7}},
         {selector:'edge.project',style:{'line-color':theme.accent,width:1.2,opacity:.5}},
         {selector:'edge.shared_keyword',style:{'line-color':theme.muted}},
+        {selector:'edge.shared_entity',style:{'line-color':kindColors.repository,width:1.5,opacity:.68}},
         {selector:'edge.entity_reference',style:{'target-arrow-shape':'triangle','target-arrow-color':theme.muted,'arrow-scale':.6}},
         {selector:'edge.parent',style:{'target-arrow-shape':'triangle','target-arrow-color':'#738a99','arrow-scale':.7}},
         {selector:'.muted',style:{opacity:.12}},
@@ -106,30 +117,36 @@ export function createGraphView(container, onNode, onEdge) {
     });
     cy.on('mouseout','node',event=>{event.target.removeClass('hovered');tooltip.hidden=true;container.style.cursor='';});
     const selected=graph.focus_id&&cy.getElementById(graph.focus_id);if(selected?.length)choose(selected,false);
-    container.setAttribute('role','img');
-    container.setAttribute('aria-label',messageMode?'Stored message and branch graph. Use the message list for keyboard access.':'Connected chat map. Search the map or use the chat list for keyboard access.');
+    container.setAttribute('role','application');container.tabIndex=0;
+    container.setAttribute('aria-label',messageMode?'Stored message and branch graph. Use arrow keys to inspect nodes, Enter to open the selected message, or use the message list.':'Connected chat map. Use arrow keys to inspect nodes, Enter to open the selected chat, or use the chat list.');
+    container.onkeydown=event=>{
+      if(!cy||!['ArrowRight','ArrowDown','ArrowLeft','ArrowUp','Enter'].includes(event.key))return;
+      const nodes=cy.nodes().sort((a,b)=>String(a.id()).localeCompare(String(b.id())));if(!nodes.length)return;
+      event.preventDefault();const current=nodes.findIndex(node=>node.hasClass('active'));
+      if(event.key==='Enter'){const node=current>=0?nodes[current]:nodes[0];onNode({...node.data(),label:node.data('fullLabel')},true);return;}
+      const backwards=event.key==='ArrowLeft'||event.key==='ArrowUp';const next=(current+(backwards?-1:1)+nodes.length)%nodes.length;choose(nodes[next]);
+      cy.animate({center:{eles:nodes[next]}},{duration:reducedMotion()?0:220});
+    };
     // Wait for the workspace to be visible and sized before the library fits its layout.
-    const instance=cy;
-    renderFrame=requestAnimationFrame(()=>{
-      if(cy!==instance)return;cy.resize();
-      if(prior){
-        if(Math.abs(prior.width-cy.width())<40&&Math.abs(prior.height-cy.height())<40)cy.viewport({zoom:prior.zoom,pan:prior.pan});
-        else fitGraph();layoutReady=true;readableLabels();return;
-      }
-      const layout=cy.layout(messageMode
-        ? {name:'breadthfirst',directed:true,padding:45,spacingFactor:1.4,avoidOverlap:true,nodeDimensionsIncludeLabels:true,animate:false}
-        : {name:'cose',animate:false,randomize:true,padding:42,nodeRepulsion:()=>11000,idealEdgeLength:()=>85,
-          edgeElasticity:()=>90,gravity:.7,componentSpacing:90,numIter:1000,nodeDimensionsIncludeLabels:false});
-      layout.one('layoutstop',()=>{
-        if(cy!==instance)return;
-        cy.resize();fitGraph();layoutReady=true;readableLabels();
-      });
-      layout.run();
+    const instance=cy;cy.resize();
+    if(prior){
+      if(Math.abs(prior.width-cy.width())<40&&Math.abs(prior.height-cy.height())<40)cy.viewport({zoom:prior.zoom,pan:prior.pan});
+      else fitGraph();layoutReady=true;readableLabels();animateEntry();return;
+    }
+    runFiniteGraphLayout(cy,messageMode,()=>{
+      if(cy!==instance)return;
+      cy.resize();fitGraph();layoutReady=true;readableLabels();animateEntry();
     });
   }
+  function animateEntry(){
+    if(reducedMotion())return;
+    container.classList.remove('graph-entering');void container.offsetWidth;container.classList.add('graph-entering');
+    enterTimer=setTimeout(()=>container.classList.remove('graph-entering'),210);
+  }
+  function reducedMotion(){return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches||false;}
   function fitGraph(){if(!cy)return;cy.fit(undefined,42);if(cy.zoom()>1.5){cy.zoom(1.5);cy.center();}}
   return {render,
-    select:(id,extra)=>{const node=cy?.getElementById(id);if(node?.length){if(extra)node.data(extra);choose(node);cy.center(node);}},
+     select:(id,extra)=>{const node=cy?.getElementById(id);if(node?.length){if(extra)node.data(extra);choose(node);cy.animate({center:{eles:node}},{duration:reducedMotion()?0:220});}},
     search:text=>{
       if(!cy)return [];
       const q=String(text||'').toLocaleLowerCase().trim();cy.elements().removeClass('muted');
@@ -140,6 +157,6 @@ export function createGraphView(container, onNode, onEdge) {
     },
     zoom:factor=>{if(cy)cy.zoom({level:Math.max(.2,Math.min(4,cy.zoom()*factor)),renderedPosition:{x:cy.width()/2,y:cy.height()/2}});},
     fit:()=>{if(cy){cy.elements().removeClass('muted active adjacent');fitGraph();updateLabels();}},
-    resize:()=>cy?.resize(),destroy:()=>{observer.disconnect();cancelAnimationFrame(resizeFrame);cancelAnimationFrame(labelFrame);cancelAnimationFrame(renderFrame);cy?.destroy();}};
+     resize:()=>cy?.resize(),destroy:()=>{observer.disconnect();cancelAnimationFrame(resizeFrame);cancelAnimationFrame(labelFrame);clearTimeout(enterTimer);cy?.destroy();}};
 }
 function shorten(text){text=String(text||'Untitled').replace(/\s+/g,' ');return text.length>48?text.slice(0,45)+'…':text;}

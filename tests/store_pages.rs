@@ -79,6 +79,7 @@ fn chat_page_snapshots_filter_sources_before_keyset_pagination_and_search() {
     assert_eq!(all.items.len(), 3);
     assert_eq!(first.items[0]["provider"], "paseo-chatgpt");
     let key = ListKey {
+        pinned: first.items[0]["pinned"].as_bool().unwrap_or(false),
         updated_at_ms: first.items[0]["updated_at_ms"].as_i64(),
         id: first.items[0]["id"].as_str().unwrap().into(),
     };
@@ -126,6 +127,7 @@ fn list_keyset_nulls_and_ties_and_limits() {
     let first = s.list_page_snapshot(1, None, None).unwrap();
     assert_eq!(first.items[0]["source_id"], "c");
     let key = ListKey {
+        pinned: first.items[0]["pinned"].as_bool().unwrap_or(false),
         updated_at_ms: first.items[0]["updated_at_ms"].as_i64(),
         id: first.items[0]["id"].as_str().unwrap().into(),
     };
@@ -165,12 +167,14 @@ fn null_updated_at_rows_are_included_in_keyset_pages() {
     let page = s.list_page_snapshot(1, None, None).unwrap();
     assert_eq!(page.items.len(), 1);
     let key = ListKey {
+        pinned: page.items[0]["pinned"].as_bool().unwrap_or(false),
         updated_at_ms: page.items[0]["updated_at_ms"].as_i64(),
         id: page.items[0]["id"].as_str().unwrap().into(),
     };
     let next = s.list_page_snapshot(1, Some(&key), None).unwrap();
     assert_eq!(next.items.len(), 1);
     let third_key = ListKey {
+        pinned: next.items[0]["pinned"].as_bool().unwrap_or(false),
         updated_at_ms: next.items[0]["updated_at_ms"].as_i64(),
         id: next.items[0]["id"].as_str().unwrap().into(),
     };
@@ -180,6 +184,7 @@ fn null_updated_at_rows_are_included_in_keyset_pages() {
         .list_page_snapshot(
             1,
             Some(&ListKey {
+                pinned: last.items[0]["pinned"].as_bool().unwrap_or(false),
                 updated_at_ms: last.items[0]["updated_at_ms"].as_i64(),
                 id: last.items[0]["id"].as_str().unwrap().into()
             }),
@@ -327,7 +332,7 @@ fn huge_parts_list_summary_search_preflight_and_null_cursor_walk() {
         .unwrap();
     let page = s.list_page_snapshot(1, None, None).unwrap();
     let c = &page.items[0];
-    assert_eq!(c.as_object().unwrap().len(), 7);
+    assert_eq!(c.as_object().unwrap().len(), 9);
     assert_eq!(c["id"], huge);
     let search = s.search_page_snapshot("needle", 10, None, None).unwrap();
     let message_hit = search

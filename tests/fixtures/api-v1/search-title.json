@@ -7,7 +7,9 @@
         "account_scope": "provisional:default",
         "source_id": "export-cv-a",
         "title": "Synthetic branches",
-        "updated_at_ms": 1700000003000
+        "updated_at_ms": 1700000003000,
+        "pinned": false,
+        "archived": false
       },
       "node_id": null,
       "message_id": null,

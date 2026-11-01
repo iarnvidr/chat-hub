@@ -27,6 +27,9 @@ pub(crate) fn canonical_tag_key(tag: &str) -> Result<String> {
     tags::normalized_tag_key(tag)
 }
 
+/// Reserved query-only selector for conversations without a project assignment.
+pub const NO_PROJECT_FILTER: &str = "__none__";
+
 #[cfg(test)]
 thread_local! { static CANDIDATE_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
@@ -46,6 +49,7 @@ pub struct LibrarySnapshot {
 }
 #[derive(Clone, Debug)]
 pub struct ListKey {
+    pub pinned: bool,
     pub updated_at_ms: Option<i64>,
     pub id: String,
 }
@@ -325,6 +329,40 @@ impl Store {
             tx.execute("INSERT INTO schema_migrations(version) VALUES(12)", [])?;
             tx.commit()?;
         }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 13 {
+            let tx = self.connection.transaction()?;
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS conversation_local_state(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0,1)),archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),updated_at_ms INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS conversation_local_state_page ON conversation_local_state(archived,pinned,conversation_id);")?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(13)", [])?;
+            tx.commit()?;
+        }
+        let v: i64 = self.connection.query_row(
+            "SELECT coalesce(max(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )?;
+        if v < 14 {
+            let mut columns = self
+                .connection
+                .prepare("PRAGMA table_info(conversation_local_state)")?;
+            let names = columns
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(columns);
+            let tx = self.connection.transaction()?;
+            if !names.iter().any(|name| name == "pinned_scope") {
+                tx.execute_batch(
+                    "ALTER TABLE conversation_local_state ADD COLUMN pinned_scope TEXT;",
+                )?;
+            }
+            tx.execute_batch("CREATE INDEX IF NOT EXISTS conversation_local_state_pin_scope ON conversation_local_state(pinned_scope,pinned,conversation_id);")?;
+            tx.execute("INSERT INTO schema_migrations(version) VALUES(14)", [])?;
+            tx.commit()?;
+        }
         self.connection.execute_batch("CREATE INDEX IF NOT EXISTS conversations_page_order ON conversations(updated_at_ms DESC,id ASC); CREATE INDEX IF NOT EXISTS graph_nodes_conversation_order ON graph_nodes(conversation_id,source_node_id); CREATE INDEX IF NOT EXISTS observations_conversation_order ON observations(conversation_id,id DESC);")?;
         Ok(())
     }
@@ -486,7 +524,7 @@ impl Store {
         project_key: &str,
         name: Option<&str>,
     ) -> Result<ProjectRenameSnapshot> {
-        if project_key.is_empty() || project_key.len() > 1024 {
+        if project_key.is_empty() || project_key.len() > 1024 || project_key == NO_PROJECT_FILTER {
             return Err(Error::Configuration("invalid project key".into()));
         }
         let normalized = name.map(str::trim).filter(|value| !value.is_empty());
@@ -672,9 +710,14 @@ impl Store {
         else {
             return Err(Error::Configuration("unknown conversation".into()));
         };
-        if !is_chatgpt_provider(&conversation_provider)
-            || !valid_upstream_conversation_id(&conversation_source_id)
-        {
+        let Some(upstream_conversation_id) =
+            normalized_upstream_conversation_id(&conversation_source_id)
+        else {
+            return Err(Error::Configuration(
+                "conversation is not an upstream ChatGPT record".into(),
+            ));
+        };
+        if !is_chatgpt_provider(&conversation_provider) {
             return Err(Error::Configuration(
                 "conversation is not an upstream ChatGPT record".into(),
             ));
@@ -736,7 +779,7 @@ impl Store {
             "conversation_id": conversation_id,
             "conversation_provider": conversation_provider,
             "conversation_scope": conversation_scope,
-            "conversation_source_id": conversation_source_id,
+            "conversation_source_id": upstream_conversation_id,
             "project_key": project_key,
             "project_provider": project_provider,
             "project_scope": project_scope,
@@ -752,6 +795,9 @@ impl Store {
         project_key: Option<&str>,
         verified_project_title: Option<&str>,
     ) -> Result<Value> {
+        if project_key == Some(NO_PROJECT_FILTER) {
+            return Err(Error::Configuration("invalid project key".into()));
+        }
         let tx = self.connection.transaction()?;
         let conversation: Option<(String, String, String)> = tx
             .query_row(
@@ -1037,6 +1083,32 @@ impl Store {
         project_key: Option<&str>,
         tag: Option<&str>,
     ) -> Result<ListPageSnapshot> {
+        self.source_list_page_snapshot_with_tag_and_archive_state(
+            limit,
+            after,
+            expected_revision,
+            source,
+            project_key,
+            tag,
+            "active",
+        )
+    }
+    // This compatibility wrapper keeps existing callers on named positional
+    // filters while the SQL implementation remains centralized below.
+    #[allow(clippy::too_many_arguments)]
+    pub fn source_list_page_snapshot_with_tag_and_archive_state(
+        &self,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+        source: &str,
+        project_key: Option<&str>,
+        tag: Option<&str>,
+        archive_state: &str,
+    ) -> Result<ListPageSnapshot> {
+        if !matches!(archive_state, "active" | "archived") {
+            return Err(Error::Configuration("invalid archive filter".into()));
+        }
         let tag_key = tag.map(tags::normalized_tag_key).transpose()?;
         self.list_page_snapshot_scoped(
             limit,
@@ -1045,6 +1117,7 @@ impl Store {
             source,
             project_key,
             tag_key.as_deref(),
+            archive_state,
         )
     }
     fn list_page_snapshot_filtered(
@@ -1061,8 +1134,12 @@ impl Store {
             if chat_only { "chatgpt" } else { "all" },
             None,
             None,
+            "active",
         )
     }
+    // These filters intentionally remain separate to make their SQL bindings
+    // and cursor contract easy to audit.
+    #[allow(clippy::too_many_arguments)]
     fn list_page_snapshot_scoped(
         &self,
         limit: usize,
@@ -1071,6 +1148,7 @@ impl Store {
         source: &str,
         project_key: Option<&str>,
         tag_key: Option<&str>,
+        archive_state: &str,
     ) -> Result<ListPageSnapshot> {
         let tx = self.connection.unchecked_transaction()?;
         let revision: i64 = tx.query_row(
@@ -1099,9 +1177,17 @@ impl Store {
                 "codex" => "(provider LIKE 'codex%' OR provider LIKE 'paseo-codex%') AND ",
                 _ => return Err(Error::Configuration("invalid source".into())),
             };
-            let project_filter = "(?6 IS NULL OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=conversations.id AND cp.project_key=?6)) AND ";
+            let project_filter = format!("(?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=conversations.id)) OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=conversations.id AND cp.project_key=?6)) AND ", NO_PROJECT_FILTER);
             let tag_filter = "(?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=conversations.id AND tt.name_key=?7)) AND ";
-            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {source_filter}{project_filter}{tag_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
+            let pinned_expr = "coalesce((SELECT pinned FROM conversation_local_state cs WHERE cs.conversation_id=conversations.id),0)";
+            let archived_expr = "coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=conversations.id),0)";
+            let archive_filter = match archive_state {
+                "active" => format!("{archived_expr}=0 AND "),
+                "archived" => format!("{archived_expr}=1 AND "),
+                _ => unreachable!(),
+            };
+            let after_filter = format!("(?1=1 OR {pinned_expr} < ?8 OR ({pinned_expr}=?8 AND ((?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3))))");
+            let budget_sql = format!("SELECT coalesce(sum(length(CAST(id AS BLOB))+length(CAST(provider AS BLOB))+length(CAST(account_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(title AS BLOB))),0) FROM (SELECT id,provider,account_scope,source_id,title FROM conversations WHERE {source_filter}{project_filter}{tag_filter}{archive_filter}{after_filter} ORDER BY {pinned_expr} DESC,updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5)");
             let mut pre = tx.prepare(&budget_sql)?;
             let source_bytes: i64 = pre.query_row(
                 params![
@@ -1111,7 +1197,8 @@ impl Store {
                     after.is_some() as i64,
                     lim,
                     project_key,
-                    tag_key
+                    tag_key,
+                    after.is_some_and(|k| k.pinned) as i64
                 ],
                 |r| r.get(0),
             )?;
@@ -1125,12 +1212,12 @@ impl Store {
                     limit: 8 * 1024 * 1024 - 64 * 1024,
                 });
             }
-            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms,(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=conversations.id) FROM conversations WHERE {source_filter}{project_filter}{tag_filter}(?1=1 OR (?2 IS NOT NULL AND (updated_at_ms < ?2 OR (updated_at_ms=?2 AND id>?3) OR updated_at_ms IS NULL)) OR (?2 IS NULL AND ?4=1 AND updated_at_ms IS NULL AND id>?3)) ORDER BY updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
+            let page_sql = format!("SELECT id,provider,account_scope,source_id,title,updated_at_ms,(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=conversations.id),{pinned_expr},{archived_expr} FROM conversations WHERE {source_filter}{project_filter}{tag_filter}{archive_filter}{after_filter} ORDER BY {pinned_expr} DESC,updated_at_ms DESC NULLS LAST,id ASC LIMIT ?5");
             let mut st = tx.prepare(&page_sql)?;
             let ids = st
                 .query_map(
-                    params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim, project_key, tag_key],
-                    |r| { let project: Option<String> = r.get(6)?; Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"provider":r.get::<_,String>(1)?,"account_scope":r.get::<_,String>(2)?,"source_id":r.get::<_,String>(3)?,"title":r.get::<_,String>(4)?,"updated_at_ms":r.get::<_,Option<i64>>(5)?,"project":project.and_then(|value|serde_json::from_str::<Value>(&value).ok())})) },
+                    params![after.is_none() as i64, after.and_then(|k| k.updated_at_ms), after.map(|k| k.id.as_str()).unwrap_or(""), after.is_some() as i64, lim, project_key, tag_key, after.is_some_and(|k| k.pinned) as i64],
+                    |r| { let project: Option<String> = r.get(6)?; Ok(serde_json::json!({"id":r.get::<_,String>(0)?,"provider":r.get::<_,String>(1)?,"account_scope":r.get::<_,String>(2)?,"source_id":r.get::<_,String>(3)?,"title":r.get::<_,String>(4)?,"updated_at_ms":r.get::<_,Option<i64>>(5)?,"project":project.and_then(|value|serde_json::from_str::<Value>(&value).ok()),"pinned":r.get::<_,i64>(7)?!=0,"archived":r.get::<_,i64>(8)?!=0})) },
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             items.extend(ids);
@@ -1261,7 +1348,35 @@ impl Store {
         expected_revision: Option<i64>,
         scope: PageScope<'_>,
     ) -> Result<SearchPageSnapshot> {
-        self.search_page_snapshot_scoped(raw_query, limit, after, expected_revision, scope)
+        self.source_search_page_snapshot_with_tag_and_archive_state(
+            raw_query,
+            limit,
+            after,
+            expected_revision,
+            scope,
+            "active",
+        )
+    }
+    pub fn source_search_page_snapshot_with_tag_and_archive_state(
+        &self,
+        raw_query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        scope: PageScope<'_>,
+        archive_state: &str,
+    ) -> Result<SearchPageSnapshot> {
+        if !matches!(archive_state, "active" | "archived") {
+            return Err(Error::Configuration("invalid archive filter".into()));
+        }
+        self.search_page_snapshot_scoped(
+            raw_query,
+            limit,
+            after,
+            expected_revision,
+            scope,
+            archive_state,
+        )
     }
     fn search_page_snapshot_filtered(
         &self,
@@ -1281,6 +1396,7 @@ impl Store {
                 project_key: None,
                 tag: None,
             },
+            "active",
         )
     }
     fn search_page_snapshot_scoped(
@@ -1290,6 +1406,7 @@ impl Store {
         after: Option<&SearchKey>,
         expected_revision: Option<i64>,
         scope: PageScope<'_>,
+        archive_state: &str,
     ) -> Result<SearchPageSnapshot> {
         let PageScope {
             source,
@@ -1342,14 +1459,15 @@ impl Store {
                     "codex" => " AND (c.provider LIKE 'codex%' OR c.provider LIKE 'paseo-codex%')",
                     _ => return Err(Error::Configuration("invalid source".into())),
                 };
-                let project_message_filter = " AND (?6 IS NULL OR f.conversation_id IN (SELECT conversation_id FROM conversation_projects WHERE project_key=?6))";
-                let project_title_filter = " AND (?6 IS NULL OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=c.id AND cp.project_key=?6))";
+                let project_message_filter = format!(" AND (?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=f.conversation_id)) OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=f.conversation_id AND cp.project_key=?6))", NO_PROJECT_FILTER);
+                let project_title_filter = format!(" AND (?6 IS NULL OR (?6='{}' AND NOT EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=c.id)) OR EXISTS(SELECT 1 FROM conversation_projects cp WHERE cp.conversation_id=c.id AND cp.project_key=?6))", NO_PROJECT_FILTER);
                 let tag_message_filter = " AND (?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=f.conversation_id AND tt.name_key=?7))";
                 let tag_title_filter = " AND (?7 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt WHERE tt.target_kind='conversation' AND tt.target_id=c.id AND tt.name_key=?7))";
-                let chat_message_filter =
-                    format!("{source_message_filter}{project_message_filter}{tag_message_filter}");
-                let chat_title_filter =
-                    format!("{source_title_filter}{project_title_filter}{tag_title_filter}");
+                let archived_value = if archive_state == "archived" { 1 } else { 0 };
+                let archive_message_filter = format!(" AND coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=f.conversation_id),0)={archived_value}");
+                let archive_title_filter = format!(" AND coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=c.id),0)={archived_value}");
+                let chat_message_filter = format!("{source_message_filter}{project_message_filter}{tag_message_filter}{archive_message_filter}");
+                let chat_title_filter = format!("{source_title_filter}{project_title_filter}{tag_title_filter}{archive_title_filter}");
                 // FTS counts tokens, not bytes: a single token may contain an
                 // entire long URL or pasted blob. Bound the excerpt separately
                 // while keeping the complete text in the authoritative store.
@@ -1491,7 +1609,7 @@ impl Store {
                     let selected = node
                         .as_ref()
                         .is_some_and(|n| graph.selected_thread.contains(n));
-                    let summary: Value=tx.query_row("SELECT json_object('id',c.id,'provider',c.provider,'account_scope',c.account_scope,'source_id',c.source_id,'title',c.title,'updated_at_ms',c.updated_at_ms,'project',(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=c.id)) FROM conversations c WHERE c.id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
+                    let summary: Value=tx.query_row("SELECT json_object('id',c.id,'provider',c.provider,'account_scope',c.account_scope,'source_id',c.source_id,'title',c.title,'updated_at_ms',c.updated_at_ms,'pinned',json(CASE WHEN coalesce((SELECT pinned FROM conversation_local_state cs WHERE cs.conversation_id=c.id),0)<>0 THEN 'true' ELSE 'false' END),'archived',json(CASE WHEN coalesce((SELECT archived FROM conversation_local_state cs WHERE cs.conversation_id=c.id),0)<>0 THEN 'true' ELSE 'false' END),'project',(SELECT json_object('project_key',p.project_key,'project_id',p.source_id,'title',p.title,'display_name',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN trim(p.local_name) WHEN trim(coalesce(p.title,''))<>'' THEN trim(p.title) ELSE NULL END,'name_source',CASE WHEN trim(coalesce(p.local_name,''))<>'' THEN 'local' WHEN trim(coalesce(p.title,''))<>'' THEN 'upstream' ELSE 'unknown' END) FROM conversation_projects cp JOIN projects p ON p.project_key=cp.project_key WHERE cp.conversation_id=c.id)) FROM conversations c WHERE c.id=?1",[&id],|r|r.get::<_,String>(0))?.parse().unwrap_or(Value::Null);
                     hits.push(serde_json::json!({"conversation":summary,"node_id":node,"message_id":msg,"leaf_node_id":leaf,"snippet":snip,"score":score,"selected_branch":selected}));
                     if serde_json::to_vec(&hits)
                         .map_or(true, |v| v.len() > 8 * 1024 * 1024 - 64 * 1024)
@@ -1645,6 +1763,12 @@ impl Store {
         })
     }
 }
+
+mod conversation_state;
+pub use conversation_state::{
+    ChatgptPinSnapshotSummary, ConversationStateChange, ConversationStateSnapshot,
+    VerifiedChatgptPinSnapshotReceipt, VerifiedConversationStateReceipt,
+};
 #[derive(Clone, Debug, Default)]
 struct SearchTopology {
     parents: std::collections::HashMap<String, Option<String>>,
@@ -1805,7 +1929,7 @@ fn read_normalized_conn(conn: &Connection, id: &str) -> Result<Option<Value>> {
     }
     ancestry.reverse();
     Ok(Some(
-        serde_json::json!({"id":id,"title":title,"provider":provider,"account_scope":scope,"scope":scope,"source_id":source,"url":url,"updated_at_ms":updated,"source_current_node_id":current,"selected_node_id":selected,"selection_reason":reason,"thread_node_ids":ancestry,"thread_complete":reached_root,"nodes":nodes,"messages":messages}),
+        serde_json::json!({"id":id,"title":title,"provider":provider,"account_scope":scope,"scope":scope,"source_id":source,"url":url,"updated_at_ms":updated,"pinned":conversation_state::state_flag(conn,&id,"pinned")?,"archived":conversation_state::state_flag(conn,&id,"archived")?,"source_current_node_id":current,"selected_node_id":selected,"selection_reason":reason,"thread_node_ids":ancestry,"thread_complete":reached_root,"nodes":nodes,"messages":messages}),
     ))
 }
 
@@ -1909,14 +2033,20 @@ fn is_chatgpt_provider(provider: &str) -> bool {
 }
 
 fn valid_upstream_conversation_id(id: &str) -> bool {
-    id.len() == 36
+    normalized_upstream_conversation_id(id).is_some()
+}
+
+fn normalized_upstream_conversation_id(id: &str) -> Option<&str> {
+    let id = id.strip_prefix("conversation:").unwrap_or(id);
+    (id.len() == 36
         && id.bytes().enumerate().all(|(index, byte)| {
             if [8, 13, 18, 23].contains(&index) {
                 byte == b'-'
             } else {
                 byte.is_ascii_hexdigit()
             }
-        })
+        }))
+    .then_some(id)
 }
 
 fn valid_upstream_project_id(id: &str) -> bool {
@@ -2742,8 +2872,8 @@ mod project_and_search_tests {
         let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
         let project_id = format!("g-p-{}", "a".repeat(32));
         store.connection.execute(
-            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Legacy chat','paseo-chatgpt','paseo-cache:owner',?1,1)",
-            [conversation_id],
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Legacy chat','paseo-chatgpt','paseo-cache:owner',?2,1)",
+            params![conversation_id, format!("conversation:{conversation_id}")],
         ).unwrap();
         store.connection.execute(
             "INSERT INTO projects(project_key,provider,account_scope,source_id,title,local_name) VALUES('current-project','chatgpt','chatgpt:observed:'||?1,?2,'Old title','Local name')",
@@ -2773,6 +2903,18 @@ mod project_and_search_tests {
             )
             .unwrap();
         assert_eq!(persisted_scope, "paseo-cache:owner");
+        let persisted_source_id: String = store
+            .connection
+            .query_row(
+                "SELECT source_id FROM conversations WHERE id=?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_source_id,
+            format!("conversation:{conversation_id}")
+        );
         let upstream_title: String = store
             .connection
             .query_row(
@@ -2796,6 +2938,14 @@ mod project_and_search_tests {
                 .unwrap(),
             0
         );
+        let nested_prefix_id = "123e4567-e89b-12d3-a456-426614174001";
+        store.connection.execute(
+            "INSERT INTO conversations(id,title,provider,account_scope,source_id,updated_at_ms) VALUES(?1,'Bad cached source','paseo-chatgpt','paseo-cache:owner',?2,1)",
+            params![nested_prefix_id, format!("conversation:conversation:{nested_prefix_id}")],
+        ).unwrap();
+        assert!(store
+            .project_assignment_context(nested_prefix_id, None)
+            .is_err());
     }
 
     #[test]
@@ -2860,7 +3010,7 @@ mod project_and_search_tests {
                 .unwrap(),
             0
         );
-        assert_eq!(store.schema_version().unwrap(), 12);
+        assert_eq!(store.schema_version().unwrap(), 14);
 
         store.connection.execute("INSERT INTO projects(project_key,provider,account_scope,source_id,title) VALUES('bad-empty','paseo-chatgpt','paseo-cache:owner','','Assigned project')", []).unwrap();
         store.connection.execute("INSERT INTO conversation_projects(conversation_id,project_key) VALUES('legacy-empty','bad-empty')", []).unwrap();

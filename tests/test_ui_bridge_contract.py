@@ -131,6 +131,7 @@ class UiBridgeContract(unittest.TestCase):
             "catalog_overview", "catalog_graph", "rebuild_catalog_index",
             "get_capture_preferences", "set_capture_preferences", "restart_capture_settings",
             "sync_chatgpt_history", "chatgpt_history_status",
+            "sync_chatgpt_pins",
         )
         for command in sensitive:
             with self.subTest(command=command):
@@ -140,6 +141,26 @@ class UiBridgeContract(unittest.TestCase):
                 self.assertIn("window: tauri::Webview", signature)
                 self.assertIn("authorize_local_main(&window)?;", body)
 
+    def test_chatgpt_pin_snapshot_is_main_only_and_read_only(self):
+        main = (ROOT / "src-tauri/src/main.rs").read_text()
+        function = rust_function(main, "sync_chatgpt_pins")
+        self.assertIsNotNone(function)
+        _, body = function
+        first_statement = next(line.strip() for line in body.splitlines() if line.strip())
+        self.assertEqual(first_statement, "authorize_local_main(&window)?;")
+        self.assertNotIn("history.snapshot()", body)
+        self.assertIn("history.note_provider_rate_limit", body)
+        handler_blocks = re.findall(r"\.invoke_handler\(tauri::generate_handler!\[(.*?)\]\)", main, re.S)
+        self.assertEqual(len(handler_blocks), 2)
+        for handler in handler_blocks:
+            self.assertIn("sync_chatgpt_pins", handler)
+        worker = (ROOT / "src-tauri/src/pin_snapshot.js").read_text()
+        provider = (ROOT / "src-tauri/src/provider_view.rs").read_text()
+        self.assertIn("/backend-api/pins?item_type=conversation", worker)
+        self.assertNotRegex(worker, r"method:\s*['\"](?:POST|DELETE)['\"]")
+        self.assertIn("payload[key] !== rows.length", worker)
+        self.assertIn("pin_snapshot_cooldown_remaining(expected_scope)", provider)
+
     def test_library_item_commands_authorize_before_any_file_or_service_io(self):
         source = (ROOT / "src-tauri/src/library_items.rs").read_text()
         commands = re.findall(r"pub async fn\s+(\w+)\s*\(", source)
@@ -147,6 +168,7 @@ class UiBridgeContract(unittest.TestCase):
             set(commands),
             {
                 "catalog_entities", "catalog_entity", "list_local_tags",
+                "catalog_entity_graph", "catalog_tag_suggestions",
                 "get_target_tags", "set_target_tags", "tagged_targets",
                 "saved_artifacts", "attach_artifact_file", "export_artifact_file",
                 "open_artifact_file", "open_catalog_link",
