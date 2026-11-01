@@ -2577,8 +2577,12 @@ mod identity_tests {
             .find(|p| p["project_key"] == "other-project")
             .unwrap();
         assert_eq!(other["conversation_count"], 1);
-        assert!(projects.iter().any(|p| p["project_key"] == "same-title-other-id"));
-        assert!(!projects.iter().any(|p| p["project_key"] == "legacy-project"));
+        assert!(projects
+            .iter()
+            .any(|p| p["project_key"] == "same-title-other-id"));
+        assert!(!projects
+            .iter()
+            .any(|p| p["project_key"] == "legacy-project"));
 
         let page = store
             .list_page_snapshot_scoped(
