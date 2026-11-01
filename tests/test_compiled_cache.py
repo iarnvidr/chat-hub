@@ -52,6 +52,12 @@ class CompiledCacheContractTests(unittest.TestCase):
         with self.assertRaises(compiled_cache.CacheError):
             compiled_cache.rust_hits_from_stats({"cache_hits": {"counts": {"Rust": "three"}}})
 
+    def test_composite_oras_installer_receives_scoped_release_download_token(self):
+        action = (ROOT / "ci/actions/cargo-sccache-cache/action.yml").read_text()
+        installer_step = action.split("    - name: Install pinned ORAS client\n", 1)[1]
+        installer_step = installer_step.split("    - name: Restore protected-main compiler cache\n", 1)[0]
+        self.assertIn("      env:\n        GH_TOKEN: ${{ inputs.github-token }}\n", installer_step)
+
     def test_rustc_wrapper_preserves_hyphenated_cargo_env_and_exact_arguments(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
