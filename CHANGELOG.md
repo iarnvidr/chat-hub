@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 — release candidate
+
+- Adds a No project filter across chats, search and the indexed overview.
+- Replaces the full-row hover with a compact action rail, an inline project picker, pin/unpin, archive/restore, tags and copy-link actions. Keyboard and reduced-motion interactions are supported.
+- Pin and archive changes use ChatGPT's signed-in session and require verified readback before updating the local library. Archived chats have a separate filter; pins sort before other chats across database pages.
+- No live personal-chat mutations were performed during implementation checks. The existing live history/capture acceptance limitations remain.
+
 ## 0.2.1 — release candidate
 
 - Compact tabbed chat workspace, Chat/Codex separation, inline expandable projects, five saved color schemes, distinct speaker styling and native tab shortcuts. Cmd/Ctrl+W leaves the app open when there are no tabs.

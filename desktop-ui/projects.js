@@ -45,7 +45,7 @@ function verifyReceipt(result, scope) {
   if (!result || typeof result !== 'object' || !Number.isSafeInteger(result.library_revision)) throw Error('update_unconfirmed');
   if (scope === 'upstream' && (result.scope !== 'upstream' || result.verified !== true)) throw Error('update_unconfirmed');
 }
-$('project-filter').addEventListener('change', () => { $('edit-project-name').disabled = !$('project-filter').value; });
+$('project-filter').addEventListener('change', () => { $('edit-project-name').disabled = !$('project-filter').value || $('project-filter').value === '__none__'; });
 $('edit-project-name').addEventListener('click', async () => {
   try {
     await loadProjects(); editingProject = projects.find(project => project.project_key === $('project-filter').value);

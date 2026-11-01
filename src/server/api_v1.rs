@@ -73,6 +73,31 @@ pub trait ReadAdapter: Send {
         }
         self.scoped_list_page_snapshot(source, project_key, limit, after, expected_revision)
     }
+    // Keep this adapter method explicit so older test/read adapters can fail
+    // closed without adopting a new options type.
+    #[allow(clippy::too_many_arguments)]
+    fn scoped_list_page_snapshot_with_tag_archive_state(
+        &mut self,
+        source: &str,
+        project_key: Option<&str>,
+        tag: Option<&str>,
+        archive_state: &str,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        if archive_state != "active" {
+            return Err(ReadError::Unavailable);
+        }
+        self.scoped_list_page_snapshot_with_tag(
+            source,
+            project_key,
+            tag,
+            limit,
+            after,
+            expected_revision,
+        )
+    }
     fn projects_snapshot(&mut self, _source: &str) -> Result<(i64, Vec<Value>), ReadError> {
         Err(ReadError::Unavailable)
     }
@@ -133,6 +158,20 @@ pub trait ReadAdapter: Send {
             scope.project_key,
         )
     }
+    fn scoped_search_page_snapshot_with_tag_archive_state(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        scope: crate::store::PageScope<'_>,
+        archive_state: &str,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        if archive_state != "active" {
+            return Err(ReadError::Unavailable);
+        }
+        self.scoped_search_page_snapshot_with_tag(query, limit, after, expected_revision, scope)
+    }
     fn detail_snapshot(&mut self, canonical_id: &str) -> Result<DetailSnapshot, ReadError>;
     /// Service readiness must be known independently of the database probe.
     fn diagnostics(&mut self) -> Result<Diagnostics, ReadError>;
@@ -158,6 +197,7 @@ pub struct DetailSnapshot {
 }
 #[derive(Clone, Debug)]
 pub struct ListKey {
+    pub pinned: bool,
     pub updated_at_ms: Option<i64>,
     pub id: String,
 }
@@ -182,6 +222,10 @@ pub struct Summary {
     pub source_id: String,
     pub title: String,
     pub updated_at_ms: Option<i64>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<ProjectSummary>,
 }
@@ -263,6 +307,7 @@ impl ReadAdapter for StoreReader {
         expected_revision: Option<i64>,
     ) -> Result<ListPageSnapshot, ReadError> {
         let after = after.map(|key| crate::store::ListKey {
+            pinned: key.pinned,
             updated_at_ms: key.updated_at_ms,
             id: key.id.clone(),
         });
@@ -292,6 +337,7 @@ impl ReadAdapter for StoreReader {
         expected_revision: Option<i64>,
     ) -> Result<ListPageSnapshot, ReadError> {
         let after = after.map(|key| crate::store::ListKey {
+            pinned: key.pinned,
             updated_at_ms: key.updated_at_ms,
             id: key.id.clone(),
         });
@@ -337,6 +383,7 @@ impl ReadAdapter for StoreReader {
         expected_revision: Option<i64>,
     ) -> Result<ListPageSnapshot, ReadError> {
         let after = after.map(|key| crate::store::ListKey {
+            pinned: key.pinned,
             updated_at_ms: key.updated_at_ms,
             id: key.id.clone(),
         });
@@ -351,6 +398,46 @@ impl ReadAdapter for StoreReader {
                 source,
                 project_key,
                 tag,
+            )
+            .map_err(store_read_error)?;
+        Ok(ListPageSnapshot {
+            library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
+            items: snapshot
+                .items
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
+    }
+    fn scoped_list_page_snapshot_with_tag_archive_state(
+        &mut self,
+        source: &str,
+        project_key: Option<&str>,
+        tag: Option<&str>,
+        archive_state: &str,
+        limit: usize,
+        after: Option<&ListKey>,
+        expected_revision: Option<i64>,
+    ) -> Result<ListPageSnapshot, ReadError> {
+        let after = after.map(|key| crate::store::ListKey {
+            pinned: key.pinned,
+            updated_at_ms: key.updated_at_ms,
+            id: key.id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .source_list_page_snapshot_with_tag_and_archive_state(
+                limit,
+                after.as_ref(),
+                expected_revision,
+                source,
+                project_key,
+                tag,
+                archive_state,
             )
             .map_err(store_read_error)?;
         Ok(ListPageSnapshot {
@@ -467,6 +554,44 @@ impl ReadAdapter for StoreReader {
                 .map_err(|_| ReadError::InvalidData)?,
         })
     }
+    fn scoped_search_page_snapshot_with_tag_archive_state(
+        &mut self,
+        query: &str,
+        limit: usize,
+        after: Option<&SearchKey>,
+        expected_revision: Option<i64>,
+        scope: crate::store::PageScope<'_>,
+        archive_state: &str,
+    ) -> Result<SearchPageSnapshot, ReadError> {
+        let after = after.map(|key| crate::store::SearchKey {
+            score: key.score,
+            conversation_id: key.conversation_id.clone(),
+            node_id: key.node_id.clone(),
+        });
+        let snapshot = self
+            .store
+            .lock()
+            .map_err(|_| ReadError::Unavailable)?
+            .source_search_page_snapshot_with_tag_and_archive_state(
+                query,
+                limit,
+                after.as_ref(),
+                expected_revision,
+                scope,
+                archive_state,
+            )
+            .map_err(store_read_error)?;
+        Ok(SearchPageSnapshot {
+            library_revision: snapshot.library_revision,
+            tag_revision: snapshot.tag_revision,
+            hits: snapshot
+                .hits
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ReadError::InvalidData)?,
+        })
+    }
     fn chat_list_page_snapshot(
         &mut self,
         limit: usize,
@@ -474,6 +599,7 @@ impl ReadAdapter for StoreReader {
         expected_revision: Option<i64>,
     ) -> Result<ListPageSnapshot, ReadError> {
         let after = after.map(|key| crate::store::ListKey {
+            pinned: key.pinned,
             updated_at_ms: key.updated_at_ms,
             id: key.id.clone(),
         });
@@ -626,6 +752,10 @@ pub(super) fn routes(
         .route("/api/v1/status", get(status))
         .route("/api/v1/version", get(version))
         .route("/api/v1/conversations", get(list))
+        .route(
+            "/api/v1/conversations/:id/state",
+            get(get_conversation_state).patch(set_conversation_state),
+        )
         .route("/api/v1/projects", get(projects))
         .route("/api/v1/projects/name", patch(rename_project))
         .route(
@@ -818,6 +948,7 @@ struct PageQuery {
     source: Option<String>,
     project_key: Option<String>,
     tag: Option<String>,
+    archive_state: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -828,6 +959,7 @@ struct SearchQuery {
     source: Option<String>,
     project_key: Option<String>,
     tag: Option<String>,
+    archive_state: Option<String>,
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -869,6 +1001,8 @@ struct Cursor {
 #[serde(tag = "kind", deny_unknown_fields)]
 enum Key {
     List {
+        #[serde(default)]
+        pinned: bool,
         updated_at_ms: Option<i64>,
         id: String,
     },
@@ -914,7 +1048,7 @@ fn decode_cursor(
     if cursor.version != 1
         || cursor.route != route
         || cursor.query != q.map(query_fingerprint)
-        || cursor.order != format!("{route}-v1")
+        || cursor.order != format!("{route}-v2")
         || cursor.revision < 0
     {
         return Err(invalid_cursor());
@@ -944,7 +1078,7 @@ fn encode_cursor(
         version: 1,
         route: route.into(),
         query: q.map(query_fingerprint),
-        order: format!("{route}-v1"),
+        order: format!("{route}-v2"),
         revision,
         tag_revision,
         after,
@@ -980,22 +1114,124 @@ fn tag_revision(cursor: &Option<Cursor>, current: Option<i64>) -> Result<(), Api
     Ok(())
 }
 fn compare_list(a: &Summary, b: &Summary) -> Ordering {
-    b.updated_at_ms
-        .cmp(&a.updated_at_ms)
-        .then_with(|| a.id.cmp(&b.id))
+    b.pinned.cmp(&a.pinned).then_with(|| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    })
 }
 fn after_list(item: &Summary, key: &Key) -> bool {
-    let Key::List { updated_at_ms, id } = key else {
+    let Key::List {
+        pinned,
+        updated_at_ms,
+        id,
+    } = key
+    else {
         return false;
     };
-    updated_at_ms
-        .cmp(&item.updated_at_ms)
+    pinned
+        .cmp(&item.pinned)
+        .then_with(|| updated_at_ms.cmp(&item.updated_at_ms))
         .then_with(|| item.id.cmp(id))
         == Ordering::Greater
 }
 async fn list(State(s): State<ApiState>, q: Result<Query<PageQuery>, QueryRejection>) -> ApiResult {
     list_route(State(s), q, "list", None).await
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationStateRequest {
+    pinned: Option<bool>,
+    archived: Option<bool>,
+    receipt: crate::store::VerifiedConversationStateReceipt,
+}
+
+async fn get_conversation_state(State(s): State<ApiState>, Path(id): Path<String>) -> ApiResult {
+    if id.trim().is_empty() || id.len() > 1024 || id.chars().any(char::is_control) {
+        return Err(invalid_request());
+    }
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let identity = tokio::task::spawn_blocking(move || {
+        let _db_permit = db_permit;
+        store
+            .lock()
+            .map_err(|_| unavailable())?
+            .conversation_state_identity(&id)
+            .map_err(|_| unavailable())
+    })
+    .await
+    .map_err(|_| unavailable())??
+    .ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Conversation not found.",
+        )
+    })?;
+    checked_json(serde_json::to_value(identity).map_err(|_| unavailable())?)
+}
+
+async fn set_conversation_state(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<ConversationStateRequest>,
+) -> ApiResult {
+    if id.trim().is_empty()
+        || id.len() > 1024
+        || id.chars().any(char::is_control)
+        || request.pinned.is_none() && request.archived.is_none()
+    {
+        return Err(invalid_request());
+    }
+    let store = s.import_store.clone().ok_or_else(unavailable)?;
+    let import_permit = s.import_ops.clone().try_acquire_owned().map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "The library is busy.",
+        )
+    })?;
+    let db_permit = s
+        .db_ops
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| unavailable())?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _import_permit = import_permit;
+        let _db_permit = db_permit;
+        store
+            .lock()
+            .map_err(|_| unavailable())?
+            .commit_verified_conversation_state(
+                &id,
+                &request.receipt,
+                crate::store::ConversationStateChange {
+                    pinned: request.pinned,
+                    archived: request.archived,
+                },
+            )
+            .map_err(|error| match error {
+                crate::error::Error::Configuration(_) => invalid_request(),
+                _ => unavailable(),
+            })
+    })
+    .await
+    .map_err(|_| unavailable())??;
+    checked_json(json!({
+        "conversation_id": result.conversation_id,
+        "pinned": result.pinned,
+        "archived": result.archived,
+        "library_revision": result.library_revision,
+        "verified": true
+    }))
+}
+
 async fn chat_list(
     State(s): State<ApiState>,
     q: Result<Query<PageQuery>, QueryRejection>,
@@ -1430,16 +1666,27 @@ async fn list_route(
     {
         return Err(invalid_request());
     }
+    let archive_state = q.archive_state.clone().unwrap_or_else(|| "active".into());
+    if !matches!(archive_state.as_str(), "active" | "archived") {
+        return Err(invalid_request());
+    }
     let tag_key = tag_filter_key(q.tag.as_deref())?;
-    let base_scope = (source != "all" && forced_source.is_none() || q.project_key.is_some())
-        .then(|| format!("{source}|{}", q.project_key.as_deref().unwrap_or("")));
+    let base_scope = format!(
+        "{source}|{}|archive:{archive_state}",
+        q.project_key.as_deref().unwrap_or("")
+    );
     let cursor_scope = tag_key
         .as_deref()
-        .map(|tag| format!("{}|tag:{tag}", base_scope.as_deref().unwrap_or("all")))
-        .or(base_scope);
-    let cursor = decode_cursor(q.cursor.as_deref(), route, cursor_scope.as_deref())?;
+        .map(|tag| format!("{base_scope}|tag:{tag}"))
+        .unwrap_or(base_scope);
+    let cursor = decode_cursor(q.cursor.as_deref(), route, Some(&cursor_scope))?;
     let after = cursor.as_ref().and_then(|c| match &c.after {
-        Key::List { updated_at_ms, id } => Some(ListKey {
+        Key::List {
+            pinned,
+            updated_at_ms,
+            id,
+        } => Some(ListKey {
+            pinned: *pinned,
             updated_at_ms: *updated_at_ms,
             id: id.clone(),
         }),
@@ -1449,10 +1696,11 @@ async fn list_route(
     let project_key = q.project_key.clone();
     let tag = q.tag;
     let snapshot = run_read(&s, move |r| {
-        r.scoped_list_page_snapshot_with_tag(
+        r.scoped_list_page_snapshot_with_tag_archive_state(
             &source,
             project_key.as_deref(),
             tag.as_deref(),
+            &archive_state,
             limit + 1,
             after.as_ref(),
             expected,
@@ -1478,10 +1726,11 @@ async fn list_route(
         let last = items.last().ok_or_else(invalid_data)?;
         Some(encode_cursor(
             route,
-            cursor_scope.as_deref(),
+            Some(&cursor_scope),
             snapshot.library_revision,
             snapshot.tag_revision,
             Key::List {
+                pinned: last.pinned,
                 updated_at_ms: last.updated_at_ms,
                 id: last.id.clone(),
             },
@@ -1536,6 +1785,7 @@ async fn search_route(
 ) -> ApiResult {
     let q = query(q)?;
     let limit = limit(q.limit)?;
+    let archive_state = q.archive_state.clone().unwrap_or_else(|| "active".into());
     let normalized = q.q.split_whitespace().collect::<Vec<_>>().join(" ");
     let source = forced_source
         .map(str::to_owned)
@@ -1545,6 +1795,7 @@ async fn search_route(
         || q.project_key
             .as_ref()
             .is_some_and(|key| key.is_empty() || key.len() > 1024)
+        || !matches!(archive_state.as_str(), "active" | "archived")
     {
         return Err(invalid_request());
     }
@@ -1552,14 +1803,10 @@ async fn search_route(
         return Err(invalid_request());
     }
     let tag_key = tag_filter_key(q.tag.as_deref())?;
-    let base_scope = if (source == "all" || forced_source.is_some()) && q.project_key.is_none() {
-        normalized.clone()
-    } else {
-        format!(
-            "{normalized}|{source}|{}",
-            q.project_key.as_deref().unwrap_or("")
-        )
-    };
+    let base_scope = format!(
+        "{normalized}|{source}|{}|archive:{archive_state}",
+        q.project_key.as_deref().unwrap_or("")
+    );
     let cursor_scope = tag_key
         .as_deref()
         .map(|tag| format!("{base_scope}|tag:{tag}"))
@@ -1583,7 +1830,7 @@ async fn search_route(
     });
     let expected = cursor.as_ref().map(|c| c.revision);
     let snapshot = run_read(&s, move |r| {
-        r.scoped_search_page_snapshot_with_tag(
+        r.scoped_search_page_snapshot_with_tag_archive_state(
             &raw_query,
             limit + 1,
             after.as_ref(),
@@ -1593,6 +1840,7 @@ async fn search_route(
                 project_key: project_key.as_deref(),
                 tag: tag.as_deref(),
             },
+            &archive_state,
         )
     })
     .await?;
@@ -1856,10 +2104,11 @@ mod tests {
         let revision = store.library_revision().unwrap();
         let token = encode_cursor(
             "list",
-            None,
+            Some("all||archive:active"),
             revision,
             None,
             Key::List {
+                pinned: false,
                 updated_at_ms: None,
                 id: "already-passed-null-row".into(),
             },
@@ -1910,10 +2159,11 @@ mod tests {
             .unwrap();
         let token = encode_cursor(
             "list",
-            Some("all|tag:work"),
+            Some("all||archive:active|tag:work"),
             tagged.library_revision,
             tagged.tag_revision,
             Key::List {
+                pinned: false,
                 updated_at_ms: None,
                 id: conversation_id.clone(),
             },
@@ -1969,7 +2219,7 @@ mod tests {
             .collect();
         let original: Value = serde_json::from_slice(&bytes).unwrap();
         for (field, replacement) in [
-            ("order", json!("search-v2")),
+            ("order", json!("search-v1")),
             ("version", json!(2)),
             ("revision", json!(-1)),
             ("unexpected", json!(true)),
@@ -2002,6 +2252,7 @@ mod tests {
             revision: 9,
             tag_revision: Some(3),
             after: Key::List {
+                pinned: false,
                 updated_at_ms: Some(1),
                 id: "conversation:one".into(),
             },

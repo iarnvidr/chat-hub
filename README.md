@@ -1,6 +1,6 @@
 # Chat Hub
 
-Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.1; a version bump is not a release or release acceptance.
+Chat Hub is a local-first conversation library with a Rust service/CLI and a Tauri desktop app. The application stores imported conversations in a normalized SQLite library, preserves conversation branches, and supports full-text search over message content. The application metadata in this candidate is version 0.2.2; a version bump is not a release or release acceptance.
 
 Provider capture is disabled by default. No real provider account, provider traffic capture, or production ingestion path has been accepted. The selective CONNECT proxy intercepts only the exact host `chatgpt.com`; subdomains, authentication/sign-in hosts and other hosts tunnel without TLS decryption. The per-install CA is not automatically added to system trust. Linux proxy checks use synthetic traffic and do not establish real-provider behavior.
 
@@ -21,6 +21,8 @@ The local index also extracts repositories, pull requests, issues, domains, link
 Local tags are stored independently of the derived index and survive rebuilds. The desktop uses the classified terminal palette, distinct speaker styles and stable graph positions. Cmd/Ctrl+W closes the selected tab and does nothing when no tabs are open. Native menu shortcuts also work while the embedded ChatGPT view has focus. Cmd/Ctrl+T opens a new chat; Ctrl+Tab cycles tabs and Cmd/Ctrl+1–9 selects tabs (9 selects the last).
 
 Projects expand inline in the sidebar, with the selected project retained when collapsed. Settings → Appearance offers five saved color schemes: Classified amber, Phosphor, Arctic, Violet and Field notes. Color changes also update the graph without losing its position.
+
+The No project filter selects unassigned conversations before pagination, including search and overview results. Each chat row has a compact action rail for pinning and a menu for project assignment, pin/unpin, archive/restore, tags and copying its ChatGPT link. Project, pin and archive changes use the signed-in ChatGPT session and require readback before the local library changes. Archived chats have a separate list filter; pinned chats sort before other chats across database pages. These upstream actions have contract and fake-provider tests; no personal-chat mutations were performed as development checks.
 
 ## Build and run
 

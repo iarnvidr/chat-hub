@@ -192,6 +192,17 @@ pub fn list_url_for_scope_and_tag(
     project_key: Option<&str>,
     tag: Option<&str>,
 ) -> Result<Url, String> {
+    list_url_for_scope_tag_archive(base, query, cursor, source, project_key, tag, None)
+}
+pub fn list_url_for_scope_tag_archive(
+    base: &str,
+    query: &str,
+    cursor: Option<&str>,
+    source: Option<&str>,
+    project_key: Option<&str>,
+    tag: Option<&str>,
+    archive_state: Option<&str>,
+) -> Result<Url, String> {
     let mut q = vec![("limit", "50")];
     if !query.trim().is_empty() {
         q.push(("q", query.trim()));
@@ -216,6 +227,12 @@ pub fn list_url_for_scope_and_tag(
             return Err("invalid_tag".into());
         }
         q.push(("tag", tag));
+    }
+    if let Some(archive_state) = archive_state {
+        if !matches!(archive_state, "active" | "archived" | "all") {
+            return Err("invalid_archive_state".into());
+        }
+        q.push(("archive_state", archive_state));
     }
     let endpoint = if query.trim().is_empty() {
         "conversations"
@@ -322,11 +339,26 @@ pub async fn list_in_scope_with_tag(
     project_key: Option<&str>,
     tag: Option<&str>,
 ) -> Result<Page, String> {
+    list_in_scope_with_tag_and_archive(base, token, q, cursor, source, project_key, tag, None).await
+}
+// Keep the server filter arguments explicit to mirror the native list command.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_in_scope_with_tag_and_archive(
+    base: &str,
+    token: &str,
+    q: &str,
+    cursor: Option<&str>,
+    source: Option<&str>,
+    project_key: Option<&str>,
+    tag: Option<&str>,
+    archive_state: Option<&str>,
+) -> Result<Page, String> {
     let c = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| "Desktop API unavailable")?;
-    let u = list_url_for_scope_and_tag(base, q, cursor, source, project_key, tag)?;
+    let u =
+        list_url_for_scope_tag_archive(base, q, cursor, source, project_key, tag, archive_state)?;
     get(&c, u, token).await
 }
 pub async fn projects(base: &str, token: &str, source: &str) -> Result<Value, String> {
@@ -537,6 +569,90 @@ pub async fn commit_project_assignment(
     }
     serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
 }
+
+pub async fn commit_conversation_state(
+    base: &str,
+    token: &str,
+    conversation_id: &str,
+    receipt: &serde_json::Value,
+    archived: Option<bool>,
+    pinned: Option<bool>,
+) -> Result<Value, String> {
+    if conversation_id.is_empty()
+        || conversation_id.len() > 1024
+        || (!archived.is_some() && !pinned.is_some())
+        || !receipt.is_object()
+    {
+        return Err("invalid_request".into());
+    }
+    let c = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = url(
+        base,
+        &["api", "v1", "conversations", conversation_id, "state"],
+        &[],
+    )?;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "receipt": receipt,
+        "archived": archived,
+        "pinned": pinned,
+    }))
+    .map_err(|_| "invalid_request")?;
+    let response = c
+        .patch(u)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| "Desktop API unavailable")?;
+    if !response.status().is_success() {
+        return Err(map_http_error(response.status(), None).into());
+    }
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Desktop API unavailable")?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err("response_too_large".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| "invalid_response".into())
+}
+
+pub async fn conversation_state_identity(
+    base: &str,
+    token: &str,
+    conversation_id: &str,
+) -> Result<Value, String> {
+    if conversation_id.is_empty() || conversation_id.len() > 1024 {
+        return Err("invalid_request".into());
+    }
+    let c = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| "Desktop API unavailable")?;
+    let u = conversation_state_url(base, conversation_id)?;
+    get(&c, u, token).await
+}
+
+fn conversation_state_url(base: &str, conversation_id: &str) -> Result<Url, String> {
+    if conversation_id.is_empty() || conversation_id.len() > 1024 {
+        return Err("invalid_request".into());
+    }
+    url(
+        base,
+        &["api", "v1", "conversations", conversation_id, "state"],
+        &[],
+    )
+}
+
 fn catalog_url(
     base: &str,
     endpoint: &str,
@@ -660,7 +776,10 @@ pub async fn detail(
 
 #[cfg(test)]
 mod source_list_tests {
-    use super::{catalog_url, list_url_for_scope, list_url_for_scope_and_tag, list_url_for_source};
+    use super::{
+        catalog_url, conversation_state_url, list_url_for_scope, list_url_for_scope_and_tag,
+        list_url_for_scope_tag_archive, list_url_for_source,
+    };
 
     #[test]
     fn source_and_project_filters_are_sent_to_server_before_pagination() {
@@ -784,5 +903,65 @@ mod source_list_tests {
             Some("   "),
         )
         .is_err());
+    }
+
+    #[test]
+    fn archive_filter_is_server_scoped_for_lists_and_searches() {
+        let list = list_url_for_scope_tag_archive(
+            "http://127.0.0.1:8000",
+            "",
+            None,
+            Some("chatgpt"),
+            None,
+            None,
+            Some("archived"),
+        )
+        .unwrap();
+        assert_eq!(list.path(), "/api/v1/conversations");
+        assert_eq!(
+            list.query_pairs()
+                .find(|(key, _)| key == "archive_state")
+                .unwrap()
+                .1,
+            "archived"
+        );
+        let search = list_url_for_scope_tag_archive(
+            "http://127.0.0.1:8000",
+            "needle",
+            None,
+            Some("chatgpt"),
+            None,
+            None,
+            Some("active"),
+        )
+        .unwrap();
+        assert_eq!(search.path(), "/api/v1/search");
+        assert_eq!(
+            search
+                .query_pairs()
+                .find(|(key, _)| key == "archive_state")
+                .unwrap()
+                .1,
+            "active"
+        );
+        assert!(list_url_for_scope_tag_archive(
+            "http://127.0.0.1:8000",
+            "",
+            None,
+            None,
+            None,
+            None,
+            Some("unknown")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn conversation_state_identity_uses_bounded_row_path() {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let endpoint = conversation_state_url("http://127.0.0.1:8000", id).unwrap();
+        assert_eq!(endpoint.path(), format!("/api/v1/conversations/{id}/state"));
+        assert!(conversation_state_url("http://127.0.0.1:8000", "").is_err());
+        assert!(conversation_state_url("http://127.0.0.1:8000", &"x".repeat(1025)).is_err());
     }
 }

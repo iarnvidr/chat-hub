@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="./overview.css">
   <link rel="stylesheet" href="./library-items.css">
   <link rel="stylesheet" href="./classified-terminal.css">
+  <link rel="stylesheet" href="./row-actions.css">
 </head>
 <body>
   <div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
@@ -23,6 +24,7 @@
       <select id="history-source" aria-label="History source" hidden><option value="chatgpt" selected>Chat</option><option value="codex">Codex</option></select>
       <div class="project-filter"><details id="project-disclosure" class="project-disclosure"><summary><span>Projects</span><span id="project-selection">All projects</span></summary><div id="project-options" role="group" aria-label="Filter by project"></div></details><select id="project-filter" aria-label="Filter by project" hidden><option value="">All projects</option></select><button id="edit-project-name" type="button" title="Rename selected project" aria-label="Rename selected project" disabled>…</button></div>
       <label class="tag-filter"><span class="sr-only">Filter by tag</span><select id="tag-filter" aria-label="Filter by tag"><option value="">All tags</option></select></label>
+      <div class="chat-list-toolbar"><span id="chat-list-label">Chats</span><button id="show-archived" type="button" aria-pressed="false">Archived</button></div>
       <div id="list-state" class="subtle" role="status" aria-live="polite"></div>
       <div class="list-scroll"><div id="conversation-list" class="conversation-list"></div><button id="load-more" type="button" hidden>Load more</button></div>
       <footer class="sidebar-footer"><button id="show-settings" type="button"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 3-.5 2-2 1-2-.5-2 3 1.5 1.5v3L2.5 15l2 3 2-.5 2 1L9 21h4l.5-2.5 2-1 2 .5 2-3-1.5-2v-3L19.5 8l-2-3-2 .5-2-1L13 3Z"/><circle cx="11" cy="12" r="3"/></svg>Settings</button><button id="workspace-sync-state" type="button" aria-label="History sync details" aria-live="polite">Saved on this Mac</button></footer>

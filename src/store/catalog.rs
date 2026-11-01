@@ -424,8 +424,9 @@ impl Store {
         } else {
             None
         };
+        let coverage_project_filter = project_filter_sql("c", "?1");
         let coverage_sql = format!(
-            "SELECT EXISTS(SELECT 1 FROM catalog_scan_coverage x JOIN catalog_chats c ON c.conversation_id=x.conversation_id WHERE x.truncated=1 AND ({source_filter}) AND (?1 IS NULL OR c.project_key=?1) AND (?2 IS NULL OR c.conversation_id=?2))"
+            "SELECT EXISTS(SELECT 1 FROM catalog_scan_coverage x JOIN catalog_chats c ON c.conversation_id=x.conversation_id WHERE x.truncated=1 AND ({source_filter}) AND {coverage_project_filter} AND (?2 IS NULL OR c.conversation_id=?2))"
         );
         let coverage_truncated: bool = tx
             .query_row(
@@ -760,12 +761,13 @@ fn read_global_relationship_map(
     // Read bounded lexical metadata from the persisted index. A keyword link is
     // considered only within the exact provider/account and requires two terms.
     type TermKey = (String, String, String);
+    let project_predicate = project_filter_sql("c", "?1");
     let sql = format!(
         "SELECT c.catalog_id,c.provider,c.account_scope,t.term
          FROM catalog_chats c
          JOIN catalog_edges e ON e.source_id=c.catalog_id AND e.basis='shared_keyword'
          JOIN catalog_terms t ON t.term_id=e.target_id
-         WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1)
+         WHERE ({source_filter}) AND {project_predicate}
          ORDER BY c.catalog_id,t.term"
     );
     let mut statement = conn.prepare(&sql)?;
@@ -1005,9 +1007,10 @@ fn read_chat_rows(
     tag_key: Option<&str>,
     limit: usize,
 ) -> Result<Vec<IndexedChat>> {
+    let project_filter = project_filter_sql("c", "?1");
     let sql = format!(
         "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
-         FROM catalog_chats c WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1)
+         FROM catalog_chats c WHERE ({source_filter}) AND {project_filter}
            AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2))
          ORDER BY c.updated_at_ms DESC NULLS LAST,catalog_id LIMIT ?3"
     );
@@ -1026,9 +1029,10 @@ fn read_chat_by_conversation(
     tag_key: Option<&str>,
     conversation_id: &str,
 ) -> Result<Option<IndexedChat>> {
+    let project_filter = project_filter_sql("c", "?2");
     let sql = format!(
         "SELECT catalog_id,conversation_id,provider,account_scope,source_id,title,updated_at_ms,project_key,project_label,project_label_source,graph_node_count,message_count,branch_count,source_time,observed_ms,parser,completeness,sample_bytes
-         FROM catalog_chats c WHERE c.conversation_id=?1 AND ({source_filter}) AND (?2 IS NULL OR c.project_key=?2)
+         FROM catalog_chats c WHERE c.conversation_id=?1 AND ({source_filter}) AND {project_filter}
            AND (?3 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?3)) LIMIT 1"
     );
     Ok(conn
@@ -1101,17 +1105,28 @@ fn read_keyword_neighbors(
     focus: &IndexedChat,
     limit: usize,
 ) -> Result<Vec<KeywordCandidate>> {
+    let scope_project_filter = project_filter_sql("c", "?3");
+    let candidate_project_filter = project_filter_sql("c", "?5");
+    let evidence_project_filter = project_filter_sql("c2", "?5");
+    let scope_sql = format!(
+        "SELECT count(*) FROM catalog_chats c WHERE provider=?1 AND account_scope=?2 AND {scope_project_filter}
+           AND (?4 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?4))"
+    );
     let scope_chat_count: i64 = conn.query_row(
-        "SELECT count(*) FROM catalog_chats c WHERE provider=?1 AND account_scope=?2 AND (?3 IS NULL OR c.project_key=?3)
-           AND (?4 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?4))",
-        params![focus.provider, focus.account_scope, project_filter, tag_filter],
+        &scope_sql,
+        params![
+            focus.provider,
+            focus.account_scope,
+            project_filter,
+            tag_filter
+        ],
         |row| row.get(0),
     )?;
     let sql = format!(
         "SELECT c.catalog_id,c.updated_at_ms,group_concat(t.term || ':' || (
              SELECT count(DISTINCT e2.source_id) FROM catalog_edges e2 JOIN catalog_chats c2 ON c2.catalog_id=e2.source_id
              WHERE e2.target_id=t.term_id AND e2.basis='shared_keyword' AND c2.provider=?3 AND c2.account_scope=?4
-               AND (?5 IS NULL OR c2.project_key=?5)
+               AND {evidence_project_filter}
                AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c2.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?6))
          ),char(31))
          FROM catalog_edges f
@@ -1120,7 +1135,7 @@ fn read_keyword_neighbors(
          JOIN catalog_chats c ON c.catalog_id=e.source_id
          WHERE f.source_id=?1 AND f.basis='shared_keyword' AND c.catalog_id<>?2
            AND c.provider=?3 AND c.account_scope=?4 AND ({source_filter})
-           AND (?5 IS NULL OR c.project_key=?5)
+           AND {candidate_project_filter}
            AND (?6 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags tg ON tg.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND tg.name_key=?6))
          GROUP BY c.catalog_id
          HAVING count(DISTINCT t.term_id)>=2
@@ -1303,8 +1318,9 @@ fn read_tagged_chat_count(
     project_key: Option<&str>,
     tag_key: Option<&str>,
 ) -> Result<i64> {
+    let project_filter = project_filter_sql("c", "?1");
     let sql = format!(
-        "SELECT count(*) FROM catalog_chats c WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2))"
+        "SELECT count(*) FROM catalog_chats c WHERE ({source_filter}) AND {project_filter} AND (?2 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=c.conversation_id AND tt.target_kind='conversation' AND t.name_key=?2))"
     );
     Ok(conn.query_row(&sql, params![project_key, tag_key], |row| row.get(0))?)
 }
@@ -1443,8 +1459,16 @@ fn validate_entity_filters(
 }
 
 fn entity_filter_sql(source: &str) -> String {
+    let project_filter = project_filter_sql("c", "?1");
     format!(
-        "({source}) AND (?1 IS NULL OR c.project_key=?1) AND (?2 IS NULL OR c.conversation_id=?2) AND (?3 IS NULL OR e.kind=?3) AND (?4 IS NULL OR e.artifact_state=?4) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=e.id AND tt.target_kind=CASE WHEN e.kind='file_artifact' THEN 'file' ELSE 'entity' END AND t.name_key=?5)) AND (?6 IS NULL OR instr(lower(e.label),lower(?6))>0 OR instr(lower(coalesce(e.canonical_url,'')),lower(?6))>0 OR instr(lower(coalesce(e.domain,'')),lower(?6))>0 OR instr(lower(coalesce(e.filename,'')),lower(?6))>0) AND (?7 IS NULL OR e.id>?7)"
+        "({source}) AND {project_filter} AND (?2 IS NULL OR c.conversation_id=?2) AND (?3 IS NULL OR e.kind=?3) AND (?4 IS NULL OR e.artifact_state=?4) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM target_tags tt JOIN tags t ON t.name_key=tt.name_key WHERE tt.target_id=e.id AND tt.target_kind=CASE WHEN e.kind='file_artifact' THEN 'file' ELSE 'entity' END AND t.name_key=?5)) AND (?6 IS NULL OR instr(lower(e.label),lower(?6))>0 OR instr(lower(coalesce(e.canonical_url,'')),lower(?6))>0 OR instr(lower(coalesce(e.domain,'')),lower(?6))>0 OR instr(lower(coalesce(e.filename,'')),lower(?6))>0) AND (?7 IS NULL OR e.id>?7)"
+    )
+}
+
+fn project_filter_sql(alias: &str, parameter: &str) -> String {
+    format!(
+        "({parameter} IS NULL OR ({parameter}='{}' AND {alias}.project_key IS NULL) OR {alias}.project_key={parameter})",
+        crate::store::NO_PROJECT_FILTER
     )
 }
 
@@ -1503,6 +1527,7 @@ fn read_stats(
     source_filter: &str,
     project_key: Option<&str>,
 ) -> Result<CatalogStats> {
+    let project_filter = project_filter_sql("c", "?1");
     let sql = format!(
         "SELECT count(*),coalesce(sum(c.graph_node_count),0),coalesce(sum(c.message_count),0),coalesce(sum(c.branch_count),0),max(c.updated_at_ms),
                 coalesce(sum(c.source_time IS NOT NULL AND trim(c.source_time)<>''),0),
@@ -1511,7 +1536,7 @@ fn read_stats(
                 coalesce(sum(c.completeness='cached_transcript'),0),
                 coalesce(sum(c.completeness<>'cached_transcript' AND c.graph_node_count>0),0),
                 count(DISTINCT c.project_key)
-         FROM catalog_chats c WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1)"
+         FROM catalog_chats c WHERE ({source_filter}) AND {project_filter}"
     );
     let (
         chats,
@@ -1542,13 +1567,13 @@ fn read_stats(
     })?;
     let shared_keyword_sql = format!(
         "SELECT count(DISTINCT e.target_id) FROM catalog_edges e JOIN catalog_chats c ON c.catalog_id=e.source_id
-         WHERE e.basis='shared_keyword' AND ({source_filter}) AND (?1 IS NULL OR c.project_key=?1)"
+         WHERE e.basis='shared_keyword' AND ({source_filter}) AND {project_filter}"
     );
     let shared_keywords: i64 =
         conn.query_row(&shared_keyword_sql, params![project_key], |row| row.get(0))?;
     let source_sql = format!(
         "SELECT c.provider,count(*),coalesce(sum(c.message_count),0),coalesce(sum(c.graph_node_count),0),coalesce(sum(c.branch_count),0)
-         FROM catalog_chats c WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1)
+         FROM catalog_chats c WHERE ({source_filter}) AND {project_filter}
          GROUP BY c.provider ORDER BY c.provider"
     );
     let mut statement = conn.prepare(&source_sql)?;
@@ -1599,8 +1624,9 @@ fn entity_counts(
     source_filter: &str,
     project_key: Option<&str>,
 ) -> Result<(i64, i64, i64, i64, i64, i64, i64)> {
+    let project_filter = project_filter_sql("c", "?1");
     let sql = format!(
-        "SELECT e.kind,count(DISTINCT e.id) FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE ({source_filter}) AND (?1 IS NULL OR c.project_key=?1) GROUP BY e.kind"
+        "SELECT e.kind,count(DISTINCT e.id) FROM catalog_entities e JOIN catalog_entity_refs r ON r.entity_id=e.id JOIN catalog_chats c ON c.conversation_id=r.conversation_id WHERE ({source_filter}) AND {project_filter} GROUP BY e.kind"
     );
     let mut counts = HashMap::new();
     let mut statement = conn.prepare(&sql)?;

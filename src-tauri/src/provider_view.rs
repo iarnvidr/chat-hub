@@ -82,6 +82,21 @@ pub struct ProjectRenameOutcome {
     pub retry_after: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ConversationActionOutcome {
+    pub state: String,
+    pub verified: bool,
+    pub conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+}
+
 impl ChatGptConnectionStatus {
     fn new(state: ChatGptConnectionState) -> Self {
         let message = match state {
@@ -123,6 +138,125 @@ enum AssignmentPoll {
 enum RenamePoll {
     Pending,
     Complete(ProjectRenameOutcome),
+}
+
+enum ActionPoll {
+    Pending,
+    Complete(ConversationActionOutcome),
+}
+
+fn parse_conversation_action_callback(
+    raw: &str,
+    expected_nonce: &str,
+    conversation_id: &str,
+    action: &str,
+    desired: bool,
+) -> Option<ActionPoll> {
+    if raw.len() > 8 * 1024 {
+        return None;
+    }
+    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    for _ in 0..3 {
+        let Some(nested) = value.as_str() else { break };
+        if nested.len() > 8 * 1024 {
+            return None;
+        }
+        value = serde_json::from_str(nested).ok()?;
+    }
+    let object = value.as_object()?;
+    if object.get("nonce")?.as_str()? != expected_nonce {
+        return None;
+    }
+    match object.get("state")?.as_str()? {
+        "running" if object.len() == 3 && object.get("cancelled")?.as_bool()? == false => {
+            Some(ActionPoll::Pending)
+        }
+        "applied" => {
+            let state_key = if action == "archive" {
+                "archived"
+            } else {
+                "pinned"
+            };
+            if object.len() != 6
+                || object.get("cancelled")?.as_bool()? != false
+                || object.get("verified")?.as_bool()? != true
+                || object.get("conversation_id")?.as_str()? != conversation_id
+                || object.get(state_key)?.as_bool()? != desired
+                || object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "nonce"
+                            | "state"
+                            | "cancelled"
+                            | "verified"
+                            | "conversation_id"
+                            | "archived"
+                            | "pinned"
+                    )
+                })
+                || object.contains_key(if action == "archive" {
+                    "pinned"
+                } else {
+                    "archived"
+                })
+            {
+                return None;
+            }
+            Some(ActionPoll::Complete(ConversationActionOutcome {
+                state: "applied".into(),
+                verified: true,
+                conversation_id: conversation_id.to_owned(),
+                archived: (action == "archive").then_some(desired),
+                pinned: (action == "pin").then_some(desired),
+                error_code: None,
+                retry_after: None,
+            }))
+        }
+        "failed" if (4..=5).contains(&object.len()) => {
+            if object.get("cancelled")?.as_bool()? != false
+                || object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "nonce" | "state" | "cancelled" | "error_code" | "retry_after"
+                    )
+                })
+            {
+                return None;
+            }
+            let error_code = object.get("error_code")?.as_str()?;
+            if !matches!(
+                error_code,
+                "cancelled"
+                    | "invalid_request"
+                    | "signed_out"
+                    | "account_unavailable"
+                    | "account_changed"
+                    | "conversation_unavailable"
+                    | "request_failed"
+                    | "rate_limited"
+                    | "verification_failed"
+            ) {
+                return None;
+            }
+            let retry_after = match object.get("retry_after") {
+                None => None,
+                Some(value) => Some(value.as_u64()?),
+            };
+            if retry_after.is_some_and(|value| !(1..=31_536_001).contains(&value)) {
+                return None;
+            }
+            Some(ActionPoll::Complete(ConversationActionOutcome {
+                state: "failed".into(),
+                verified: false,
+                conversation_id: conversation_id.to_owned(),
+                archived: None,
+                pinned: None,
+                error_code: Some(error_code.into()),
+                retry_after,
+            }))
+        }
+        _ => None,
+    }
 }
 
 fn parse_project_rename_callback(raw: &str, expected_nonce: &str) -> Option<RenamePoll> {
@@ -710,6 +844,123 @@ impl ProviderViewState {
         }
     }
 
+    /// Apply a user-requested pin or archive mutation and require provider
+    /// readback before returning a commit receipt to the local store.
+    pub async fn set_conversation_state(
+        &self,
+        conversation_id: &str,
+        action: &str,
+        desired: bool,
+        expected_scope: &str,
+    ) -> Result<ConversationActionOutcome, String> {
+        if !valid_conversation_id(conversation_id)
+            || !valid_observed_scope(expected_scope)
+            || !matches!(action, "archive" | "pin")
+        {
+            return Err("invalid_conversation_action".into());
+        }
+        let (webview, loaded) = self
+            .inner
+            .lock()
+            .map_err(|_| "provider_unavailable".to_string())
+            .map(|inner| (inner.webview.clone(), inner.loaded))?;
+        let generation = {
+            let page = self
+                .page
+                .lock()
+                .map_err(|_| "provider_unavailable".to_string())?;
+            if !page.exact_origin {
+                return Err("chatgpt_not_open".into());
+            }
+            if page.account_scope.as_deref() != Some(expected_scope) {
+                return Err("chatgpt_account_changed".into());
+            }
+            page.navigation_generation
+        };
+        if !loaded {
+            return Err("chatgpt_loading".into());
+        }
+        let nonce = fresh_probe_nonce().ok_or_else(|| "provider_unavailable".to_string())?;
+        let key = format!("__chatHubConversationAction_{nonce}");
+        let key_json = serde_json::to_string(&key).map_err(|_| "provider_unavailable")?;
+        let nonce_json = serde_json::to_string(&nonce).map_err(|_| "provider_unavailable")?;
+        let scope_json =
+            serde_json::to_string(expected_scope).map_err(|_| "invalid_conversation_action")?;
+        let id_json =
+            serde_json::to_string(conversation_id).map_err(|_| "invalid_conversation_action")?;
+        let action_json =
+            serde_json::to_string(action).map_err(|_| "invalid_conversation_action")?;
+        let desired_json =
+            serde_json::to_string(&desired).map_err(|_| "invalid_conversation_action")?;
+        let script = format!(
+            "({})({key_json},{nonce_json},{scope_json},{id_json},{action_json},{desired_json})",
+            include_str!("conversation_actions.js")
+        );
+        webview
+            .eval(&script)
+            .map_err(|_| "provider_unavailable".to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                cleanup_probe(&webview, &key_json);
+                return Err("conversation_action_timeout".into());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let tx = Mutex::new(Some(tx));
+            if webview
+                .eval_with_callback(
+                    format!("JSON.stringify(window[{key_json}]||null)"),
+                    move |value| {
+                        if let Ok(mut slot) = tx.lock() {
+                            if let Some(tx) = slot.take() {
+                                let _ = tx.send(value);
+                            }
+                        }
+                    },
+                )
+                .is_err()
+            {
+                cleanup_probe(&webview, &key_json);
+                return Err("provider_unavailable".into());
+            }
+            match tokio::time::timeout(remaining.min(Duration::from_secs(2)), rx).await {
+                Ok(Ok(raw)) => match parse_conversation_action_callback(
+                    &raw,
+                    &nonce,
+                    conversation_id,
+                    action,
+                    desired,
+                ) {
+                    Some(ActionPoll::Pending) => {}
+                    Some(ActionPoll::Complete(outcome)) => {
+                        let same_page = self.page.lock().ok().is_some_and(|page| {
+                            page.navigation_generation == generation
+                                && page.exact_origin
+                                && page.account_scope.as_deref() == Some(expected_scope)
+                        });
+                        cleanup_probe(&webview, &key_json);
+                        return if same_page {
+                            Ok(outcome)
+                        } else {
+                            Err("chatgpt_page_changed".into())
+                        };
+                    }
+                    None => {
+                        cleanup_probe(&webview, &key_json);
+                        return Err("provider_unavailable".into());
+                    }
+                },
+                Ok(Err(_)) => {
+                    cleanup_probe(&webview, &key_json);
+                    return Err("provider_unavailable".into());
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Initialize the provider's own signed-in browser session in the hidden
     /// child webview. This never reveals the view or replaces a live page.
     pub fn prepare_session(&self) -> Result<bool, String> {
@@ -1063,11 +1314,61 @@ impl ProviderViewState {
 mod target_url_tests {
     use super::{
         allowed_provider_navigation, current_chatgpt_conversation_id, exact_chatgpt_origin,
-        page_metadata_script, parse_assignment_callback, parse_page_metadata_callback,
-        parse_probe_callback, parse_project_rename_callback, should_prepare_session, target_url,
-        valid_observed_scope, AssignmentPoll, ChatGptConnectionState, ProbePoll,
-        ProjectRenameOutcome, RenamePoll,
+        page_metadata_script, parse_assignment_callback, parse_conversation_action_callback,
+        parse_page_metadata_callback, parse_probe_callback, parse_project_rename_callback,
+        should_prepare_session, target_url, valid_observed_scope, ActionPoll, AssignmentPoll,
+        ChatGptConnectionState, ConversationActionOutcome, ProbePoll, ProjectRenameOutcome,
+        RenamePoll,
     };
+
+    #[test]
+    fn conversation_action_callbacks_bind_nonce_target_and_verified_state() {
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let applied = serde_json::json!({
+            "nonce":"n1", "state":"applied", "cancelled":false,
+            "verified":true, "conversation_id":id, "pinned":true
+        });
+        assert!(matches!(
+            parse_conversation_action_callback(&applied.to_string(), "n1", id, "pin", true),
+            Some(ActionPoll::Complete(ConversationActionOutcome {
+                pinned: Some(true),
+                ..
+            }))
+        ));
+        let failed = serde_json::json!({
+            "nonce":"n1", "state":"failed", "cancelled":false,
+            "error_code":"rate_limited", "retry_after":30
+        });
+        assert!(
+            matches!(parse_conversation_action_callback(&failed.to_string(), "n1", id, "archive", false), Some(ActionPoll::Complete(ConversationActionOutcome { error_code: Some(code), retry_after: Some(30), .. })) if code == "rate_limited")
+        );
+        let long_cooldown = serde_json::json!({
+            "nonce":"n1", "state":"failed", "cancelled":false,
+            "error_code":"rate_limited", "retry_after":31_536_001
+        });
+        assert!(matches!(
+            parse_conversation_action_callback(&long_cooldown.to_string(), "n1", id, "pin", true),
+            Some(ActionPoll::Complete(ConversationActionOutcome {
+                retry_after: Some(31_536_001),
+                ..
+            }))
+        ));
+        for invalid in [
+            serde_json::json!({"nonce":"other", "state":"applied", "cancelled":false,"verified":true,"conversation_id":id,"pinned":true}),
+            serde_json::json!({"nonce":"n1", "state":"applied", "cancelled":false,"verified":true,"conversation_id":"123e4567-e89b-12d3-a456-426614174001","pinned":true}),
+            serde_json::json!({"nonce":"n1", "state":"applied", "cancelled":false,"verified":true,"conversation_id":id,"pinned":false}),
+            serde_json::json!({"nonce":"n1", "state":"applied", "cancelled":false,"verified":true,"conversation_id":id,"pinned":true,"archived":false}),
+        ] {
+            assert!(parse_conversation_action_callback(
+                &invalid.to_string(),
+                "n1",
+                id,
+                "pin",
+                true
+            )
+            .is_none());
+        }
+    }
 
     #[test]
     fn accepts_only_chatgpt_root_or_uuid_conversation() {

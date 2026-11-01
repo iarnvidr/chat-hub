@@ -18,6 +18,7 @@ function bootApp({records = () => [], detail = id => ({conversation: {id, title:
     }
     addEventListener(name, fn) { this.events[name] = fn; }
     setAttribute(name, value) { this.attributes[name] = value; }
+    getAttribute(name) { return this.attributes[name] ?? null; }
     removeAttribute(name) { delete this.attributes[name]; }
     replaceChildren(...children) { this.children = children; }
     append(...children) { this.children.push(...children); }
@@ -57,6 +58,7 @@ function bootApp({records = () => [], detail = id => ({conversation: {id, title:
     branchChoices: () => [], orderedMessages: () => [], messageText: () => '',
     hasUnsupportedContent: () => false, renderMarkdown: () => {},
     updateStatus: async () => {},
+    createRowActions: () => ({wrap: (chat, button) => button, close() {}}),
   });
   const tabs = fs.readFileSync(`${ROOT}/desktop-ui/conversation-tabs.js`, 'utf8')
     .replaceAll('export function', 'function');

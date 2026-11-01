@@ -32,7 +32,7 @@ fn tags_persist_across_open_and_v12_migration_isolated_from_index() {
     let db = common::temp_dir("store-tags").join("library.sqlite");
     let path = db.to_str().unwrap();
     let mut store = Store::open(path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 12);
+    assert_eq!(store.schema_version().unwrap(), 13);
     let conversation_id = store.ingest_observation(&observation()).unwrap();
     store
         .set_target_tags(
@@ -47,7 +47,7 @@ fn tags_persist_across_open_and_v12_migration_isolated_from_index() {
     drop(store);
 
     let store = Store::open(path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 12);
+    assert_eq!(store.schema_version().unwrap(), 13);
     assert_eq!(
         store.target_tags("conversation", &conversation_id).unwrap(),
         ["Planning", "Reference"]
@@ -59,11 +59,11 @@ fn tags_persist_across_open_and_v12_migration_isolated_from_index() {
     drop(store);
 
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch("DROP TRIGGER target_tags_conversation_cleanup; DROP INDEX target_tags_by_tag; DROP INDEX target_tags_by_target; DROP INDEX artifact_contents_by_conversation; DROP TABLE artifact_contents; DROP TABLE target_tags; DROP TABLE tags; DROP TABLE tag_state; DELETE FROM schema_migrations WHERE version=12;")
+    conn.execute_batch("DROP TRIGGER target_tags_conversation_cleanup; DROP INDEX target_tags_by_tag; DROP INDEX target_tags_by_target; DROP INDEX artifact_contents_by_conversation; DROP TABLE artifact_contents; DROP TABLE target_tags; DROP TABLE tags; DROP TABLE tag_state; DROP INDEX conversation_local_state_page; DROP TABLE conversation_local_state; DELETE FROM schema_migrations WHERE version>=12;")
         .unwrap();
     drop(conn);
     let migrated = Store::open(path).unwrap();
-    assert_eq!(migrated.schema_version().unwrap(), 12);
+    assert_eq!(migrated.schema_version().unwrap(), 13);
     assert!(migrated
         .target_tags("conversation", &conversation_id)
         .unwrap()
