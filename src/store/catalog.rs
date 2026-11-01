@@ -4138,12 +4138,12 @@ mod tests {
 
         let logical_rows = read_chat_rows(&store.connection, "1=1", None, None, 20).unwrap();
         assert_eq!(logical_rows.len(), 2);
-        assert!(logical_rows
-            .iter()
-            .any(|chat| chat.conversation_id == canonical_ids[0] && chat.account_scope == account_a));
-        assert!(logical_rows
-            .iter()
-            .any(|chat| chat.conversation_id == canonical_ids[1] && chat.account_scope == account_b));
+        assert!(logical_rows.iter().any(
+            |chat| chat.conversation_id == canonical_ids[0] && chat.account_scope == account_a
+        ));
+        assert!(logical_rows.iter().any(
+            |chat| chat.conversation_id == canonical_ids[1] && chat.account_scope == account_b
+        ));
 
         let physical_sources_a: i64 = store
             .connection
