@@ -19,7 +19,7 @@ test('pin snapshot reads a complete list without any provider writes or credenti
   const result=await run({items:[{type:'conversation',id}],total:1,has_more:false});
   assert.equal(result.state.state,'complete');assert.equal(result.state.complete,true);assert.equal(result.state.account_scope,result.scope);assert.deepEqual(result.state.pinned_ids,[id]);
   assert.deepEqual(result.calls.map(call=>[call.path,call.method]),[['/api/auth/session','GET'],['/backend-api/pins','GET']]);
-  assert.match(result.calls[1].query,/item_type=conversation/);assert.doesNotMatch(JSON.stringify(result.state),new RegExp(result.token));
+  assert.equal(result.calls[1].query,'?item_type=conversation');assert.doesNotMatch(JSON.stringify(result.state),new RegExp(result.token));
   const empty=await run({items:[],total:0,has_more:false});assert.equal(empty.state.complete,true);assert.deepEqual(empty.state.pinned_ids,[]);
 });
 test('partial, ambiguous and unknown pin payloads cannot publish an authoritative empty list',async()=>{

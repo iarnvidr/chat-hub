@@ -115,7 +115,7 @@ function (key, nonce, expectedScope, conversationId, action, desired) {
         return found;
       };
       const readPinState = async () => {
-        const value = await request("/backend-api/pins?item_type=conversation&limit=1000", { headers });
+        const value = await request("/backend-api/pins?item_type=conversation", { headers });
         return value;
       };
       const before = action === "archive" ? await readConversation() : null;

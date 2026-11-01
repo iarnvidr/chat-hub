@@ -47,7 +47,7 @@ test('pin and unpin use the documented routes and require exact list readback', 
   const calls = [];
   const fetch = async (input, options = {}) => {
     const url = new URL(input);
-    calls.push([url.pathname, options.method || 'GET', options.body]);
+    calls.push([url.pathname, options.method || 'GET', options.body, url.search]);
     if (url.pathname === '/api/auth/session') return jsonResponse({accessToken: sessionToken(), user: {}});
     if (url.pathname === '/backend-api/pins/conversation/' + id) {
       if (options.method === 'POST') pinned = true;
@@ -66,6 +66,7 @@ test('pin and unpin use the documented routes and require exact list readback', 
     [`/backend-api/pins/conversation/${id}`, 'POST'], ['/backend-api/pins', 'GET'],
   ]);
   assert.equal(calls[2][2], '{}');
+  assert.ok(calls.filter(call=>call[0]==='/backend-api/pins').every(call=>call[3]==='?item_type=conversation'),'pin verification uses the server-accepted default query');
   const remove = await invoke('pin', false, fetch, scope);
   assert.equal(remove.state, 'applied');
   assert.equal(remove.pinned, false);
