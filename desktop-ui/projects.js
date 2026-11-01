@@ -1,6 +1,11 @@
+import { createProjectHoverPicker } from './project-hover.js';
+
 const $ = id => document.getElementById(id);
-const renameDialog = $('project-editor'), assignDialog = $('chat-project-editor');
-let projects = [], editingProject, editingChat, returnToChat = false, busy = false;
+const renameDialog = $('project-editor');
+// Assignment now always goes through ChatGPT. Remove the old dialog so its
+// local-only assignment path cannot be selected or called from this UI.
+$('chat-project-editor')?.remove();
+let projects = [], editingProject, returnToChat = false, busy = false;
 const invoke = (command, args) => window.ChatHub.invoke(command, args);
 const label = (project, index = 0) => project.display_name || project.title || `Unnamed project ${index + 1}`;
 function projectProvider(project) {
@@ -39,7 +44,7 @@ function closeDialog(dialog) {
 }
 function beginBusy(value) {
   busy = value;
-  for (const id of ['project-editor-save','project-editor-cancel','chat-project-save','chat-project-cancel']) $(id).disabled = value;
+  for (const id of ['project-editor-save','project-editor-cancel']) $(id).disabled = value;
 }
 function verifyReceipt(result, scope) {
   if (!result || typeof result !== 'object' || !Number.isSafeInteger(result.library_revision)) throw Error('update_unconfirmed');
@@ -81,37 +86,15 @@ $('project-editor-form').addEventListener('submit', async event => {
   } catch (error) { $('project-editor-status').textContent = errorMessage(error); }
   finally { beginBusy(false); }
 });
-window.addEventListener('chat-hub:edit-chat-project', async event => {
-  editingChat = event.detail; if (!editingChat?.id) return;
-  try {
-    await loadProjects();
-    const select = $('chat-project-choice'); select.replaceChildren();
-    const none = document.createElement('option'); none.value = ''; none.textContent = 'No project'; select.append(none);
-    projects.forEach((project, index) => {
-      const option = document.createElement('option'); option.value = project.project_key; option.textContent = label(project,index);
-      option.selected = option.value === editingChat.project?.project_key; select.append(option);
-    });
-    $('chat-project-title').textContent = editingChat.title || 'Conversation'; $('chat-project-status').textContent = '';
-    $('chat-project-scope').value = 'upstream'; $('chat-project-save').textContent = 'Update in ChatGPT';
-    await openDialog(assignDialog);
-  } catch (error) { $('app-status').textContent = errorMessage(error); }
+const projectPicker = createProjectHoverPicker({
+  invoke,
+  onChanged: () => window.dispatchEvent(new Event('chat-hub:history-updated')),
+  doc: document,
+  win: window,
 });
-$('chat-project-scope').addEventListener('change', () => {
-  $('chat-project-save').textContent = $('chat-project-scope').value === 'local' ? 'Save locally' : 'Update in ChatGPT';
+window.addEventListener('chat-hub:edit-chat-project', event => {
+  projectPicker.open(event.detail, $('set-chat-project'));
 });
-$('chat-project-cancel').addEventListener('click', () => closeDialog(assignDialog));
-$('chat-project-form').addEventListener('submit', async event => {
-  event.preventDefault(); if (busy || !editingChat) return;
-  const scope = $('chat-project-scope').value; beginBusy(true);
-  $('chat-project-status').textContent = scope === 'upstream' ? 'Updating and checking ChatGPT…' : 'Saving assignment…';
-  try {
-    const result = await invoke('set_conversation_project', {conversationId:editingChat.id, projectKey:$('chat-project-choice').value || null, scope});
-    verifyReceipt(result, scope); beginBusy(false); closeDialog(assignDialog);
-    window.dispatchEvent(new Event('chat-hub:history-updated'));
-    $('app-status').textContent = scope === 'upstream' ? 'Project assignment updated in ChatGPT.' : 'Project assignment saved locally.';
-  } catch (error) { $('chat-project-status').textContent = errorMessage(error); }
-  finally { beginBusy(false); }
-});
-for (const dialog of [renameDialog,assignDialog]) dialog.addEventListener('cancel', event => {
-  event.preventDefault(); closeDialog(dialog);
+renameDialog.addEventListener('cancel', event => {
+  event.preventDefault(); closeDialog(renameDialog);
 });
