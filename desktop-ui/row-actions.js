@@ -31,16 +31,16 @@ function chatgptProjectIdentity(projectKey) {
 }
 
 function projectPickerScope(chat) {
-  if (observedChatgptScope(chat?.account_scope)) return chat.account_scope;
+  if (observedChatgptScope(chat?.account_scope)) return {observedScope:chat.account_scope,legacyScope:null};
   if (!['chatgpt', 'paseo-chatgpt'].includes(chat?.provider) ||
       typeof chat.account_scope !== 'string' || !/^paseo-cache:[A-Za-z0-9:_-]{1,256}$/.test(chat.account_scope)) return null;
   const currentProject = chatgptProjectIdentity(chat.project?.project_key);
   if (currentProject?.provider === 'chatgpt' && observedChatgptScope(currentProject.accountScope) &&
       (typeof chat.project.project_id !== 'string' || chat.project.project_id === currentProject.projectId) &&
       (typeof chat.project.account_scope !== 'string' || chat.project.account_scope === currentProject.accountScope)) {
-    return currentProject.accountScope;
+    return {observedScope:currentProject.accountScope,legacyScope:chat.account_scope};
   }
-  return chat.account_scope;
+  return {observedScope:null,legacyScope:chat.account_scope};
 }
 
 export function createRowActions({invoke,onChanged=()=>{},doc=document,win=window}) {
@@ -116,11 +116,10 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
         const choices=[{project_key:null,display_name:'No project'},...result.projects.filter(project=>{
           const identity=chatgptProjectIdentity(project?.project_key);
           if(!identity||!pickerScope)return false;
-          const compatibleProvider=observedChatgptScope(identity.accountScope)
-            ? identity.provider==='chatgpt'||(identity.provider==='paseo-chatgpt'&&chat.provider==='chatgpt')
-            : /^paseo-cache:/.test(identity.accountScope)&&identity.provider==='paseo-chatgpt'&&['chatgpt','paseo-chatgpt'].includes(chat.provider);
-          if(!compatibleProvider)return false;
-          if(identity.accountScope!==pickerScope)return false;
+          const observedChoice=pickerScope.observedScope===identity.accountScope&&
+            (identity.provider==='chatgpt'||(identity.provider==='paseo-chatgpt'&&chat.provider==='chatgpt'));
+          const legacyChoice=pickerScope.legacyScope===identity.accountScope&&identity.provider==='paseo-chatgpt';
+          if(!observedChoice&&!legacyChoice)return false;
           return typeof project.account_scope!=='string'||project.account_scope===identity.accountScope;
         })];
       function draw(){

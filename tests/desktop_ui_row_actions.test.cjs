@@ -66,13 +66,15 @@ test('legacy-only chat uses only its validated current project scope for project
   const legacy={...chat,provider:'paseo-chatgpt',account_scope:'paseo-cache:legacy-owner',project:{project_key:`project:["chatgpt","${ownerScope}","g-p-current"]`,project_id:'g-p-current'}};
   const ui=await setup(async command=>command==='list_projects'?{projects:[
     {project_key:`project:["chatgpt","${ownerScope}","g-p-current"]`,title:'Current project'},
+    {project_key:'project:["paseo-chatgpt","paseo-cache:legacy-owner","g-p-legacy-own"]',title:'Legacy project'},
+    {project_key:'project:["paseo-chatgpt","paseo-cache:other-owner","g-p-other-cache"]',title:'Other cache project'},
     {project_key:`project:["chatgpt","${otherScope}","g-p-foreign"]`,title:'Foreign project'}
   ]}:{scope:'upstream',verified:true,library_revision:9},legacy);
   const anchor=ui.doc.createElement('button');ui.doc.body.append(anchor);
   ui.win.events['chat-hub:open-project-picker']({detail:{chat:legacy,anchor,focus:false}});
   await Promise.resolve();await Promise.resolve();
   const choices=ui.menu.querySelectorAll('button').filter(n=>n.dataset.action==='choose-project');
-  assert.deepEqual(choices.map(n=>n.children[1]?.textContent),['No project','Current project']);
+  assert.deepEqual(choices.map(n=>n.children[1]?.textContent),['No project','Current project','Legacy project']);
 });
 test('unmapped legacy chat keeps only exact cached-scope project options',async()=>{
   const legacy={...chat,provider:'paseo-chatgpt',account_scope:'paseo-cache:legacy-owner'};
