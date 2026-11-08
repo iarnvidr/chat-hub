@@ -1,7 +1,7 @@
 //! Best-effort snapshot staging. Only committed sink outcomes are durable.
 use crate::capture_lane::{CaptureContext, CaptureMetadata};
-use chat_hub_model::{IngestOutcome, ObservationSink};
 pub use chat_hub_model::{Counters, Snapshot};
+use chat_hub_model::{IngestOutcome, ObservationSink};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::{

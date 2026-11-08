@@ -45,6 +45,11 @@ images. The module has a first-class check for every Cargo workspace package,
 including the desktop, as well as formatting, Python, Bun and browser checks.
 Each package check includes Clippy. The package-to-check coverage is regression
 tested so adding a member cannot silently omit it from validation.
+Implementation crates and the CLI deny all Clippy warnings. The existing Tauri
+desktop target still has unrelated, pre-refactor style warnings: its check
+denies Clippy correctness problems while reporting those style warnings, and
+its Rust tests and native macOS build remain mandatory. This baseline should
+be removed when the desktop warnings are addressed independently.
 
 ```sh
 dagger check -l --all

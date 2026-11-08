@@ -85,9 +85,7 @@ pub fn normalize_chatgpt_document_in_scope(
         }
         if let Some(parts) = content.get("parts") {
             if !parts.is_array() {
-                return Err(NormalizationError(
-                    "content parts must be an array".into(),
-                ));
+                return Err(NormalizationError("content parts must be an array".into()));
             }
         }
         graph.push(GraphNode {
@@ -166,14 +164,25 @@ mod tests {
             }
         });
         let observation = normalize_chatgpt_document_in_scope(
-            &document, "fixture-v1", 456, "chatgpt:observed:account-a"
-        ).unwrap();
+            &document,
+            "fixture-v1",
+            456,
+            "chatgpt:observed:account-a",
+        )
+        .unwrap();
         assert_eq!(observation.account_scope, "chatgpt:observed:account-a");
         assert_eq!(observation.graph.len(), 2);
         assert_eq!(observation.current_node.as_deref(), Some("reply"));
         assert_eq!(observation.raw_payload, document);
-        assert_eq!(observation.url.as_deref(), Some("https://chatgpt.com/c/conversation%2Fwith%20spaces"));
-        let reply = observation.graph.iter().find(|node| node.source_node_id == "reply").unwrap();
+        assert_eq!(
+            observation.url.as_deref(),
+            Some("https://chatgpt.com/c/conversation%2Fwith%20spaces")
+        );
+        let reply = observation
+            .graph
+            .iter()
+            .find(|node| node.source_node_id == "reply")
+            .unwrap();
         assert_eq!(reply.parts.len(), 2);
         assert_eq!(reply.parts[1]["asset_pointer"], "asset-1");
     }
@@ -181,10 +190,19 @@ mod tests {
     #[test]
     fn invalid_scope_and_malformed_parts_are_rejected_by_the_shared_parser() {
         let mut document = json!({"id": "one", "mapping": {}});
-        assert_eq!(normalize_chatgpt_document_in_scope(&document, "fixture", 1, "bad/scope").unwrap_err().0,
-            "invalid capture profile scope");
-        document["mapping"]["node"] = json!({"parent": null, "message": {"content": {"parts": {}}}});
-        assert_eq!(normalize_chatgpt_document(&document, "fixture", 1).unwrap_err().0,
-            "content parts must be an array");
+        assert_eq!(
+            normalize_chatgpt_document_in_scope(&document, "fixture", 1, "bad/scope")
+                .unwrap_err()
+                .0,
+            "invalid capture profile scope"
+        );
+        document["mapping"]["node"] =
+            json!({"parent": null, "message": {"content": {"parts": {}}}});
+        assert_eq!(
+            normalize_chatgpt_document(&document, "fixture", 1)
+                .unwrap_err()
+                .0,
+            "content parts must be an array"
+        );
     }
 }

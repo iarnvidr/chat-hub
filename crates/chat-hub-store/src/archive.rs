@@ -552,8 +552,18 @@ impl Store {
         drop(output.file.take());
         let result = (|| -> Result<BackupReceipt> {
             let mut target = Connection::open(output.staging_path())?;
+            // Pin a read transaction before the incremental SQLite backup.
+            // Without this snapshot, a fast WAL writer can advance pages while
+            // backup.step() is copying, producing mixed-generation output on
+            // some platforms. A WAL reader does not block writer commits.
+            let snapshot = src.unchecked_transaction()?;
+            let pinned_revision: i64 = snapshot.query_row(
+                "SELECT revision FROM library_state WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?;
             {
-                let backup = Backup::new(src, &mut target)?;
+                let backup = Backup::new(&snapshot, &mut target)?;
                 backup_to_completion(
                     &backup,
                     128,
@@ -561,6 +571,7 @@ impl Store {
                     Duration::from_secs(30),
                 )?;
             }
+            drop(snapshot);
             let schema_version =
                 target.query_row("SELECT max(version) FROM schema_migrations", [], |r| {
                     r.get(0)
@@ -570,6 +581,11 @@ impl Store {
                 [],
                 |r| r.get(0),
             )?;
+            if library_revision != pinned_revision {
+                return Err(Error::Configuration(
+                    "backup source revision changed during snapshot".into(),
+                ));
+            }
             let conversation_count =
                 target.query_row("SELECT count(*) FROM conversations", [], |r| {
                     r.get::<_, i64>(0)

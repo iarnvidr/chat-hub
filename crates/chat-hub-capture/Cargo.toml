@@ -15,7 +15,9 @@ hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server", "http1"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 ring = "0.17"
-rustls = "0.23"
+# Capture explicitly selects rustls's ring CryptoProvider. A per-crate Dagger
+# build must not rely on another workspace package enabling this feature.
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

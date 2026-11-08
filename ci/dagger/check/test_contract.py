@@ -263,6 +263,8 @@ class DaggerContract(unittest.TestCase):
 
     def test_each_crate_has_full_failure_log_and_locked_cargo_commands(self):
         script = (MODULE_DIR / "run-crate.sh").read_text()
+        self.assertIn('if [[ "$1" == "chat-hub-desktop" ]]', script)
+        self.assertIn('cargo clippy --locked -p "$1" --all-targets --all-features -- -D clippy::correctness', script)
         self.assertIn('cargo clippy --locked -p "$1" --all-targets --all-features -- -D warnings', script)
         self.assertIn('cargo test --locked -p "$1" --all-targets --timings -vv', script)
         for check, _ in crate_checks().values():

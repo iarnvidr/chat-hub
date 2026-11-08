@@ -365,18 +365,21 @@ fn populated_backup_is_a_consistent_snapshot_during_wal_writes() {
             while !stop.load(Ordering::Acquire) {
                 seq += 1;
                 let title = format!("pair-{seq}");
-                writer
-                    .ingest_observation(&observation(
-                        "paired",
-                        &title,
-                        vec![node(
-                            "n",
-                            None,
-                            vec![json!(format!("wal snapshot marker revision-{seq}"))],
-                        )],
-                        Some("n"),
-                    ))
-                    .unwrap();
+                // Exercise accepted, consecutive revisions. A constant
+                // observed_ms can legitimately make later observations stale
+                // and would invalidate the revision/count assertion below.
+                let mut next = observation(
+                    "paired",
+                    &title,
+                    vec![node(
+                        "n",
+                        None,
+                        vec![json!(format!("wal snapshot marker revision-{seq}"))],
+                    )],
+                    Some("n"),
+                );
+                next.observed_ms = 10 + i64::try_from(seq).unwrap();
+                writer.ingest_observation(&next).unwrap();
                 commits.fetch_add(1, Ordering::Release);
                 thread::yield_now();
             }
@@ -384,16 +387,29 @@ fn populated_backup_is_a_consistent_snapshot_during_wal_writes() {
     };
     started.wait();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while commits.load(Ordering::Acquire) < 5 && std::time::Instant::now() < deadline {
+    while commits.load(Ordering::Acquire) < 32 && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(2));
     }
     let before = commits.load(Ordering::Acquire);
-    assert!(before >= 5, "writer must commit before backup");
+    assert!(before >= 32, "writer must commit before backup");
     let receipt: BackupReceipt = store.backup_to(&dest).unwrap();
     let during = commits.load(Ordering::Acquire);
     stop.store(true, Ordering::Release);
     writer.join().unwrap();
     let after = commits.load(Ordering::Acquire);
+    // Distinguish a broken backup snapshot from inconsistent live writes.
+    let live = check_database(&source);
+    let live_revision: i64 = live
+        .query_row("SELECT revision FROM library_state", [], |r| r.get(0))
+        .unwrap();
+    let live_observations: i64 = live
+        .query_row("SELECT count(*) FROM observations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        live_revision, live_observations,
+        "live writer must be transactionally consistent"
+    );
+    drop(live);
     assert!(
         after > before,
         "writer must commit after snapshot begins/completes"

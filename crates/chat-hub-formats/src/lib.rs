@@ -2,7 +2,8 @@
 
 mod normalization;
 pub use normalization::{
-    normalize_chatgpt_document, normalize_chatgpt_document_in_scope, parse_event, NormalizationError,
+    normalize_chatgpt_document, normalize_chatgpt_document_in_scope, parse_event,
+    NormalizationError,
 };
 
 use serde::Serialize;

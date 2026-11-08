@@ -422,9 +422,9 @@ async fn start_internal(
         }
     }
     let api_store = tokio::task::spawn_blocking(move || Store::open_service(&path))
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
         .map_err(|e| e.to_string())?;

@@ -10,7 +10,11 @@ pub fn normalize_chatgpt_document(
     parser: &str,
     observed_ms: i64,
 ) -> Result<Observation> {
-    Ok(chat_hub_formats::normalize_chatgpt_document(doc, parser, observed_ms)?)
+    Ok(chat_hub_formats::normalize_chatgpt_document(
+        doc,
+        parser,
+        observed_ms,
+    )?)
 }
 
 pub fn normalize_chatgpt_document_in_scope(
@@ -20,7 +24,10 @@ pub fn normalize_chatgpt_document_in_scope(
     account_scope: impl Into<String>,
 ) -> Result<Observation> {
     Ok(chat_hub_formats::normalize_chatgpt_document_in_scope(
-        doc, parser, observed_ms, account_scope,
+        doc,
+        parser,
+        observed_ms,
+        account_scope,
     )?)
 }
 
@@ -42,7 +49,10 @@ impl Store {
 impl chat_hub_model::ObservationSink for Store {
     type Error = crate::error::Error;
 
-    fn store_observation(&mut self, observation: &Observation) -> Result<chat_hub_model::IngestOutcome> {
+    fn store_observation(
+        &mut self,
+        observation: &Observation,
+    ) -> Result<chat_hub_model::IngestOutcome> {
         self.ingest_observation_outcome(observation)
     }
 }

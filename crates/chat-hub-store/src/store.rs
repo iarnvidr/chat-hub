@@ -28,9 +28,13 @@ impl Store {
     /// to the runtime. WAL and FULL durability are part of the storage contract.
     pub fn open_service(path: &str) -> Result<Self> {
         let store = Self::open(path)?;
-        let journal: String = store.connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        let journal: String = store
+            .connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         if journal != "wal" && journal != "memory" {
-            return Err(Error::Configuration("SQLite WAL mode is unavailable".into()));
+            return Err(Error::Configuration(
+                "SQLite WAL mode is unavailable".into(),
+            ));
         }
         store.connection.execute_batch("PRAGMA synchronous=FULL;")?;
         store.health()?;
@@ -39,7 +43,8 @@ impl Store {
 
     /// Independent read-only connection for a file-backed service library.
     pub fn open_read_only(&self) -> Result<Option<Self>> {
-        self.connection.path()
+        self.connection
+            .path()
             .filter(|path| !path.is_empty() && *path != ":memory:")
             .map(Self::open_reader)
             .transpose()
@@ -54,7 +59,12 @@ impl Store {
     }
 
     /// Check a provider/account-scoped identity without exposing SQL to importers.
-    pub fn contains_source(&self, provider: &str, account_scope: &str, source_id: &str) -> Result<bool> {
+    pub fn contains_source(
+        &self,
+        provider: &str,
+        account_scope: &str,
+        source_id: &str,
+    ) -> Result<bool> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM conversations WHERE provider=?1 AND account_scope=?2 AND source_id=?3)",
             params![provider, account_scope, source_id],
