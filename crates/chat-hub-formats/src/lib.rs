@@ -1,5 +1,11 @@
 //! Bounded input and transcript-format decoding shared by Chat Hub adapters.
 
+mod normalization;
+pub use normalization::{
+    normalize_chatgpt_document, normalize_chatgpt_document_in_scope, parse_event,
+    NormalizationError,
+};
+
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Read;

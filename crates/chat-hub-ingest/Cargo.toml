@@ -1,0 +1,11 @@
+[package]
+name = "chat-hub-ingest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+chat-hub-formats = { path = "../chat-hub-formats", version = "0.1.0" }
+chat-hub-store = { path = "../chat-hub-store", version = "0.1.0" }
+serde_json = "1"

@@ -3,6 +3,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -24,6 +25,13 @@ class PrepareFixture(unittest.TestCase):
                 subprocess.run(["python3", str(SCRIPT), str(fixture), version], check=True)
                 self.assertIn(f'version = "{version}"', (fixture / "Cargo.toml").read_text())
                 self.assertIn(f'version = "{version}"', (fixture / "src-tauri/Cargo.toml").read_text())
+                self.assertIn(f'version = "{version}"', (fixture / "crates/chat-hub-api/Cargo.toml").read_text())
+                for relative in ("Cargo.toml", "crates/chat-hub-runtime/Cargo.toml"):
+                    package = tomllib.loads((fixture / relative).read_text())
+                    for section in ("dependencies", "dev-dependencies"):
+                        dependency = package.get(section, {}).get("chat-hub-api")
+                        if dependency is not None:
+                            self.assertEqual(dependency["version"], version)
                 self.assertEqual(json.loads((fixture / "src-tauri/tauri.conf.json").read_text())["version"], version)
                 self.assertFalse((fixture / "src-tauri/Cargo.lock").exists())
                 lock = (fixture / "Cargo.lock").read_text()
@@ -31,8 +39,11 @@ class PrepareFixture(unittest.TestCase):
                 self.assertIn(f'version = "{version}"', section)
                 root_lock = (fixture / "Cargo.lock").read_text()
                 self.assertIn('name = "chat-hub"\nversion = "' + version + '"', root_lock)
+                self.assertIn('name = "chat-hub-api"\nversion = "' + version + '"', root_lock)
                 self.assertIn('name = "chat-hub-model"\nversion = "0.1.0"', root_lock)
                 self.assertIn('name = "chat-hub-formats"\nversion = "0.1.0"', root_lock)
+                for package in ("chat-hub-store", "chat-hub-ingest", "chat-hub-capture", "chat-hub-runtime"):
+                    self.assertIn(f'name = "{package}"\nversion = "0.1.0"', root_lock)
                 subprocess.run(["cargo", "metadata", "--format-version", "1", "--locked", "--offline", "--no-deps", "--manifest-path", str(fixture / "src-tauri/Cargo.toml")], check=True, stdout=subprocess.DEVNULL)
                 subprocess.run(["cargo", "metadata", "--format-version", "1", "--locked", "--offline", "--no-deps", "--manifest-path", str(fixture / "Cargo.toml")], check=True, stdout=subprocess.DEVNULL)
 

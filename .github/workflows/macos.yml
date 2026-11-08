@@ -85,6 +85,28 @@ jobs:
         uses: ./ci/actions/macos-native-build
         with:
           publish-transport: 'false'
+      - name: Stage the already-validated PR application and DMG
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          directory="artifacts/pr-macos"
+          mkdir -p "$directory"
+          app="$RUNNER_TEMP/chat-hub/Chat Hub.app"
+          dmg="$RUNNER_TEMP/chat-hub/Chat_Hub_${version}_macos-arm64.dmg"
+          test -d "$app"
+          test -s "$dmg"
+          codesign --verify --deep --strict "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$directory/Chat_Hub_${version}_macos-arm64.zip"
+          cp "$dmg" "$directory/"
+          (cd "$directory" && shasum -a 256 "Chat_Hub_${version}_macos-arm64.zip" "Chat_Hub_${version}_macos-arm64.dmg" > SHA256SUMS)
+      - name: Upload installable Apple Silicon PR preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat-hub-macos-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/pr-macos
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
       - name: Record compiler cache hits (no PR cache writes)
         if: always()
         uses: ./ci/actions/cargo-sccache-cache

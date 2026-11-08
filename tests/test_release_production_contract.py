@@ -1,7 +1,10 @@
 """Production build-chain contracts: real bundle, ad-hoc mode, evidence, gated publish."""
 import unittest
+import fnmatch
 import json
 import os
+import re
+import runpy
 import subprocess
 import tarfile
 import tempfile
@@ -97,13 +100,31 @@ class ProductionContract(unittest.TestCase):
         self.assertIn('--mapping-run-id "$GITHUB_RUN_ID"', mapping)
 
     def test_native_actions_trigger_main_acceptance_and_ship_in_corresponding_source(self):
-        native_scope = (ROOT / "build/native_scope.py").read_text()
+        native_scope = runpy.run_path(str(ROOT / "build/native_scope.py"))
         acceptance = (ROOT / ".github/workflows/accept-native.yml").read_text()
-        sources = (ROOT / "build/release_sources.py").read_text()
-        self.assertIn("'ci/actions/**'", native_scope)
-        self.assertIn('"ci/actions/**"', acceptance)
-        self.assertIn('"ci/actions"', sources)
-        self.assertIn('".github/workflows"', sources)
+        trigger = acceptance.split("    paths:\n", 1)[1].split("\npermissions:", 1)[0]
+        patterns = re.findall(r'^\s+- "([^"]+)"$', trigger, re.M)
+        source_helpers = runpy.run_path(str(ROOT / "build/release_sources.py"))
+        sources = {relative for relative, _ in source_helpers["_source_files"](ROOT)}
+        for path in (
+            "ci/actions/gha-artifact-upload/main.go",
+            "ci/actions/macos-native-build/action.yml",
+            "ci/dagger/check/main.dang",
+            "ci/dagger/check/dagger-module.toml",
+            "dagger.toml",
+            ".github/workflows/check.yml",
+            "tests/fixtures/chatgpt-export/array.json",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(native_scope["requires_native"]([path]))
+                self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns))
+                self.assertIn(path, sources)
+        # Both supported Rust toolchain filenames must invalidate acceptance;
+        # not just whichever file happens to exist in this revision.
+        for path in ("rust-toolchain", "rust-toolchain.toml", ".cargo/config.toml"):
+            with self.subTest(path=path):
+                self.assertTrue(native_scope["requires_native"]([path]))
+                self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns))
 
     def test_workflow_checkouts_fetch_the_immutable_event_sha(self):
         files = [*ROOT.joinpath(".github/workflows").glob("*.yml"),

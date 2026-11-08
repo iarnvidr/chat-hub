@@ -1,7 +1,10 @@
 name: Checks
 on:
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
 concurrency:
@@ -10,6 +13,7 @@ concurrency:
 jobs:
   contracts:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     permissions:
       actions: write
       contents: read
@@ -24,24 +28,153 @@ jobs:
           git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA"
           git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
-      - name: Python contract suites (tests and build helpers)
-        uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
+      # A public PR can validate cold, without a private engine, Dagger Cloud
+      # account or package-write access. Registry credentials stay on the host.
+      - name: Restore compatible compiled work from GitHub Packages
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          oras="$(bash build/install-oras.sh "$RUNNER_TEMP/chat-hub-cache-oras")"
+          python3 ci/scripts/oci_cache.py restore --destination ci/cache/linux-cargo --oras "$oras"
+      - name: Rehydrate unchanged crate objects from their published packages
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          oras="$(bash build/install-oras.sh "$RUNNER_TEMP/chat-hub-cache-oras")"
+          python3 ci/scripts/crate_artifacts.py restore --destination ci/cache/linux-cargo --oras "$oras"
+      - id: dagger-checks
+        name: Dagger v1 crate, format, Clippy, Python, Bun and browser checks
+        uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
         with:
-          version: 0.21.11
-          verb: call
-          module: ./ci/dagger/check
-          args: >-
-            cached-checks --source . --cache-mode read --registry-token env:GH_TOKEN
-            --repository ${{ github.repository }} --event-name ${{ github.event_name }}
-            --ref ${{ github.ref }} --actor ${{ github.actor }}
-            --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }} --sha ${{ github.sha }}
+          version: 1.0.0-beta.25
+          verb: check
+          dagger-flags: --progress logs
+      # A failing test must not discard successful compilation. The run/attempt
+      # nonce belongs to the exporter, never to the compiler cache volume key.
+      - id: cargo-export
+        name: Export reusable Cargo output even when a check failed
+        if: ${{ always() && steps.dagger-checks.outcome != 'skipped' && !cancelled() }}
+        continue-on-error: true
+        run: >-
+          dagger -m ci/dagger/check api call export-cargo-cache
+          --nonce "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --output ci/cache/linux-cargo
+      - name: Keep actual Cargo diagnostics separate from reusable output
+        if: ${{ always() && steps.cargo-export.outcome == 'success' && !cancelled() }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ -d ci/cache/linux-cargo/check-logs ]]; then
+            mv ci/cache/linux-cargo/check-logs artifacts/cargo-check-logs
+            shopt -s nullglob
+            for log in artifacts/cargo-check-logs/*.log; do
+              echo "::group::Cargo diagnostics: $(basename "$log")"
+              tail -n 100 "$log"
+              echo '::endgroup::'
+            done
+          fi
+      - name: Upload actual Cargo output for diagnosis
+        if: ${{ always() && steps.cargo-export.outcome == 'success' && !cancelled() }}
+        continue-on-error: true
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-cargo-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/cargo-check-logs
+          retention-days: 14
+      - id: cargo-archive
+        name: Archive the Cargo snapshot without changing timestamps or modes
+        if: ${{ always() && steps.cargo-export.outcome == 'success' && !cancelled() }}
+        continue-on-error: true
+        run: python3 ci/scripts/oci_cache.py pack --source ci/cache/linux-cargo --output artifacts/cargo-cache
+      - name: Retain compiled data for the trusted GHCR publisher
+        if: ${{ always() && steps.cargo-archive.outcome == 'success' && !cancelled() }}
+        continue-on-error: true
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-cargo-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/cargo-cache
+          retention-days: 14
+      # Reusable crate objects are separately published and retrieved by source
+      # closure. Cargo still verifies fingerprint freshness after each restore;
+      # the full snapshot provides shared third-party dependency objects.
+      - id: crate-pack
+        name: Extract separately addressable compiled outputs for all nine crates
+        if: ${{ success() && steps.dagger-checks.outcome == 'success' && steps.cargo-archive.outcome == 'success' }}
+        run: >-
+          python3 ci/scripts/crate_artifacts.py --source ci/cache/linux-cargo
+          --cache-manifest artifacts/cargo-cache/cache-manifest.json
+          --output artifacts/crates
+      - name: Retain model crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-model-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-model
+          retention-days: 14
+      - name: Retain formats crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-formats-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-formats
+          retention-days: 14
+      - name: Retain store crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-store-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-store
+          retention-days: 14
+      - name: Retain ingest crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-ingest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-ingest
+          retention-days: 14
+      - name: Retain capture crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-capture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-capture
+          retention-days: 14
+      - name: Retain API crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-api-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-api
+          retention-days: 14
+      - name: Retain runtime crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-runtime
+          retention-days: 14
+      - name: Retain CLI crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub
+          retention-days: 14
+      - name: Retain desktop crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-desktop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-desktop
+          retention-days: 14
       - name: Record the exact successful PR check receipt
-        if: github.event_name == 'pull_request'
+        if: ${{ success() && github.event_name == 'pull_request' && steps.dagger-checks.outcome == 'success' }}
         run: python3 build/release_artifact.py check-receipt --root "$GITHUB_WORKSPACE"
       - uses: ./ci/actions/gha-artifact-upload
-        if: github.event_name == 'pull_request'
+        if: ${{ success() && github.event_name == 'pull_request' && steps.dagger-checks.outcome == 'success' }}
         with:
           name: chat-hub-check-receipt-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/check-receipt.json
