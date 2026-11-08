@@ -481,8 +481,11 @@ version = "0.2.5"
 dependencies = [
  "axum",
  "base64 0.22.1",
- "chat-hub-formats",
- "chat-hub-model",
+ "chat-hub-api",
+ "chat-hub-capture",
+ "chat-hub-ingest",
+ "chat-hub-runtime",
+ "chat-hub-store",
  "flate2",
  "http-body-util",
  "hyper",
@@ -500,6 +503,48 @@ dependencies = [
  "tokio-rustls",
  "tower",
  "url",
+ "webpki-roots 0.26.11",
+ "x509-parser",
+]
+
+[[package]]
+name = "chat-hub-api"
+version = "0.2.5"
+dependencies = [
+ "axum",
+ "chat-hub-ingest",
+ "chat-hub-model",
+ "chat-hub-store",
+ "http-body-util",
+ "hyper",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "chat-hub-capture"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chat-hub-formats",
+ "chat-hub-model",
+ "chat-hub-store",
+ "flate2",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tokio-rustls",
  "webpki-roots 0.26.11",
  "x509-parser",
 ]
@@ -531,15 +576,53 @@ dependencies = [
 name = "chat-hub-formats"
 version = "0.1.0"
 dependencies = [
+ "chat-hub-model",
  "serde",
  "serde_json",
  "time",
 ]
 
 [[package]]
+name = "chat-hub-ingest"
+version = "0.1.0"
+dependencies = [
+ "chat-hub-formats",
+ "chat-hub-store",
+ "serde_json",
+]
+
+[[package]]
 name = "chat-hub-model"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "chat-hub-runtime"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chat-hub-api",
+ "chat-hub-capture",
+ "chat-hub-model",
+ "chat-hub-store",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "chat-hub-store"
+version = "0.1.0"
+dependencies = [
+ "chat-hub-formats",
+ "chat-hub-model",
+ "ring",
+ "rusqlite",
  "serde",
  "serde_json",
 ]

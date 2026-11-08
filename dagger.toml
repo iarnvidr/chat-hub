@@ -1,0 +1,5 @@
+# Native Dang runtime; all containers are digest-pinned in the module.
+# There are no remote SDK/module refs or floating images to resolve in dagger.lock.
+[modules.chat-hub-ci]
+source = "./ci/dagger/check"
+main = true

@@ -1,6 +1,14 @@
 [workspace]
-members = [".", "src-tauri", "crates/chat-hub-model", "crates/chat-hub-formats"]
-default-members = [".", "crates/chat-hub-model", "crates/chat-hub-formats"]
+members = [
+    ".", "src-tauri", "crates/chat-hub-model", "crates/chat-hub-formats",
+    "crates/chat-hub-store", "crates/chat-hub-ingest", "crates/chat-hub-capture",
+    "crates/chat-hub-api", "crates/chat-hub-runtime",
+]
+default-members = [
+    ".", "crates/chat-hub-model", "crates/chat-hub-formats", "crates/chat-hub-store",
+    "crates/chat-hub-ingest", "crates/chat-hub-capture", "crates/chat-hub-api",
+    "crates/chat-hub-runtime",
+]
 resolver = "2"
 
 [package]
@@ -17,14 +25,21 @@ name = "chat-hub"
 path = "src/main.rs"
 
 [dependencies]
-chat-hub-model = { path = "crates/chat-hub-model", version = "0.1.0" }
-chat-hub-formats = { path = "crates/chat-hub-formats", version = "0.1.0" }
+chat-hub-store = { path = "crates/chat-hub-store", version = "0.1.0" }
+chat-hub-ingest = { path = "crates/chat-hub-ingest", version = "0.1.0" }
+chat-hub-capture = { path = "crates/chat-hub-capture", version = "0.1.0" }
+chat-hub-api = { path = "crates/chat-hub-api", version = "0.2.5" }
+chat-hub-runtime = { path = "crates/chat-hub-runtime", version = "0.1.0" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "io-util"] }
+
+[dev-dependencies]
+# End-to-end tests exercise the composition through the compatibility facade.
+# Production database, transport and HTTP dependencies belong to their owner crates.
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "io-util"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 ring = "0.17"
 base64 = "0.22"
@@ -38,10 +53,7 @@ hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server", "http1"] }
 http-body-util = "0.1"
 
-[dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-rcgen = { version = "0.13", features = ["pem"] }
 x509-parser = "0.16"
 url = "=2.5.8"
 

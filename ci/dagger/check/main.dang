@@ -1,0 +1,293 @@
+"""
+Chat Hub's per-crate portable checks. Native macOS app acceptance stays on a Mac.
+"""
+type ChatHubCi {
+  let ws: Workspace!
+
+  new(ws: Workspace!) {
+    self.ws = ws
+    self
+  }
+
+  let rustTools: Container! = container(platform: "linux/amd64")
+    .from("rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b")
+  let bunTools: Container! = container(platform: "linux/amd64")
+    .from("oven/bun:1.2.22@sha256:66ba69deede44e3af5dc542def218fdb3bcad2205900ea761dc5623bf973d2df")
+
+  # A fresh hosted engine is seeded by a compatible GHCR compilation snapshot.
+  # A miss is an ordinary cold build. This directory never enters source scopes.
+  let cargoSeed: Directory! {
+    ws.directory("/ci/cache/linux-cargo", exclude: [".gitignore"])
+  }
+  # Dagger v1 includes seed and sharing mode in the cache's identity. EVERY
+  # mount, including export, must reuse this exact object. No run/commit key.
+  let cargoCache: CacheVolume! {
+    cacheVolume("chat-hub-cargo-linux-amd64-rust-1.99.1-bookworm-v1",
+      source: cargoSeed, sharing: CacheSharingMode.LOCKED)
+  }
+  let rustSystem: Container! {
+    rustTools
+      .withExec(["sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends build-essential rsync pkg-config python3 openssl libssl-dev libxdo-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf ffmpeg libatomic1 && rm -rf /var/lib/apt/lists/*"])
+      .withExec(["rustup", "component", "add", "rustfmt", "clippy"])
+      .withExec(["sh", "-ec", "if command -v node >/dev/null 2>&1; then echo 'Node executable is prohibited in this CI environment' >&2; exit 1; fi"])
+  }
+  # Apt repositories can advance independently of the pinned base image. Native
+  # link/build-script outputs must not cross system-ABI boundaries.
+  let rustSystemABI: String! {
+    rustSystem
+      .withExec(["bash", "-euc", "set -o pipefail; dpkg-query -W | LC_ALL=C sort | sha256sum | cut -d ' ' -f 1 | tr -d '\\n'"])
+      .stdout
+  }
+  let rustBase: Container! {
+    rustSystem
+      .withMountedCache("/cache", cargoCache)
+      .withEnvVariable("CARGO_HOME", "/cache/cargo")
+      .withEnvVariable("CARGO_TARGET_DIR", `/cache/target/${rustSystemABI}`)
+      .withEnvVariable("CARGO_INCREMENTAL", "0")
+      .withEnvVariable("CARGO_BUILD_JOBS", "2")
+      .withEnvVariable("CARGO_PROFILE_DEV_DEBUG", "0")
+      .withEnvVariable("CARGO_PROFILE_TEST_DEBUG", "0")
+      .withFile("/run-rust.sh", ws.file("/ci/dagger/check/run-rust.sh"))
+      .withFile("/run-crate.sh", ws.file("/ci/dagger/check/run-crate.sh"))
+      .withFile("/stable-worktree.py", ws.file("/ci/dagger/check/stable-worktree.py"))
+      .withWorkdir("/")
+  }
+
+  # Cargo resolves every workspace manifest, but does not need unrelated source.
+  # Placeholder targets fail compilation if a source closure misses a dependency.
+  # REAL lib.rs files are not skeleton inputs: formats currently puts its actual
+  # implementation there, so using them would invalidate every unrelated check.
+  let workspaceSkeleton: Directory! {
+    ws.directory("/", include: [
+      "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**",
+      "crates/*/Cargo.toml", "src-tauri/Cargo.toml",
+    ], exclude: ["**/target", "**/__pycache__", "**/node_modules"])
+      .withNewFile("/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/src/main.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/src-tauri/src/main.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/src-tauri/build.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/crates/chat-hub-model/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/crates/chat-hub-formats/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/crates/chat-hub-store/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/crates/chat-hub-ingest/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/crates/chat-hub-capture/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/crates/chat-hub-api/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/crates/chat-hub-runtime/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+  }
+  let modelSource: Directory! {
+    workspaceSkeleton.withDirectory("/crates/chat-hub-model", ws.directory("/crates/chat-hub-model"))
+  }
+  let formatsSource: Directory! {
+    modelSource.withDirectory("/crates/chat-hub-formats", ws.directory("/crates/chat-hub-formats"))
+  }
+  let storeSource: Directory! {
+    formatsSource
+      .withDirectory("/crates/chat-hub-store", ws.directory("/crates/chat-hub-store"))
+      .withDirectory("/tests/fixtures", ws.directory("/tests/fixtures"))
+  }
+  let ingestSource: Directory! {
+    storeSource.withDirectory("/crates/chat-hub-ingest", ws.directory("/crates/chat-hub-ingest"))
+  }
+  let captureLibSource: Directory! {
+    formatsSource.withDirectory("/crates/chat-hub-capture", ws.directory("/crates/chat-hub-capture"))
+  }
+  # Capture's own tests exercise a real Store as a DEV-dependency; merely using
+  # the proxy does not introduce a production dependency on SQLite.
+  let captureSource: Directory! {
+    captureLibSource
+      .withDirectory("/crates/chat-hub-store", ws.directory("/crates/chat-hub-store"))
+      .withDirectory("/tests/fixtures", ws.directory("/tests/fixtures"))
+  }
+  let apiSource: Directory! {
+    ingestSource.withDirectory("/crates/chat-hub-api", ws.directory("/crates/chat-hub-api"))
+  }
+  let runtimeSource: Directory! {
+    apiSource
+      .withDirectory("/crates/chat-hub-capture", ws.directory("/crates/chat-hub-capture"))
+      .withDirectory("/crates/chat-hub-runtime", ws.directory("/crates/chat-hub-runtime"))
+  }
+  let rootLibSource: Directory! {
+    runtimeSource.withDirectory("/src", ws.directory("/src"))
+  }
+  # Root integration tests include native adapter modules with #[path], inspect
+  # the Tauri configuration, and execute the Python capture-smoke contract.
+  # Their source dependencies belong here, not in independent leaf-crate checks.
+  let cliSource: Directory! {
+    rootLibSource
+      .withDirectory("/tests", ws.directory("/tests", include: ["*.rs", "common/**", "fixtures/**"]))
+      .withDirectory("/src-tauri/src", ws.directory("/src-tauri/src", include: [
+        "main.rs", "desktop_runtime.rs", "service_health.rs", "e2e_protocol.rs",
+        "window_policy.rs", "desktop_api.rs", "desktop_archive.rs",
+      ]))
+      .withFile("/src-tauri/tauri.conf.json", ws.file("/src-tauri/tauri.conf.json"))
+      .withFile("/build/native_capture_contract.py", ws.file("/build/native_capture_contract.py"))
+  }
+  let desktopSource: Directory! {
+    rootLibSource
+      .withDirectory("/src-tauri", ws.directory("/src-tauri", exclude: ["gen", "**/target"]))
+      .withDirectory("/desktop-ui", ws.directory("/desktop-ui"))
+      .withFile("/LICENSE", ws.file("/LICENSE"))
+  }
+
+  # One independently cached native Dagger check per Cargo workspace member.
+  # Cargo invocations are serialized by LOCKED; each compiler has at most 2 jobs.
+  # Other Dagger checks still run independently if one crate fails.
+  pub modelTests: Void @check {
+    rustBase.withMountedDirectory("/input", modelSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/model-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-model"])
+      .sync
+    null
+  }
+  pub formatsTests: Void @check {
+    rustBase.withMountedDirectory("/input", formatsSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/formats-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-formats"])
+      .sync
+    null
+  }
+  pub storeTests: Void @check {
+    rustBase.withMountedDirectory("/input", storeSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/store-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-store"])
+      .sync
+    null
+  }
+  pub ingestTests: Void @check {
+    rustBase.withMountedDirectory("/input", ingestSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/ingest-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-ingest"])
+      .sync
+    null
+  }
+  pub captureTests: Void @check {
+    rustBase.withMountedDirectory("/input", captureSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/capture-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-capture"])
+      .sync
+    null
+  }
+  pub apiTests: Void @check {
+    rustBase.withMountedDirectory("/input", apiSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/api-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-api"])
+      .sync
+    null
+  }
+  pub runtimeTests: Void @check {
+    rustBase.withMountedDirectory("/input", runtimeSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/runtime-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-runtime"])
+      .sync
+    null
+  }
+  pub cliTests: Void @check {
+    rustBase.withMountedDirectory("/input", cliSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/cli-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub"])
+      .sync
+    null
+  }
+  pub desktopTests: Void @check {
+    rustBase.withMountedDirectory("/input", desktopSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/desktop-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-desktop"])
+      .sync
+    null
+  }
+
+  """
+  Formatting needs all Rust sources, but does not compile any crate.
+  """
+  pub rustStyle: Void @check {
+    rustTools
+      .withExec(["rustup", "component", "add", "rustfmt"])
+      .withMountedDirectory("/src", ws.directory("/", include: [
+        "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**",
+        "src/**", "tests/*.rs", "tests/common/**", "crates/**", "src-tauri/**",
+      ], exclude: ["**/target", "**/__pycache__", "**/node_modules", "src-tauri/gen"]))
+      .withWorkdir("/src")
+      .withExec(["cargo", "fmt", "--all", "--", "--check"])
+      .sync
+    null
+  }
+
+  let javascriptSource: Directory! {
+    ws.directory("/", include: [
+      "desktop-ui/**", "src-tauri/src/*.js", "tests/*.test.cjs", "tests/fixtures/**",
+      "build/test-desktop-js.sh",
+    ], exclude: ["**/node_modules"])
+  }
+  pub javascript: Void @check {
+    bunTools
+      .withEnvVariable("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+      .withExec(["sh", "-ec", "if command -v node >/dev/null 2>&1; then echo 'Node executable is prohibited in this CI environment' >&2; exit 1; fi"])
+      .withMountedDirectory("/src", javascriptSource)
+      .withWorkdir("/src")
+      .withExec(["bash", "build/test-desktop-js.sh"])
+      .sync
+    null
+  }
+  pub browser: Void @check {
+    bunTools
+      .withEnvVariable("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+      .withExec(["sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends chromium && rm -rf /var/lib/apt/lists/*"])
+      .withExec(["sh", "-ec", "if command -v node >/dev/null 2>&1; then echo 'Node executable is prohibited in this CI environment' >&2; exit 1; fi"])
+      .withNewFile("/tmp/pwdeps/package.json", "{\"private\":true,\"dependencies\":{\"playwright\":\"1.58.2\"}}")
+      .withWorkdir("/tmp/pwdeps")
+      .withMountedCache("/root/.bun/install/cache", cacheVolume("chat-hub-bun-playwright"))
+      .withExec(["bun", "install", "--ignore-scripts"])
+      .withMountedDirectory("/src", javascriptSource
+        .withFile("/tests/desktop_ui_browser.cjs", ws.file("/tests/desktop_ui_browser.cjs"))
+        .withFile("/tests/desktop_workspace.cjs", ws.file("/tests/desktop_workspace.cjs"))
+        .withFile("/tests/desktop_chat_features.cjs", ws.file("/tests/desktop_chat_features.cjs"))
+        .withFile("/tests/desktop_ui_graph_browser.cjs", ws.file("/tests/desktop_ui_graph_browser.cjs")))
+      .withWorkdir("/src")
+      .withEnvVariable("PLAYWRIGHT_MODULE", "/tmp/pwdeps/node_modules/playwright")
+      .withEnvVariable("CHROMIUM_PATH", "/usr/bin/chromium")
+      .withExec(["bun", "tests/desktop_ui_browser.cjs"])
+      .withExec(["bun", "tests/desktop_workspace.cjs"])
+      .withExec(["bun", "tests/desktop_chat_features.cjs"])
+      .withExec(["bun", "tests/desktop_ui_graph_browser.cjs"])
+      .sync
+    null
+  }
+  """
+  Python release/native/security contracts inspect repository-wide inputs.
+  This intentionally broad scope does not contaminate the Rust crate scopes.
+  """
+  pub contracts: Void @check {
+    container(platform: "linux/amd64")
+      .from("python:3.14.0-slim-bookworm@sha256:d13fa0424035d290decef3d575cea23d1b7d5952cdf429df8f5542c71e961576")
+      .withExec(["sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends bash build-essential git rsync zstd && rm -rf /var/lib/apt/lists/*"])
+      .withDirectory("/usr/local/cargo", rustTools.directory("/usr/local/cargo"))
+      .withDirectory("/usr/local/rustup", rustTools.directory("/usr/local/rustup"))
+      .withFile("/usr/local/bin/bun", bunTools.file("/usr/local/bin/bun"))
+      .withEnvVariable("CARGO_HOME", "/usr/local/cargo")
+      .withEnvVariable("RUSTUP_HOME", "/usr/local/rustup")
+      .withEnvVariable("CARGO_BUILD_JOBS", "2")
+      .withEnvVariable("PATH", "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+      .withExec(["sh", "-ec", "if command -v node >/dev/null 2>&1; then echo 'Node executable is prohibited in this CI environment' >&2; exit 1; fi"])
+      .withMountedDirectory("/src", ws.directory("/", exclude: [
+        ".git", "**/target", "**/__pycache__", "**/node_modules", "src-tauri/gen", "ci/cache", "artifacts",
+      ]))
+      .withWorkdir("/src")
+      .withExec(["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"])
+      .withExec(["python3", "-m", "unittest", "discover", "-s", "build", "-p", "test_*.py", "-v"])
+      .withExec(["python3", "-m", "unittest", "discover", "-s", "ci/dagger/check", "-p", "test_*.py", "-v"])
+      .sync
+    null
+  }
+
+  """
+  Snapshot compiled data even if a check failed. This is NOT a passing receipt.
+  A fresh run/attempt nonce invalidates only the mutable-volume snapshot copy.
+  """
+  pub exportCargoCache(nonce: String!): Directory! {
+    rustTools
+      .withMountedCache("/cache", cargoCache)
+      .withEnvVariable("CHAT_HUB_CACHE_EXPORT_NONCE", nonce)
+      .withExec(["sh", "-ec", "mkdir -p /snapshot/cargo /snapshot/target; for part in registry git; do if test -d /cache/cargo/$part; then cp -a /cache/cargo/$part /snapshot/cargo/; fi; done; for part in target worktree source-state check-logs; do if test -d /cache/$part; then cp -a /cache/$part /snapshot/; fi; done"])
+      .directory("/snapshot")
+  }
+}

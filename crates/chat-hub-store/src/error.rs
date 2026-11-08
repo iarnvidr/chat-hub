@@ -1,0 +1,58 @@
+//! Storage and archive errors; database dependencies stay inside this crate.
+use std::{fmt, io};
+
+#[derive(Debug)]
+pub enum Error {
+    Io(io::Error),
+    Database(rusqlite::Error),
+    Configuration(String),
+    Http(String),
+    RestoreRecovery {
+        details: String,
+    },
+    ReadBudgetExceeded {
+        kind: &'static str,
+        limit: usize,
+    },
+    ArchivePublished {
+        destination: std::path::PathBuf,
+        operation: &'static str,
+        source: io::Error,
+    },
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Database(e) => write!(f, "database error: {e}"),
+            Self::Configuration(e) => write!(f, "configuration error: {e}"),
+            Self::Http(e) => write!(f, "HTTP error: {e}"),
+            Self::RestoreRecovery { details } => write!(f, "Restore recovery required: {details}"),
+            Self::ReadBudgetExceeded { kind, limit } => {
+                write!(f, "read budget exceeded ({kind}, limit {limit})")
+            }
+            Self::ArchivePublished { destination, operation, source } => write!(
+                f,
+                "archive was published at {} but {operation} failed; durability is unconfirmed: {source}",
+                destination.display()
+            ),
+        }
+    }
+}
+impl std::error::Error for Error {}
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Database(e)
+    }
+}
+impl From<chat_hub_formats::NormalizationError> for Error {
+    fn from(error: chat_hub_formats::NormalizationError) -> Self {
+        Self::Configuration(error.0)
+    }
+}
+pub type Result<T> = std::result::Result<T, Error>;

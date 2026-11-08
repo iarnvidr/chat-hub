@@ -58,7 +58,7 @@ import json,pathlib,sys
 root=pathlib.Path(sys.argv[1]); expected=sys.argv[2]
 assert (root/'Cargo.toml').read_text().split('version = "',1)[1].split('"',1)[0] == expected
 assert (root/'src-tauri/Cargo.toml').read_text().split('version = "',1)[1].split('"',1)[0] == expected
-assert json.loads((root/'src-tauri/tauri.conf.json').read_text())['version'] == expected
+assert (root/'crates/chat-hub-api/Cargo.toml').read_text().split('version = "',1)[1].split('"',1)[0] == expected
 assert json.loads((root/'src-tauri/tauri.conf.json').read_text())['version'] == expected
 PY
   CARGO_TARGET_DIR="$target" cargo build --locked --offline --manifest-path "$source/src-tauri/Cargo.toml" --target aarch64-apple-darwin --features native-smoke

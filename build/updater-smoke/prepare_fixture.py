@@ -12,21 +12,32 @@ repo = pathlib.Path(__file__).resolve().parents[2]
 if root == repo or repo in root.parents:
     raise SystemExit("refusing to mutate the smoke script's checkout; prepare a temporary source copy")
 manifest = root / "src-tauri/Cargo.toml"
-root_manifest = root / "Cargo.toml"
 config = root / "src-tauri/tauri.conf.json"
 root_lock = root / "Cargo.lock"
-s = manifest.read_text()
-rs = root_manifest.read_text()
-rs, rn = re.subn(r'(?m)^version = "[^"]+"$', f'version = "{version}"', rs, count=1)
-assert rn == 1
-root_manifest.write_text(rs)
-s, n = re.subn(r'(?m)^version = "[^"]+"$', f'version = "{version}"', s, count=1)
-assert n == 1
-manifest.write_text(s)
+app_manifests = ("Cargo.toml", "src-tauri/Cargo.toml", "crates/chat-hub-api/Cargo.toml")
+for relative in app_manifests:
+    app_manifest = root / relative
+    updated, count = re.subn(r'(?m)^version = "[^"]+"$', f'version = "{version}"',
+                            app_manifest.read_text(), count=1)
+    if count != 1:
+        raise SystemExit(f"missing app package version in disposable fixture: {relative}")
+    app_manifest.write_text(updated)
+# The API library exposes the app's binary version. Update its local dependency
+# requirements too, including runtime's test-support dependency, while leaving
+# the independent implementation-library versions untouched.
+dependency_manifests = [root / "Cargo.toml", root / "src-tauri/Cargo.toml",
+                        *(root / "crates").glob("*/Cargo.toml")]
+for dependency_manifest in dependency_manifests:
+    source = dependency_manifest.read_text()
+    updated = re.sub(r'(?m)^(chat-hub-api\s*=\s*\{[^}\n]*\bversion\s*=\s*")[^"]+(")',
+                     lambda match: match[1] + version + match[2], source)
+    if updated != source:
+        dependency_manifest.write_text(updated)
 cfg = json.loads(config.read_text())
 cfg["version"] = version
 config.write_text(json.dumps(cfg, indent=2) + "\n")
-# Both app packages share one workspace lockfile. Stable leaf crate versions
+# The CLI, desktop and API's binary-version response share the app version and
+# one workspace lockfile. Stable implementation-library versions
 # remain independent when the disposable fixture changes the app version.
 if not root_lock.is_file():
     raise SystemExit(f"missing workspace lockfile in disposable fixture: {root_lock}")

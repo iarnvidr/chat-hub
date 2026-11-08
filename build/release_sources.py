@@ -10,14 +10,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FORMAT = "chat-hub-corresponding-source-v1"
 EXCLUDED_DIRS = {".git", "target", ".tools", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "dist", "build-cache"}
+SOURCE_ROOTS = (
+    "src", "src-tauri", "crates", "desktop-ui", "build", "tests", "tools", "docs",
+    "ci/actions", "ci/scripts", "ci/dagger", ".github/workflows",
+)
+ROOT_FILES = (
+    "Cargo.toml", "Cargo.lock", "dagger.toml", "dagger.lock", "LICENSE", "NOTICE",
+    "rust-toolchain", "rust-toolchain.toml", "rust-toolchain.yaml", "README.md",
+    ".cargo/config", ".cargo/config.toml",
+)
 
 
 def _source_files(root):
     """Enumerate allowlisted source inputs without following symlinks."""
-    roots = ["src", "src-tauri", "crates", "desktop-ui", "build", "ci/actions", "ci/scripts", ".github/workflows"]
-    root_files = ["Cargo.toml", "Cargo.lock", "LICENSE", "NOTICE", "rust-toolchain", "rust-toolchain.toml", "rust-toolchain.yaml", "README.md"]
-    candidates = set(root_files)
-    for directory in roots:
+    # Retain the native Dagger module, checks and fixtures alongside the app's
+    # sources, but never ci/cache: it contains restored compiler data, not code.
+    candidates = set(ROOT_FILES)
+    for directory in SOURCE_ROOTS:
         base = root / directory
         if base.is_dir() and not base.is_symlink():
             for path in base.rglob("*"):
@@ -50,7 +59,7 @@ def prepare(destination, root=ROOT):
         for relative, source in _source_files(root):
             target = stage / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
+            shutil.copy2(source, target)
             entries.append({"path": relative, "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
         if not {"LICENSE", "NOTICE"}.issubset({entry["path"] for entry in entries}):
             raise FileNotFoundError("required corresponding source missing: LICENSE or NOTICE")
