@@ -13,16 +13,21 @@ function validRow(value) {
 
 export function createPendingConversationStore(storage=globalThis.localStorage,now=()=>Date.now()) {
   let rows=[];
+  let persistenceAvailable = Boolean(storage && typeof storage.setItem === 'function');
+  let persistenceError = false;
   try {
     const parsed=JSON.parse(storage?.getItem(STORAGE_KEY)||'[]');
     if(Array.isArray(parsed))rows=parsed.filter(validRow).slice(-MAX_PENDING).map(row=>({...row}));
-  } catch { rows=[]; }
+  } catch { rows=[]; persistenceError = true; }
   function persist(){
     try {
       // Unsaved blank drafts are session UI state only. Persist a row once it has a provider ID.
       const durable=rows.filter(row=>conversationId.test(row.source_id||'')).slice(-MAX_PENDING);
-      storage?.setItem(STORAGE_KEY,JSON.stringify(durable));
-    } catch { /* Sidebar pending state remains available for this app session. */ }
+      if (!storage || typeof storage.setItem !== 'function') throw Error('pending_storage_unavailable');
+      storage.setItem(STORAGE_KEY,JSON.stringify(durable));
+      persistenceAvailable = true;
+      persistenceError = false;
+    } catch { persistenceAvailable = false; persistenceError = true; /* Keep in-memory rows; never claim they are durable. */ }
   }
   function list(){return rows.map(row=>({...row}));}
   function get(pendingId){const row=rows.find(item=>item.pending_id===pendingId);return row?{...row}:null;}
@@ -62,7 +67,13 @@ export function createPendingConversationStore(storage=globalThis.localStorage,n
     if(rows.length!==before)persist();
     return before-rows.length;
   }
-  return {list,get,createDraft,attachProviderConversation,setAccountScope,removeUnstartedDraft,reconcileCaptured};
+  function diagnostics(){
+    return {pending_count:rows.filter(row=>Boolean(row.source_id)).length,
+      unsaved_draft_count:rows.filter(row=>!row.source_id).length,
+      storage_available:persistenceAvailable && !persistenceError,
+      persistence_error:persistenceError};
+  }
+  return {list,get,createDraft,attachProviderConversation,setAccountScope,removeUnstartedDraft,reconcileCaptured,diagnostics};
 }
 
 export function pendingConversationItem(row) {
