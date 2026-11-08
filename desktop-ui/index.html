@@ -67,6 +67,7 @@
           <section class="settings-section" aria-labelledby="library-title"><h2 id="library-title">Library</h2><p>Import a ChatGPT export, or keep a portable copy of your local library.</p><details class="library-tools"><summary>Library tools</summary><div class="library-tools-menu"><button id="import" type="button">Import export</button><button id="backup-library" type="button">Save library backup</button><button id="restore-library" type="button">Restore backup</button><button id="export-library-json" type="button">Export library as JSON</button></div></details></section>
           <section class="settings-section" aria-labelledby="catalog-title"><h2 id="catalog-title">Chat index</h2><p>Saved chats are indexed locally for the overview, shared keywords and message graphs. Rebuilding does not change the original conversations.</p><button id="rebuild-catalog" type="button">Rebuild index</button><p id="catalog-status" role="status" aria-live="polite"></p></section>
           <section class="settings-section" aria-labelledby="software-title"><h2 id="software-title">Software</h2><p id="version" data-testid="app-version">Loading…</p><details class="update-menu"><summary>Software updates</summary><section class="update-card"><h3>Software updates</h3><p>Stable channel</p><div class="actions"><button id="check" data-testid="check-updates">Check for updates</button><button id="install" hidden>Update &amp; relaunch</button></div><div id="message" data-testid="update-message" role="status" aria-live="polite">Checking version…</div></section></details></section>
+          <section class="settings-section" aria-labelledby="diagnostic-export-title"><h2 id="diagnostic-export-title">Diagnostics</h2><p>Export metadata only: sync progress, retry timing, capture counters and pending-chat counts. No chat messages, titles or account tokens are included.</p><button id="export-diagnostics" type="button">Export diagnostics…</button><p id="diagnostics-export-status" role="status" aria-live="polite"></p></section>
           <details class="settings-section diagnostics"><summary>Service details</summary><div id="health" aria-live="polite">Starting local service…</div><div id="capture-health" aria-live="polite"></div><button id="retry-health" class="quiet" hidden>Retry connection</button></details>
         </div>
       </main>
@@ -82,6 +83,7 @@
   <script type="module" src="./reader-tools.js"></script>
   <script type="module" src="./provider-view.js"></script>
   <script type="module" src="./history-sync.js"></script>
+  <script type="module" src="./diagnostic-export.js"></script>
   <script type="module" src="./workspace.js"></script>
   <script type="module" src="./overview.js"></script>
   <script type="module" src="./catalog-items.js"></script>
