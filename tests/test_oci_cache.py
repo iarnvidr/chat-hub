@@ -222,11 +222,14 @@ class MetadataTests(unittest.TestCase):
             module.mkdir(parents=True)
             (module / "main.dang").write_text(f'let image = "{IMAGE}"')
             (module / "run-rust.sh").write_text("cargo test\n")
+            (module / "run-crate.sh").write_text("cargo test -p model\n")
             (module / "stable-worktree.py").write_text("# stable timestamps\n")
             first = cache.compatibility(root)
             (root / "Cargo.lock").write_text("new dependencies\n")
             self.assertEqual(cache.compatibility(root), first)
             (module / "stable-worktree.py").write_text("# changed mirror algorithm\n")
+            self.assertNotEqual(cache.compatibility(root), first)
+            (module / "run-crate.sh").write_text("cargo test -p new-model\n")
             self.assertNotEqual(cache.compatibility(root), first)
 
     def test_restore_uses_same_pr_then_main_and_never_another_fork_cache(self):

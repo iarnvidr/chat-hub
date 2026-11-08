@@ -12,11 +12,14 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import tomllib
 import unittest
 
 MODULE_DIR = Path(__file__).resolve().parent
 ROOT = MODULE_DIR.parents[2]
+sys.path.insert(0, str(ROOT / "ci/scripts"))
+import crate_sources
 MODULE = (MODULE_DIR / "main.dang").read_text()
 DIRECTORIES = dict(re.findall(r"\blet (\w+): Directory! \{\n(.*?)\n  \}", MODULE, re.S))
 CHECKS = dict(re.findall(r"\bpub (\w+): Void @check \{\n(.*?)\n  \}", MODULE, re.S))
@@ -170,6 +173,12 @@ def crate_checks() -> dict[str, tuple[str, str]]:
 
 
 class DaggerContract(unittest.TestCase):
+    def test_published_crate_fingerprint_uses_exact_dagger_source_scope(self):
+        for crate, (_, label) in crate_checks().items():
+            self.assertEqual(crate_sources.crate_scope(ROOT, crate), label)
+            self.assertEqual(crate_sources.scope(label, ROOT), scope(label))
+            self.assertRegex(crate_sources.fingerprint(ROOT, crate)["sha256"], r"^[a-f0-9]{64}$")
+
     def test_native_v1_workspace_and_module_are_pinned(self):
         root = tomllib.loads((ROOT / "dagger.toml").read_text())
         self.assertEqual(root["modules"]["chat-hub-ci"], {"source": "./ci/dagger/check", "main": True})

@@ -17,32 +17,45 @@ function and is attempted even after failed validation: successful checks and
 retained compilation artifacts are independent.
 
 On successful runs, `ci/scripts/crate_artifacts.py` extracts the actual compiled
-objects and Cargo fingerprints belonging to **each of the nine crates**, with
+objects, Cargo fingerprints, and verified source timestamps belonging to **each of the nine crates**, with
 one digest-bound `crate.tar.zst` and `crate-manifest.json` bundle per package.
 They appear individually in the GitHub Actions run under
 `chat-hub-crate-<package>-<run>-<attempt>`. The trusted `workflow_run` publisher
 also makes immutable OCI packages available at
 `ghcr.io/iarnvidr/chat-hub-crate-<package>:run-<run>-<attempt>`; moving `pr-N`
 and green `main` aliases are added only after validation by trusted code.
-An ordinary `oras pull` retrieves a bundle for examination or manual loading.
+These are actual reusable input packages: the pre-Dagger Actions step resolves
+each `pr-N`/`main` OCI alias to an immutable digest, verifies the checksum,
+trusted publisher, exact Dagger source closure, and pinned compiler recipe,
+and restores only matching crate-owned target files and source timestamps.
+Its SHA-256 source closure comes directly from the `main.dang` Directory
+expressions, including transitive workspace dependencies and synthetic
+placeholders; editing an unrelated crate therefore cannot invalidate a leaf
+package. Independent misses are reported, and Cargo compiles those crates.
+The shared snapshot still supplies third-party dependency objects efficiently,
+and Cargo's own fingerprint logic remains the final authority on freshness.
+An ordinary `oras pull` can also retrieve an immutable bundle for inspection.
 These **are compiled Cargo objects, not installable binaries or release
 qualifications**. The CLI check additionally compiles a runnable Linux debug
 binary, included in its own crate bundle. The macOS PR workflow retains a
 separate signed (ad-hoc), unnotarized application ZIP and matching DMG for
 hands-on testing.
 
-For reliable incremental compilation, restore the **complete cache archive**
-instead of overlaying individual crate objects: Cargo needs the corresponding
-dependency outputs, fingerprints and stable source mirrors. The per-crate
-packages provide separately addressable objects while the shared snapshot
-remains the dependency-coherent restore unit. Compiler output is never trusted
-as a substitute for the current commit's green checks.
+The warm path restores the complete cache snapshot **and** individually matches
+and consumes the published crate packages. Even with no shared snapshot, a
+standalone crate package can be loaded: it carries the owner objects and their
+source timestamps. Cargo may still have to rebuild it if required third-party
+dependencies are absent or compiler/linker configuration changed. Changes to a
+library correctly rebuild its downstream dependents; unrelated libraries remain
+reusable. Compiler output is never evidence for skipping current checks.
 
-The Actions job can seed the engine from compatible GHCR OCI cache data, or
-compile cold when no previous cache is available. Read-only restore happens in
+The Actions job can seed the engine from compatible GHCR OCI packages, or
+compile cold when no previous package is available. Read-only restore happens in
 the unprivileged pull-request job. A trusted `workflow_run` publisher separately
 validates run identity and publishes inert cache data and successful evidence.
 That publisher becomes active only after this workflow lands on `main`.
 
-Run local source-closure and stable fingerprint regressions with
+Tests verify OCI package selection and restoration, poisoned-archive rejection,
+and real Cargo JSON `fresh: true` after restoring only one published-style
+crate archive into a new cache. Run local source-closure and fingerprint regressions with
 `python3 -m unittest discover -s ci/dagger/check -p 'test_*.py' -v`.

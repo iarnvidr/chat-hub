@@ -111,7 +111,10 @@ def compatibility(root: Path) -> dict:
     images = set(re.findall(r"rust:[A-Za-z0-9_.-]+@sha256:[a-f0-9]{64}", module.read_text()))
     if len(images) != 1:
         raise CacheError("expected one digest-pinned Rust image in Dagger module")
-    scripts = [root / "ci/dagger/check/run-rust.sh"]
+    # Dagger source scopes and Cargo flags are part of the object ABI/key too.
+    # A change to the compilation recipe must never consume prior objects.
+    scripts = [module, root / "ci/dagger/check/run-rust.sh",
+               root / "ci/dagger/check/run-crate.sh"]
     helper = root / "ci/dagger/check/stable-worktree.py"
     if helper.exists():
         scripts.append(helper)
@@ -453,12 +456,14 @@ def registry_descriptors(value: dict, expected_files: dict[str, int]) -> dict:
     return indexed
 
 
-def fetch_registry_bundle(run_oras, image: str, digest: str, destination: Path) -> None:
+def fetch_registry_bundle(run_oras, image: str, digest: str, destination: Path,
+                          expected_files: dict[str, int] | None = None) -> None:
     raw = run_oras(["manifest", "fetch", f"{image}@{digest}"])
     if len(raw.encode()) > MAX_JSON_BYTES:
         raise CacheError("OCI manifest exceeds limit")
     try:
-        descriptors = registry_descriptors(json.loads(raw), {ARCHIVE: MAX_ARCHIVE_BYTES, MANIFEST: MAX_JSON_BYTES})
+        descriptors = registry_descriptors(json.loads(raw), expected_files or
+                                           {ARCHIVE: MAX_ARCHIVE_BYTES, MANIFEST: MAX_JSON_BYTES})
     except (json.JSONDecodeError, AttributeError) as exc:
         raise CacheError("invalid OCI manifest") from exc
     # Explicit output paths: never let an OCI title choose a filesystem path.
@@ -735,10 +740,8 @@ def publish(event_path: Path, oras: str) -> None:
                 run_oras(["tag", f"{image}@{digest}", alias])
             print(f"Retained compiler cache {image}@{digest}; producer conclusion: {run.get('conclusion')}; not check evidence")
             if run.get("conclusion") == "success":
-                # Dagger's full snapshot is still the atomic Cargo restore unit.
-                # Publish the real compiled outputs for each workspace member
-                # separately, without running untrusted PR code or unpacking
-                # any downloaded compiler objects in this privileged job.
+                # Independently reusable, source-closure-bound compiler objects.
+                # The privileged job never extracts/executes producer data.
                 import crate_artifacts
 
                 for crate in crate_artifacts.crates(Path.cwd()):
@@ -750,10 +753,13 @@ def publish(event_path: Path, oras: str) -> None:
                          crate_artifacts.MANIFEST: MAX_JSON_BYTES},
                     )
                     crate_artifacts.validate_bundle(crate_bundle, crate, manifest, repo)
+                    crate_record = read_json(crate_bundle / crate_artifacts.MANIFEST)
+                    crate_record["publication"] = manifest["publication"]
+                    write_json(crate_bundle / crate_artifacts.MANIFEST, crate_record)
                     crate_image = f"ghcr.io/{repo}-crate-{crate}"
                     crate_digest = publish_bundle(
                         run_oras, crate_image, immutable, crate_bundle,
-                        {crate_artifacts.ARCHIVE: "application/vnd.chat-hub.rust-crate-objects.v1.tar+zstd",
+                        {crate_artifacts.ARCHIVE: "application/vnd.chat-hub.rust-crate-objects.v2.tar+zstd",
                          crate_artifacts.MANIFEST: "application/json"},
                         repo, revision,
                     )

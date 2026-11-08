@@ -10,11 +10,19 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "ci/scripts"))
+import crate_artifacts
+import crate_sources
+import oci_cache
 
 
 RUNNER = Path(__file__).with_name("run-rust.sh")
@@ -333,6 +341,49 @@ class CargoFingerprintTests(CacheRunnerCase):
         self.assertEqual(self.freshness(self.build()), {MODEL: True, APP: True})
         for relative, previous in source_times.items():
             self.assertEqual((self.cache / "worktree" / relative).stat().st_mtime_ns, previous, str(relative))
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd is unavailable")
+    def test_rehydrated_published_leaf_objects_are_cargo_fresh_without_full_snapshot(self):
+        """Real rustc outputs, not a mocked cache-hit counter or elapsed time."""
+        self.assertEqual(self.freshness(self.build()), {MODEL: False, APP: False})
+        original_source = self.cache / "source-state/last-real.json"
+        existing = json.loads(original_source.read_text())["files"]
+        inputs = {"Cargo.toml": self.source / "Cargo.toml",
+                  "Cargo.lock": self.source / "Cargo.lock",
+                  "model/Cargo.toml": self.source / "model/Cargo.toml",
+                  "model/src/lib.rs": self.source / "model/src/lib.rs"}
+        subset = {path: existing[path] for path in inputs}
+        identifier = {"scope": "modelSource", "sha256": "a" * 64, "files": len(inputs)}
+        seed = json.dumps({"schema": 1, "source": identifier, "files": subset}).encode()
+        archive = self.root / "leaf-crate.tar.zst"
+        # Fixture name is outside the production workspace naming contract.
+        with mock.patch.object(crate_artifacts, "CRATE_NAME", re.compile(r"cache-fixture-[a-z]+\Z")):
+            outputs = crate_artifacts.selected(self.cache, "cache-fixture-model")
+            self.assertGreater(len(outputs), 1)
+            crate_artifacts.archive_files(self.cache, outputs, archive, seed)
+
+            # Model a fresh hosted engine with the same stable /cache pathname;
+            # only the separate published *model* bundle is restored.
+            self.cache.rename(self.root / "old-cache")
+            self.cache.mkdir()
+            objects = self.root / "extracted-leaf"
+            objects.mkdir()
+            process = subprocess.Popen(["zstd", "-q", "-dc", str(archive)], stdout=subprocess.PIPE)
+            with process.stdout:
+                inventory = oci_cache.unpack_tar(process.stdout, objects)
+            self.assertEqual(process.wait(timeout=30), 0)
+            record = {"source": identifier, "archive": {"files": inventory["entries"]}}
+            with mock.patch.object(crate_sources, "scope", return_value=inputs):
+                replaced, _ = crate_artifacts.install_objects(
+                    objects, self.cache, "cache-fixture-model", record, self.source)
+            self.assertGreater(replaced, 1)
+        self.assertEqual(self.freshness(self.build("cache-fixture-model"), expected={MODEL}),
+                         {MODEL: True})
+        self.assertEqual(self.freshness(self.build()), {MODEL: True, APP: False})
+
+        path = self.source / "app/src/lib.rs"
+        path.write_text(path.read_text().replace("* 2", "* 3"))
+        self.assertEqual(self.freshness(self.build()), {MODEL: True, APP: False})
 
     def test_same_size_changed_leaf_rebuilds_only_that_leaf(self) -> None:
         self.freshness(self.build())

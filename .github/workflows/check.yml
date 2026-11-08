@@ -38,6 +38,14 @@ jobs:
           set -euo pipefail
           oras="$(bash build/install-oras.sh "$RUNNER_TEMP/chat-hub-cache-oras")"
           python3 ci/scripts/oci_cache.py restore --destination ci/cache/linux-cargo --oras "$oras"
+      - name: Rehydrate unchanged crate objects from their published packages
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          oras="$(bash build/install-oras.sh "$RUNNER_TEMP/chat-hub-cache-oras")"
+          python3 ci/scripts/crate_artifacts.py restore --destination ci/cache/linux-cargo --oras "$oras"
       - id: dagger-checks
         name: Dagger v1 crate, format, Clippy, Python, Bun and browser checks
         uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
@@ -89,9 +97,9 @@ jobs:
           name: chat-hub-cargo-cache-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/cargo-cache
           retention-days: 14
-      # A full snapshot remains the Cargo restore unit (dependency fingerprints
-      # must travel together). These per-package bundles make the actual crate
-      # objects independently downloadable and publishable by immutable digest.
+      # Reusable crate objects are separately published and retrieved by source
+      # closure. Cargo still verifies fingerprint freshness after each restore;
+      # the full snapshot provides shared third-party dependency objects.
       - id: crate-pack
         name: Extract separately addressable compiled outputs for all nine crates
         if: ${{ success() && steps.dagger-checks.outcome == 'success' && steps.cargo-archive.outcome == 'success' }}
