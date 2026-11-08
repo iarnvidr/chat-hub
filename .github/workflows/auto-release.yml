@@ -1,0 +1,160 @@
+name: Publish accepted Chat Hub merge build
+
+# Every successful native acceptance on protected main creates a commit-addressed
+# GitHub prerelease, not a new stable updater version.
+on:
+  workflow_run:
+    workflows: ["Map accepted Chat Hub macOS artifact"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      acceptance_run_id:
+        description: Successful main acceptance run ID for retry/backfill
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: merge-release-${{ github.event.workflow_run.head_sha || inputs.acceptance_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - id: source
+        name: Authenticate exact successful trusted-main acceptance run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPT_RUN_ID: ${{ github.event.workflow_run.id || inputs.acceptance_run_id }}
+          EVENT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$ACCEPT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ACCEPT_RUN_ID" > "$RUNNER_TEMP/run.json"
+          python3 - "$RUNNER_TEMP/run.json" "$ACCEPT_RUN_ID" "$EVENT_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import json,re,sys,os
+          run=json.load(open(sys.argv[1]))
+          repo=os.environ['GITHUB_REPOSITORY'].lower()
+          if (run.get('id')!=int(sys.argv[2])
+              or run.get('name')!='Map accepted Chat Hub macOS artifact'
+              or run.get('path')!='.github/workflows/accept-native.yml'
+              or run.get('status')!='completed' or run.get('conclusion')!='success'
+              or run.get('event')!='push' or run.get('head_branch')!='main'
+              or (run.get('repository') or {}).get('full_name','').lower()!=repo
+              or (run.get('head_repository') or {}).get('full_name','').lower()!=repo):
+              raise SystemExit('Acceptance must be a successful protected-main push run')
+          sha=run.get('head_sha','')
+          if not re.fullmatch('[a-f0-9]{40}',sha) or (sys.argv[3] and sys.argv[3]!=sha):
+              raise SystemExit('Acceptance SHA does not match the triggering event')
+          with open(sys.argv[4],'a') as f:
+              f.write('sha='+sha+'\n')
+              f.write('run_id='+str(run['id'])+'\n')
+          PY
+      - name: Checkout only the accepted commit from protected main history
+        env:
+          ACCEPT_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags origin refs/heads/main
+          git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$ACCEPT_SHA" FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$ACCEPT_SHA"
+      - name: Restore exact accepted ZIP and DMG; do not rebuild
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPT_RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import json;print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          python3 build/release_artifact.py retrieve --root "$GITHUB_WORKSPACE" \
+            --tag "v$version" --mapping-run-id "$ACCEPT_RUN_ID"
+      - name: Verify staged source binding and create SHA-256 inventory
+        env:
+          ACCEPT_SHA: ${{ steps.source.outputs.sha }}
+          ACCEPT_RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - "$ACCEPT_SHA" "$ACCEPT_RUN_ID" <<'PY'
+          import hashlib,json,pathlib,subprocess,sys
+          sha,run_id=sys.argv[1],int(sys.argv[2])
+          root=pathlib.Path.cwd(); path=root/'artifacts'
+          source=json.loads((path/'release-input.json').read_text())
+          version=json.loads((root/'src-tauri/tauri.conf.json').read_text())['version']
+          tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
+          if (source.get('accepted_commit')!=sha or source.get('accepted_tree')!=tree
+              or source.get('version')!=version or source.get('source_run_id')!=run_id
+              or source.get('acceptance')!='trusted-main-build'):
+              raise SystemExit('Candidate no longer identifies the accepted merge')
+          zip_name='Chat_Hub_'+version+'_macos-arm64.zip'
+          dmg_name='Chat_Hub_'+version+'_macos-arm64.dmg'
+          wanted={zip_name,zip_name+'.sha256',dmg_name}
+          if set(source.get('files',{}))!=wanted:
+              raise SystemExit('Expected accepted native ZIP, checksum and DMG')
+          for name in wanted:
+              data=(path/name).read_bytes()
+              if len(data)>512*1024*1024 or hashlib.sha256(data).hexdigest()!=source['files'][name]:
+                  raise SystemExit('Unverified native artifact: '+name)
+          hashes={n:source['files'][n] for n in (zip_name,dmg_name)}
+          (path/'SHA256SUMS').write_text(''.join(hashes[n]+'  '+n+'\n' for n in sorted(hashes)))
+          (path/'build-info.json').write_text(json.dumps({
+              'schema':1,'kind':'ad-hoc-signed-merge-preview',
+              'repository':source['repository'],'commit':sha,'tree':tree,
+              'tag':'merge-'+sha,'app_version':version,'native_run_id':run_id,
+              'native_artifact_digest':source['source_artifact_digest'],'files':hashes},sort_keys=True)+'\n')
+          (path/'merge-notes.md').write_text(
+              'Commit: '+sha+'\nApp version: '+version+'\n'
+              'Validated native build: https://github.com/'+source['repository']+
+              '/actions/runs/'+str(run_id)+'\n\n'
+              'Apple Silicon app/DMG: ad-hoc signed and not notarized; Gatekeeper may block it. '
+              'This commit-addressed prerelease is not a new stable application version '
+              'and does not modify the stable signed updater feed.\n')
+          PY
+      - name: Create commit-addressed GitHub prerelease without overwriting
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPT_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="merge-$ACCEPT_SHA"
+          version="$(python3 -c 'import json;print(json.load(open("artifacts/build-info.json"))["app_version"])')"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+            test "$sha" = "$ACCEPT_SHA"
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/release.json"
+            python3 - "$RUNNER_TEMP/release.json" "$version" "$tag" <<'PY'
+          import hashlib,json,pathlib,sys
+          data=json.load(open(sys.argv[1]));v,tag=sys.argv[2:]
+          names={'Chat_Hub_'+v+'_macos-arm64.zip','Chat_Hub_'+v+'_macos-arm64.dmg','SHA256SUMS','build-info.json'}
+          assets=data.get('assets',[])
+          if data.get('tag_name')!=tag or data.get('draft') or not data.get('prerelease') or {a.get('name') for a in assets}!=names:
+              raise SystemExit('Existing release is not this validated preview')
+          for asset in assets:
+              p=pathlib.Path('artifacts')/asset['name']
+              if asset.get('size')!=p.stat().st_size:
+                  raise SystemExit('Existing asset size mismatch')
+              if asset.get('digest') and asset['digest']!='sha256:'+hashlib.sha256(p.read_bytes()).hexdigest():
+                  raise SystemExit('Existing asset digest mismatch')
+          PY
+          else
+            gh release create "$tag" \
+              "artifacts/Chat_Hub_"$version"_macos-arm64.zip" \
+              "artifacts/Chat_Hub_"$version"_macos-arm64.dmg" \
+              artifacts/SHA256SUMS artifacts/build-info.json \
+              --repo "$GITHUB_REPOSITORY" --target "$ACCEPT_SHA" \
+              --title "Chat Hub merge build $ACCEPT_SHA (app $version)" \
+              --notes-file artifacts/merge-notes.md --prerelease --latest=false
+          fi
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
