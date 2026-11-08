@@ -23,6 +23,8 @@ const projectNames = new Map();
 let pendingConversationStore;
 try { pendingConversationStore=createPendingConversationStore(window.localStorage); }
 catch { pendingConversationStore=createPendingConversationStore(null); }
+// Export only counts and storage health, never pending provider IDs or chat bodies.
+window.ChatHub.pendingSummary = () => pendingConversationStore.diagnostics();
 const rowActions = createRowActions({invoke, onChanged: () => window.dispatchEvent(new Event('chat-hub:history-updated'))});
 function projectLabel(project) {
   return project.display_name || project.title || projectNames.get(project.project_key) || 'Project name pending';
