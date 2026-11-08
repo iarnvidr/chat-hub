@@ -734,6 +734,32 @@ def publish(event_path: Path, oras: str) -> None:
             if alias:
                 run_oras(["tag", f"{image}@{digest}", alias])
             print(f"Retained compiler cache {image}@{digest}; producer conclusion: {run.get('conclusion')}; not check evidence")
+            if run.get("conclusion") == "success":
+                # Dagger's full snapshot is still the atomic Cargo restore unit.
+                # Publish the real compiled outputs for each workspace member
+                # separately, without running untrusted PR code or unpacking
+                # any downloaded compiler objects in this privileged job.
+                import crate_artifacts
+
+                for crate in crate_artifacts.crates(Path.cwd()):
+                    crate_bundle = stage / f"crate-{crate}"
+                    artifact_download(
+                        repo, run, f"chat-hub-crate-{crate}-{run['id']}-{run['run_attempt']}",
+                        crate_bundle,
+                        {crate_artifacts.ARCHIVE: crate_artifacts.MAX_CRATE_BYTES,
+                         crate_artifacts.MANIFEST: MAX_JSON_BYTES},
+                    )
+                    crate_artifacts.validate_bundle(crate_bundle, crate, manifest, repo)
+                    crate_image = f"ghcr.io/{repo}-crate-{crate}"
+                    crate_digest = publish_bundle(
+                        run_oras, crate_image, immutable, crate_bundle,
+                        {crate_artifacts.ARCHIVE: "application/vnd.chat-hub.rust-crate-objects.v1.tar+zstd",
+                         crate_artifacts.MANIFEST: "application/json"},
+                        repo, revision,
+                    )
+                    if alias:
+                        run_oras(["tag", f"{crate_image}@{crate_digest}", alias])
+                    print(f"Retained {crate} compiled objects at {crate_image}@{crate_digest}")
             if run.get("conclusion") == "success" and run["event"] == "pull_request":
                 try:
                     evidence = stage / "evidence"

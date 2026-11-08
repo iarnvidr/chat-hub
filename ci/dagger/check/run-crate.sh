@@ -14,3 +14,8 @@ else
   cargo clippy --locked -p "$1" --all-targets --all-features -- -D warnings
 fi
 cargo test --locked -p "$1" --all-targets --timings -vv
+if [[ "$1" == "chat-hub" ]]; then
+  # Cargo test builds test harnesses, not necessarily a runnable CLI. Produce
+  # an actual command binary using the same locked dependency/artifact cache.
+  cargo build --locked -p chat-hub --bin chat-hub
+fi

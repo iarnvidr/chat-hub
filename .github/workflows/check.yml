@@ -89,6 +89,79 @@ jobs:
           name: chat-hub-cargo-cache-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/cargo-cache
           retention-days: 14
+      # A full snapshot remains the Cargo restore unit (dependency fingerprints
+      # must travel together). These per-package bundles make the actual crate
+      # objects independently downloadable and publishable by immutable digest.
+      - id: crate-pack
+        name: Extract separately addressable compiled outputs for all nine crates
+        if: ${{ success() && steps.dagger-checks.outcome == 'success' && steps.cargo-archive.outcome == 'success' }}
+        run: >-
+          python3 ci/scripts/crate_artifacts.py --source ci/cache/linux-cargo
+          --cache-manifest artifacts/cargo-cache/cache-manifest.json
+          --output artifacts/crates
+      - name: Retain model crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-model-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-model
+          retention-days: 14
+      - name: Retain formats crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-formats-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-formats
+          retention-days: 14
+      - name: Retain store crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-store-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-store
+          retention-days: 14
+      - name: Retain ingest crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-ingest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-ingest
+          retention-days: 14
+      - name: Retain capture crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-capture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-capture
+          retention-days: 14
+      - name: Retain API crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-api-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-api
+          retention-days: 14
+      - name: Retain runtime crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-runtime
+          retention-days: 14
+      - name: Retain CLI crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub
+          retention-days: 14
+      - name: Retain desktop crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-desktop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-desktop
+          retention-days: 14
       - name: Record the exact successful PR check receipt
         if: ${{ success() && github.event_name == 'pull_request' && steps.dagger-checks.outcome == 'success' }}
         run: python3 build/release_artifact.py check-receipt --root "$GITHUB_WORKSPACE"

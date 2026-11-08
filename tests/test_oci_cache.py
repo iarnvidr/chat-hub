@@ -255,6 +255,52 @@ class MetadataTests(unittest.TestCase):
 
 
 class PublicationTests(unittest.TestCase):
+    def test_green_publisher_retains_all_nine_crates_individually_without_extracting(self):
+        import crate_artifacts
+
+        run = workflow_run()
+        run["conclusion"] = "success"
+        crate_names = crate_artifacts.crates(ROOT)
+        downloaded = []
+
+        def download(repo, source_run, name, output, expected_files):
+            downloaded.append(name)
+            output.mkdir()
+            if name.startswith("chat-hub-cargo-cache-"):
+                payload = b"opaque, never extracted"
+                (output / cache.ARCHIVE).write_bytes(payload)
+                cache.write_json(output / cache.MANIFEST, manifest(payload))
+            elif name.startswith("chat-hub-crate-"):
+                (output / crate_artifacts.ARCHIVE).write_bytes(b"opaque compiled object")
+                (output / crate_artifacts.MANIFEST).write_text("{}")
+            else:
+                cache.write_json(output / cache.CHECK_RECEIPT, evidence())
+
+        @contextmanager
+        def session(_):
+            yield mock.Mock()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            event = Path(temporary) / "event.json"
+            cache.write_json(event, {"workflow_run": run})
+            env = {"GITHUB_REPOSITORY": REPOSITORY, "GITHUB_EVENT_NAME": "workflow_run"}
+            with mock.patch.dict(os.environ, env), \
+                 mock.patch.object(cache, "validated_run", return_value=run), \
+                 mock.patch.object(cache, "artifact_download", side_effect=download), \
+                 mock.patch.object(cache, "validate_producer", return_value={**publication(), "conclusion": "success"}), \
+                 mock.patch.object(cache, "registry_session", session), \
+                 mock.patch.object(cache, "publish_bundle", return_value="sha256:" + "9" * 64) as publisher, \
+                 mock.patch.object(cache, "validate_evidence"), \
+                 mock.patch.object(crate_artifacts, "validate_bundle") as validate_crate, \
+                 mock.patch.object(cache, "unpack_tar") as unpack:
+                cache.publish(event, "/tools/oras")
+        self.assertEqual(validate_crate.call_count, len(crate_names))
+        self.assertEqual(len(downloaded), len(crate_names) + 2)  # cache + 9 crates + receipt
+        self.assertEqual(publisher.call_count, len(crate_names) + 2)
+        self.assertEqual({call.args[1] for call in publisher.call_args_list[1:-1]},
+                         {f"ghcr.io/{REPOSITORY}-crate-{name}" for name in crate_names})
+        unpack.assert_not_called()
+
     def test_run_is_refetched_and_forks_or_unexpected_workflows_are_rejected(self):
         original = workflow_run()
         api = mock.Mock(return_value=original)
