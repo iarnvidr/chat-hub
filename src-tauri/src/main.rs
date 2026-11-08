@@ -781,6 +781,91 @@ struct ArchiveReceipt {
     message_count: Option<u64>,
 }
 
+/// A deliberately metadata-only export; conversation content and provider identifiers
+/// never enter this command. An existing file is never overwritten.
+#[tauri::command]
+async fn export_diagnostics(
+    window: tauri::Webview,
+    app: tauri::AppHandle,
+    history: State<'_, chatgpt_history::ChatgptHistoryState>,
+    pending_count: u32,
+    unsaved_draft_count: u32,
+    pending_storage_available: bool,
+    capture_saved_count: u32,
+) -> Result<serde_json::Value, String> {
+    authorize_local_main(&window)?;
+    let _permit = desktop_archive::try_acquire().map_err(str::to_string)?;
+    let status = history.snapshot()?;
+    // Never serialize the unfiltered provider status (message, content-type,
+    // provider error descriptions or account/session identifiers).
+    let sync_state = match status.state.as_str() {
+        "idle" | "running" | "syncing" | "completed" | "complete" |
+        "partial" | "error" | "failed" => status.state.as_str(),
+        _ => "unknown",
+    };
+    let sync_error = match status.error_code.as_deref() {
+        Some("rate_limited") => "rate_limited",
+        Some("signed_out") => "signed_out",
+        Some("login_required") => "login_required",
+        Some(_) => "other",
+        None => "none",
+    };
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "privacy": "metadata_only_no_transcript_or_account_identifiers",
+        "exported_unix_seconds": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        "application": {
+            "version": app.package_info().version.to_string(),
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "build_channel": "unspecified"
+        },
+        "pending": {
+            "provider_id_acquired": pending_count.min(1000),
+            "session_drafts": unsaved_draft_count.min(1000),
+            "metadata_storage_available": pending_storage_available,
+            "transcripts_durable": false
+        },
+        "capture": {"committed_since_service_start": capture_saved_count},
+        "history": {
+            "state": sync_state,
+            "error_code": sync_error,
+            "configured": status.configured,
+            "processed_exports": status.processed_exports,
+            "total_exports": status.total_exports,
+            "processed_conversations": status.processed_conversations,
+            "total_conversations": status.total_conversations,
+            "imported": status.imported,
+            "updated": status.updated,
+            "unchanged": status.unchanged,
+            "failed": status.failed,
+            "retry_after_seconds": status.retry_after,
+            "automatic_retry_paused": status.automatic_retry_paused,
+            "challenge_detected": status.challenge_detected
+        }
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().set_file_name("chat-hub-diagnostics.json")
+        .add_filter("Chat Hub diagnostics", &["json"])
+        .save_file(move |file| { let _ = tx.send(file); });
+    let Some(file) = rx.await.map_err(|_| "save_dialog_unavailable")? else {
+        return Ok(serde_json::json!({"cancelled":true,"published":false}));
+    };
+    let destination = file.into_path().map_err(|_| "invalid_destination")?;
+    let payload = serde_json::to_vec_pretty(&report).map_err(|_| "diagnostics_encode_failed")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Write;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true).create_new(true).open(destination)
+            .map_err(|_| "diagnostics_destination_exists_or_unavailable".to_string())?;
+        output.write_all(&payload).map_err(|_| "diagnostics_write_failed".to_string())?;
+        output.sync_all().map_err(|_| "diagnostics_durability_unconfirmed".to_string())?;
+        Ok::<(), String>(())
+    }).await.map_err(|_| "diagnostics_write_failed".to_string())??;
+    Ok(serde_json::json!({"cancelled":false,"published":true}))
+}
+
 #[tauri::command]
 async fn backup_library(
     window: tauri::Webview,
@@ -1796,6 +1881,7 @@ fn main() {
             get_conversation,
             import_chatgpt_export,
             backup_library,
+            export_diagnostics,
             export_library_json,
             get_capture_preferences,
             set_capture_preferences,
@@ -1870,6 +1956,7 @@ fn main() {
             get_conversation,
             import_chatgpt_export,
             backup_library,
+            export_diagnostics,
             export_library_json,
             get_capture_preferences,
             set_capture_preferences,
