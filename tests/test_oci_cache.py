@@ -224,6 +224,9 @@ class MetadataTests(unittest.TestCase):
             (module / "run-rust.sh").write_text("cargo test\n")
             (module / "run-crate.sh").write_text("cargo test -p model\n")
             (module / "stable-worktree.py").write_text("# stable timestamps\n")
+            scripts = root / "ci/scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "crate_sources.py").write_text("# closure identity\n")
             first = cache.compatibility(root)
             (root / "Cargo.lock").write_text("new dependencies\n")
             self.assertEqual(cache.compatibility(root), first)

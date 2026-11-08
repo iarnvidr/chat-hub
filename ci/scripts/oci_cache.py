@@ -114,7 +114,8 @@ def compatibility(root: Path) -> dict:
     # Dagger source scopes and Cargo flags are part of the object ABI/key too.
     # A change to the compilation recipe must never consume prior objects.
     scripts = [module, root / "ci/dagger/check/run-rust.sh",
-               root / "ci/dagger/check/run-crate.sh"]
+               root / "ci/dagger/check/run-crate.sh",
+               root / "ci/scripts/crate_sources.py"]
     helper = root / "ci/dagger/check/stable-worktree.py"
     if helper.exists():
         scripts.append(helper)
