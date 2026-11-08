@@ -225,6 +225,12 @@ function attachPendingToLiveTab(tab,sourceConversationId,accountScope) {
     else {pendingId=`pending-chatgpt:${Date.now()}-${++liveDraftSequence}`;pendingConversationStore.createDraft(pendingId);}
   }
   pendingConversationStore.attachProviderConversation(pendingId,sourceConversationId,accountScope);
+  if (!pendingConversationStore.diagnostics().storage_available) {
+    // A provider ID is NOT a durable transcript; do not let a failed metadata
+    // write remain silent when a restart could erase the only recovery pointer.
+    $('app-status').textContent =
+      'Pending chat metadata could not be saved on this Mac. Keep this session open and export diagnostics.';
+  }
   conversationTabs.update(tab.id,{pendingId,sourceConversationId,accountScope,title:'ChatGPT conversation'});
   drawList();
   return conversationTabs.get(tab.id);
