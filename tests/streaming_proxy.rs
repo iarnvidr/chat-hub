@@ -180,6 +180,10 @@ async fn large_request_and_response_stream_before_upstream_completion() {
         s.write_all(&prefix).await.unwrap();
         release_rx.await.unwrap();
         s.write_all(&vec![b'z'; n - 64]).await.unwrap();
+        // Complete the large TLS response before dropping the mock upstream.
+        // Abruptly dropping it can discard buffered ciphertext and omit
+        // close_notify, causing platform-dependent UnexpectedEof failures.
+        s.shutdown().await.unwrap();
     });
     let mut c = client(&f).await;
     let n = 2 * 1024 * 1024 + 17;
