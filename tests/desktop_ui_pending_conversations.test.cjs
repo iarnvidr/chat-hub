@@ -41,3 +41,23 @@ test('non-UUID provider identifiers are never persisted as pending chat targets'
   assert.equal(store.attachProviderConversation('pending-one','not-a-chat-id',SCOPE),null);
   assert.deepEqual(store.list(),[]);assert.equal(storage.getItem('chat-hub.pending-chatgpt-conversations.v1'),null);
 });
+
+test('pending storage failure is visible in diagnostics without leaking provider identifiers',async()=>{
+  const {createPendingConversationStore}=await import('../desktop-ui/pending-conversations.js');
+  const broken={getItem:()=>null,setItem:()=>{throw Error('quota exceeded with private path');}};
+  const store=createPendingConversationStore(broken,()=>111);
+  store.attachProviderConversation('p',UUID,SCOPE);
+  assert.equal(store.list().length,1,'the entry remains in memory');
+  assert.deepEqual(store.diagnostics(),{pending_count:1,unsaved_draft_count:0,storage_available:false,persistence_error:true});
+  const report=JSON.stringify(store.diagnostics());
+  assert.doesNotMatch(report,/123e4567|chatgpt:observed|private path/);
+});
+
+test('successful pending metadata write is distinguished from transcript persistence',async()=>{
+  const {createPendingConversationStore}=await import('../desktop-ui/pending-conversations.js');
+  const store=createPendingConversationStore(new Storage(),()=>333);
+  store.createDraft('new');
+  assert.deepEqual(store.diagnostics(),{pending_count:0,unsaved_draft_count:1,storage_available:true,persistence_error:false});
+  store.attachProviderConversation('new',UUID,SCOPE);
+  assert.equal(store.diagnostics().pending_count,1);
+});
