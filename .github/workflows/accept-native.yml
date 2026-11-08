@@ -3,28 +3,6 @@ name: Map accepted Chat Hub macOS artifact
 on:
   push:
     branches: [main]
-    paths:
-      - "src-tauri/**"
-      - "build/**"
-      - "tests/native/**"
-      - "tests/fixtures/**"
-      - ".cargo/**"
-      - "src/**"
-      - "crates/**"
-      - "frontend/**"
-      - "desktop-ui/**"
-      - "ci/**"
-      - "ci/actions/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "rust-toolchain"
-      - "dagger.toml"
-      - "dagger.lock"
-      - "tauri.conf.json"
-      - ".github/workflows/macos.yml"
-      - ".github/workflows/check.yml"
-      - ".github/workflows/accept-native.yml"
 
 permissions:
   actions: read
