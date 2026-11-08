@@ -2,6 +2,7 @@ use chat_hub::{
     config::Config,
     proxy::{CaptureEvent, ProxyConfig},
     service::{self, ServiceHandle, ServiceStatus},
+    store::Store,
 };
 use ring::rand::SecureRandom;
 use std::{path::Path, time::Duration};
@@ -15,6 +16,8 @@ pub struct DesktopRuntime {
     handle: ServiceHandle,
     #[allow(dead_code)]
     pub database_path: std::path::PathBuf,
+    #[allow(dead_code)]
+    pub capture_recovery: serde_json::Value,
     capture_status: chat_hub::live_capture::CaptureStatus,
     capture: mpsc::Sender<CaptureEvent>,
 }
@@ -22,6 +25,11 @@ pub struct DesktopRuntime {
 impl DesktopRuntime {
     pub fn status(&self) -> ServiceStatus {
         self.handle.status()
+    }
+
+    #[allow(dead_code)] // Desktop support menu; isolated runtime tests omit the menu.
+    pub fn capture_snapshot(&self) -> chat_hub::live_capture::Snapshot {
+        self.capture_status.snapshot()
     }
 
     pub async fn shutdown(self) -> serde_json::Value {
@@ -98,6 +106,26 @@ pub async fn start_with_capture_config(
         capture_profile_scope,
         proxy_addr: "127.0.0.1:0".parse().expect("valid loopback address"),
     };
+    // Replay only already-captured records, even when capture has since been
+    // disabled. This performs no provider requests and is independent of 429s.
+    // The temporary connection is dropped before starting the service writer.
+    let recovery_path = config.database_path.clone();
+    let recovery = tokio::task::spawn_blocking(move || {
+        let mut store = Store::open_service(&recovery_path)?;
+        store.recover_pending_captures()
+    })
+    .await;
+    let capture_recovery = match recovery {
+        Ok(Ok(status)) => {
+            let state = if status.pending_items == 0 && status.failed == 0 { "complete" } else { "pending" };
+            let mut value = serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
+            value["status"] = state.into();
+            value
+        }
+        _ => serde_json::json!({"status":"failed"}),
+    };
+    // Failed/corrupt records remain on disk and are visible in diagnostics.
+    // Do not make the existing library inaccessible merely because replay failed.
     let (handle, capture) = service::start_with_proxy(config, 64, proxy_config).await?;
     let capture_status = handle.capture_status().clone();
     let status = handle.status();
@@ -115,6 +143,7 @@ pub async fn start_with_capture_config(
         token,
         ca_dir,
         database_path,
+        capture_recovery,
         handle,
         capture_status,
         capture,
