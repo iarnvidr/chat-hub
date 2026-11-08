@@ -1,9 +1,7 @@
 """Production build-chain contracts: real bundle, ad-hoc mode, evidence, gated publish."""
 import unittest
-import fnmatch
 import json
 import os
-import re
 import runpy
 import subprocess
 import tarfile
@@ -102,8 +100,13 @@ class ProductionContract(unittest.TestCase):
     def test_native_actions_trigger_main_acceptance_and_ship_in_corresponding_source(self):
         native_scope = runpy.run_path(str(ROOT / "build/native_scope.py"))
         acceptance = (ROOT / ".github/workflows/accept-native.yml").read_text()
-        trigger = acceptance.split("    paths:\n", 1)[1].split("\npermissions:", 1)[0]
-        patterns = re.findall(r'^\s+- "([^"]+)"$', trigger, re.M)
+        trigger = acceptance.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
+        # Native acceptance now runs on EVERY main merge. A changed-path filter
+        # would suppress a release for documentation-only changes.
+        self.assertIn("push:", trigger)
+        self.assertIn("branches: [main]", trigger)
+        self.assertNotIn("paths:", trigger)
+        self.assertNotIn("paths-ignore:", trigger)
         source_helpers = runpy.run_path(str(ROOT / "build/release_sources.py"))
         sources = {relative for relative, _ in source_helpers["_source_files"](ROOT)}
         for path in (
@@ -117,14 +120,14 @@ class ProductionContract(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertTrue(native_scope["requires_native"]([path]))
-                self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns))
                 self.assertIn(path, sources)
-        # Both supported Rust toolchain filenames must invalidate acceptance;
-        # not just whichever file happens to exist in this revision.
+        # Rust toolchain changes still invalidate the narrower PR-native scope.
         for path in ("rust-toolchain", "rust-toolchain.toml", ".cargo/config.toml"):
             with self.subTest(path=path):
                 self.assertTrue(native_scope["requires_native"]([path]))
-                self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns))
+        # Documentation-only changes remain out of PR-native scope, but the
+        # unconditional main acceptance builds them for release.
+        self.assertFalse(native_scope["requires_native"](["docs/UPDATES.md"]))
 
     def test_workflow_checkouts_fetch_the_immutable_event_sha(self):
         files = [*ROOT.joinpath(".github/workflows").glob("*.yml"),
