@@ -20,47 +20,148 @@ fn numbers(value: &Value, names: &[&str]) -> Value {
     Value::Object(output)
 }
 fn known<'a>(value: &'a Value, allowed: &[&str]) -> &'a str {
-    value.as_str().filter(|s| allowed.contains(s)).unwrap_or("unknown")
+    value
+        .as_str()
+        .filter(|s| allowed.contains(s))
+        .unwrap_or("unknown")
 }
 
 pub fn metadata_report(raw: &Value, version: &str, commit: Option<&str>, now_ms: u128) -> Value {
-    let mut capture = numbers(&raw["capture"], &["per_capture_bytes", "retained_byte_limit", "queue_limit"]);
+    let mut capture = numbers(
+        &raw["capture"],
+        &["per_capture_bytes", "retained_byte_limit", "queue_limit"],
+    );
     capture["status"] = known(&raw["capture"]["status"], &["available", "unavailable"]).into();
-    capture["enabled"] = raw["capture"]["enabled"].as_bool().map(Value::Bool).unwrap_or(Value::Null);
-    capture["counters"] = numbers(&raw["capture"]["counters"], &[
-        "started", "active", "completed_responses", "admitted", "queued", "writer_in_flight",
-        "committed_imported", "committed_updated", "committed_unchanged", "invalid_snapshot",
-        "unsupported_encoding", "decode_failed", "oversized", "dropped", "interrupted",
-        "store_failed", "shutdown_unprocessed", "retained_bytes",
-    ]);
-    capture["last_error_code"] = known(&raw["capture"]["counters"]["last_error_code"], &[
-        "invalid_snapshot", "unsupported_encoding", "capture_decode_failed", "capture_oversized",
-        "capture_dropped", "capture_interrupted", "capture_store_failed", "capture_shutdown_unprocessed",
-    ]).into();
-    let mut history = numbers(&raw["history"], &[
-        "processed_exports", "total_exports", "processed_conversations", "total_conversations",
-        "imported", "updated", "unchanged", "failed", "retry_after",
-    ]);
-    history["state"] = known(&raw["history"]["state"], &[
-        "idle", "running", "syncing", "complete", "completed", "error", "failed", "partial", "cancelled",
-    ]).into();
-    history["error_code"] = known(&raw["history"]["error_code"], &[
-        "rate_limited", "signed_out", "login_required", "verification_required", "cancelled",
-        "history_import_transport_failed", "history_import_http_503_busy", "store_failed",
-        "provider_not_ready", "invalid_response", "response_too_large", "status_unavailable",
-    ]).into();
-    for key in ["configured", "auto_sync", "automatic_retry_paused", "challenge_detected"] {
-        history[key] = raw["history"][key].as_bool().map(Value::Bool).unwrap_or(Value::Null);
+    capture["enabled"] = raw["capture"]["enabled"]
+        .as_bool()
+        .map(Value::Bool)
+        .unwrap_or(Value::Null);
+    capture["counters"] = numbers(
+        &raw["capture"]["counters"],
+        &[
+            "started",
+            "active",
+            "completed_responses",
+            "admitted",
+            "queued",
+            "writer_in_flight",
+            "committed_imported",
+            "committed_updated",
+            "committed_unchanged",
+            "invalid_snapshot",
+            "unsupported_encoding",
+            "decode_failed",
+            "oversized",
+            "dropped",
+            "interrupted",
+            "store_failed",
+            "shutdown_unprocessed",
+            "retained_bytes",
+        ],
+    );
+    capture["last_error_code"] = known(
+        &raw["capture"]["counters"]["last_error_code"],
+        &[
+            "invalid_snapshot",
+            "unsupported_encoding",
+            "capture_decode_failed",
+            "capture_oversized",
+            "capture_dropped",
+            "capture_interrupted",
+            "capture_store_failed",
+            "capture_shutdown_unprocessed",
+        ],
+    )
+    .into();
+    let mut history = numbers(
+        &raw["history"],
+        &[
+            "processed_exports",
+            "total_exports",
+            "processed_conversations",
+            "total_conversations",
+            "imported",
+            "updated",
+            "unchanged",
+            "failed",
+            "retry_after",
+        ],
+    );
+    history["state"] = known(
+        &raw["history"]["state"],
+        &[
+            "idle",
+            "running",
+            "syncing",
+            "complete",
+            "completed",
+            "error",
+            "failed",
+            "partial",
+            "cancelled",
+        ],
+    )
+    .into();
+    history["error_code"] = known(
+        &raw["history"]["error_code"],
+        &[
+            "rate_limited",
+            "signed_out",
+            "login_required",
+            "verification_required",
+            "cancelled",
+            "history_import_transport_failed",
+            "history_import_http_503_busy",
+            "store_failed",
+            "provider_not_ready",
+            "invalid_response",
+            "response_too_large",
+            "status_unavailable",
+        ],
+    )
+    .into();
+    for key in [
+        "configured",
+        "auto_sync",
+        "automatic_retry_paused",
+        "challenge_detected",
+    ] {
+        history[key] = raw["history"][key]
+            .as_bool()
+            .map(Value::Bool)
+            .unwrap_or(Value::Null);
     }
-    let mut journal = numbers(&raw["journal"], &["pending_items", "retained_bytes", "incomplete_files"]);
+    let mut journal = numbers(
+        &raw["journal"],
+        &["pending_items", "retained_bytes", "incomplete_files"],
+    );
     journal["status"] = known(&raw["journal"]["status"], &["available", "unavailable"]).into();
-    let mut recovery = numbers(&raw["startup_recovery"], &[
-        "pending_items", "retained_bytes", "incomplete_files", "recovered", "failed",
-    ]);
-    recovery["status"] = known(&raw["startup_recovery"]["status"], &["complete", "pending", "failed"]).into();
-    let valid_version = !version.is_empty() && version.len() <= 64 &&
-        version.bytes().all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b));
-    let commit = commit.filter(|value| value.len() == 40 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    let mut recovery = numbers(
+        &raw["startup_recovery"],
+        &[
+            "pending_items",
+            "retained_bytes",
+            "incomplete_files",
+            "recovered",
+            "failed",
+        ],
+    );
+    recovery["status"] = known(
+        &raw["startup_recovery"]["status"],
+        &["complete", "pending", "failed"],
+    )
+    .into();
+    let valid_version = !version.is_empty()
+        && version.len() <= 64
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b));
+    let commit = commit.filter(|value| {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
     json!({
         "schema": 1, "kind": "chat-hub-metadata-diagnostics", "exported_unix_ms": now_ms.min(u64::MAX as u128) as u64,
         "build": {"app_version": if valid_version {version} else {"unknown"}, "source_commit": commit},
@@ -84,12 +185,23 @@ pub fn metadata_report(raw: &Value, version: &str, commit: Option<&str>, now_ms:
 /// The native Save dialog chooses the destination. The webview supplies no path.
 pub fn write_report(path: &Path, report: &Value) -> Result<(), &'static str> {
     let data = serde_json::to_vec_pretty(report).map_err(|_| "diagnostics_encode_failed")?;
-    if data.len() > MAX_REPORT { return Err("diagnostics_too_large"); }
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).ok_or("diagnostics_invalid_destination")?;
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() { return Err("diagnostics_unsafe_destination"); }
+    if data.len() > MAX_REPORT {
+        return Err("diagnostics_too_large");
     }
-    let temp = parent.join(format!(".chat-hub-diagnostics-{}-{}.tmp", std::process::id(), NEXT_EXPORT.fetch_add(1, Ordering::Relaxed)));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or("diagnostics_invalid_destination")?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("diagnostics_unsafe_destination");
+        }
+    }
+    let temp = parent.join(format!(
+        ".chat-hub-diagnostics-{}-{}.tmp",
+        std::process::id(),
+        NEXT_EXPORT.fetch_add(1, Ordering::Relaxed)
+    ));
     let result = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -98,12 +210,17 @@ pub fn write_report(path: &Path, report: &Value) -> Result<(), &'static str> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&temp).map_err(|_| "diagnostics_create_failed")?;
-        file.write_all(&data).map_err(|_| "diagnostics_write_failed")?;
+        let mut file = options
+            .open(&temp)
+            .map_err(|_| "diagnostics_create_failed")?;
+        file.write_all(&data)
+            .map_err(|_| "diagnostics_write_failed")?;
         file.sync_all().map_err(|_| "diagnostics_sync_failed")?;
         fs::rename(&temp, path).map_err(|_| "diagnostics_publish_failed")?;
         #[cfg(unix)]
-        File::open(parent).and_then(|directory| directory.sync_all()).map_err(|_| "diagnostics_durability_unconfirmed")?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "diagnostics_durability_unconfirmed")?;
         Ok(())
     })();
     let _ = fs::remove_file(temp);
@@ -132,7 +249,11 @@ mod tests {
     }
     #[test]
     fn atomic_report_is_valid_json_and_private() {
-        let dir = std::env::temp_dir().join(format!("chat-hub-support-{}-{}", std::process::id(), NEXT_EXPORT.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "chat-hub-support-{}-{}",
+            std::process::id(),
+            NEXT_EXPORT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("diagnostics.json");
         let report = metadata_report(&json!({}), "0.2.5", Some(&"a".repeat(40)), 42);
@@ -143,9 +264,15 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
             std::os::unix::fs::symlink(&path, dir.join("link.json")).unwrap();
-            assert_eq!(write_report(&dir.join("link.json"), &report), Err("diagnostics_unsafe_destination"));
+            assert_eq!(
+                write_report(&dir.join("link.json"), &report),
+                Err("diagnostics_unsafe_destination")
+            );
         }
         fs::remove_dir_all(dir).unwrap();
     }

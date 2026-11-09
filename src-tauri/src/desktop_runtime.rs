@@ -117,7 +117,11 @@ pub async fn start_with_capture_config(
     .await;
     let capture_recovery = match recovery {
         Ok(Ok(status)) => {
-            let state = if status.pending_items == 0 && status.failed == 0 { "complete" } else { "pending" };
+            let state = if status.pending_items == 0 && status.failed == 0 {
+                "complete"
+            } else {
+                "pending"
+            };
             let mut value = serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
             value["status"] = state.into();
             value

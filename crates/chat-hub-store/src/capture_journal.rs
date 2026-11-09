@@ -1,6 +1,9 @@
 //! Private, bounded recovery for normalized live captures, before their DB commit.
 //! This is not a packet journal: interrupted/unobserved streams remain unrecorded.
-use crate::{error::{Error, Result}, store::Store};
+use crate::{
+    error::{Error, Result},
+    store::Store,
+};
 use chat_hub_model::{IngestOutcome, Observation};
 use ring::digest::{digest, SHA256};
 use serde::Serialize;
@@ -29,7 +32,11 @@ fn error(code: &str) -> Error {
     Error::Configuration(code.to_owned())
 }
 fn sha256(data: &[u8]) -> String {
-    digest(&SHA256, data).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    digest(&SHA256, data)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -48,7 +55,9 @@ fn private_dir(path: &Path) -> Result<()> {
         }
         match builder.create(path) {
             Ok(()) => {
-                if let Some(parent) = path.parent() { sync_dir(parent)?; }
+                if let Some(parent) = path.parent() {
+                    sync_dir(parent)?;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
@@ -66,10 +75,14 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-struct Journal { dir: PathBuf }
+struct Journal {
+    dir: PathBuf,
+}
 impl Journal {
     fn for_database(database: &str, create: bool) -> Result<Option<Self>> {
-        if database.is_empty() || database == ":memory:" { return Ok(None); }
+        if database.is_empty() || database == ":memory:" {
+            return Ok(None);
+        }
         let path = Path::new(database);
         let metadata = fs::metadata(path)?;
         // A restore replaces the database file. Its old pending transcripts must
@@ -81,7 +94,9 @@ impl Journal {
         };
         #[cfg(not(unix))]
         let generation = format!("{:?}", metadata.created()?);
-        let name = path.file_name().ok_or_else(|| error("capture_journal_database_path"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| error("capture_journal_database_path"))?;
         let root = path.with_file_name(format!("{}.capture-journal", name.to_string_lossy()));
         let dir = root.join(sha256(generation.as_bytes()));
         if create {
@@ -102,10 +117,10 @@ impl Journal {
     fn entries(&self) -> Result<(Vec<PathBuf>, CaptureRecoveryStatus)> {
         let mut paths = Vec::new();
         let mut status = CaptureRecoveryStatus::default();
-        let mut count = 0usize;
-        for entry in fs::read_dir(&self.dir)? {
-            count += 1;
-            if count > ITEM_COUNT_LIMIT * 2 { return Err(error("capture_journal_too_many_files")); }
+        for (count, entry) in fs::read_dir(&self.dir)?.enumerate() {
+            if count >= ITEM_COUNT_LIMIT * 2 {
+                return Err(error("capture_journal_too_many_files"));
+            }
             let entry = entry?;
             let metadata = fs::symlink_metadata(entry.path())?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -115,7 +130,9 @@ impl Journal {
             if entry.path().extension().is_some_and(|ext| ext == "json") {
                 status.pending_items += 1;
                 paths.push(entry.path());
-            } else { status.incomplete_files += 1; }
+            } else {
+                status.incomplete_files += 1;
+            }
         }
         paths.sort();
         Ok((paths, status))
@@ -127,8 +144,12 @@ impl Journal {
             return Err(error("capture_journal_invalid_entry"));
         }
         let mut data = Vec::new();
-        File::open(path)?.take(ITEM_LIMIT + 1).read_to_end(&mut data)?;
-        if data.len() as u64 > ITEM_LIMIT { return Err(error("capture_journal_oversized")); }
+        File::open(path)?
+            .take(ITEM_LIMIT + 1)
+            .read_to_end(&mut data)?;
+        if data.len() as u64 > ITEM_LIMIT {
+            return Err(error("capture_journal_oversized"));
+        }
         let expected = format!("{}.json", sha256(&data));
         if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
             return Err(error("capture_journal_digest_mismatch"));
@@ -137,18 +158,27 @@ impl Journal {
     }
 
     fn stage(&self, observation: &Observation) -> Result<PathBuf> {
-        let data = serde_json::to_vec(observation).map_err(|_| error("capture_journal_encode_failed"))?;
-        if data.len() as u64 > ITEM_LIMIT { return Err(error("capture_journal_oversized")); }
+        let data =
+            serde_json::to_vec(observation).map_err(|_| error("capture_journal_encode_failed"))?;
+        if data.len() as u64 > ITEM_LIMIT {
+            return Err(error("capture_journal_oversized"));
+        }
         let destination = self.dir.join(format!("{}.json", sha256(&data)));
         if destination.exists() {
             self.read(&destination)?;
             return Ok(destination);
         }
         let (_, status) = self.entries()?;
-        if status.pending_items >= ITEM_COUNT_LIMIT || status.retained_bytes.saturating_add(data.len() as u64) > BYTE_LIMIT {
+        if status.pending_items >= ITEM_COUNT_LIMIT
+            || status.retained_bytes.saturating_add(data.len() as u64) > BYTE_LIMIT
+        {
             return Err(error("capture_journal_full"));
         }
-        let temp = self.dir.join(format!(".pending-{}-{}", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
+        let temp = self.dir.join(format!(
+            ".pending-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
         let result = (|| {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -163,7 +193,9 @@ impl Journal {
             // Atomic no-replace publication, even with overlapping startup recovery.
             match fs::hard_link(&temp, &destination) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { self.read(&destination)?; }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    self.read(&destination)?;
+                }
                 Err(e) => return Err(e.into()),
             }
             sync_dir(&self.dir)?;
@@ -200,19 +232,27 @@ impl Store {
             return Ok(CaptureRecoveryStatus::default());
         };
         let (paths, mut status) = journal.entries()?;
-        if status.retained_bytes > BYTE_LIMIT { return Err(error("capture_journal_full")); }
+        if status.retained_bytes > BYTE_LIMIT {
+            return Err(error("capture_journal_full"));
+        }
         for path in paths {
             let observation = match journal.read(&path) {
                 Ok(value) => value,
-                Err(_) => { status.failed += 1; continue; }
+                Err(_) => {
+                    status.failed += 1;
+                    continue;
+                }
             };
             if self.ingest_observation_outcome(&observation).is_err() {
                 status.failed += 1;
                 // A busy/broken DB should not incur one timeout per queued entry.
                 break;
             }
-            if journal.acknowledge(&path).is_err() { status.failed += 1; }
-            else { status.recovered += 1; }
+            if journal.acknowledge(&path).is_err() {
+                status.failed += 1;
+            } else {
+                status.recovered += 1;
+            }
         }
         let current = journal.entries()?.1;
         status.pending_items = current.pending_items;
@@ -221,7 +261,10 @@ impl Store {
         Ok(status)
     }
 
-    pub(crate) fn store_captured_observation(&mut self, observation: &Observation) -> Result<IngestOutcome> {
+    pub(crate) fn store_captured_observation(
+        &mut self,
+        observation: &Observation,
+    ) -> Result<IngestOutcome> {
         let Some(database) = self.connection().path().map(str::to_owned) else {
             return self.ingest_observation_outcome(observation);
         };
@@ -247,7 +290,10 @@ mod tests {
     use chat_hub_model::ObservationSink;
     use serde_json::json;
 
-    struct Fixture { dir: PathBuf, database: String }
+    struct Fixture {
+        dir: PathBuf,
+        database: String,
+    }
     impl Fixture {
         fn new() -> Self {
             let mut random = [0u8; 16];
@@ -259,28 +305,57 @@ mod tests {
             Self { dir, database }
         }
     }
-    impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.dir); } }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
     fn observation(scope: &str) -> Observation {
         Observation {
-            provider: "chatgpt".into(), account_scope: scope.into(), source_id: "synthetic-source".into(),
-            title: "Synthetic capture".into(), url: None, current_node: None, graph: vec![],
-            raw_payload: json!({"title":"Synthetic capture"}), source_time: None,
-            observed_ms: 1, parser: "chatgpt-live-v1".into(), completeness: "complete".into(),
+            provider: "chatgpt".into(),
+            account_scope: scope.into(),
+            source_id: "synthetic-source".into(),
+            title: "Synthetic capture".into(),
+            url: None,
+            current_node: None,
+            graph: vec![],
+            raw_payload: json!({"title":"Synthetic capture"}),
+            source_time: None,
+            observed_ms: 1,
+            parser: "chatgpt-live-v1".into(),
+            completeness: "complete".into(),
         }
     }
     #[test]
     fn failed_commit_is_retained_and_replayed_after_restart() {
         let f = Fixture::new();
         let mut store = Store::open_service(&f.database).unwrap();
-        store.connection().execute_batch("PRAGMA query_only=ON").unwrap();
-        assert!(store.store_observation(&observation("provisional:test")).is_err());
-        assert_eq!(Store::capture_recovery_status(&f.database).unwrap().pending_items, 1);
+        store
+            .connection()
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        assert!(store
+            .store_observation(&observation("provisional:test"))
+            .is_err());
+        assert_eq!(
+            Store::capture_recovery_status(&f.database)
+                .unwrap()
+                .pending_items,
+            1
+        );
         drop(store);
         let mut reopened = Store::open_service(&f.database).unwrap();
         assert_eq!(reopened.recover_pending_captures().unwrap().recovered, 1);
-        assert!(reopened.contains_source("chatgpt", "provisional:test", "synthetic-source").unwrap());
-        assert!(!reopened.contains_source("chatgpt", "provisional:other", "synthetic-source").unwrap());
-        assert_eq!(reopened.recover_pending_captures().unwrap().pending_items, 0);
+        assert!(reopened
+            .contains_source("chatgpt", "provisional:test", "synthetic-source")
+            .unwrap());
+        assert!(!reopened
+            .contains_source("chatgpt", "provisional:other", "synthetic-source")
+            .unwrap());
+        assert_eq!(
+            reopened.recover_pending_captures().unwrap().pending_items,
+            0
+        );
     }
     #[test]
     fn journal_survives_before_commit_and_repeat_replay_keeps_one_chat() {
@@ -313,11 +388,18 @@ mod tests {
     fn restored_database_does_not_replay_the_replaced_library_journal() {
         let f = Fixture::new();
         let store = Store::open(&f.database).unwrap();
-        Journal::for_database(&f.database, true).unwrap().unwrap().stage(&observation("provisional:test")).unwrap();
+        Journal::for_database(&f.database, true)
+            .unwrap()
+            .unwrap()
+            .stage(&observation("provisional:test"))
+            .unwrap();
         drop(store);
         fs::rename(&f.database, f.dir.join("old.sqlite3")).unwrap();
         let mut restored = Store::open(&f.database).unwrap();
-        assert_eq!(restored.recover_pending_captures().unwrap().pending_items, 0);
+        assert_eq!(
+            restored.recover_pending_captures().unwrap().pending_items,
+            0
+        );
         assert_eq!(restored.library_snapshot().unwrap().conversations.len(), 0);
     }
     #[cfg(unix)]
@@ -328,8 +410,14 @@ mod tests {
         let _store = Store::open(&f.database).unwrap();
         let journal = Journal::for_database(&f.database, true).unwrap().unwrap();
         let ticket = journal.stage(&observation("provisional:test")).unwrap();
-        assert_eq!(fs::metadata(&journal.dir).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(&ticket).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&journal.dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&ticket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         symlink(&ticket, journal.dir.join("untrusted.json")).unwrap();
         assert!(journal.entries().is_err());
     }

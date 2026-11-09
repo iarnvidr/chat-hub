@@ -25,23 +25,39 @@ fn collect<R: Runtime>(app: &AppHandle<R>) -> Value {
                     "legacy_ingest":{"accepted":status.ingest.accepted,"stored":status.ingest.stored,
                         "ignored":status.ingest.ignored,"failed":status.ingest.failed,"unprocessed":status.ingest.unprocessed}
                 });
-                raw["capture"] = serde_json::to_value(runtime.capture_snapshot()).unwrap_or(Value::Null);
+                raw["capture"] =
+                    serde_json::to_value(runtime.capture_snapshot()).unwrap_or(Value::Null);
                 raw["startup_recovery"] = runtime.capture_recovery.clone();
                 database = Some(runtime.database_path.clone());
             }
         };
     }
     // Drop the runtime mutex before filesystem work. Export must not stop capture.
-    raw["journal"] = database.as_ref().and_then(|path| path.to_str())
+    raw["journal"] = database
+        .as_ref()
+        .and_then(|path| path.to_str())
         .and_then(|path| chat_hub::store::Store::capture_recovery_status(path).ok())
         .and_then(|status| serde_json::to_value(status).ok())
-        .map(|mut value| { value["status"] = "available".into(); value })
+        .map(|mut value| {
+            value["status"] = "available".into();
+            value
+        })
         .unwrap_or_else(|| json!({"status":"unavailable"}));
-    raw["history"] = app.try_state::<crate::chatgpt_history::ChatgptHistoryState>()
+    raw["history"] = app
+        .try_state::<crate::chatgpt_history::ChatgptHistoryState>()
         .and_then(|state| state.snapshot().ok())
-        .and_then(|status| serde_json::to_value(status).ok()).unwrap_or(Value::Null);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-    snapshot::metadata_report(&raw, env!("CARGO_PKG_VERSION"), option_env!("CHAT_HUB_BUILD_COMMIT"), now)
+        .and_then(|status| serde_json::to_value(status).ok())
+        .unwrap_or(Value::Null);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    snapshot::metadata_report(
+        &raw,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("CHAT_HUB_BUILD_COMMIT"),
+        now,
+    )
 }
 
 pub fn export<R: Runtime>(app: &AppHandle<R>) {
@@ -49,20 +65,34 @@ pub fn export<R: Runtime>(app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         let report = collect(&app);
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        app.dialog().file().set_title("Export metadata-only diagnostics")
-            .set_file_name("chat-hub-diagnostics.json").add_filter("JSON", &["json"])
-            .save_file(move |path| { let _ = sender.send(path); });
-        let Ok(Some(path)) = receiver.await else { return; };
-        let Ok(path) = path.into_path() else {
-            app.dialog().message("The selected diagnostics destination is unavailable.").title("Chat Hub diagnostics").show(|_| {});
+        app.dialog()
+            .file()
+            .set_title("Export metadata-only diagnostics")
+            .set_file_name("chat-hub-diagnostics.json")
+            .add_filter("JSON", &["json"])
+            .save_file(move |path| {
+                let _ = sender.send(path);
+            });
+        let Ok(Some(path)) = receiver.await else {
             return;
         };
-        let result = tokio::task::spawn_blocking(move || snapshot::write_report(&path, &report)).await;
+        let Ok(path) = path.into_path() else {
+            app.dialog()
+                .message("The selected diagnostics destination is unavailable.")
+                .title("Chat Hub diagnostics")
+                .show(|_| {});
+            return;
+        };
+        let result =
+            tokio::task::spawn_blocking(move || snapshot::write_report(&path, &report)).await;
         let message = match result {
             Ok(Ok(())) => "Metadata-only diagnostics saved. Conversation text, identifiers, credentials, paths and raw logs were excluded.",
             Ok(Err("diagnostics_durability_unconfirmed")) => "The diagnostics file was written, but disk durability could not be confirmed.",
             _ => "Diagnostics could not be saved. Choose another destination and retry; your library was not changed.",
         };
-        app.dialog().message(message).title("Chat Hub diagnostics").show(|_| {});
+        app.dialog()
+            .message(message)
+            .title("Chat Hub diagnostics")
+            .show(|_| {});
     });
 }
