@@ -1,7 +1,6 @@
 name: Publish accepted Chat Hub merge build
 
-# Every successful native acceptance on protected main creates a commit-addressed
-# GitHub prerelease, not a new stable updater version.
+# Preview identity differs from the embedded base version. Never touch stable updates.
 on:
   workflow_run:
     workflows: ["Map accepted Chat Hub macOS artifact"]
@@ -81,47 +80,14 @@ jobs:
           version="$(python3 -c 'import json;print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
           python3 build/release_artifact.py retrieve --root "$GITHUB_WORKSPACE" \
             --tag "v$version" --mapping-run-id "$ACCEPT_RUN_ID"
-      - name: Verify staged source binding and create SHA-256 inventory
+      - name: Verify source binding and prepare uniquely named preview assets
         env:
           ACCEPT_SHA: ${{ steps.source.outputs.sha }}
           ACCEPT_RUN_ID: ${{ steps.source.outputs.run_id }}
         run: |
           set -euo pipefail
-          python3 - "$ACCEPT_SHA" "$ACCEPT_RUN_ID" <<'PY'
-          import hashlib,json,pathlib,subprocess,sys
-          sha,run_id=sys.argv[1],int(sys.argv[2])
-          root=pathlib.Path.cwd(); path=root/'artifacts'
-          source=json.loads((path/'release-input.json').read_text())
-          version=json.loads((root/'src-tauri/tauri.conf.json').read_text())['version']
-          tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
-          if (source.get('accepted_commit')!=sha or source.get('accepted_tree')!=tree
-              or source.get('version')!=version or source.get('source_run_id')!=run_id
-              or source.get('acceptance')!='trusted-main-build'):
-              raise SystemExit('Candidate no longer identifies the accepted merge')
-          zip_name='Chat_Hub_'+version+'_macos-arm64.zip'
-          dmg_name='Chat_Hub_'+version+'_macos-arm64.dmg'
-          wanted={zip_name,zip_name+'.sha256',dmg_name}
-          if set(source.get('files',{}))!=wanted:
-              raise SystemExit('Expected accepted native ZIP, checksum and DMG')
-          for name in wanted:
-              data=(path/name).read_bytes()
-              if len(data)>512*1024*1024 or hashlib.sha256(data).hexdigest()!=source['files'][name]:
-                  raise SystemExit('Unverified native artifact: '+name)
-          hashes={n:source['files'][n] for n in (zip_name,dmg_name)}
-          (path/'SHA256SUMS').write_text(''.join(hashes[n]+'  '+n+'\n' for n in sorted(hashes)))
-          (path/'build-info.json').write_text(json.dumps({
-              'schema':1,'kind':'ad-hoc-signed-merge-preview',
-              'repository':source['repository'],'commit':sha,'tree':tree,
-              'tag':'merge-'+sha,'app_version':version,'native_run_id':run_id,
-              'native_artifact_digest':source['source_artifact_digest'],'files':hashes},sort_keys=True)+'\n')
-          (path/'merge-notes.md').write_text(
-              'Commit: '+sha+'\nApp version: '+version+'\n'
-              'Validated native build: https://github.com/'+source['repository']+
-              '/actions/runs/'+str(run_id)+'\n\n'
-              'Apple Silicon app/DMG: ad-hoc signed and not notarized; Gatekeeper may block it. '
-              'This commit-addressed prerelease is not a new stable application version '
-              'and does not modify the stable signed updater feed.\n')
-          PY
+          python3 build/merge_preview.py --root "$GITHUB_WORKSPACE" \
+            --sha "$ACCEPT_SHA" --run-id "$ACCEPT_RUN_ID"
       - name: Create commit-addressed GitHub prerelease without overwriting
         env:
           GH_TOKEN: ${{ github.token }}
@@ -129,32 +95,20 @@ jobs:
         run: |
           set -euo pipefail
           tag="merge-$ACCEPT_SHA"
-          version="$(python3 -c 'import json;print(json.load(open("artifacts/build-info.json"))["app_version"])')"
+          preview="$(python3 -c 'import json;print(json.load(open("artifacts/build-info.json"))["display_version"])')"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
             test "$sha" = "$ACCEPT_SHA"
             gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/release.json"
-            python3 - "$RUNNER_TEMP/release.json" "$version" "$tag" <<'PY'
-          import hashlib,json,pathlib,sys
-          data=json.load(open(sys.argv[1]));v,tag=sys.argv[2:]
-          names={'Chat_Hub_'+v+'_macos-arm64.zip','Chat_Hub_'+v+'_macos-arm64.dmg','SHA256SUMS','build-info.json'}
-          assets=data.get('assets',[])
-          if data.get('tag_name')!=tag or data.get('draft') or not data.get('prerelease') or {a.get('name') for a in assets}!=names:
-              raise SystemExit('Existing release is not this validated preview')
-          for asset in assets:
-              p=pathlib.Path('artifacts')/asset['name']
-              if asset.get('size')!=p.stat().st_size:
-                  raise SystemExit('Existing asset size mismatch')
-              if asset.get('digest') and asset['digest']!='sha256:'+hashlib.sha256(p.read_bytes()).hexdigest():
-                  raise SystemExit('Existing asset digest mismatch')
-          PY
+            python3 build/merge_preview.py --root "$GITHUB_WORKSPACE" \
+              --sha "$ACCEPT_SHA" --verify-existing "$RUNNER_TEMP/release.json"
           else
             gh release create "$tag" \
-              "artifacts/Chat_Hub_"$version"_macos-arm64.zip" \
-              "artifacts/Chat_Hub_"$version"_macos-arm64.dmg" \
+              "artifacts/Chat_Hub_${preview}_macos-arm64.zip" \
+              "artifacts/Chat_Hub_${preview}_macos-arm64.dmg" \
               artifacts/SHA256SUMS artifacts/build-info.json \
               --repo "$GITHUB_REPOSITORY" --target "$ACCEPT_SHA" \
-              --title "Chat Hub merge build $ACCEPT_SHA (app $version)" \
+              --title "Chat Hub $preview" \
               --notes-file artifacts/merge-notes.md --prerelease --latest=false
           fi
           echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"
