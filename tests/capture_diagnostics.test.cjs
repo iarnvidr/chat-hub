@@ -1,8 +1,9 @@
 const test=require('node:test');
 const assert=require('node:assert/strict');
-const {readFileSync}=require('node:fs');
+const {pathToFileURL}=require('node:url');
 const {resolve}=require('node:path');
-const modulePromise=import('data:text/javascript;base64,'+readFileSync(resolve(__dirname,'../desktop-ui/capture-status.js')).toString('base64'));
+// Bun rejects oversized data: module specifiers; load the real ESM file instead.
+const modulePromise=import(pathToFileURL(resolve(__dirname,'../desktop-ui/capture-status.js')).href);
 test('capture details distinguish confirmed commits, active work and failures',async()=>{
   const {formatCaptureDetails}=await modulePromise;
   const text=formatCaptureDetails({status:'available',enabled:true,counters:{committed_imported:2,committed_updated:1,committed_unchanged:1,active:3,store_failed:1,dropped:2}});
