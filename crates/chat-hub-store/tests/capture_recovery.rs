@@ -20,7 +20,11 @@ impl Fixture {
         let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         let directory = std::env::temp_dir().join(format!("chat-hub-recovery-{suffix}"));
         fs::create_dir(&directory).unwrap();
-        let database = directory.join("library.sqlite3").to_str().unwrap().to_owned();
+        let database = directory
+            .join("library.sqlite3")
+            .to_str()
+            .unwrap()
+            .to_owned();
         Self {
             directory,
             database,
@@ -113,7 +117,10 @@ fn failed_transcript_commit_recovers_prompt_reply_and_search_after_restart() {
         .iter()
         .any(|message| message["content"] == "Durable reply marker"));
     assert_eq!(saved["current_node"], "reply");
-    assert_eq!(reopened.search("Durable reply marker", 10).unwrap().len(), 1);
+    assert_eq!(
+        reopened.search("Durable reply marker", 10).unwrap().len(),
+        1
+    );
     assert_eq!(reopened.recover_pending_captures().unwrap().recovered, 0);
     assert_eq!(reopened.library_snapshot().unwrap().conversations.len(), 1);
 }
