@@ -142,9 +142,9 @@ test('pin cooldown is scoped to the connected account and survives history coold
   activeScope=ACCOUNT_A;await ui.dispatch('chat-hub:chatgpt-connected');await ui.flush();
   assert.equal(historyStarts,1);assert.deepEqual(pinScopes,[ACCOUNT_A]);
   activeScope=ACCOUNT_B;await ui.dispatch('chat-hub:chatgpt-connected');await ui.flush();
-  assert.deepEqual(pinScopes,[ACCOUNT_A,ACCOUNT_B]);
+  assert.deepEqual(pinScopes,[ACCOUNT_A], 'global provider Retry-After blocks pin refresh even on account switch');
   ui.advance(6_000);await ui.dispatch('chat-hub:chatgpt-connected');await ui.flush();
-  assert.deepEqual(pinScopes,[ACCOUNT_A,ACCOUNT_B]);
+  assert.deepEqual(pinScopes,[ACCOUNT_A], 'account switch cannot bypass provider cooldown');
   assert.equal(historyStarts,1);
 });
 
@@ -328,7 +328,7 @@ test('provider cooldown deadline persists locally across app restart without acc
   await first.button.click();
   await first.flush();
   const saved=JSON.parse(storage.get('chat-hub.chatgpt-history-cooldown.v1'));
-  assert.deepEqual(Object.keys(saved).sort(),['automatic_retry_paused','provider','until','verification_needed']);
+  assert.deepEqual(Object.keys(saved).sort(),['automatic_retries_remaining','automatic_retry_paused','backoff_until','provider','until','verification_needed']);
   assert.equal(saved.provider,'chatgpt');
   assert.equal(saved.automatic_retry_paused,false);
 
