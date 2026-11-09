@@ -1,3 +1,5 @@
+import './build-identity.js';
+
 const menus = [...document.querySelectorAll('details.library-tools, details.update-menu')];
 
 function closeMenus(except) {
