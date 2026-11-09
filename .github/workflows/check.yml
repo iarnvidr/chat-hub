@@ -52,23 +52,35 @@ jobs:
         with:
           version: 1.0.0-beta.25
           verb: check
-          dagger-flags: --progress logs
+          dagger-flags: --progress logs -vv
       # A failing test must not discard successful compilation. The run/attempt
       # nonce belongs to the exporter, never to the compiler cache volume key.
       - id: cargo-export
         name: Export reusable Cargo output even when a check failed
         if: ${{ always() && steps.dagger-checks.outcome != 'skipped' && !cancelled() }}
         continue-on-error: true
-        run: >-
-          dagger -m ci/dagger/check api call export-cargo-cache
-          --nonce "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --output ci/cache/linux-cargo
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          # Never export into the directory that seeded this lazy Dagger graph.
+          # A cache export is not a check: bound it so a stuck export cannot cancel
+          # an otherwise completed gate or suppress the failing check's logs.
+          timeout --signal=TERM --kill-after=15s 300s \
+            dagger -m ci/dagger/check api call export-cargo-cache \
+            --progress plain --nonce "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --output artifacts/linux-cargo
+      - name: Report unavailable reusable compilation output
+        if: ${{ always() && steps.cargo-export.outcome == 'failure' && !cancelled() }}
+        run: |
+          echo '::warning::Cargo export failed or timed out. No fresh cache/crate package is claimed; required checks retain their actual outcome.'
+          echo 'Cargo output export unavailable. Required checks and native acceptance remain authoritative.' >> "$GITHUB_STEP_SUMMARY"
       - name: Keep actual Cargo diagnostics separate from reusable output
         if: ${{ always() && steps.cargo-export.outcome == 'success' && !cancelled() }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          if [[ -d ci/cache/linux-cargo/check-logs ]]; then
-            mv ci/cache/linux-cargo/check-logs artifacts/cargo-check-logs
+          if [[ -d artifacts/linux-cargo/check-logs ]]; then
+            mv artifacts/linux-cargo/check-logs artifacts/cargo-check-logs
             shopt -s nullglob
             for log in artifacts/cargo-check-logs/*.log; do
               echo "::group::Cargo diagnostics: $(basename "$log")"
@@ -88,7 +100,7 @@ jobs:
         name: Archive the Cargo snapshot without changing timestamps or modes
         if: ${{ always() && steps.cargo-export.outcome == 'success' && !cancelled() }}
         continue-on-error: true
-        run: python3 ci/scripts/oci_cache.py pack --source ci/cache/linux-cargo --output artifacts/cargo-cache
+        run: python3 ci/scripts/oci_cache.py pack --source artifacts/linux-cargo --output artifacts/cargo-cache
       - name: Retain compiled data for the trusted GHCR publisher
         if: ${{ always() && steps.cargo-archive.outcome == 'success' && !cancelled() }}
         continue-on-error: true
@@ -104,7 +116,7 @@ jobs:
         name: Extract separately addressable compiled outputs for all nine crates
         if: ${{ success() && steps.dagger-checks.outcome == 'success' && steps.cargo-archive.outcome == 'success' }}
         run: >-
-          python3 ci/scripts/crate_artifacts.py --source ci/cache/linux-cargo
+          python3 ci/scripts/crate_artifacts.py --source artifacts/linux-cargo
           --cache-manifest artifacts/cargo-cache/cache-manifest.json
           --output artifacts/crates
       - name: Retain model crate objects
