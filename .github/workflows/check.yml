@@ -52,7 +52,7 @@ jobs:
         with:
           version: 1.0.0-beta.25
           verb: check
-          dagger-flags: --progress logs -vv
+          dagger-flags: --progress plain -vv
       # A failing test must not discard successful compilation. The run/attempt
       # nonce belongs to the exporter, never to the compiler cache volume key.
       - id: cargo-export
