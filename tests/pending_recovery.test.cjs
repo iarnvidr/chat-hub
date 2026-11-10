@@ -1,8 +1,9 @@
 const test=require('node:test');
 const assert=require('node:assert/strict');
-const {readFileSync}=require('node:fs');
+const {pathToFileURL}=require('node:url');
 const {resolve}=require('node:path');
-const modulePromise=import('data:text/javascript;base64,'+readFileSync(resolve(__dirname,'../desktop-ui/pending-conversations.js')).toString('base64'));
+// Import the actual ESM file; Bun rejects overlong data: module specifiers.
+const modulePromise=import(pathToFileURL(resolve(__dirname,'../desktop-ui/pending-conversations.js')).href);
 const ID='00000000-0000-0000-0000-000000000001';
 const A='chatgpt:observed:'+'a'.repeat(64),B='chatgpt:observed:'+'b'.repeat(64);
 function memory(){let value=null;return {getItem(){return value;},setItem(_key,text){value=text;}};}
