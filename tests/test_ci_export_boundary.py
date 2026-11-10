@@ -25,7 +25,7 @@ class ExportBoundaryTests(unittest.TestCase):
         self.assertIn("steps.cargo-export.outcome == 'success'", archive)
 
     def test_receipts_still_require_real_success(self):
-        checks = self.workflow.split('      - id: dagger-checks\n', 1)[1].split('      - id: cargo-export\n', 1)[0]
+        checks = self.workflow.split('      - id: dagger-checks\n', 1)[1].split('\n      - ', 1)[0]
         self.assertNotIn('continue-on-error:', checks)
         self.assertIn('verb: check', checks)
         self.assertIn('-vv', checks)
