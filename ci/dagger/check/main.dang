@@ -265,6 +265,9 @@ type ChatHubCi {
       .withFile("/usr/local/bin/bun", bunTools.file("/usr/local/bin/bun"))
       .withEnvVariable("CARGO_HOME", "/usr/local/cargo")
       .withEnvVariable("RUSTUP_HOME", "/usr/local/rustup")
+      # The pinned rust:1.99.1 image has the stable toolchain already installed.
+      # Avoid downloading a second named 1.99.1 toolchain in Python policy tests.
+      .withEnvVariable("RUSTUP_TOOLCHAIN", "stable")
       .withEnvVariable("CARGO_BUILD_JOBS", "2")
       .withEnvVariable("PATH", "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
       .withExec(["sh", "-ec", "if command -v node >/dev/null 2>&1; then echo 'Node executable is prohibited in this CI environment' >&2; exit 1; fi"])
