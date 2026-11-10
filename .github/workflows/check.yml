@@ -64,6 +64,16 @@ jobs:
             -v "$GITHUB_WORKSPACE:/src:ro" -w /src \
             oven/bun:1.2.22@sha256:66ba69deede44e3af5dc542def218fdb3bcad2205900ea761dc5623bf973d2df \
             bash build/test-desktop-js.sh
+      # The Dagger check reports only the aggregated failure when a Python
+      # unittest subprocess exits nonzero. This diagnostic runs the same repo
+      # tests on the hosted runner and leaves the required Dagger gate unchanged.
+      - name: Expose Python contract traceback when the Dagger gate fails
+        if: ${{ failure() && steps.dagger-checks.outcome == 'failure' && !cancelled() }}
+        continue-on-error: true
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          python3 -m unittest discover -s build -p 'test_*.py' -v
+          python3 -m unittest discover -s ci/dagger/check -p 'test_*.py' -v
       # A failing test must not discard successful compilation. The run/attempt
       # nonce belongs to the exporter, never to the compiler cache volume key.
       - id: cargo-export
