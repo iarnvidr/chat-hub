@@ -105,7 +105,7 @@ pub struct SearchSnapshot {
     pub hits: Vec<Value>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Observation {
     pub provider: String,
     pub account_scope: String,
@@ -121,7 +121,7 @@ pub struct Observation {
     pub completeness: String,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GraphNode {
     pub source_node_id: String,
     pub source_message_id: Option<String>,

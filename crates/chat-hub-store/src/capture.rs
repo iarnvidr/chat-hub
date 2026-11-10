@@ -41,7 +41,7 @@ impl Store {
             .unwrap_or_default()
             .as_millis() as i64;
         let observation = normalize_chatgpt_document(&doc, "chatgpt-live-v1", observed_ms)?;
-        self.ingest_observation(&observation)?;
+        self.store_captured_observation(&observation)?;
         Ok(true)
     }
 }
@@ -53,6 +53,6 @@ impl chat_hub_model::ObservationSink for Store {
         &mut self,
         observation: &Observation,
     ) -> Result<chat_hub_model::IngestOutcome> {
-        self.ingest_observation_outcome(observation)
+        self.store_captured_observation(observation)
     }
 }

@@ -20,18 +20,19 @@ test('blank drafts are session-only; provider-ID pending chats persist minimal m
   assert.deepEqual(restarted.list(),[{pending_id:'pending-one',source_id:UUID,account_scope:SCOPE,created_at_ms:1234}]);
 });
 
-test('capture reconciliation requires exactly one provider and account-scope match',async()=>{
+test('capture reconciliation requires an exact provider and account scope, not a unique physical copy',async()=>{
   const {createPendingConversationStore}=await import('../desktop-ui/pending-conversations.js');
   const store=createPendingConversationStore(new Storage(),()=>5);
   store.attachProviderConversation('pending-one',UUID,SCOPE);
   assert.equal(store.reconcileCaptured([{provider:'chatgpt',source_id:UUID,account_scope:OTHER}]),0);
   assert.equal(store.list().length,1);
+  assert.equal(store.reconcileCaptured([{provider:'paseo-chatgpt',source_id:UUID,account_scope:SCOPE}]),0);
   assert.equal(store.reconcileCaptured([
     {provider:'chatgpt',source_id:UUID,account_scope:SCOPE},
     {provider:'chatgpt',source_id:UUID,account_scope:SCOPE},
-  ]),0);
-  assert.equal(store.list().length,1);
-  assert.equal(store.reconcileCaptured([{provider:'chatgpt',source_id:UUID,account_scope:SCOPE}]),1);
+  ]),1);
+  assert.equal(store.list().length,0);
+  assert.equal(store.reconcileCaptured([{provider:'chatgpt',source_id:UUID,account_scope:SCOPE}]),0);
   assert.deepEqual(store.list(),[]);
 });
 

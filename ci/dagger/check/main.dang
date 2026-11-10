@@ -259,12 +259,15 @@ type ChatHubCi {
   pub contracts: Void @check {
     container(platform: "linux/amd64")
       .from("python:3.14.0-slim-bookworm@sha256:d13fa0424035d290decef3d575cea23d1b7d5952cdf429df8f5542c71e961576")
-      .withExec(["sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends bash build-essential git rsync zstd && rm -rf /var/lib/apt/lists/*"])
+      .withExec(["sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends --no-upgrade bash build-essential git rsync zstd && rm -rf /var/lib/apt/lists/*"])
       .withDirectory("/usr/local/cargo", rustTools.directory("/usr/local/cargo"))
       .withDirectory("/usr/local/rustup", rustTools.directory("/usr/local/rustup"))
       .withFile("/usr/local/bin/bun", bunTools.file("/usr/local/bin/bun"))
       .withEnvVariable("CARGO_HOME", "/usr/local/cargo")
       .withEnvVariable("RUSTUP_HOME", "/usr/local/rustup")
+      # The pinned rust:1.99.1 image has the stable toolchain already installed.
+      # Avoid downloading a second named 1.99.1 toolchain in Python policy tests.
+      .withEnvVariable("RUSTUP_TOOLCHAIN", "stable")
       .withEnvVariable("CARGO_BUILD_JOBS", "2")
       .withEnvVariable("PATH", "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
       .withExec(["sh", "-ec", "if command -v node >/dev/null 2>&1; then echo 'Node executable is prohibited in this CI environment' >&2; exit 1; fi"])
