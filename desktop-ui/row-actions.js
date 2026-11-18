@@ -13,6 +13,7 @@ export function actionError(error) {
 }
 
 export function createRowActions({invoke,onChanged=()=>{},doc=document,win=window}) {
+  const canWrite=()=>win.ChatHub?.transport!=='http'||win.ChatHub.capabilities?.writes===true;
   const paths={pin:'M12 17v5M8 3h8v6l3 4v3H5v-3l3-4V3Z',more:'M5 12h.01M12 12h.01M19 12h.01',folder:'M3 7V4h6l3 3h9v13H3V7Z',archive:'M3 4h18v4H3zM5 8v12h14V8M10 12h4',tag:'M20 13l-7 7L3 10V3h7l10 10ZM7 7h.01',link:'M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-2 2M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l2-2',back:'m14 5-7 7 7 7',check:'m5 12 4 4L19 6'};
   const node=(tag,text,cls)=>{const n=doc.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
   function icon(kind){const svg=doc.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('aria-hidden','true');const path=doc.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d',paths[kind]||paths.more);svg.append(path);return svg;}
@@ -108,10 +109,12 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
     finally{busy=false;if(target)for(const b of menu.querySelectorAll('button,input'))b.disabled=false;}
   }
   function open(chat,button,hover=false){
+    if(!canWrite())return;
     if(target?.id===chat.id&&trigger===button&&!menu.hidden){if(!hover)close();return;}
     close(false);target=chat;trigger=button;hoverPicker=hover;menu.hidden=false;button.setAttribute('aria-expanded','true');actions();if(!hover)menu.querySelector('button:not(:disabled)')?.focus();
   }
   win.addEventListener('chat-hub:open-project-picker',event=>{
+    if(!canWrite())return;
     const chat=event.detail?.chat,button=event.detail?.anchor;
     if(!chatgptConversationId(chat)||!button)return;
     close(false);target=chat;trigger=button;hoverPicker=event.detail?.focus===false;
@@ -129,7 +132,7 @@ export function createRowActions({invoke,onChanged=()=>{},doc=document,win=windo
   });
   function wrap(chat,primary){
     const row=node('div',undefined,'conversation-row');row.dataset.id=chat.id;row.dataset.pinned=String(Boolean(chat.pinned));row.classList.toggle('selected',primary.classList.contains('selected'));
-    const rail=node('div',undefined,'thread-action-rail');rail.setAttribute('role','group');rail.setAttribute('aria-label','Chat actions');
+    const rail=node('div',undefined,'thread-action-rail');rail.setAttribute('role','group');rail.setAttribute('aria-label','Chat actions');rail.hidden=!canWrite();
     const more=node('button',undefined,'thread-action thread-more');more.type='button';more.append(icon('more'));more.setAttribute('aria-label',`Actions for ${chat.title||'conversation'}`);more.setAttribute('aria-haspopup','menu');more.setAttribute('aria-expanded','false');more.setAttribute('aria-controls',menu.id);more.addEventListener('click',()=>open(chat,more));rail.append(more);
     rail.addEventListener('pointerenter',event=>{if(event.pointerType==='touch')return;clearTimeout(hoverCloseTimer);clearTimeout(hoverOpenTimer);hoverOpenTimer=setTimeout(()=>open(chat,more,true),180);});
     rail.addEventListener('pointerleave',()=>{clearTimeout(hoverOpenTimer);if(target?.id!==chat.id||!hoverPicker)return;clearTimeout(hoverCloseTimer);hoverCloseTimer=setTimeout(()=>{if(!menu.matches(':hover')&&!menu.contains(doc.activeElement))close(false);},220);});

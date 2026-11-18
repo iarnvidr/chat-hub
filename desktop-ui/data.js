@@ -17,6 +17,44 @@ export function normalizeSearch(response) {
   }) };
 }
 
+// Browser edition transport. The access token is submitted once to the session
+// endpoint and is never retained by this client; subsequent requests rely on
+// the server's HTTP-only cookie.
+export function httpBridge({ fetchImpl = globalThis.fetch, base = '' } = {}) {
+  const csrfToken = () => globalThis.document?.cookie?.split(';').map(part => part.trim())
+    .find(part => part.startsWith('chat_hub_csrf='))?.slice('chat_hub_csrf='.length) || '';
+  async function request(path, options = {}) {
+    const mutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(options.method);
+    const response = await fetchImpl(`${base}${path}`, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      ...options,
+      headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(mutating && !path.endsWith('/session') ? { 'X-CSRF-Token': csrfToken() } : {}), ...(options.headers || {}) },
+    });
+    let body = null;
+    if (response.status !== 204) {
+      try { body = await response.json(); } catch { body = null; }
+    }
+    if (!response.ok) {
+      const error = new Error(body?.code || body?.error || `http_${response.status}`);
+      error.code = body?.code || body?.error || `http_${response.status}`;
+      error.status = response.status;
+      throw error;
+    }
+    return body;
+  }
+
+  return {
+    invoke(command, args = {}) {
+      if (typeof command !== 'string' || !/^[a-z][a-z0-9_]*$/.test(command)) throw new Error('invalid_command');
+      return request(`/api/bridge/${command}`, { method: 'POST', body: JSON.stringify({ args }) });
+    },
+    capabilities() { return request('/api/capabilities'); },
+    login(token) { return request('/api/session', { method: 'POST', body: JSON.stringify({ token }) }); },
+    logout() { return request('/api/session', { method: 'DELETE', headers: { 'X-CSRF-Token': csrfToken() } }); },
+  };
+}
+
 export function fixtureAdapter() {
   const load = async path => {
     const response = await fetch(new URL(path, import.meta.url));
