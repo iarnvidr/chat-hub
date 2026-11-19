@@ -34,8 +34,17 @@ into chat, issue text, URLs, or logs. Set `CHAT_HUB_WEB_TOKEN_FILE` to choose
 another private path. Removing the file does not rotate a running server's
 token; restart the server after rotating it.
 
-Open `http://localhost:8080/` from the worker container, or use the configured
-dev-container preview URL from the owner browser. To check readiness:
+Open the configured HTTPS dev-container preview URL from the owner browser. The
+preview must preserve the public Host header for sign-in. Session cookies use
+Secure by default. To test sign-in over plain HTTP on the same machine, bind to
+loopback and opt out of Secure cookies for that process:
+
+```sh
+CHAT_HUB_DATABASE=/path/to/restored/chat-hub.sqlite3 \
+  CHAT_HUB_WEB_ADDR=127.0.0.1:8080 CHAT_HUB_WEB_COOKIE_SECURE=0 scripts/dev-web.sh
+```
+
+Then open `http://127.0.0.1:8080/`. To check readiness:
 
 ```sh
 curl --fail --silent http://127.0.0.1:8080/healthz
@@ -45,6 +54,18 @@ The health response contains status and capture state only. The start script
 also sets `CHAT_HUB_CAPTURE_ENABLED=false`; capture remains disabled in backend
 development. Do not add chat content or credentials to server logs, Dagger
 output, CI artifacts, or public repository text.
+
+Reload the browser after editing a file in `desktop-ui/`. The server reads
+assets from disk, and development mode leaves the service worker unregistered.
+Rust changes require restarting the dev command.
+
+## Install the PWA
+
+For an HTTPS deployment, set `CHAT_HUB_WEB_MODE=stable` and
+`CHAT_HUB_WEB_SERVICE_WORKER=1`. After signing in, use the browser's install
+menu, or Safari's Share → Add to Home Screen on iPhone. The service worker uses
+the network first for shell assets. Library reads require a server connection
+and are never cached by the service worker.
 
 ## Dagger and image publication
 
