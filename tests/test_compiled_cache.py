@@ -291,7 +291,7 @@ class TrustedWriterTests(unittest.TestCase):
         dagger_step = checks.split("      - id: dagger-checks\n", 1)[1].split("      - id: cargo-export\n", 1)[0]
         self.assertIn("version: 1.0.0-beta.25", dagger_step)
         self.assertIn("verb: check", dagger_step)
-        self.assertIn("dagger-flags: --progress logs", dagger_step)
+        self.assertIn("dagger-flags: --progress plain", dagger_step)
         self.assertNotIn("GH_TOKEN", dagger_step)
         self.assertNotIn("registry-token", dagger_step)
         export_step = checks.split("      - id: cargo-export\n", 1)[1].split("      - name:", 1)[0]

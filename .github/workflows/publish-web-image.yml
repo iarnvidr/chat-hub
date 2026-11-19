@@ -1,0 +1,109 @@
+name: Publish Chat Hub web image
+on:
+  workflow_run:
+    workflows: [Checks]
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: chat-hub-web-image-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - name: Authenticate exact successful Checks run
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          EVENT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > "$RUNNER_TEMP/check-run.json"
+          python3 - "$RUNNER_TEMP/check-run.json" "$SOURCE_RUN_ID" "$EVENT_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import json, os, re, sys
+          run=json.load(open(sys.argv[1], encoding="utf-8"))
+          repo=os.environ["GITHUB_REPOSITORY"].lower()
+          if (run.get("id") != int(sys.argv[2])
+              or run.get("name") != "Checks"
+              or run.get("path") != ".github/workflows/check.yml"
+              or run.get("status") != "completed" or run.get("conclusion") != "success"
+              or run.get("event") != "push" or run.get("head_branch") != "main"
+              or (run.get("repository") or {}).get("full_name", "").lower() != repo
+              or (run.get("head_repository") or {}).get("full_name", "").lower() != repo):
+              raise SystemExit("source must be a successful trusted-main Checks run")
+          sha=run.get("head_sha", "")
+          if not re.fullmatch(r"[a-f0-9]{40}", sha) or sha != sys.argv[3]:
+              raise SystemExit("source SHA does not match the triggering run")
+          with open(sys.argv[4], "a", encoding="utf-8") as output:
+              output.write(f"source_sha={sha}\n")
+              output.write(f"source_run_id={run['id']}\n")
+              output.write(f"source_run_attempt={run['run_attempt']}\n")
+          PY
+      - name: Check out only the accepted commit from main history
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags origin refs/heads/main
+          git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$SOURCE_SHA"
+      - name: Restore compatible published Cargo cache
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          oras="$(bash build/install-oras.sh "$RUNNER_TEMP/chat-hub-web-oras")"
+          python3 ci/scripts/oci_cache.py restore --destination ci/cache/linux-cargo --oras "$oras"
+      - name: Publish the Dagger-built server image by immutable run tag
+        id: publish-image
+        uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          version: 1.0.0-beta.25
+          verb: call
+          module: ./ci/dagger/check
+          args: >-
+            publish-web-image
+            --address=ghcr.io/${{ github.repository }}-web:run-${{ steps.source.outputs.source_run_id }}-${{ steps.source.outputs.source_run_attempt }}
+            --username=${{ github.actor }}
+            --token=env://GH_TOKEN
+          dagger-flags: --progress plain
+      - name: Write source and publication receipt
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+          IMAGE_REF: ${{ steps.publish-image.outputs.output }}
+        run: |
+          set -euo pipefail
+          python3 ci/scripts/web_image_receipt.py \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$SOURCE_RUN_ID" \
+            --run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --publisher-run-id "$GITHUB_RUN_ID" \
+            --publisher-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --image-ref "$IMAGE_REF" \
+            --output artifacts/chat-hub-web-image-receipt.json
+      - name: Retain immutable image receipt for deploy resolution
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-web-image-receipt-${{ steps.source.outputs.source_run_id }}-${{ steps.source.outputs.source_run_attempt }}
+          path: artifacts/chat-hub-web-image-receipt.json
+          retention-days: 90

@@ -570,16 +570,23 @@ async fn exercise_live_tls(enabled: bool, case: Option<&str>) {
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["capture"]["enabled"], enabled);
         assert_eq!(v["service"]["status"], "ready");
         assert_eq!(v["database"]["status"], "healthy");
         assert!(!v.to_string().contains("PRIVATE_SQL_SENTINEL"));
         assert!(!v.to_string().contains("PRIVATE_BODY_SENTINEL"));
-        if enabled && v["capture"]["counters"][terminal] == 1 {
-            break v;
-        }
-        if !enabled && handle.status().ingest.ignored == 1 {
-            break v;
+        // The capture status endpoint reports an unavailable snapshot when
+        // the writer holds the counter lock. Keep polling within the deadline.
+        match v["capture"]["status"].as_str() {
+            Some("available") => {
+                assert_eq!(v["capture"]["enabled"], enabled);
+                if (enabled && v["capture"]["counters"][terminal] == 1)
+                    || (!enabled && handle.status().ingest.ignored == 1)
+                {
+                    break v;
+                }
+            }
+            Some("unavailable") => {}
+            _ => panic!("unexpected capture status: {}", v["capture"]),
         }
         assert!(tokio::time::Instant::now() < deadline, "{v}");
         tokio::task::yield_now().await;

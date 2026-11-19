@@ -192,9 +192,9 @@ class DaggerContract(unittest.TestCase):
 
     def test_one_native_test_check_per_workspace_crate(self):
         self.assertEqual(set(crate_checks()), set(workspace()))
-        self.assertEqual(len(crate_checks()), 9)
+        self.assertEqual(len(crate_checks()), 10)
         self.assertEqual(set(CHECKS) - {check for check, _ in crate_checks().values()},
-                         {"rustStyle", "javascript", "browser", "contracts"})
+                         {"rustStyle", "javascript", "browser", "contracts", "webSmoke"})
 
     def test_every_test_scope_contains_all_production_and_selected_dev_dependencies(self):
         packages = workspace()
@@ -226,7 +226,7 @@ class DaggerContract(unittest.TestCase):
                     self.assertEqual(skeleton.get(relative), helper.PLACEHOLDER.decode(), relative)
 
     def test_ui_and_unrelated_rust_edits_do_not_enter_leaf_check_inputs(self):
-        leaf_scopes = ["modelSource", "formatsSource", "storeSource", "ingestSource", "captureSource", "apiSource", "runtimeSource"]
+        leaf_scopes = ["modelSource", "formatsSource", "storeSource", "ingestSource", "captureSource", "apiSource", "runtimeSource", "webSource"]
         for name in leaf_scopes:
             self.assertFalse(any(path.startswith("desktop-ui/") for path in scope(name)))
             self.assertNotIn("src-tauri/src/browser_history.js", scope(name))
@@ -290,6 +290,24 @@ class DaggerContract(unittest.TestCase):
             self.assertIn(f'"bun", "tests/{test}"', CHECKS["browser"])
         self.assertIn('"ci/dagger/check", "-p", "test_*.py"', CHECKS["contracts"])
         self.assertIn('"cargo", "fmt", "--all", "--", "--check"', CHECKS["rustStyle"])
+
+    def test_server_image_uses_locked_cache_and_trusted_digest_publication(self):
+        image = MODULE.split("pub webImage:", 1)[1].split("pub publishWebImage(", 1)[0]
+        self.assertIn('rustBase', image)
+        self.assertIn('cargo build --locked --release -p chat-hub-web', image)
+        self.assertIn('.file("/web-binary")', image)
+        self.assertIn('ws.directory("/desktop-ui")', image)
+        self.assertIn('.withUser("10001:10001")', image)
+        publisher = (ROOT / ".github/workflows/publish-web-image.yml").read_text()
+        self.assertIn("workflows: [Checks]", publisher)
+        self.assertIn("run.get(\"conclusion\") != \"success\"", publisher)
+        self.assertIn("--token=env://GH_TOKEN", publisher)
+        self.assertIn("steps.publish-image.outputs.output", publisher)
+        self.assertIn("web_image_receipt.py", publisher)
+        self.assertIn('"health_endpoint": "/healthz"', (ROOT / "ci/scripts/web_image_receipt.py").read_text())
+        self.assertIn("webSmoke", CHECKS)
+        self.assertIn("web-image-smoke.py", CHECKS["webSmoke"])
+        self.assertTrue((MODULE_DIR / "web-image-smoke.py").is_file())
 
 
 if __name__ == "__main__":

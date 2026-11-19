@@ -2,12 +2,12 @@
 members = [
     ".", "src-tauri", "crates/chat-hub-model", "crates/chat-hub-formats",
     "crates/chat-hub-store", "crates/chat-hub-ingest", "crates/chat-hub-capture",
-    "crates/chat-hub-api", "crates/chat-hub-runtime",
+    "crates/chat-hub-api", "crates/chat-hub-runtime", "crates/chat-hub-web",
 ]
 default-members = [
     ".", "crates/chat-hub-model", "crates/chat-hub-formats", "crates/chat-hub-store",
     "crates/chat-hub-ingest", "crates/chat-hub-capture", "crates/chat-hub-api",
-    "crates/chat-hub-runtime",
+    "crates/chat-hub-runtime", "crates/chat-hub-web",
 ]
 resolver = "2"
 
