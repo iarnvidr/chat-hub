@@ -9,7 +9,17 @@ test('HTTP bridge rejects unsafe commands and exposes stable error codes',async(
 test('PWA auth and service worker keep private API data out of browser caches',()=>{const html=fs.readFileSync(require.resolve('../desktop-ui/index.html'),'utf8'),auth=fs.readFileSync(require.resolve('../desktop-ui/auth.js'),'utf8'),worker=fs.readFileSync(require.resolve('../desktop-ui/service-worker.js'),'utf8');assert.match(html,/type="password" autocomplete="current-password"/);assert.match(auth,/caps\.service_worker !== true/);assert.ok(worker.includes('api|auth'));assert.match(worker,/fetch\(request\)[\s\S]*?caches\.match\(request\)/);assert.doesNotMatch(auth,/localStorage|sessionStorage/);});
 test('alternate selection changes selected branch only',async()=>{const d=await fixtureAdapter().getConversation('cv-a','n-b');assert.equal(d.selection.source_current_node_id,'n-a');assert.equal(d.selection.selected_node_id,'n-b');});
 test('fallback detail is served only for its matching conversation id',async()=>{const a=fixtureAdapter(),d=await a.getConversation('cv-b');assert.equal(d.conversation.id,'cv-b');assert.equal(d.conversation.title,'Synthetic fallback');await assert.rejects(a.getConversation('missing'),/not found/i);});
-test('search dedupe uses opaque tuple identity, including null versus string null',()=>{const app=fs.readFileSync(require.resolve('../desktop-ui/app.js'),'utf8');assert.match(app,/JSON\.stringify\(\[x\.id,x\.search_node_id\]\)/);});
+test('search grouping keeps saved sources and null versus string null distinct',async()=>{
+  const {groupSearchConversations}=await import('../desktop-ui/search.js');
+  const title={id:'logical',search_conversation_id:'copy-a',search_node_id:null};
+  const rows=groupSearchConversations([title,
+    {...title,search_node_id:'null'},
+    {...title,search_conversation_id:'copy-b'},title]);
+  assert.equal(rows.length,1);
+  assert.deepEqual(rows[0].matching_hits.map(hit=>[hit.conversation_id,hit.node_id]),[
+    ['copy-a',null],['copy-a','null'],['copy-b',null],
+  ]);
+});
 test('import cancellation uses official fixture wrapper shape',()=>{const r=apiFixture('import-cancelled.json');assert.deepEqual(Object.keys(r),['cancelled','result']);assert.equal(r.cancelled,true);assert.equal(r.result,null);});
 test('official import receipt preserves truncation and error fields',()=>{const r=apiFixture('import-result.json');assert.equal(r.errors[0].code,'invalid_conversation');assert.equal(r.errors_truncated,false);});
 test('actual app uses normative search normalization and safe allowlisted errors',()=>{const app=fs.readFileSync(require.resolve('../desktop-ui/app.js'),'utf8');assert.match(app,/normalizeSearch/);assert.match(app,/safeError/);assert.doesNotMatch(app,/Could not load conversations: \$\{s\}/);});

@@ -34,6 +34,8 @@ Set project and project rename open anchored hover controls, with keyboard focus
 
 The Rust packages share one Cargo workspace and root lockfile. Stable conversation/catalog types live in `crates/chat-hub-model`; bounded import parsing and transcript decoding live in `crates/chat-hub-formats`. Their versions are independent of app releases. See [workspace and compiled-output reuse](docs/workspace-builds.md) for the CI build layout and cache policy.
 
+Imported and directly captured copies of the same upstream chat share one library identity. Search and indexed references retain access to every saved copy; see [saved history identity](docs/history-identity.md).
+
 Requires stable Rust, rustfmt, and Clippy.
 
 Install or update the Rust CLI locally:

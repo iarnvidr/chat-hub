@@ -20,8 +20,9 @@ class Element {
   getBoundingClientRect(){return {left:200,right:260,top:80,bottom:110,height:240,width:246};}
 }
 function environment(){const doc={events:{},createElement(tag){return new Element(tag,this);},createElementNS(ns,tag){return this.createElement(tag);},getElementById(id){return [this.body,...this.body.querySelectorAll('*')].find(n=>n.id===id)||this.status;},addEventListener(type,handler){(this.events[type]??=[]).push(handler);}};doc.body=new Element('body',doc);doc.status=new Element('div',doc);doc.status.id='app-status';doc.body.append(doc.status);const win={innerWidth:1100,innerHeight:760,events:{},addEventListener(type,fn){this.events[type]=fn;},dispatchEvent(){},navigator:{clipboard:{writeText:async()=>{}}}};return {doc,win};}
-const chat={id:'local-chat',source_id:'a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1',provider:'chatgpt',account_scope:'chatgpt:observed:owner',title:'A chat',pinned:false,archived:false};
-async function setup(invoke){const {createRowActions}=await import('../desktop-ui/row-actions.js');const {doc,win}=environment();let changed=0;const actions=createRowActions({doc,win,invoke,onChanged:()=>changed++});const primary=doc.createElement('button');primary.className='conversation-item';const row=actions.wrap(chat,primary);doc.body.append(row);return {doc,win,row,primary,actions,get changed(){return changed;},menu:doc.body.children.find(n=>n.id==='thread-actions-menu')};}
+const ownerScope='chatgpt:observed:'+'a'.repeat(64),otherScope='chatgpt:observed:'+'b'.repeat(64);
+const chat={id:'local-chat',source_id:'a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1',provider:'chatgpt',account_scope:ownerScope,title:'A chat',pinned:false,archived:false};
+async function setup(invoke,rowChat=chat){const {createRowActions}=await import('../desktop-ui/row-actions.js');const {doc,win}=environment();let changed=0;const actions=createRowActions({doc,win,invoke,onChanged:()=>changed++});const primary=doc.createElement('button');primary.className='conversation-item';const row=actions.wrap(rowChat,primary);doc.body.append(row);return {doc,win,row,primary,actions,get changed(){return changed;},menu:doc.body.children.find(n=>n.id==='thread-actions-menu')};}
 
 test('pin only refreshes after a verified native receipt; a rejection leaves the row unchanged',async()=>{
   let accept;const calls=[];const ui=await setup((command,args)=>{calls.push([command,args]);return new Promise(resolve=>accept=resolve);});
@@ -42,15 +43,15 @@ test('the single row action area opens one menu on hover and preserves pointer t
   await ui.menu.fire('pointerleave');await new Promise(resolve=>setTimeout(resolve,310));assert.equal(ui.menu.hidden,true);
 });
 test('project submenu includes No project and sends null with verified upstream scope',async()=>{
-  const calls=[];const ui=await setup(async(command,args)=>{calls.push([command,args]);if(command==='list_projects')return {projects:[{project_key:'project:["chatgpt","chatgpt:observed:owner","g-p-example"]',title:'Example'}]};return {scope:'upstream',verified:true,library_revision:4};});
+  const calls=[];const ui=await setup(async(command,args)=>{calls.push([command,args]);if(command==='list_projects')return {projects:[{project_key:`project:["chatgpt","${ownerScope}","g-p-example"]`,title:'Example'}]};return {scope:'upstream',verified:true,library_revision:4};});
   await ui.row.querySelector('.thread-more').fire('click');await ui.menu.querySelectorAll('button').find(n=>n.dataset.action==='project').fire('click');
   const choices=ui.menu.querySelectorAll('button').filter(n=>n.dataset.action==='choose-project');assert.equal(choices.length,2);await choices[0].fire('click');assert.equal(ui.changed,1);assert.deepEqual(calls.at(-1),['set_conversation_project',{conversationId:chat.id,projectKey:null,scope:'upstream'}]);
 });
 test('reader project picker is anchored, upstream-only, and filters other account scopes',async()=>{
   const calls=[];const ui=await setup(async(command,args)=>{calls.push([command,args]);return command==='list_projects'?{projects:[
-    {project_key:'project:["chatgpt","chatgpt:observed:owner","g-p-mine"]',title:'My project'},
-    {project_key:'project:["chatgpt","chatgpt:observed:other","g-p-other"]',title:'Other account'},
-    {project_key:'project:["paseo-codex_local","chatgpt:observed:owner","local"]',title:'Codex'}
+    {project_key:`project:["chatgpt","${ownerScope}","g-p-mine"]`,title:'My project'},
+    {project_key:`project:["chatgpt","${otherScope}","g-p-other"]`,title:'Other account'},
+    {project_key:`project:["paseo-codex_local","${ownerScope}","local"]`,title:'Codex'}
   ]}:{scope:'upstream',verified:true,library_revision:8};});
   const anchor=ui.doc.createElement('button');ui.doc.body.append(anchor);
   ui.win.events['chat-hub:open-project-picker']({detail:{chat,anchor,focus:false}});
@@ -59,7 +60,44 @@ test('reader project picker is anchored, upstream-only, and filters other accoun
   const choices=ui.menu.querySelectorAll('button').filter(n=>n.dataset.action==='choose-project');
   assert.deepEqual(choices.map(n=>n.children[1]?.textContent),['No project','My project']);
   await choices[1].fire('click');
-  assert.deepEqual(calls.at(-1),['set_conversation_project',{conversationId:chat.id,projectKey:'project:["chatgpt","chatgpt:observed:owner","g-p-mine"]',scope:'upstream'}]);
+  assert.deepEqual(calls.at(-1),['set_conversation_project',{conversationId:chat.id,projectKey:`project:["chatgpt","${ownerScope}","g-p-mine"]`,scope:'upstream'}]);
+});
+test('legacy-only chat uses only its validated current project scope for project choices',async()=>{
+  const legacy={...chat,provider:'paseo-chatgpt',account_scope:'paseo-cache:legacy-owner',project:{project_key:`project:["chatgpt","${ownerScope}","g-p-current"]`,project_id:'g-p-current'}};
+  const ui=await setup(async command=>command==='list_projects'?{projects:[
+    {project_key:`project:["chatgpt","${ownerScope}","g-p-current"]`,title:'Current project'},
+    {project_key:'project:["paseo-chatgpt","paseo-cache:legacy-owner","g-p-legacy-own"]',title:'Legacy project'},
+    {project_key:'project:["paseo-chatgpt","paseo-cache:other-owner","g-p-other-cache"]',title:'Other cache project'},
+    {project_key:`project:["chatgpt","${otherScope}","g-p-foreign"]`,title:'Foreign project'}
+  ]}:{scope:'upstream',verified:true,library_revision:9},legacy);
+  const anchor=ui.doc.createElement('button');ui.doc.body.append(anchor);
+  ui.win.events['chat-hub:open-project-picker']({detail:{chat:legacy,anchor,focus:false}});
+  await Promise.resolve();await Promise.resolve();
+  const choices=ui.menu.querySelectorAll('button').filter(n=>n.dataset.action==='choose-project');
+  assert.deepEqual(choices.map(n=>n.children[1]?.textContent),['No project','Current project','Legacy project']);
+});
+test('unmapped legacy chat keeps only exact cached-scope project options',async()=>{
+  const legacy={...chat,provider:'paseo-chatgpt',account_scope:'paseo-cache:legacy-owner'};
+  const ui=await setup(async command=>command==='list_projects'?{projects:[
+    {project_key:'project:["paseo-chatgpt","paseo-cache:legacy-owner","g-p-same-cache"]',title:'Same cache project'},
+    {project_key:'project:["paseo-chatgpt","paseo-cache:other-owner","g-p-other-cache"]',title:'Other cache project'},
+    {project_key:`project:["chatgpt","${ownerScope}","g-p-observed"]`,title:'Observed account project'}
+  ]}:{scope:'upstream',verified:true,library_revision:10},legacy);
+  await ui.row.querySelector('.thread-more').fire('click');
+  await ui.menu.querySelectorAll('button').find(n=>n.dataset.action==='project').fire('click');
+  const choices=ui.menu.querySelectorAll('button').filter(n=>n.dataset.action==='choose-project');
+  assert.deepEqual(choices.map(n=>n.children[1]?.textContent),['No project','Same cache project']);
+});
+test('observed chat scope stays authoritative over foreign current-project metadata',async()=>{
+  const observed={...chat,project:{project_key:`project:["chatgpt","${otherScope}","g-p-foreign"]`,project_id:'g-p-foreign'}};
+  const ui=await setup(async command=>command==='list_projects'?{projects:[
+    {project_key:`project:["chatgpt","${ownerScope}","g-p-current"]`,title:'Current project'},
+    {project_key:`project:["chatgpt","${otherScope}","g-p-foreign"]`,title:'Foreign project'}
+  ]}:{},observed);
+  await ui.row.querySelector('.thread-more').fire('click');
+  await ui.menu.querySelectorAll('button').find(n=>n.dataset.action==='project').fire('click');
+  const choices=ui.menu.querySelectorAll('button').filter(n=>n.dataset.action==='choose-project');
+  assert.deepEqual(choices.map(n=>n.children[1]?.textContent),['No project','Current project']);
 });
 test('closing a project request before it resolves cannot reopen an old row menu',async()=>{
   let finish;const ui=await setup(()=>new Promise(resolve=>finish=resolve));await ui.row.querySelector('.thread-more').fire('click');const request=ui.menu.querySelectorAll('button').find(n=>n.dataset.action==='project').fire('click');ui.actions.close();finish({projects:[]});await request;assert.equal(ui.menu.hidden,true);assert.equal(ui.menu.children.length,0);
