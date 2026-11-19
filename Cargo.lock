@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "chat-hub"
-version = "0.2.6"
+version = "0.2.5"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "chat-hub-desktop"
-version = "0.2.6"
+version = "0.2.5"
 dependencies = [
  "axum",
  "block2",
