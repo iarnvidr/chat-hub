@@ -34,6 +34,28 @@ into chat, issue text, URLs, or logs. Set `CHAT_HUB_WEB_TOKEN_FILE` to choose
 another private path. Removing the file does not rotate a running server's
 token; restart the server after rotating it.
 
+## Preview behind a trusted proxy
+
+To let an owner-only tailnet proxy handle access, set
+`CHAT_HUB_WEB_AUTH=none` and bind the backend to loopback. The app opens directly
+to the library in this mode, and the dev command skips token-file creation.
+The server rejects wildcard and non-loopback binds in this mode.
+
+```sh
+CHAT_HUB_DATABASE=/path/to/restored/chat-hub.sqlite3 \
+  CHAT_HUB_WEB_AUTH=none CHAT_HUB_WEB_ADDR=127.0.0.1:8080 \
+  CHAT_HUB_WEB_ORIGIN=http://preview.example.test:5173 scripts/dev-web.sh
+```
+
+Set `CHAT_HUB_WEB_ORIGIN` to the exact browser origin, including a nondefault
+port, and configure the private proxy to preserve the browser's Host and
+Origin headers. Omit it for direct access at `http://127.0.0.1:8080`.
+Anyone who can reach the backend using that origin can read the library.
+Enforce the owner-only access gate at the proxy before exposing the preview.
+Omit `CHAT_HUB_WEB_AUTH` or set it to `token` to require app login.
+
+## Preview with app login
+
 Open the configured HTTPS dev-container preview URL from the owner browser. The
 preview must preserve the public Host header for sign-in. Session cookies use
 Secure by default. To test sign-in over plain HTTP on the same machine, bind to
