@@ -2,6 +2,7 @@
 import unittest
 import json
 import os
+import runpy
 import subprocess
 import tarfile
 import tempfile
@@ -97,13 +98,36 @@ class ProductionContract(unittest.TestCase):
         self.assertIn('--mapping-run-id "$GITHUB_RUN_ID"', mapping)
 
     def test_native_actions_trigger_main_acceptance_and_ship_in_corresponding_source(self):
-        native_scope = (ROOT / "build/native_scope.py").read_text()
+        native_scope = runpy.run_path(str(ROOT / "build/native_scope.py"))
         acceptance = (ROOT / ".github/workflows/accept-native.yml").read_text()
-        sources = (ROOT / "build/release_sources.py").read_text()
-        self.assertIn("'ci/actions/**'", native_scope)
-        self.assertIn('"ci/actions/**"', acceptance)
-        self.assertIn('"ci/actions"', sources)
-        self.assertIn('".github/workflows"', sources)
+        trigger = acceptance.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
+        # Native acceptance now runs on EVERY main merge. A changed-path filter
+        # would suppress a release for documentation-only changes.
+        self.assertIn("push:", trigger)
+        self.assertIn("branches: [main]", trigger)
+        self.assertNotIn("paths:", trigger)
+        self.assertNotIn("paths-ignore:", trigger)
+        source_helpers = runpy.run_path(str(ROOT / "build/release_sources.py"))
+        sources = {relative for relative, _ in source_helpers["_source_files"](ROOT)}
+        for path in (
+            "ci/actions/gha-artifact-upload/main.go",
+            "ci/actions/macos-native-build/action.yml",
+            "ci/dagger/check/main.dang",
+            "ci/dagger/check/dagger-module.toml",
+            "dagger.toml",
+            ".github/workflows/check.yml",
+            "tests/fixtures/chatgpt-export/array.json",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(native_scope["requires_native"]([path]))
+                self.assertIn(path, sources)
+        # Rust toolchain changes still invalidate the narrower PR-native scope.
+        for path in ("rust-toolchain", "rust-toolchain.toml", ".cargo/config.toml"):
+            with self.subTest(path=path):
+                self.assertTrue(native_scope["requires_native"]([path]))
+        # Documentation-only changes remain out of PR-native scope, but the
+        # unconditional main acceptance builds them for release.
+        self.assertFalse(native_scope["requires_native"](["docs/UPDATES.md"]))
 
     def test_workflow_checkouts_fetch_the_immutable_event_sha(self):
         files = [*ROOT.joinpath(".github/workflows").glob("*.yml"),

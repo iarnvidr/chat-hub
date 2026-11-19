@@ -1,0 +1,40 @@
+name: Publish reusable CI data
+on:
+  workflow_run:
+    workflows: [Checks]
+    types: [completed]
+permissions:
+  contents: read
+  actions: read
+  packages: write
+concurrency:
+  group: chat-hub-ci-data-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'pull_request' ||
+       (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      # workflow_run and GITHUB_SHA refer to the trusted default-branch workflow.
+      # Never check out the triggering PR, execute downloaded data, or import a
+      # PR-authored Dockerfile in this package-write job.
+      - name: Fetch the exact trusted publisher revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA"
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
+      - name: Publish validated inert cache archives and distinct green evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          oras="$(bash build/install-oras.sh "$RUNNER_TEMP/chat-hub-publisher-oras")"
+          python3 ci/scripts/oci_cache.py publish --event "$GITHUB_EVENT_PATH" --oras "$oras"

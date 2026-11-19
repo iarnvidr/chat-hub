@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -90,25 +91,32 @@ class ReleaseContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "root"
             root.mkdir()
-            for name in ("LICENSE", "NOTICE", "README.md", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
+            for name in ("LICENSE", "NOTICE", "README.md", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "dagger.toml", "dagger.lock"):
                 (root / name).write_text(name)
             for directory, files in {
+                ".cargo": ["config.toml", "credentials.toml"],
                 "src": ["main.rs"], "src-tauri": ["Cargo.toml", "tauri.conf.json", "Info.plist", "src/main.rs", "icons/icon.png"],
                 "crates/chat-hub-model": ["Cargo.toml", "src/lib.rs"],
                 "crates/chat-hub-formats": ["Cargo.toml", "src/lib.rs"],
+                "crates/chat-hub-store": ["Cargo.toml", "src/lib.rs"],
                 "desktop-ui": ["index.html"], "build": ["build-native-macos.sh"],
                 "ci/actions/macos-native-build": ["action.yml"],
                 "ci/actions/gha-artifact-upload": ["action.yml", "main.go"],
-                "ci/scripts": ["compiled_cache.py"],
+                "ci/scripts": ["compiled_cache.py", "run-rust.sh"],
+                "ci/dagger/check": ["dagger-module.toml", "main.dang"],
+                "tests": ["window_policy.rs", "fixtures/chatgpt-export/array.json"],
+                "tools": ["paseo_cache_export.py"],
+                "docs": ["api-v1-contract.md"],
                 ".github/workflows": ["macos.yml", "accept-native.yml"],
             }.items():
                 for name in files:
                     path = root / directory / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(name)
-            for directory in ("target", ".tools", ".git"):
+            (root / "ci/scripts/run-rust.sh").chmod(0o755)
+            for directory in ("target", ".tools", ".git", "ci/cache/linux-cargo", "ci/dagger/check/target"):
                 path = root / directory
-                path.mkdir()
+                path.mkdir(parents=True)
                 (path / "secret.tmp").write_text("exclude")
             (root / "src" / "escape").symlink_to(root / "NOTICE")
             out = Path(tmp) / "source"
@@ -120,6 +128,7 @@ class ReleaseContracts(unittest.TestCase):
                 "src/main.rs", "src-tauri/Cargo.toml",
                 "crates/chat-hub-model/Cargo.toml", "crates/chat-hub-model/src/lib.rs",
                 "crates/chat-hub-formats/Cargo.toml", "crates/chat-hub-formats/src/lib.rs",
+                "crates/chat-hub-store/Cargo.toml", "crates/chat-hub-store/src/lib.rs",
                 "src-tauri/tauri.conf.json", "src-tauri/Info.plist",
                 "src-tauri/src/main.rs", "src-tauri/icons/icon.png",
                 "desktop-ui/index.html", "build/build-native-macos.sh",
@@ -127,16 +136,39 @@ class ReleaseContracts(unittest.TestCase):
                 "ci/actions/gha-artifact-upload/action.yml",
                 "ci/actions/gha-artifact-upload/main.go",
                 "ci/scripts/compiled_cache.py",
+                "ci/scripts/run-rust.sh", "ci/dagger/check/dagger-module.toml", "ci/dagger/check/main.dang",
+                "tests/window_policy.rs", "tests/fixtures/chatgpt-export/array.json",
+                "tools/paseo_cache_export.py", "docs/api-v1-contract.md",
                 ".github/workflows/macos.yml", ".github/workflows/accept-native.yml",
-                "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
+                "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "dagger.toml", "dagger.lock",
+                ".cargo/config.toml",
                 "LICENSE", "NOTICE",
             }.issubset(paths))
             self.assertFalse(any(path.startswith((".git/", "target/", ".tools/")) for path in paths))
+            self.assertFalse(any(path.startswith(("ci/cache/", "ci/dagger/check/target/")) for path in paths))
             self.assertNotIn("src/escape", paths)
+            self.assertNotIn(".cargo/credentials.toml", paths)
+            self.assertEqual((out / "ci/scripts/run-rust.sh").stat().st_mode & 0o777, 0o755)
             for item in manifest["files"]:
                 self.assertEqual(hashlib.sha256((out / item["path"]).read_bytes()).hexdigest(), item["sha256"])
             with self.assertRaises(FileExistsError):
                 release_sources.prepare(out, root)
+
+    def test_corresponding_sources_include_every_workspace_package_and_native_fixture(self):
+        paths = {relative for relative, _ in release_sources._source_files(ROOT)}
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        for member in manifest["workspace"]["members"]:
+            roots = [ROOT] if member == "." else list(ROOT.glob(member))
+            self.assertTrue(roots, f"workspace member has no source directory: {member}")
+            for package_root in roots:
+                relative = (package_root / "Cargo.toml").relative_to(ROOT).as_posix()
+                self.assertIn(relative, paths)
+                for source in (package_root / "src").rglob("*.rs"):
+                    self.assertIn(source.relative_to(ROOT).as_posix(), paths)
+        self.assertIn("tests/fixtures/chatgpt-export/array.json", paths)
+        self.assertIn("ci/dagger/check/dagger-module.toml", paths)
+        self.assertIn("ci/dagger/check/main.dang", paths)
+        self.assertIn("dagger.toml", paths)
 
 
 if __name__ == "__main__":

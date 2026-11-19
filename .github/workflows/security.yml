@@ -27,12 +27,23 @@ jobs:
           set -euo pipefail
           archive="gitleaks_${VERSION}_linux_x64.tar.gz"
           base="https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}"
-          curl --fail --location "$base/$archive" -o "$archive"
-          curl --fail --location "$base/gitleaks_${VERSION}_checksums.txt" -o checksums.txt
-          grep "  $archive$" checksums.txt | sha256sum --check
-          tar -xzf "$archive" gitleaks
           mkdir -p "$HOME/.local/bin"
-          install gitleaks "$HOME/.local/bin/gitleaks"
+          if curl --fail --location --retry 2 "$base/$archive" -o "$archive" \
+            && curl --fail --location --retry 2 "$base/gitleaks_${VERSION}_checksums.txt" -o checksums.txt \
+            && grep "  $archive$" checksums.txt | sha256sum --check; then
+            tar -xzf "$archive" gitleaks
+            install gitleaks "$HOME/.local/bin/gitleaks"
+          else
+            # GitHub's release-asset CDN has repeatedly returned HTTP 504.
+            # Use Go's checksum-verified, exact-version official module instead;
+            # never silently skip the secret scan or fetch a floating version.
+            echo 'Pinned release asset unavailable; building pinned Gitleaks source via Go module checksum database.'
+            mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+            GOBIN="$RUNNER_TEMP/gitleaks-bin" GOSUMDB=sum.golang.org GOTOOLCHAIN=auto \
+              go install "github.com/zricethezav/gitleaks/v8@v${VERSION}"
+            install "$RUNNER_TEMP/gitleaks-bin/gitleaks" "$HOME/.local/bin/gitleaks"
+          fi
+          "$HOME/.local/bin/gitleaks" version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: gitleaks detect --source . --no-git --redact
   dependency-review:

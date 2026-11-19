@@ -263,7 +263,7 @@ class TrustedWriterTests(unittest.TestCase):
                     "os.environ", {"GITHUB_REF": ref, "GITHUB_EVENT_NAME": event, "GITHUB_RUN_ID": "123"}, clear=True):
                 self.assertFalse(compiled_cache.trusted_main_writer())
 
-    def test_workflows_make_cache_readable_to_prs_but_writable_only_from_main_jobs(self):
+    def test_native_sccache_remains_read_only_for_prs_and_written_only_on_main(self):
         macos = (ROOT / ".github/workflows/macos.yml").read_text()
         pr_job = macos.split("  package-pr:", 1)[1].split("  package-main:", 1)[0]
         main_job = macos.split("  package-main:", 1)[1].split("  artifact-transfer:", 1)[0]
@@ -274,25 +274,63 @@ class TrustedWriterTests(unittest.TestCase):
         self.assertIn("mode: publish", main_job)
 
         accept = (ROOT / ".github/workflows/accept-native.yml").read_text()
-        seed_job = accept.split("  linux-cache-seed:", 1)[1].split("  artifact-transfer:", 1)[0]
-        self.assertIn("if: github.ref == 'refs/heads/main'", seed_job)
-        self.assertIn("packages: write", seed_job)
-        self.assertIn("seed-linux-cache", seed_job)
+        native_job = accept.split("  native-build:", 1)[1].split("  artifact-transfer:", 1)[0]
+        self.assertIn("branches: [main]", accept)
+        self.assertIn("packages: write", native_job)
+        self.assertIn("mode: publish", native_job)
+        self.assertNotIn("linux-cache-seed", accept)
+
+    def test_linux_uses_one_native_dagger_graph_and_failure_independent_cache_export(self):
+        checks = (ROOT / ".github/workflows/check.yml").read_text()
+        self.assertIn("  pull_request:", checks)
+        self.assertIn("    branches: [main]", checks)
+        self.assertIn("  contracts:", checks)
+        self.assertIn("packages: read", checks)
+        self.assertNotIn("packages: write", checks)
+        self.assertIn("oci_cache.py restore", checks)
+        dagger_step = checks.split("      - id: dagger-checks\n", 1)[1].split("      - id: cargo-export\n", 1)[0]
+        self.assertIn("version: 1.0.0-beta.25", dagger_step)
+        self.assertIn("verb: check", dagger_step)
+        self.assertIn("dagger-flags: --progress logs", dagger_step)
+        self.assertNotIn("GH_TOKEN", dagger_step)
+        self.assertNotIn("registry-token", dagger_step)
+        export_step = checks.split("      - id: cargo-export\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("always()", export_step)
+        self.assertIn("!cancelled()", export_step)
+        self.assertIn("dagger -m ci/dagger/check api call export-cargo-cache", export_step)
+        self.assertIn('--nonce "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"', export_step)
+        self.assertIn("oci_cache.py pack", checks)
+        receipt = checks.split("      - name: Record the exact successful PR check receipt\n", 1)[1]
+        self.assertIn("success()", receipt)
+        self.assertIn("steps.dagger-checks.outcome == 'success'", receipt)
 
         manual_ci = (ROOT / ".github/workflows/ci.yml").read_text()
-        rust_job = manual_ci.split("  rust:", 1)[1].split("  browser:", 1)[0]
-        self.assertIn("packages: read", rust_job)
-        self.assertIn("cached-linux-checks", rust_job)
-        self.assertIn("--registry-token env:GH_TOKEN", rust_job)
+        self.assertIn("uses: ./.github/workflows/check.yml", manual_ci)
+        self.assertNotIn("cargo test", manual_ci)
+        self.assertNotIn("  rust:", manual_ci)
+        self.assertNotIn("  browser:", manual_ci)
+        # Built-in Node actions are not needed for host-side archive transport.
+        for workflow in (checks, manual_ci):
+            self.assertNotRegex(workflow, r"uses:\s+actions/(cache|upload-artifact|download-artifact)@")
 
-    def test_dagger_removes_cache_secret_before_any_cargo_command(self):
-        dagger_source = (ROOT / "ci/dagger/check/main.go").read_text()
-        cargo_start = dagger_source.index('WithExec([]string{"cargo", "fmt"')
-        pull_secret_removal = dagger_source.index('WithoutSecretVariable("GH_TOKEN")')
-        guard = dagger_source.index('${GH_TOKEN+x}')
-        self.assertLess(pull_secret_removal, cargo_start)
-        self.assertLess(guard, cargo_start)
-        self.assertIn('WithoutEnvVariable("GH_TOKEN")', dagger_source[pull_secret_removal:cargo_start])
+    def test_linux_package_publisher_is_trusted_default_branch_and_data_only(self):
+        publisher = (ROOT / ".github/workflows/publish-ci-cache.yml").read_text()
+        self.assertIn("workflow_run:", publisher)
+        self.assertIn("workflows: [Checks]", publisher)
+        self.assertIn("types: [completed]", publisher)
+        self.assertIn("packages: write", publisher)
+        self.assertIn("head_repository.full_name == github.repository", publisher)
+        self.assertIn('checkout --quiet --detach "$GITHUB_SHA"', publisher)
+        self.assertIn('oci_cache.py publish --event "$GITHUB_EVENT_PATH"', publisher)
+        self.assertNotIn("workflow_run.head_sha", publisher)
+        self.assertNotIn("cargo test", publisher)
+        self.assertNotIn("docker build", publisher)
+
+    def test_dagger_validation_does_not_receive_registry_credentials(self):
+        dagger_source = (ROOT / "ci/dagger/check/main.dang").read_text()
+        self.assertNotIn("withSecretVariable", dagger_source)
+        self.assertNotIn("registryToken", dagger_source)
+        self.assertNotIn("GH_TOKEN", dagger_source)
 
 
 class CachePublisherTests(unittest.TestCase):

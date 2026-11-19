@@ -1,0 +1,21 @@
+[package]
+name = "chat-hub-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+chat-hub-model = { path = "../chat-hub-model", version = "0.1.0" }
+chat-hub-store = { path = "../chat-hub-store", version = "0.1.0" }
+chat-hub-capture = { path = "../chat-hub-capture", version = "0.1.0" }
+chat-hub-api = { path = "../chat-hub-api", version = "0.2.5" }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+
+[dev-dependencies]
+chat-hub-api = { path = "../chat-hub-api", version = "0.2.5", features = ["test-support"] }
+tower = { version = "0.5", features = ["util"] }

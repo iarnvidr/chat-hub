@@ -17,8 +17,14 @@ class NativeScopeTests(unittest.TestCase):
                      'ci/actions/gha-artifact-upload/main.go',
                      'crates/chat-hub-model/src/store.rs',
                      'crates/chat-hub-formats/Cargo.toml',
+                     'crates/chat-hub-store/src/lib.rs',
+                     'ci/dagger/check/main.dang',
+                     'ci/dagger/check/dagger-module.toml',
                      'ci/scripts/compiled_cache.py',
-                     'Cargo.lock', 'tests/native/launch.sh'):
+                     'dagger.toml', 'dagger.lock',
+                     '.cargo/config.toml', 'rust-toolchain',
+                     'Cargo.lock', 'tests/native/launch.sh',
+                     'tests/fixtures/chatgpt-export/array.json'):
             with self.subTest(path=path):
                 self.assertTrue(native_scope.requires_native([path]))
 

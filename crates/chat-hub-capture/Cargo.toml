@@ -1,0 +1,33 @@
+[package]
+name = "chat-hub-capture"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+chat-hub-model = { path = "../chat-hub-model", version = "0.1.0" }
+chat-hub-formats = { path = "../chat-hub-formats", version = "0.1.0" }
+base64 = "0.22"
+flate2 = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server", "http1"] }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+ring = "0.17"
+# Capture explicitly selects rustls's ring CryptoProvider. A per-crate Dagger
+# build must not rely on another workspace package enabling this feature.
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+
+[dev-dependencies]
+# Persistence is only a test adapter. Production capture knows the model's
+# ObservationSink contract, never a database or the application runtime.
+chat-hub-store = { path = "../chat-hub-store", version = "0.1.0" }
+x509-parser = "0.16"

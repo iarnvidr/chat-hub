@@ -1,19 +1,9 @@
-pub mod archive;
-pub mod artifacts;
-pub mod ca;
-pub mod capture;
-pub mod capture_lane;
-pub mod catalog;
-pub mod config;
-pub mod error;
-pub mod importer;
-pub mod library_export;
-pub mod live_capture;
-pub mod proxy;
-mod request_identity;
-pub mod runtime;
-pub mod server;
-pub mod service;
-pub mod store;
-
-// Proxy integration contract: proxy::run(ProxyConfig) -> Result<()>; kept unreferenced until available.
+//! Stable public facade and CLI composition for the modular Chat Hub workspace.
+//!
+//! Implementations live in their owning crates. These reexports preserve the
+//! desktop and integration-test API without duplicating a second application core.
+pub use chat_hub_api::server;
+pub use chat_hub_capture::{ca, capture_lane, live_capture, proxy};
+pub use chat_hub_ingest::importer;
+pub use chat_hub_runtime::{config, runtime, service};
+pub use chat_hub_store::{archive, artifacts, capture, catalog, error, library_export, store};

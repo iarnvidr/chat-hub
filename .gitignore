@@ -11,3 +11,4 @@
 *.sqlite3
 *.db
 .DS_Store
+/desktop-ui/build-identity.json

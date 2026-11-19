@@ -1,4 +1,9 @@
-"""Execute production authorization policy and panic hook without desktop dependencies."""
+"""Execute production authorization policy and panic hook without desktop dependencies.
+
+Parsed-URL behavior is exercised by tests/window_policy.rs in the root crate's
+normal Cargo test target. Do not recursively launch Cargo here: Dagger's cliTests
+already executes that target with the shared compiler cache and source closure.
+"""
 import pathlib
 import subprocess
 import sys
@@ -18,15 +23,6 @@ class WindowPolicyTests(unittest.TestCase):
             binary.chmod(0o700)
             result = subprocess.run(["bash", "-c", '"$1"', "runner", str(binary)], text=True, capture_output=True, check=True, timeout=30)
             self.assertIn("2 passed", result.stdout)
-
-    def test_parsed_urls_execute_production_policy(self):
-        result = subprocess.run(
-            ["cargo", "test", "--locked", "--manifest-path", str(ROOT / "Cargo.toml"), "--test", "window_policy"],
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_native_main_ownership_wiring_is_single_and_post_build(self):
         source = (ROOT / "src-tauri/src/main.rs").read_text()

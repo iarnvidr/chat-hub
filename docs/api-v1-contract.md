@@ -1,6 +1,6 @@
 # API v1 contract
 
-**Status: normative contract; fixtures are not endpoint/readiness evidence.** The API v1 implementation now exists in `src/server/api_v1.rs`; this document and its synthetic [fixtures](../tests/fixtures/api-v1/README.md) do not independently prove runtime behavior or readiness. The [shared normalization contract](SERVICE-NORMALIZATION-CONTRACT.md) remains applicable to its broader proposed requirements; this document specifies the initial single-account API projection.
+**Status: normative contract; fixtures are not endpoint/readiness evidence.** The API v1 implementation now exists in `crates/chat-hub-api/src/server/api_v1.rs`; this document and its synthetic [fixtures](../tests/fixtures/api-v1/README.md) do not independently prove runtime behavior or readiness. The [shared normalization contract](SERVICE-NORMALIZATION-CONTRACT.md) remains applicable to its broader proposed requirements; this document specifies the initial single-account API projection.
 
 ## Transport and compatibility
 

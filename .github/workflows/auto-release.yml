@@ -1,0 +1,114 @@
+name: Publish accepted Chat Hub merge build
+
+# Preview identity differs from the embedded base version. Never touch stable updates.
+on:
+  workflow_run:
+    workflows: ["Map accepted Chat Hub macOS artifact"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      acceptance_run_id:
+        description: Successful main acceptance run ID for retry/backfill
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: merge-release-${{ github.event.workflow_run.head_sha || inputs.acceptance_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - id: source
+        name: Authenticate exact successful trusted-main acceptance run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPT_RUN_ID: ${{ github.event.workflow_run.id || inputs.acceptance_run_id }}
+          EVENT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$ACCEPT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ACCEPT_RUN_ID" > "$RUNNER_TEMP/run.json"
+          python3 - "$RUNNER_TEMP/run.json" "$ACCEPT_RUN_ID" "$EVENT_SHA" "$GITHUB_OUTPUT" <<'PY'
+          import json,re,sys,os
+          run=json.load(open(sys.argv[1]))
+          repo=os.environ['GITHUB_REPOSITORY'].lower()
+          if (run.get('id')!=int(sys.argv[2])
+              or run.get('name')!='Map accepted Chat Hub macOS artifact'
+              or run.get('path')!='.github/workflows/accept-native.yml'
+              or run.get('status')!='completed' or run.get('conclusion')!='success'
+              or run.get('event')!='push' or run.get('head_branch')!='main'
+              or (run.get('repository') or {}).get('full_name','').lower()!=repo
+              or (run.get('head_repository') or {}).get('full_name','').lower()!=repo):
+              raise SystemExit('Acceptance must be a successful protected-main push run')
+          sha=run.get('head_sha','')
+          if not re.fullmatch('[a-f0-9]{40}',sha) or (sys.argv[3] and sys.argv[3]!=sha):
+              raise SystemExit('Acceptance SHA does not match the triggering event')
+          with open(sys.argv[4],'a') as f:
+              f.write('sha='+sha+'\n')
+              f.write('run_id='+str(run['id'])+'\n')
+          PY
+      - name: Checkout only the accepted commit from protected main history
+        env:
+          ACCEPT_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$GITHUB_WORKSPACE" fetch --no-tags origin refs/heads/main
+          git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$ACCEPT_SHA" FETCH_HEAD
+          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$ACCEPT_SHA"
+      - name: Restore exact accepted ZIP and DMG; do not rebuild
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPT_RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import json;print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          python3 build/release_artifact.py retrieve --root "$GITHUB_WORKSPACE" \
+            --tag "v$version" --mapping-run-id "$ACCEPT_RUN_ID"
+      - name: Verify source binding and prepare uniquely named preview assets
+        env:
+          ACCEPT_SHA: ${{ steps.source.outputs.sha }}
+          ACCEPT_RUN_ID: ${{ steps.source.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          python3 build/merge_preview.py --root "$GITHUB_WORKSPACE" \
+            --sha "$ACCEPT_SHA" --run-id "$ACCEPT_RUN_ID"
+      - name: Create commit-addressed GitHub prerelease without overwriting
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPT_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="merge-$ACCEPT_SHA"
+          preview="$(python3 -c 'import json;print(json.load(open("artifacts/build-info.json"))["display_version"])')"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+            test "$sha" = "$ACCEPT_SHA"
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/release.json"
+            python3 build/merge_preview.py --root "$GITHUB_WORKSPACE" \
+              --sha "$ACCEPT_SHA" --verify-existing "$RUNNER_TEMP/release.json"
+          else
+            gh release create "$tag" \
+              "artifacts/Chat_Hub_${preview}_macos-arm64.zip" \
+              "artifacts/Chat_Hub_${preview}_macos-arm64.dmg" \
+              artifacts/SHA256SUMS artifacts/build-info.json \
+              --repo "$GITHUB_REPOSITORY" --target "$ACCEPT_SHA" \
+              --title "Chat Hub $preview" \
+              --notes-file artifacts/merge-notes.md --prerelease --latest=false
+          fi
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag" >> "$GITHUB_STEP_SUMMARY"

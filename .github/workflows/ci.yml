@@ -3,56 +3,10 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  actions: write
+  packages: read
+# The manual entrypoint uses the same graph as PR/main validation.
+# Do not copy Cargo/Bun/browser commands into a second pipeline.
 jobs:
-  rust:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - name: Fetch exact workflow revision
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          git init --quiet "$GITHUB_WORKSPACE"
-          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA"
-          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
-      - name: Linux Rust and desktop UI checks
-        uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
-        env:
-          GH_TOKEN: ${{ github.token }}
-        with:
-          version: 0.21.11
-          verb: call
-          module: ./ci/dagger/check
-          args: >-
-            cached-linux-checks --source . --registry-token env:GH_TOKEN
-            --repository ${{ github.repository }} --event-name ${{ github.event_name }}
-            --ref ${{ github.ref }} --actor ${{ github.actor }}
-            --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }} --sha ${{ github.sha }}
-  browser:
-    name: Desktop UI browser (Linux)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: Fetch exact workflow revision
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          git init --quiet "$GITHUB_WORKSPACE"
-          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git -C "$GITHUB_WORKSPACE" -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --no-tags origin "$GITHUB_SHA"
-          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
-      - name: Browser-test desktop UI on Linux
-        uses: dagger/dagger-for-github@496f1b3d8b0d823834c13e67cf8a8e08ca3b9602
-        with:
-          version: 0.21.11
-          verb: call
-          module: ./ci/dagger/check
-          args: browser-checks --source .
+  checks:
+    uses: ./.github/workflows/check.yml

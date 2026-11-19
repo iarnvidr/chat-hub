@@ -1,0 +1,59 @@
+name: Audit or remove an obsolete empty release draft
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Exact numeric release ID (not a tag ID)
+        required: true
+        type: string
+      confirm_tag:
+        description: Exact tag of the obsolete draft, for example v0.2.0
+        required: true
+        type: string
+      delete:
+        description: Delete this validated empty draft; leave false to audit only
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: cleanup-release-draft-${{ inputs.release_id }}
+  cancel-in-progress: false
+jobs:
+  cleanup:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Use protected-main cleanup policy
+        run: |
+          set -euo pipefail
+          git init --quiet "$GITHUB_WORKSPACE"
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --depth=1 origin refs/heads/main
+          git checkout --quiet --detach FETCH_HEAD
+      - name: Audit and optionally remove only the selected empty obsolete draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          CONFIRM_TAG: ${{ inputs.confirm_tag }}
+          DELETE_DRAFT: ${{ inputs.delete }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest.json"
+          validate() {
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$RUNNER_TEMP/draft.json"
+            python3 build/release_drafts.py --draft "$RUNNER_TEMP/draft.json" \
+              --latest "$RUNNER_TEMP/latest.json" --release-id "$RELEASE_ID" --tag "$CONFIRM_TAG"
+          }
+          validate
+          if [ "$DELETE_DRAFT" = true ]; then
+            validate
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+            echo "Deleted validated obsolete empty draft $RELEASE_ID. No Git tag was deleted." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Audit only: draft $RELEASE_ID is obsolete and has no uploaded assets. Nothing was deleted." >> "$GITHUB_STEP_SUMMARY"
+          fi

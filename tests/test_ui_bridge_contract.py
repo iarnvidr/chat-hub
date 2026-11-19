@@ -220,7 +220,7 @@ class UiBridgeContract(unittest.TestCase):
         self.assertIn("focus_id.as_deref()", body)
         api = (ROOT / "src-tauri/src/desktop_api.rs").read_text()
         self.assertIn('query.push(("focus_id", focus_id.to_owned()))', api)
-        server = (ROOT / "src/server/api_v1.rs").read_text()
+        server = (ROOT / "crates/chat-hub-api/src/server/api_v1.rs").read_text()
         self.assertRegex(server, r"store\.catalog_neighborhood_tagged\(\s*focus_id,\s*&source,\s*project_key\.as_deref\(\),\s*tag\.as_deref\(\),\s*limit,?\s*\)")
 
     def test_guard_requires_live_native_main_ownership_and_local_origin(self):
