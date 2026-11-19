@@ -108,7 +108,7 @@ type ChatHubCi {
       .withDirectory("/crates/chat-hub-runtime", ws.directory("/crates/chat-hub-runtime"))
   }
   let webSource: Directory! {
-    runtimeSource.withDirectory("/crates/chat-hub-web", ws.directory("/crates/chat-hub-web"))
+    apiSource.withDirectory("/crates/chat-hub-web", ws.directory("/crates/chat-hub-web"))
   }
   let rootLibSource: Directory! {
     runtimeSource.withDirectory("/src", ws.directory("/src"))

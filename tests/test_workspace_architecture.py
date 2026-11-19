@@ -17,6 +17,7 @@ EXPECTED_EDGES = {
     "chat-hub-ingest": {"chat-hub-store", "chat-hub-formats"},
     "chat-hub-capture": {"chat-hub-model", "chat-hub-formats"},
     "chat-hub-api": {"chat-hub-model", "chat-hub-store", "chat-hub-ingest"},
+    "chat-hub-web": {"chat-hub-api", "chat-hub-store"},
     "chat-hub-runtime": {
         "chat-hub-model", "chat-hub-store", "chat-hub-capture", "chat-hub-api"
     },
@@ -57,7 +58,8 @@ class WorkspaceArchitecture(unittest.TestCase):
         for name in EXPECTED_EDGES:
             with self.subTest(crate=name):
                 path, document = self.packages[name]
-                self.assertTrue((path.parent / "src/lib.rs").is_file())
+                entry_point = "main.rs" if name == "chat-hub-web" else "lib.rs"
+                self.assertTrue((path.parent / "src" / entry_point).is_file())
                 self.assertFalse(document["package"].get("publish", True))
 
     def test_production_edges_are_explicit_and_point_towards_lower_layers(self):

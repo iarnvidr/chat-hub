@@ -142,13 +142,13 @@ class CrateArtifactTests(unittest.TestCase):
              mock.patch.object(cache, "fetch_registry_bundle", side_effect=fetch):
             outcomes = crates.restore(destination, "fake-oras", root_copy)
         for name in ("chat-hub-model", "chat-hub-formats", "chat-hub-store",
-                     "chat-hub-ingest", "chat-hub-api"):
+                     "chat-hub-ingest", "chat-hub-api", "chat-hub-web"):
             self.assertIn("installed", outcomes[name], name)
             self.assertEqual((destination / "target/abi-123/debug/deps" /
                               f"lib{name.replace('-', '_')}-12345678.rlib").read_bytes(), name.encode())
         for name in ("chat-hub-capture", "chat-hub-runtime", "chat-hub", "chat-hub-desktop"):
             self.assertIn("miss", outcomes[name], name)
-        self.assertEqual(len(list((destination / "target/abi-123/debug/deps").glob("*.rlib"))), 5)
+        self.assertEqual(len(list((destination / "target/abi-123/debug/deps").glob("*.rlib"))), 6)
 
     @unittest.skipUnless(shutil.which("zstd"), "zstd is unavailable")
     def test_restore_rejects_cross_crate_paths_and_does_not_overwrite(self):
