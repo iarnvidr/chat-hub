@@ -141,7 +141,7 @@ jobs:
       # closure. Cargo still verifies fingerprint freshness after each restore;
       # the full snapshot provides shared third-party dependency objects.
       - id: crate-pack
-        name: Extract separately addressable compiled outputs for all nine crates
+        name: Extract separately addressable compiled outputs for all workspace crates
         if: ${{ success() && steps.dagger-checks.outcome == 'success' && steps.cargo-archive.outcome == 'success' }}
         run: >-
           python3 ci/scripts/crate_artifacts.py --source artifacts/linux-cargo
@@ -209,6 +209,13 @@ jobs:
         with:
           name: chat-hub-crate-chat-hub-desktop-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/crates/chat-hub-desktop
+          retention-days: 14
+      - name: Retain web crate objects
+        if: ${{ success() && steps.crate-pack.outcome == 'success' }}
+        uses: ./ci/actions/gha-artifact-upload
+        with:
+          name: chat-hub-crate-chat-hub-web-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/crates/chat-hub-web
           retention-days: 14
       - name: Record the exact successful PR check receipt
         if: ${{ success() && github.event_name == 'pull_request' && steps.dagger-checks.outcome == 'success' }}

@@ -73,6 +73,7 @@ type ChatHubCi {
       .withNewFile("/crates/chat-hub-capture/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
       .withNewFile("/crates/chat-hub-api/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
       .withNewFile("/crates/chat-hub-runtime/src/lib.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
+      .withNewFile("/crates/chat-hub-web/src/main.rs", "// chat-hub-ci: workspace skeleton\ncompile_error!(\"Dagger source closure omitted a required Cargo target\");\n")
   }
   let modelSource: Directory! {
     workspaceSkeleton.withDirectory("/crates/chat-hub-model", ws.directory("/crates/chat-hub-model"))
@@ -105,6 +106,9 @@ type ChatHubCi {
     apiSource
       .withDirectory("/crates/chat-hub-capture", ws.directory("/crates/chat-hub-capture"))
       .withDirectory("/crates/chat-hub-runtime", ws.directory("/crates/chat-hub-runtime"))
+  }
+  let webSource: Directory! {
+    apiSource.withDirectory("/crates/chat-hub-web", ws.directory("/crates/chat-hub-web"))
   }
   let rootLibSource: Directory! {
     runtimeSource.withDirectory("/src", ws.directory("/src"))
@@ -181,6 +185,13 @@ type ChatHubCi {
       .sync
     null
   }
+  pub webTests: Void @check {
+    rustBase.withMountedDirectory("/input", webSource)
+      .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/web-tests.log")
+      .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-web"])
+      .sync
+    null
+  }
   pub cliTests: Void @check {
     rustBase.withMountedDirectory("/input", cliSource)
       .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/cli-tests.log")
@@ -192,6 +203,45 @@ type ChatHubCi {
     rustBase.withMountedDirectory("/input", desktopSource)
       .withEnvVariable("CHAT_HUB_CARGO_LOG", "/cache/check-logs/desktop-tests.log")
       .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "/run-crate.sh", "chat-hub-desktop"])
+      .sync
+    null
+  }
+
+  """
+  Build the server image using the shared locked Cargo cache. Publication is a
+  separate trusted workflow_run operation after the exact main Checks run passes.
+  """
+  pub webImage: Container! {
+    let binary: File! {
+      rustBase
+        .withMountedDirectory("/input", webSource)
+        .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "-ec",
+          "cargo build --locked --release -p chat-hub-web && install -m 0755 \"$CARGO_TARGET_DIR/release/chat-hub-web\" /web-binary"])
+        .file("/web-binary")
+    }
+    container(platform: "linux/amd64")
+      .from("python:3.14.0-slim-bookworm@sha256:d13fa0424035d290decef3d575cea23d1b7d5952cdf429df8f5542c71e961576")
+      .withFile("/usr/local/bin/chat-hub-web", binary, permissions: 493)
+      .withDirectory("/app/desktop-ui", ws.directory("/desktop-ui"))
+      .withExec(["sh", "-ec", "apt-get update && apt-get install -y --no-install-recommends passwd && rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin chat-hub && chmod -R a+rX /app/desktop-ui"])
+      .withUser("10001:10001")
+      .withWorkdir("/app")
+      .withEnvVariable("CHAT_HUB_DESKTOP_UI", "/app/desktop-ui")
+      .withEnvVariable("CHAT_HUB_WEB_ADDR", "0.0.0.0:8080")
+      .withExposedPort(8080)
+      .withEntrypoint(["/usr/local/bin/chat-hub-web"])
+  }
+
+  pub publishWebImage(address: String!, username: String!, token: Secret!): String! {
+    webImage
+      .withRegistryAuth("ghcr.io", username, token)
+      .publish(address)
+  }
+
+  pub webSmoke: Void @check {
+    webImage
+      .withFile("/tmp/web-image-smoke.py", ws.file("/ci/dagger/check/web-image-smoke.py"))
+      .withExec(["python3", "/tmp/web-image-smoke.py"])
       .sync
     null
   }

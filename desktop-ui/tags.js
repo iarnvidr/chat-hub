@@ -2,12 +2,13 @@ import { createTagHoverEditor } from './tag-hover.js';
 const $=id=>document.getElementById(id);
 const invoke=(command,args={})=>window.ChatHub.invoke(command,args);
 const native=typeof window.__TAURI_INTERNALS__?.invoke==='function';
+const canRead=()=>native||(window.ChatHub?.transport==='http'&&window.ChatHub.capabilities?.read===true);
 let currentChat,tagLoad=0,chatLoad=0;
 const node=(tag,text)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;return n;};
 const editor=createTagHoverEditor({invoke,onSaved:()=>window.dispatchEvent(new Event('chat-hub:tags-updated'))});
 function chips(root,tags){root.replaceChildren();for(const tag of tags){const chip=node('span',tag);chip.className='tag-chip';root.append(chip);}}
 async function loadTags(){
-  if(!native)return;const token=++tagLoad;
+  if(!canRead())return;const token=++tagLoad;
   try{const data=await invoke('list_local_tags');if(token!==tagLoad)return;
     const select=$('tag-filter'),value=select.value;select.replaceChildren(new Option('All tags',''));
     for(const item of data.items||[])select.append(new Option(`${item.name} · ${item.target_count}`,item.name));
@@ -15,7 +16,7 @@ async function loadTags(){
   }catch{/* Keep the current filter while the library is busy. */}
 }
 async function loadChatTags(){
-  const chat=currentChat,token=++chatLoad;if(!chat||!native)return;
+  const chat=currentChat,token=++chatLoad;if(!chat||!canRead())return;
   try{const result=await invoke('get_target_tags',{targetKind:'conversation',targetId:chat.id});
     if(token===chatLoad&&currentChat?.id===chat.id)chips($('reader-tags'),result.tags||[]);
   }catch{if(token===chatLoad)$('reader-tags').replaceChildren();}
@@ -42,3 +43,4 @@ window.addEventListener('chat-hub:conversation-loaded',event=>{currentChat=event
 window.addEventListener('chat-hub:tags-updated',()=>{loadTags();loadChatTags();});
 window.addEventListener('chat-hub:catalog-indexed',loadTags);
 if(native)loadTags();
+window.addEventListener('chat-hub:authenticated',loadTags);

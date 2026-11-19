@@ -42,7 +42,7 @@ function scriptSource(relativePath,append=''){
 }
 
 test('category graph sends scoped filters with a supported limit and selecting an entity keeps Graph mode',async()=>{
-  const window=new FakeWindow();
+  const window=new FakeWindow();window.ChatHub.transport='http';window.ChatHub.capabilities={read:true,catalog_write:false};
   const document={body:new FakeElement('body'),createElement:()=>new FakeElement(),getElementById(id){if(!idRegistry.has(id))new FakeElement(id);return idRegistry.get(id);},querySelector:()=>null};
   const storage=new Map([['chat-hub.overview-display-mode','graph']]);
   const context=vm.createContext({window,document,localStorage:{getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value)},Event,CustomEvent,console,setTimeout,clearTimeout,Map,Set,Math,JSON,Number,String,Array,Promise});
@@ -64,8 +64,10 @@ test('category graph sends scoped filters with a supported limit and selecting a
   };
   context.window.ChatHub.invoke=async(command,args)=>{
     window.__testInvocations.push({command,args});
-    if(command==='catalog_entity_graph')return {total_entities:1,truncated:false,nodes:[{id:'entity:file',kind:'file_artifact',label:'Report.csv',entity_id:'entity:file'}],edges:[]};
+    if(command==='catalog_entity_graph')return {index:{stale:true},total_entities:1,truncated:false,nodes:[{id:'entity:file',kind:'file_artifact',label:'Report.csv',entity_id:'entity:file'}],edges:[]};
     if(command==='catalog_entity')return {entity:{id:'entity:file',kind:'file_artifact',label:'Report.csv',reference_count:1,artifact_state:'metadata_present',content_saved:false},references:[],references_truncated:false};
+    if(command==='catalog_overview')return {index:{stale:true},stats:{}};
+    if(command==='catalog_graph')return {nodes:[],edges:[],clusters:0,unmapped_count:0};
     if(command==='get_target_tags')return {tags:[]};
     return {};
   };
@@ -90,11 +92,19 @@ test('category graph sends scoped filters with a supported limit and selecting a
     const call=window.__testInvocations.filter(item=>item.command==='catalog_entity_graph').at(-1);
     assert.deepEqual(call.args,{source:'codex',projectKey:'project:alpha',tag:'reviewed',kind:'file_artifact',conversationId:'local-chat-id',query:'needle',artifactState:'metadata_present',limit:40});
     assert.equal(window.__testGraph.nodes[0].kind,'file_artifact');
+    assert.ok(document.getElementById('overview-state').textContent.includes('read-only'));
     window.__testOnNode(window.__testGraph.nodes[0],false);
     await new Promise(resolve=>setTimeout(resolve,0));
     assert.equal(document.getElementById('overview-mode-graph').getAttribute('aria-pressed'),'true');
     assert.equal(document.getElementById('overview-mode-list').getAttribute('aria-pressed'),'false');
     assert.ok(document.getElementById('library-overview').classList.contains('entity-category-mode'));
     assert.equal(document.getElementById('overview-map').hidden,false);
+    context.showOverview(false);
+    await new Promise(resolve=>setTimeout(resolve,0));
+    assert.ok(document.getElementById('overview-state').textContent.includes('read-only'));
+    assert.equal(window.__testInvocations.some(item=>item.command==='rebuild_catalog_index'),false);
+    document.getElementById('rebuild-catalog').dispatchEvent(new Event('click'));
+    await new Promise(resolve=>setTimeout(resolve,0));
+    assert.equal(window.__testInvocations.some(item=>item.command==='rebuild_catalog_index'),false);
   }finally{idRegistry.clear();}
 });
