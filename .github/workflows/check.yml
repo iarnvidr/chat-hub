@@ -71,6 +71,13 @@ jobs:
         if: ${{ failure() && steps.dagger-checks.outcome == 'failure' && !cancelled() }}
         continue-on-error: true
         run: |
+          bun_dir="$RUNNER_TEMP/chat-hub-diagnostic-bin"
+          mkdir -p "$bun_dir"
+          docker run --rm --entrypoint cat \
+            oven/bun:1.2.22@sha256:66ba69deede44e3af5dc542def218fdb3bcad2205900ea761dc5623bf973d2df \
+            /usr/local/bin/bun > "$bun_dir/bun"
+          chmod 0755 "$bun_dir/bun"
+          export PATH="$bun_dir:$PATH"
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           python3 -m unittest discover -s build -p 'test_*.py' -v
           python3 -m unittest discover -s ci/dagger/check -p 'test_*.py' -v
