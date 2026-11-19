@@ -16,6 +16,8 @@ const DISPLAY_MODE_KEY='chat-hub.overview-display-mode';
 let displayMode=(()=>{try{return normalizeOverviewMode(localStorage.getItem(DISPLAY_MODE_KEY));}catch{return 'graph';}})();
 const native = () => typeof window.__TAURI_INTERNALS__?.invoke === 'function';
 const invoke = (command, args = {}) => window.ChatHub.invoke(command, args);
+const canReadCatalog = () => native() || (window.ChatHub?.transport === 'http' && window.ChatHub.capabilities?.read === true);
+const canRebuildCatalog = () => native() || (window.ChatHub?.transport === 'http' && window.ChatHub.capabilities?.catalog_write === true);
 const filters = () => ({source: $('history-source').value, projectKey: $('project-filter').value || null,tag:$('tag-filter').value||null});
 const element = (tag, text, cls) => {
   const node = document.createElement(tag); if (text !== undefined) node.textContent = text;
@@ -134,7 +136,7 @@ function renderStats(stats) {
 }
 async function rebuild(manual = false) {
   if (rebuilding) return rebuilding;
-  if (!native()) { state('Open the desktop app to index your saved chats.'); return; }
+  if (!canRebuildCatalog()) { state('The chat index is read-only in this server session. Rebuilding is disabled.'); return; }
   $('rebuild-catalog').disabled = true;
   state('Indexing saved chats locally… You can keep reading while this runs.');
   rebuilding = invoke('rebuild_catalog_index').then(() => {
@@ -147,7 +149,7 @@ async function rebuild(manual = false) {
   if (manual && !messageDetail) await refresh(false);
 }
 async function refresh(allowRebuild = false) {
-  if (!native() || messageDetail || entityDetail || $('overview-kind').value!=='chats') return;
+  if (!canReadCatalog() || messageDetail || entityDetail || $('overview-kind').value!=='chats') return;
   if(displayMode==='list'){window.dispatchEvent(new Event('chat-hub:show-chat-list'));return;}
   const token = ++request, args = filters(), requestedFocus = focusId;
   const project = $('project-filter').selectedOptions?.[0]?.textContent || 'All projects';
@@ -156,7 +158,7 @@ async function refresh(allowRebuild = false) {
     let overview = await invoke('catalog_overview', args);
     if (token !== request || messageDetail) return;
     if (!overview?.index || !overview?.stats) throw Error('invalid_catalog');
-    if (overview.index.stale && allowRebuild) {
+    if (overview.index.stale && allowRebuild && canRebuildCatalog()) {
       await rebuild();
       if (token !== request || messageDetail) return;
       overview = await invoke('catalog_overview', args);
@@ -172,10 +174,16 @@ async function refresh(allowRebuild = false) {
     $('graph-caption').textContent = requestedFocus
       ? `${Math.max(0, graph.nodes.length - 1)} related chats · Select a line for its evidence. Back returns to the library map.`
       : `${graph.nodes.length} chats · ${graph.edges.length} connections · ${graph.clusters} clusters${graph.unmapped_count ? ` · ${graph.unmapped_count} other chats in the sidebar` : ''}. Select to inspect; double-click to open.`;
-    state(overview.index.stale ? 'Index needs refreshing. Rebuild it in Settings.' : '');
+    state(overview.index.stale
+      ? canRebuildCatalog()
+        ? 'Index needs refreshing. Rebuild it in Settings.'
+        : 'The chat index is missing or out of date. This server session is read-only, so it cannot rebuild the index.'
+      : '');
   } catch (error) {
     console.error('Chat map could not render:', String(error?.message || error).slice(0,180));
-    if (token === request) state('Connections could not load. Your saved chats remain available in the sidebar.');
+    if (token === request) state(window.ChatHub?.transport === 'http'
+      ? 'The chat index could not be loaded. It may be missing or out of date; this server session is read-only, so it cannot rebuild it.'
+      : 'Connections could not load. Your saved chats remain available in the sidebar.');
   }
 }
 function renderList(nodes) {
@@ -373,7 +381,7 @@ function showMessages(detail) {
 $('show-overview').addEventListener('click', () => showOverview());
 $('overview-back').addEventListener('click', () => {if(window.dispatchEvent(new Event('chat-hub:overview-back',{cancelable:true})))showOverview();});
 $('overview-read-chat').addEventListener('click', () => openChat(messageDetail?.conversation?.id));
-$('rebuild-catalog').addEventListener('click', () => rebuild(true));
+$('rebuild-catalog').addEventListener('click', () => { if (canRebuildCatalog()) rebuild(true); });
 $('graph-zoom-in').addEventListener('click', () => view.zoom(1.25));
 $('graph-zoom-out').addEventListener('click', () => view.zoom(.8));
 $('graph-reset').addEventListener('click', () => view.fit());

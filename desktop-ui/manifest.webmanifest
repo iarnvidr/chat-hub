@@ -1,0 +1,13 @@
+{
+  "name": "Chat Hub",
+  "short_name": "Chat Hub",
+  "description": "Your private conversation library",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#111318",
+  "theme_color": "#111318",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

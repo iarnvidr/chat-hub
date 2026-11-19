@@ -6,6 +6,9 @@ const $=id=>document.getElementById(id),panel=$('library-overview');
 const invoke=(command,args={})=>window.ChatHub.invoke(command,args);
 let mode='chats',conversationId=null,cursor=null,items=[],searchHits=[],generation=0,selected=null,loading=false,searchTimer,viewMode=getOverviewDisplayMode();
 let refreshTimer;
+const catalogIndexMessage=()=>window.ChatHub?.transport==='http'&&window.ChatHub.capabilities?.catalog_write!==true
+  ? 'The chat index is missing or out of date. This server session is read-only, so it cannot rebuild the index.'
+  : 'The chat index needs refreshing. Rebuild it in Settings.';
 const element=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
 const filters=()=>({source:$('history-source').value,projectKey:$('project-filter').value||null,tag:$('tag-filter').value||null});
 const display=element('div',undefined,'overview-display-mode');display.id='overview-display-mode';display.setAttribute('role','group');display.setAttribute('aria-label','Overview view');
@@ -41,16 +44,17 @@ async function showItems(reset=true){
     if(viewMode==='graph'){
       const result=await invoke('catalog_entity_graph',{...filters(),kind:mode,conversationId,query,artifactState:mode==='file_artifact'?$('artifact-state-filter').value||null:null,limit:40});
       if(token!==generation)return;controls(false);showCatalogEntityGraph(result,title());
+      if(result.index?.stale)$('overview-state').textContent=catalogIndexMessage();
       if(result.truncated)$('graph-caption').textContent+=' More indexed items are omitted from this bounded graph.';
       return;
     }
     const result=await invoke('catalog_entities',{...filters(),kind:mode,conversationId,query,artifactState:mode==='file_artifact'?$('artifact-state-filter').value||null:null,cursor,limit:40});
     if(token!==generation)return;cursor=result.next_cursor;items.push(...result.items||[]);
     $('overview-stats').textContent=`${Number(result.total||0).toLocaleString()} ${title().toLocaleLowerCase()}${conversationId?' in this chat':''}`;
-    $('catalog-items-state').textContent=result.coverage_truncated?'Some very large chats were only partially indexed.':'';
-    if(!items.length)$('catalog-items-state').textContent='No indexed items match these filters.';
+    $('catalog-items-state').textContent=result.index?.stale?catalogIndexMessage():result.coverage_truncated?'Some very large chats were only partially indexed.':'';
+    if(!items.length&&!result.index?.stale)$('catalog-items-state').textContent='No indexed items match these filters.';
     draw();$('catalog-items-more').hidden=!cursor;
-  }catch(error){if(token===generation){const message='The index is unavailable. Rebuild it in Settings, or try again once the current library task finishes.';$('catalog-items-state').textContent=message;$('overview-state').textContent=message;}}
+  }catch(error){if(token===generation){const message=window.ChatHub?.transport==='http'&&window.ChatHub.capabilities?.catalog_write!==true?'The chat index is unavailable or has not been built. This server session is read-only, so it cannot rebuild the index.':'The index is unavailable. Rebuild it in Settings, or try again once the current library task finishes.';$('catalog-items-state').textContent=message;$('overview-state').textContent=message;}}
   finally{if(token===generation){loading=false;$('catalog-items-more').disabled=false;}}
 }
 function draw(){
