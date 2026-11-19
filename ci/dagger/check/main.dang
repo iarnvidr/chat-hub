@@ -214,10 +214,10 @@ type ChatHubCi {
   pub webImage: Container! {
     let binary: File! {
       rustBase
-        .withMountedCache("/cache", cargoCache)
-        .withDirectory("/input", webSource)
-        .withExec(["bash", "/run-rust.sh", "/input", "/cache", "cargo", "build", "--locked", "--release", "-p", "chat-hub-web"])
-        .file(`/cache/target/${rustSystemABI}/release/chat-hub-web`)
+        .withMountedDirectory("/input", webSource)
+        .withExec(["bash", "/run-rust.sh", "/input", "/cache", "bash", "-ec",
+          "cargo build --locked --release -p chat-hub-web && install -m 0755 \"$CARGO_TARGET_DIR/release/chat-hub-web\" /web-binary"])
+        .file("/web-binary")
     }
     container(platform: "linux/amd64")
       .from("python:3.14.0-slim-bookworm@sha256:d13fa0424035d290decef3d575cea23d1b7d5952cdf429df8f5542c71e961576")

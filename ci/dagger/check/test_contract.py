@@ -261,7 +261,7 @@ class DaggerContract(unittest.TestCase):
         cache = re.search(r"let cargoCache: CacheVolume! \{(.*?)\n  \}", MODULE, re.S)[1]
         self.assertIn("source: cargoSeed, sharing: CacheSharingMode.LOCKED", cache)
         self.assertNotRegex(cache, r"(?i)\b(?:nonce|run.?id|commit|sha)\b")
-        self.assertEqual(MODULE.count('.withMountedCache("/cache", cargoCache)'), 3)
+        self.assertEqual(MODULE.count('.withMountedCache("/cache", cargoCache)'), 2)
         export = MODULE.split("pub exportCargoCache(", 1)[1]
         self.assertIn('withEnvVariable("CHAT_HUB_CACHE_EXPORT_NONCE", nonce)', export)
         for directory in ("target", "worktree", "source-state", "check-logs"):
@@ -293,8 +293,9 @@ class DaggerContract(unittest.TestCase):
 
     def test_server_image_uses_locked_cache_and_trusted_digest_publication(self):
         image = MODULE.split("pub webImage:", 1)[1].split("pub publishWebImage(", 1)[0]
-        self.assertIn('withMountedCache("/cache", cargoCache)', image)
-        self.assertIn('"--locked", "--release", "-p", "chat-hub-web"', image)
+        self.assertIn('rustBase', image)
+        self.assertIn('cargo build --locked --release -p chat-hub-web', image)
+        self.assertIn('.file("/web-binary")', image)
         self.assertIn('ws.directory("/desktop-ui")', image)
         self.assertIn('.withUser("10001:10001")', image)
         publisher = (ROOT / ".github/workflows/publish-web-image.yml").read_text()
