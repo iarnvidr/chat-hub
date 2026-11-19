@@ -62,7 +62,8 @@ class CrateArtifactTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("zstd"), "zstd is unavailable")
     def test_each_workspace_crate_has_real_separate_verified_compiler_objects(self):
         names = crates.crates(ROOT)
-        self.assertEqual(len(names), 9)
+        self.assertEqual(len(names), 10)
+        self.assertIn("chat-hub-web", names)
         for crate in names:
             self.write_output(crate, crate.encode())
         output = self.path / "bundles"
@@ -95,7 +96,7 @@ class CrateArtifactTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("zstd"), "zstd is unavailable")
     def test_published_packages_restore_only_unchanged_dependency_closures(self):
-        """Simulate nine trusted OCI bundles after modifying capture only."""
+        """Simulate trusted OCI bundles after modifying capture only."""
         names = crates.crates(ROOT)
         for crate in names:
             self.write_output(crate, crate.encode())
@@ -176,7 +177,7 @@ class CrateArtifactTests(unittest.TestCase):
             crates.install_objects(objects, destination, "chat-hub-model", record, ROOT)
         self.assertFalse((destination / "target").exists())
 
-    def test_workflow_requires_nine_individual_uploads_and_pr_app_bundle(self):
+    def test_workflow_requires_individual_uploads_and_pr_app_bundle(self):
         check = (ROOT / ".github/workflows/check.yml").read_text()
         for crate in crates.crates(ROOT):
             self.assertIn(f"chat-hub-crate-{crate}-${{{{ github.run_id }}}}", check)
