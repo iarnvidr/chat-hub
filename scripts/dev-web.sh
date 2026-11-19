@@ -15,6 +15,16 @@ if [[ ! -f "$database" ]]; then
   exit 2
 fi
 
+web_binary="${CHAT_HUB_WEB_BIN:-}"
+if [[ -n "$web_binary" && ( "$web_binary" != /* || ! -f "$web_binary" || ! -x "$web_binary" ) ]]; then
+  echo 'CHAT_HUB_WEB_BIN must point to an absolute path to an executable chat-hub-web binary.' >&2
+  exit 2
+fi
+if [[ -z "$web_binary" ]] && ! command -v cargo >/dev/null; then
+  echo 'Install the repository Rust toolchain or set CHAT_HUB_WEB_BIN to a verified build.' >&2
+  exit 2
+fi
+
 state_root="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}"
 token_file="${CHAT_HUB_WEB_TOKEN_FILE:-$state_root/chat-hub-web/access-token}"
 python3 "$repo_root/scripts/ensure-private-token.py" "$token_file"
@@ -25,4 +35,7 @@ export CHAT_HUB_DESKTOP_UI="${CHAT_HUB_DESKTOP_UI:-$repo_root/desktop-ui}"
 export CHAT_HUB_WEB_ADDR="${CHAT_HUB_WEB_ADDR:-0.0.0.0:8080}"
 export CHAT_HUB_CAPTURE_ENABLED=false
 
+if [[ -n "$web_binary" ]]; then
+  exec "$web_binary"
+fi
 exec cargo run --locked --manifest-path "$repo_root/Cargo.toml" -p chat-hub-web

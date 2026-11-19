@@ -22,6 +22,25 @@ being actively written by another Chat Hub instance. The default address is
 from this checkout's `desktop-ui/` directory. Set `CHAT_HUB_DESKTOP_UI` to use a
 different directory.
 
+In a UI container without Cargo, set `CHAT_HUB_WEB_BIN` to the absolute path of
+a verified Linux `chat-hub-web` executable from the matching source revision.
+The script starts it directly and still serves the UI from this checkout.
+Keep the binary outside the checkout with the other preview runtime files.
+
+Once the tailnet preview target and restored library are available, start the
+preview in the UI container:
+
+```sh
+CHAT_HUB_DATABASE=/path/to/restored/chat-hub.sqlite3 \
+  CHAT_HUB_WEB_BIN=/path/to/verified/chat-hub-web \
+  CHAT_HUB_WEB_ADDR=127.0.0.1:8080 CHAT_HUB_WEB_COOKIE_SECURE=0 \
+  ui-preview start chat-hub
+```
+
+Open the preview link privately. Open the access-token file in a local editor
+and paste its contents into the app's password field. Keep the preview link
+and app token out of shared terminal output, screenshots, and PR comments.
+
 The first run creates a random access-token file at
 `$XDG_STATE_HOME/chat-hub-web/access-token`, or
 `~/.local/state/chat-hub-web/access-token` when `XDG_STATE_HOME` is unset. Its
