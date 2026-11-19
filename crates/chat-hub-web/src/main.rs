@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -25,11 +25,67 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_SESSIONS: usize = 64;
 
 #[derive(Clone)]
+enum WebAuth {
+    Token(Arc<str>),
+    TrustedProxy(Uri),
+}
+
+impl WebAuth {
+    fn login_required(&self) -> bool {
+        matches!(self, Self::Token(_))
+    }
+}
+
+#[derive(Clone)]
 struct WebState {
-    access_token: Arc<str>,
+    auth: WebAuth,
     api_token: Arc<str>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     api_router: Arc<Mutex<Option<Router>>>,
+}
+
+fn trusted_origin(addr: SocketAddr, origin: Option<String>) -> Result<Uri, String> {
+    if !addr.ip().is_loopback() {
+        return Err("CHAT_HUB_WEB_AUTH=none requires a loopback bind address".into());
+    }
+    let origin = origin.unwrap_or_else(|| format!("http://{addr}"));
+    let uri: Uri = origin
+        .parse()
+        .map_err(|_| "invalid CHAT_HUB_WEB_ORIGIN".to_owned())?;
+    let (Some(scheme @ ("http" | "https")), Some(host)) = (uri.scheme_str(), uri.authority())
+    else {
+        return Err("CHAT_HUB_WEB_ORIGIN must be an HTTP(S) origin without a path".into());
+    };
+    if host.as_str().contains('@') || origin != format!("{scheme}://{host}") {
+        return Err("CHAT_HUB_WEB_ORIGIN must be an HTTP(S) origin without a path".into());
+    }
+    Ok(uri)
+}
+
+async fn restrict_trusted_origin(
+    State(state): State<WebState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let WebAuth::TrustedProxy(origin) = &state.auth else {
+        return next.run(request).await;
+    };
+    // Probes reach loopback directly. Library routes require the configured
+    // host even without an Origin header, so DNS rebinding cannot read them.
+    if request.uri().path() == "/healthz" {
+        return next.run(request).await;
+    }
+    let headers = request.headers();
+    let expected_host = origin.authority().unwrap().as_str();
+    let expected_origin = format!("{}://{expected_host}", origin.scheme_str().unwrap());
+    if headers.get(header::HOST).map(HeaderValue::as_bytes) != Some(expected_host.as_bytes())
+        || headers
+            .get(header::ORIGIN)
+            .is_some_and(|value| value.as_bytes() != expected_origin.as_bytes())
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
 }
 
 struct Session {
@@ -64,19 +120,7 @@ async fn authenticate(
     if *request.method() != axum::http::Method::GET || !read_path_allowed(request.uri().path()) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(sid) = cookie(request.headers(), "chat_hub_session") else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let valid = state
-        .sessions
-        .lock()
-        .ok()
-        .map(|mut sessions| {
-            sessions.retain(|_, session| session.expires > Instant::now());
-            sessions.contains_key(&sid)
-        })
-        .unwrap_or(false);
-    if !valid {
+    if !has_read_access(&state, request.headers()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", state.api_token)) {
@@ -120,6 +164,9 @@ async fn login(
     headers: HeaderMap,
     Json(login): Json<LoginRequest>,
 ) -> Response {
+    let WebAuth::Token(access_token) = &state.auth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     if let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -139,8 +186,8 @@ async fn login(
         }
     }
     if login.token.is_empty()
-        || login.token.len() != state.access_token.len()
-        || !bool::from(login.token.as_bytes().ct_eq(state.access_token.as_bytes()))
+        || login.token.len() != access_token.len()
+        || !bool::from(login.token.as_bytes().ct_eq(access_token.as_bytes()))
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -184,6 +231,9 @@ async fn login(
 }
 
 async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    if !state.auth.login_required() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let (Some(sid), Some(csrf)) = (
         cookie(&headers, "chat_hub_session"),
         cookie(&headers, "chat_hub_csrf"),
@@ -214,22 +264,26 @@ async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
     response
 }
 
-async fn capabilities(State(state): State<WebState>, headers: HeaderMap) -> Response {
-    let valid = cookie(&headers, "chat_hub_session")
-        .and_then(|sid| {
-            state.sessions.lock().ok().and_then(|mut sessions| {
-                sessions.retain(|_, session| session.expires > Instant::now());
-                sessions.contains_key(&sid).then_some(())
+fn has_read_access(state: &WebState, headers: &HeaderMap) -> bool {
+    !state.auth.login_required()
+        || cookie(headers, "chat_hub_session")
+            .and_then(|sid| {
+                state.sessions.lock().ok().and_then(|mut sessions| {
+                    sessions.retain(|_, session| session.expires > Instant::now());
+                    sessions.contains_key(&sid).then_some(())
+                })
             })
-        })
-        .is_some();
-    if !valid {
+            .is_some()
+}
+
+async fn capabilities(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    if !has_read_access(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let stable = env::var("CHAT_HUB_WEB_MODE").is_ok_and(|mode| mode == "stable");
     let service_worker =
         stable && env::var("CHAT_HUB_WEB_SERVICE_WORKER").is_ok_and(|value| value == "1");
-    Json(serde_json::json!({"authenticated":true,"capabilities":{"read":true,"writes":false,"catalog_write":false,"capture":false,"capture_controls":false,"desktop":false,"desktop_diagnostics":false,"import_export":false,"native_file_dialog":false,"provider_view":false,"updater":false,"dev_mode":!stable,"service_worker":service_worker}})).into_response()
+    Json(serde_json::json!({"authenticated":true,"login_required":state.auth.login_required(),"capabilities":{"read":true,"writes":false,"catalog_write":false,"capture":false,"capture_controls":false,"desktop":false,"desktop_diagnostics":false,"import_export":false,"native_file_dialog":false,"provider_view":false,"updater":false,"dev_mode":!stable,"service_worker":service_worker}})).into_response()
 }
 
 fn query_string(args: &Value, search: bool) -> Result<String, StatusCode> {
@@ -240,6 +294,10 @@ fn query_string(args: &Value, search: bool) -> Result<String, StatusCode> {
             continue;
         }
         if value.is_null() {
+            continue;
+        }
+        if !search && key == "query" && value.as_str().is_some_and(|query| query.trim().is_empty())
+        {
             continue;
         }
         let key = if search && key == "query" {
@@ -301,17 +359,15 @@ fn snake_case(value: &str) -> String {
     result
 }
 
-async fn bridge(
-    State(state): State<WebState>,
-    Path(command): Path<String>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Response {
+fn check_bridge_access(state: &WebState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    if !state.auth.login_required() {
+        return Ok(());
+    }
     let (Some(sid), Some(csrf)) = (
-        cookie(&headers, "chat_hub_session"),
-        cookie(&headers, "chat_hub_csrf"),
+        cookie(headers, "chat_hub_session"),
+        cookie(headers, "chat_hub_csrf"),
     ) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return Err(StatusCode::UNAUTHORIZED);
     };
     let session_valid = state
         .sessions
@@ -326,8 +382,17 @@ async fn bridge(
             })
         })
         .unwrap_or(false);
-    if !session_valid {
-        return StatusCode::FORBIDDEN.into_response();
+    session_valid.then_some(()).ok_or(StatusCode::FORBIDDEN)
+}
+
+async fn bridge(
+    State(state): State<WebState>,
+    Path(command): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(status) = check_bridge_access(&state, &headers) {
+        return status.into_response();
     }
     let args = match payload.get("args") {
         Some(args) => args,
@@ -466,19 +531,32 @@ fn required_path(name: &str, default: Option<&str>) -> Result<PathBuf, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = env::var("CHAT_HUB_WEB_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".into())
+        .parse()?;
+    let auth = match env::var("CHAT_HUB_WEB_AUTH") {
+        Ok(mode) if mode == "none" => {
+            WebAuth::TrustedProxy(trusted_origin(addr, env::var("CHAT_HUB_WEB_ORIGIN").ok())?)
+        }
+        Ok(mode) if mode != "token" => return Err("CHAT_HUB_WEB_AUTH must be token or none".into()),
+        Err(error) if error != env::VarError::NotPresent => return Err(error.into()),
+        _ => {
+            let token_path = required_path("CHAT_HUB_WEB_TOKEN_FILE", None)?;
+            let access_token = fs::read_to_string(token_path)?.trim().to_owned();
+            if access_token.is_empty() {
+                return Err("web access token file is empty".into());
+            }
+            WebAuth::Token(Arc::from(access_token))
+        }
+    };
     let db_path = required_path("CHAT_HUB_DATABASE", None)?;
-    let token_path = required_path("CHAT_HUB_WEB_TOKEN_FILE", None)?;
     let ui_path = required_path("CHAT_HUB_DESKTOP_UI", Some("desktop-ui"))?;
-    let access_token = fs::read_to_string(token_path)?.trim().to_owned();
-    if access_token.is_empty() {
-        return Err("web access token file is empty".into());
-    }
     let store = chat_hub_store::store::Store::open_existing(
         db_path.to_str().ok_or("database path is not UTF-8")?,
     )?;
     let api_token = random_secret()?;
     let state = WebState {
-        access_token: Arc::from(access_token),
+        auth,
         api_token: Arc::from(api_token.clone()),
         sessions: Arc::default(),
         api_router: Arc::new(Mutex::new(None)),
@@ -498,14 +576,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/bridge/:command", post(bridge))
         .merge(api)
         .fallback_service(static_files)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            restrict_trusted_origin,
+        ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store, no-cache, must-revalidate"),
         ))
         .with_state(state);
-    let addr: SocketAddr = env::var("CHAT_HUB_WEB_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".into())
-        .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("chat-hub-web listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
@@ -519,8 +598,12 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_app() -> Router {
+        test_app_with_auth(WebAuth::Token(Arc::from("synthetic-access-token")))
+    }
+
+    fn test_app_with_auth(auth: WebAuth) -> Router {
         let state = WebState {
-            access_token: Arc::from("synthetic-access-token"),
+            auth,
             api_token: Arc::from("synthetic-api-token"),
             sessions: Arc::default(),
             api_router: Arc::new(Mutex::new(None)),
@@ -540,6 +623,10 @@ mod tests {
             .route("/api/capabilities", get(capabilities))
             .route("/api/bridge/:command", post(bridge))
             .merge(api)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                restrict_trusted_origin,
+            ))
             .with_state(state)
     }
 
@@ -684,7 +771,9 @@ mod tests {
                     .header(header::COOKIE, &cookie_header)
                     .header("x-csrf-token", csrf)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"args":{"limit":10}}"#))
+                    .body(Body::from(
+                        r#"{"args":{"query":"","cursor":null,"source":"chatgpt","projectKey":null,"tag":null,"archiveState":"active"}}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -693,31 +782,45 @@ mod tests {
         for (command, args, expected) in [
             (
                 "list_conversations",
-                r#"{"query":"synthetic query"}"#,
+                r#"{"query":"  ","cursor":null,"source":"chatgpt","projectKey":null,"tag":null,"archiveState":"active"}"#,
                 StatusCode::OK,
             ),
-            ("list_projects", r#"{"source":"all"}"#, StatusCode::OK),
+            (
+                "list_conversations",
+                r#"{"query":"synthetic query","cursor":null,"source":"chatgpt","projectKey":null,"tag":null,"archiveState":"active"}"#,
+                StatusCode::OK,
+            ),
+            ("list_projects", r#"{"source":"chatgpt"}"#, StatusCode::OK),
             ("list_local_tags", r#"{}"#, StatusCode::OK),
             (
                 "get_target_tags",
                 r#"{"targetKind":"conversation","targetId":"synthetic-id"}"#,
                 StatusCode::OK,
             ),
-            ("catalog_overview", r#"{"source":"all"}"#, StatusCode::OK),
+            (
+                "catalog_overview",
+                r#"{"source":"chatgpt","projectKey":null,"tag":null}"#,
+                StatusCode::OK,
+            ),
             (
                 "catalog_graph",
-                r#"{"source":"all","limit":40}"#,
+                r#"{"source":"chatgpt","projectKey":null,"tag":null,"focusId":null,"limit":100}"#,
                 StatusCode::OK,
             ),
             (
                 "catalog_entities",
-                r#"{"source":"all","kind":"repository","limit":40}"#,
+                r#"{"source":"chatgpt","projectKey":null,"tag":null,"kind":"file_artifact","conversationId":null,"query":null,"artifactState":"metadata_present","cursor":null,"limit":40}"#,
                 StatusCode::OK,
             ),
             (
                 "catalog_entity_graph",
-                r#"{"source":"all","kind":"repository","limit":80}"#,
+                r#"{"source":"chatgpt","projectKey":null,"tag":null,"kind":"repository","conversationId":null,"query":null,"artifactState":null,"limit":40}"#,
                 StatusCode::OK,
+            ),
+            (
+                "get_conversation",
+                r#"{"id":"missing-id"}"#,
+                StatusCode::NOT_FOUND,
             ),
             (
                 "get_conversation",
@@ -830,6 +933,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_needs_loopback_and_its_configured_browser_origin() {
+        for addr in ["0.0.0.0:8080", "100.64.0.1:8080", "[::]:8080"] {
+            assert!(
+                trusted_origin(addr.parse().unwrap(), None).is_err(),
+                "{addr}"
+            );
+        }
+        let bind = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            trusted_origin(bind, None)
+                .unwrap()
+                .authority()
+                .unwrap()
+                .as_str(),
+            "127.0.0.1:8080"
+        );
+        assert!(trusted_origin(bind, Some("http://preview.example.test/path".into())).is_err());
+        let origin = "http://preview.example.test:5173";
+        let app = test_app_with_auth(WebAuth::TrustedProxy(
+            trusted_origin(bind, Some(origin.into())).unwrap(),
+        ));
+        let host = "preview.example.test:5173";
+        for (method, path, sent_host, sent_origin, expected) in [
+            ("GET", "/api/capabilities", host, origin, StatusCode::OK),
+            ("GET", "/api/v1/conversations", host, origin, StatusCode::OK),
+            (
+                "POST",
+                "/api/bridge/list_conversations",
+                host,
+                origin,
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                "/api/bridge/rebuild_catalog_index",
+                host,
+                origin,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "POST",
+                "/api/v1/catalog/rebuild",
+                host,
+                origin,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "DELETE",
+                "/api/session",
+                host,
+                origin,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                "/api/capabilities",
+                "untrusted.example.test",
+                origin,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "POST",
+                "/api/bridge/list_conversations",
+                host,
+                "http://untrusted.example.test",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::HOST, sent_host)
+                        .header(header::ORIGIN, sent_origin)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"args":{}}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {path}");
+            if path == "/api/capabilities" && response.status().is_success() {
+                let body = to_bytes(response.into_body(), 4096).await.unwrap();
+                let capabilities: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(capabilities["login_required"], false);
+                assert_eq!(capabilities["authenticated"], true);
+            }
+        }
     }
 
     #[tokio::test]

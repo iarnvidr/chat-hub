@@ -22,8 +22,10 @@ async function resume() {
     const caps = await bridge.capabilities();
     if (caps?.authenticated !== true) return false;
     applyCapabilities(caps);
+    const loginRequired = caps.login_required !== false;
+    document.getElementById('server-logout').hidden = !loginRequired;
     const syncState = document.getElementById('workspace-sync-state');
-    if (syncState) syncState.textContent = 'Server session active';
+    if (syncState) syncState.textContent = loginRequired ? 'Server session active' : 'Server connected';
     if (caps.dev_mode === true || caps.service_worker !== true) {
       await navigator.serviceWorker?.getRegistrations().then(registrations => Promise.all(registrations.map(registration => registration.unregister())));
     } else if ('serviceWorker' in navigator) {
@@ -63,8 +65,11 @@ if (window.ChatHub?.transport === 'http') {
     window.location.reload();
   });
 
-  gate.hidden = false;
   document.querySelector('.skip-link').hidden = true;
-  tokenField.focus();
-  resume().then(authenticated => { if (authenticated) tokenField.blur(); });
+  resume().then(authenticated => {
+    if (!authenticated) {
+      gate.hidden = false;
+      tokenField.focus();
+    }
+  });
 }
