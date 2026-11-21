@@ -3,7 +3,11 @@ use tauri::{
     AppHandle, Manager, Runtime,
 };
 
+#[path = "support_diagnostics.rs"]
+mod support_diagnostics;
+
 const CLOSE_TAB_MENU_ID: &str = "chat-hub-close-tab";
+const EXPORT_DIAGNOSTICS_MENU_ID: &str = "chat-hub-export-diagnostics";
 
 #[cfg(target_os = "macos")]
 const CLOSE_TAB_ACCELERATOR: &str = "Cmd+W";
@@ -38,6 +42,13 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         (submenu.text().ok().as_deref() == Some("File")).then(|| submenu.clone())
     });
 
+    let diagnostics = MenuItem::with_id(
+        app,
+        EXPORT_DIAGNOSTICS_MENU_ID,
+        "Export diagnostics…",
+        true,
+        None::<&str>,
+    )?;
     if let Some(file_menu) = file_menu {
         let close_window = file_menu.items()?.into_iter().find_map(|item| {
             let predefined = item.as_predefined_menuitem()?;
@@ -54,6 +65,16 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             Some(CLOSE_TAB_ACCELERATOR),
         )?;
         file_menu.append(&close_tab)?;
+        file_menu.append(&PredefinedMenuItem::separator(app)?)?;
+        file_menu.append(&diagnostics)?;
+    } else {
+        menu.append(&Submenu::with_id_and_items(
+            app,
+            "chat-hub-file-menu",
+            "File",
+            true,
+            &[&diagnostics],
+        )?)?;
     }
 
     let new_tab = MenuItem::with_id(
@@ -103,9 +124,13 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     Ok(menu)
 }
 
-/// Native menu events only dispatch a fixed local event. The UI decides
-/// whether a tab exists; with no tabs the action intentionally does nothing.
+/// Export is initiated by a native menu action, not an untrusted provider event.
+/// Other menu events continue to dispatch only fixed local UI events.
 pub fn handle<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
+    if event.id().as_ref() == EXPORT_DIAGNOSTICS_MENU_ID {
+        support_diagnostics::export(app);
+        return;
+    }
     let (event_name, detail) = match event.id().as_ref() {
         CLOSE_TAB_MENU_ID => ("chat-hub:menu-close-tab", None),
         "chat-hub-new-tab" => ("chat-hub:menu-new-tab", None),
