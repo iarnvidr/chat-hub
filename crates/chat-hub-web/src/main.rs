@@ -87,7 +87,9 @@ fn origin_matches(headers: &HeaderMap, uri: &Uri, require_origin: bool) -> bool 
     };
     let expected_origin = format!("{}://{expected_host}", uri.scheme_str().unwrap_or(""));
     headers.get_all(header::HOST).iter().count() == 1
-        && headers.get(header::HOST).is_some_and(|value| value.as_bytes() == expected_host.as_bytes())
+        && headers
+            .get(header::HOST)
+            .is_some_and(|value| value.as_bytes() == expected_host.as_bytes())
         && headers.get_all(header::ORIGIN).iter().count() <= 1
         && (!require_origin || headers.contains_key(header::ORIGIN))
         && headers
@@ -107,17 +109,24 @@ fn authelia_request_authorized(
     if !proxy_ips.contains(&peer.ip()) || proxy_ips.is_empty() {
         return false;
     }
-    if !origin_matches(headers, origin, *method != axum::http::Method::GET
-            && *method != axum::http::Method::HEAD) {
+    if !origin_matches(
+        headers,
+        origin,
+        *method != axum::http::Method::GET && *method != axum::http::Method::HEAD,
+    ) {
         return false;
     }
     // The ForwardAuth middleware replaces Remote-User after consulting
     // Authelia. Never trust an arbitrary browser-provided user header or a
     // direct request from another proxy-network container.
     headers.get_all("remote-user").iter().count() == 1
-        && headers.get("remote-user").is_some_and(|value| value.as_bytes() == expected_user.as_bytes())
+        && headers
+            .get("remote-user")
+            .is_some_and(|value| value.as_bytes() == expected_user.as_bytes())
         && headers.get_all("x-forwarded-proto").iter().count() == 1
-        && headers.get("x-forwarded-proto").is_some_and(|value| value == "https")
+        && headers
+            .get("x-forwarded-proto")
+            .is_some_and(|value| value == "https")
 }
 
 async fn restrict_trusted_origin(
@@ -137,7 +146,11 @@ async fn restrict_trusted_origin(
                 return StatusCode::FORBIDDEN.into_response();
             }
         }
-        WebAuth::Authelia { origin, expected_user, proxy_ips } => {
+        WebAuth::Authelia {
+            origin,
+            expected_user,
+            proxy_ips,
+        } => {
             let peer = request
                 .extensions()
                 .get::<ConnectInfo<SocketAddr>>()
@@ -628,7 +641,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(mode) if mode != "token" => {
             return Err("CHAT_HUB_WEB_AUTH must be authelia, token or none".into());
-        },
+        }
         Err(error) if error != env::VarError::NotPresent => return Err(error.into()),
         _ => {
             let token_path = required_path("CHAT_HUB_WEB_TOKEN_FILE", None)?;
@@ -677,7 +690,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("chat-hub-web listening on {}", listener.local_addr()?);
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1131,8 +1148,8 @@ mod tests {
         assert!(!body.contains("conversation"));
     }
     fn authelia_test_app() -> Router {
-        let origin = authelia_origin(Some("https://chat-hub-preview.ginnungagaps.xyz".into()))
-            .unwrap();
+        let origin =
+            authelia_origin(Some("https://chat-hub-preview.ginnungagaps.xyz".into())).unwrap();
         test_app_with_auth(WebAuth::Authelia {
             origin,
             expected_user: Arc::from("esben"),
@@ -1159,9 +1176,7 @@ mod tests {
         if let Some(origin) = origin {
             builder = builder.header(header::ORIGIN, origin);
         }
-        let mut request = builder
-            .body(Body::from(r#"{"args":{}}"#))
-            .unwrap();
+        let mut request = builder.body(Body::from(r#"{"args":{}}"#)).unwrap();
         if let Some(peer) = peer {
             request
                 .extensions_mut()
@@ -1196,22 +1211,25 @@ mod tests {
         );
         let response = app.clone().oneshot(good).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body: Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), 4096).await.unwrap()
-        ).unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["authenticated"], true);
         assert_eq!(body["login_required"], false);
         assert_eq!(body["capabilities"]["read"], true);
         assert_eq!(body["capabilities"]["writes"], false);
         // Browser API calls use the same authenticated Authelia session and
         // must not require any additional Chat Hub cookie or access token.
-        let response = app.clone().oneshot(authelia_request(
-            "POST",
-            "/api/bridge/list_conversations",
-            Some("172.21.0.2:53111"),
-            Some("esben"),
-            Some("https://chat-hub-preview.ginnungagaps.xyz"),
-        )).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(authelia_request(
+                "POST",
+                "/api/bridge/list_conversations",
+                Some("172.21.0.2:53111"),
+                Some("esben"),
+                Some("https://chat-hub-preview.ginnungagaps.xyz"),
+            ))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let mut second_login = authelia_request(
             "POST",
@@ -1224,8 +1242,15 @@ mod tests {
         let response = app.clone().oneshot(second_login).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         // The endpoint cannot create a second server-login session.
-        let health = app.oneshot(Request::builder().uri("/healthz")
-            .body(Body::empty()).unwrap()).await.unwrap();
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
     }
 
@@ -1235,38 +1260,114 @@ mod tests {
         let allowed = Some("https://chat-hub-preview.ginnungagaps.xyz");
         for (peer, user, origin, path, method) in [
             (None, Some("esben"), None, "/api/capabilities", "GET"),
-            (Some("172.21.0.99:5000"), Some("esben"), None, "/api/capabilities", "GET"),
-            (Some("127.0.0.1:5000"), Some("esben"), None, "/api/capabilities", "GET"),
-            (Some("172.21.0.2:5000"), None, None, "/api/capabilities", "GET"),
-            (Some("172.21.0.2:5000"), Some("alice"), None, "/api/capabilities", "GET"),
-            (Some("172.21.0.2:5000"), Some("esben"), None,
-                "/api/bridge/list_conversations", "POST"),
-            (Some("172.21.0.2:5000"), Some("esben"),
-                Some("https://evil.example"), "/api/bridge/list_conversations", "POST"),
+            (
+                Some("172.21.0.99:5000"),
+                Some("esben"),
+                None,
+                "/api/capabilities",
+                "GET",
+            ),
+            (
+                Some("127.0.0.1:5000"),
+                Some("esben"),
+                None,
+                "/api/capabilities",
+                "GET",
+            ),
+            (
+                Some("172.21.0.2:5000"),
+                None,
+                None,
+                "/api/capabilities",
+                "GET",
+            ),
+            (
+                Some("172.21.0.2:5000"),
+                Some("alice"),
+                None,
+                "/api/capabilities",
+                "GET",
+            ),
+            (
+                Some("172.21.0.2:5000"),
+                Some("esben"),
+                None,
+                "/api/bridge/list_conversations",
+                "POST",
+            ),
+            (
+                Some("172.21.0.2:5000"),
+                Some("esben"),
+                Some("https://evil.example"),
+                "/api/bridge/list_conversations",
+                "POST",
+            ),
         ] {
-            let response = app.clone().oneshot(authelia_request(
-                method, path, peer, user, origin,
-            )).await.unwrap();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN,
-                "{method} {path} {peer:?} {user:?} {origin:?}");
+            let response = app
+                .clone()
+                .oneshot(authelia_request(method, path, peer, user, origin))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} {peer:?} {user:?} {origin:?}"
+            );
         }
-        let mut bad = authelia_request("GET", "/api/capabilities",
-            Some("172.21.0.2:5000"), Some("esben"), None);
-        bad.headers_mut().insert(header::HOST, HeaderValue::from_static("evil.example"));
-        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
-        let mut bad = authelia_request("GET", "/api/capabilities",
-            Some("172.21.0.2:5000"), Some("esben"), None);
-        bad.headers_mut().insert("x-forwarded-proto", HeaderValue::from_static("http"));
-        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
-        let mut bad = authelia_request("GET", "/api/capabilities",
-            Some("172.21.0.2:5000"), Some("esben"), None);
-        bad.headers_mut().append("remote-user", HeaderValue::from_static("alice"));
-        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let mut bad = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:5000"),
+            Some("esben"),
+            None,
+        );
+        bad.headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("evil.example"));
+        assert_eq!(
+            app.clone().oneshot(bad).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut bad = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:5000"),
+            Some("esben"),
+            None,
+        );
+        bad.headers_mut()
+            .insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert_eq!(
+            app.clone().oneshot(bad).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut bad = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:5000"),
+            Some("esben"),
+            None,
+        );
+        bad.headers_mut()
+            .append("remote-user", HeaderValue::from_static("alice"));
+        assert_eq!(
+            app.clone().oneshot(bad).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
         // A different origin is forbidden even if Authelia asserted identity.
-        let mut bad = authelia_request("GET", "/api/capabilities",
-            Some("172.21.0.2:5000"), Some("esben"), allowed);
-        bad.headers_mut().insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
-        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let mut bad = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:5000"),
+            Some("esben"),
+            allowed,
+        );
+        bad.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert_eq!(
+            app.clone().oneshot(bad).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
-
 }
