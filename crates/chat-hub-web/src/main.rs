@@ -540,7 +540,7 @@ async fn start_capture(
 ) -> Result<
     (
         chat_hub_runtime::service::ServiceHandle,
-        tokio::sync::mpsc::Sender<chat_hub_runtime::capture_lane::CaptureEvent>,
+        tokio::sync::mpsc::Sender<chat_hub_runtime::proxy::CaptureEvent>,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -1146,7 +1146,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_response_contains_only_metadata() {
-        let response = healthz().await;
+        let app = test_app_with_auth(WebAuth::TrustedProxy("http://127.0.0.1:8080".parse().unwrap()));
+        let response = app.oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap()).await.unwrap();
         let bytes = to_bytes(response.into_response().into_body(), 1024)
             .await
             .unwrap();
