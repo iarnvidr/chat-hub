@@ -1213,15 +1213,20 @@ mod tests {
             Some("https://chat-hub-preview.ginnungagaps.xyz"),
         )).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let response = app.clone().oneshot(authelia_request(
+        let mut second_login = authelia_request(
             "POST",
             "/api/session",
             Some("172.21.0.2:53111"),
             Some("esben"),
             Some("https://chat-hub-preview.ginnungagaps.xyz"),
-        )).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        );
+        *second_login.body_mut() = Body::from(r#"{"token":"not-required"}"#);
+        let response = app.clone().oneshot(second_login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         // The endpoint cannot create a second server-login session.
+        let health = app.oneshot(Request::builder().uri("/healthz")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
     }
 
     #[tokio::test]
