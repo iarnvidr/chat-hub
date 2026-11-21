@@ -1220,6 +1220,29 @@ mod tests {
     }
 
     #[test]
+    fn browser_shell_replaces_exactly_one_server_auth_marker() {
+        let authelia = WebAuth::Authelia {
+            origin: authelia_origin(Some("https://chat-hub-preview.ginnungagaps.xyz".into()))
+                .unwrap(),
+            expected_user: Arc::from("esben"),
+            proxy_ips: Arc::new(vec!["172.21.0.2".parse().unwrap()]),
+        };
+        assert!(render_index_html("<html></html>", &authelia).is_err());
+        assert!(render_index_html(
+            &format!("{INDEX_AUTH_MARKER}{INDEX_AUTH_MARKER}"),
+            &authelia,
+        ).is_err());
+        let shell = render_index_html(INDEX_AUTH_MARKER, &authelia).unwrap();
+        assert!(shell.contains(r#"content="authelia""#));
+        assert!(!shell.contains(r#"content="token""#));
+        let dev = render_index_html(
+            INDEX_AUTH_MARKER,
+            &WebAuth::Token(Arc::from("synthetic-token")),
+        ).unwrap();
+        assert!(dev.contains(r#"content="token""#));
+    }
+
+    #[test]
     fn authelia_mode_requires_explicit_exact_https_origin() {
         assert!(authelia_origin(None).is_err());
         for value in [
@@ -1251,6 +1274,12 @@ mod tests {
         assert_eq!(body["login_required"], false);
         assert_eq!(body["capabilities"]["read"], true);
         assert_eq!(body["capabilities"]["writes"], false);
+        let response = app.clone().oneshot(authelia_request(
+            "GET", "/", Some("172.21.0.2:5000"), Some("esben"), None,
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&html).contains(r#"content="authelia""#));
         // Browser API calls use the same authenticated Authelia session and
         // must not require any additional Chat Hub cookie or access token.
         let response = app
