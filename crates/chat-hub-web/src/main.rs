@@ -709,6 +709,7 @@ mod tests {
             .layer(middleware::from_fn_with_state(state.clone(), authenticate))
             .with_state(());
         Router::new()
+            .route("/healthz", get(healthz))
             .route("/api/session", post(login).delete(logout))
             .route("/api/capabilities", get(capabilities))
             .route("/api/bridge/:command", post(bridge))
@@ -1129,4 +1130,138 @@ mod tests {
         assert!(!body.contains("token"));
         assert!(!body.contains("conversation"));
     }
+    fn authelia_test_app() -> Router {
+        let origin = authelia_origin(Some("https://chat-hub-preview.ginnungagaps.xyz".into()))
+            .unwrap();
+        test_app_with_auth(WebAuth::Authelia {
+            origin,
+            expected_user: Arc::from("esben"),
+            proxy_ips: Arc::new(vec!["172.21.0.2".parse().unwrap()]),
+        })
+    }
+
+    fn authelia_request(
+        method: &str,
+        path: &str,
+        peer: Option<&str>,
+        user: Option<&str>,
+        origin: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "chat-hub-preview.ginnungagaps.xyz")
+            .header("x-forwarded-proto", "https")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(user) = user {
+            builder = builder.header("remote-user", user);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        let mut request = builder
+            .body(Body::from(r#"{"args":{}}"#))
+            .unwrap();
+        if let Some(peer) = peer {
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        }
+        request
+    }
+
+    #[test]
+    fn authelia_mode_requires_explicit_exact_https_origin() {
+        assert!(authelia_origin(None).is_err());
+        for value in [
+            "http://chat-hub-preview.ginnungagaps.xyz",
+            "https://chat-hub-preview.ginnungagaps.xyz/path",
+            "https://user@chat-hub-preview.ginnungagaps.xyz",
+            "https://chat-hub-preview.ginnungagaps.xyz?token=secret",
+        ] {
+            assert!(authelia_origin(Some(value.into())).is_err(), "{value}");
+        }
+        assert!(authelia_origin(Some("https://chat-hub-preview.ginnungagaps.xyz".into())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn authelia_identity_from_traefik_is_the_only_browser_login() {
+        let app = authelia_test_app();
+        let good = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:59595"),
+            Some("esben"),
+            None,
+        );
+        let response = app.clone().oneshot(good).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 4096).await.unwrap()
+        ).unwrap();
+        assert_eq!(body["authenticated"], true);
+        assert_eq!(body["login_required"], false);
+        assert_eq!(body["capabilities"]["read"], true);
+        assert_eq!(body["capabilities"]["writes"], false);
+        // Browser API calls use the same authenticated Authelia session and
+        // must not require any additional Chat Hub cookie or access token.
+        let response = app.clone().oneshot(authelia_request(
+            "POST",
+            "/api/bridge/list_conversations",
+            Some("172.21.0.2:53111"),
+            Some("esben"),
+            Some("https://chat-hub-preview.ginnungagaps.xyz"),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(authelia_request(
+            "POST",
+            "/api/session",
+            Some("172.21.0.2:53111"),
+            Some("esben"),
+            Some("https://chat-hub-preview.ginnungagaps.xyz"),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // The endpoint cannot create a second server-login session.
+    }
+
+    #[tokio::test]
+    async fn authelia_rejects_direct_peer_wrong_user_and_spoofed_browser_headers() {
+        let app = authelia_test_app();
+        let allowed = Some("https://chat-hub-preview.ginnungagaps.xyz");
+        for (peer, user, origin, path, method) in [
+            (None, Some("esben"), None, "/api/capabilities", "GET"),
+            (Some("172.21.0.99:5000"), Some("esben"), None, "/api/capabilities", "GET"),
+            (Some("127.0.0.1:5000"), Some("esben"), None, "/api/capabilities", "GET"),
+            (Some("172.21.0.2:5000"), None, None, "/api/capabilities", "GET"),
+            (Some("172.21.0.2:5000"), Some("alice"), None, "/api/capabilities", "GET"),
+            (Some("172.21.0.2:5000"), Some("esben"), None,
+                "/api/bridge/list_conversations", "POST"),
+            (Some("172.21.0.2:5000"), Some("esben"),
+                Some("https://evil.example"), "/api/bridge/list_conversations", "POST"),
+        ] {
+            let response = app.clone().oneshot(authelia_request(
+                method, path, peer, user, origin,
+            )).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN,
+                "{method} {path} {peer:?} {user:?} {origin:?}");
+        }
+        let mut bad = authelia_request("GET", "/api/capabilities",
+            Some("172.21.0.2:5000"), Some("esben"), None);
+        bad.headers_mut().insert(header::HOST, HeaderValue::from_static("evil.example"));
+        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let mut bad = authelia_request("GET", "/api/capabilities",
+            Some("172.21.0.2:5000"), Some("esben"), None);
+        bad.headers_mut().insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let mut bad = authelia_request("GET", "/api/capabilities",
+            Some("172.21.0.2:5000"), Some("esben"), None);
+        bad.headers_mut().append("remote-user", HeaderValue::from_static("alice"));
+        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
+        // A different origin is forbidden even if Authelia asserted identity.
+        let mut bad = authelia_request("GET", "/api/capabilities",
+            Some("172.21.0.2:5000"), Some("esben"), allowed);
+        bad.headers_mut().insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
+        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
 }
