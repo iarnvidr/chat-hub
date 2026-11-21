@@ -26,7 +26,7 @@ class Element {
   focus() { this.focused = true; }
 }
 
-async function setup(capabilities) {
+async function setup(capabilities, authMode = 'authelia') {
   const nodes = new Map();
   const el = key => {
     if (!nodes.has(key)) nodes.set(key, new Element());
@@ -55,7 +55,8 @@ async function setup(capabilities) {
     httpBridge: () => bridge,
     document: {
       getElementById: el,
-      querySelector: selector => selector === '.skip-link' ? skip : null,
+      querySelector: selector => selector === '.skip-link' ? skip
+        : selector === 'meta[name="chat-hub-auth-mode"]' ? {content:authMode} : null,
       querySelectorAll: () => [],
     },
     window: {
@@ -84,7 +85,7 @@ test('Authelia-authenticated owner opens library with no extra token form', asyn
 });
 
 test('expired Authelia or failed proxy check offers reconnect, never token login', async () => {
-  for (const status of [403, 502, undefined]) {
+  for (const status of [401, 403, 502, undefined]) {
     const error = Object.assign(new Error('server unavailable'), {status});
     const h = await setup(error);
     assert.equal(h.gate.hidden, false, 'gate must explain unavailable connection');
@@ -99,7 +100,7 @@ test('expired Authelia or failed proxy check offers reconnect, never token login
 
 test('standalone token-auth development still uses its own login flow', async () => {
   const error = Object.assign(new Error('missing developer session'), {status:401});
-  const h = await setup(error);
+  const h = await setup(error, 'token');
   assert.equal(h.gate.hidden, false);
   assert.equal(h.form.hidden, false);
   assert.equal(h.reconnect.hidden, true);
