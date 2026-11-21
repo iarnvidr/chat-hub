@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{connect_info::ConnectInfo, Path, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     env, fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -28,6 +28,13 @@ const MAX_SESSIONS: usize = 64;
 enum WebAuth {
     Token(Arc<str>),
     TrustedProxy(Uri),
+    // The only user login is Authelia. Requests must originate from the
+    // configured Traefik container and carry an identity set by ForwardAuth.
+    Authelia {
+        origin: Uri,
+        expected_user: Arc<str>,
+        proxy_ips: Arc<Vec<IpAddr>>,
+    },
 }
 
 impl WebAuth {
@@ -44,11 +51,7 @@ struct WebState {
     api_router: Arc<Mutex<Option<Router>>>,
 }
 
-fn trusted_origin(addr: SocketAddr, origin: Option<String>) -> Result<Uri, String> {
-    if !addr.ip().is_loopback() {
-        return Err("CHAT_HUB_WEB_AUTH=none requires a loopback bind address".into());
-    }
-    let origin = origin.unwrap_or_else(|| format!("http://{addr}"));
+fn exact_origin(origin: &str) -> Result<Uri, String> {
     let uri: Uri = origin
         .parse()
         .map_err(|_| "invalid CHAT_HUB_WEB_ORIGIN".to_owned())?;
@@ -62,28 +65,94 @@ fn trusted_origin(addr: SocketAddr, origin: Option<String>) -> Result<Uri, Strin
     Ok(uri)
 }
 
+fn trusted_origin(addr: SocketAddr, origin: Option<String>) -> Result<Uri, String> {
+    if !addr.ip().is_loopback() {
+        return Err("CHAT_HUB_WEB_AUTH=none requires a loopback bind address".into());
+    }
+    exact_origin(&origin.unwrap_or_else(|| format!("http://{addr}")))
+}
+
+fn authelia_origin(origin: Option<String>) -> Result<Uri, String> {
+    let value = origin.ok_or("CHAT_HUB_WEB_ORIGIN is required for Authelia")?;
+    let uri = exact_origin(&value)?;
+    if uri.scheme_str() != Some("https") {
+        return Err("Authelia requires a secure HTTPS browser origin".into());
+    }
+    Ok(uri)
+}
+
+fn origin_matches(headers: &HeaderMap, uri: &Uri, require_origin: bool) -> bool {
+    let Some(expected_host) = uri.authority().map(|value| value.as_str()) else {
+        return false;
+    };
+    let expected_origin = format!("{}://{expected_host}", uri.scheme_str().unwrap_or(""));
+    headers.get_all(header::HOST).iter().count() == 1
+        && headers.get(header::HOST).is_some_and(|value| value.as_bytes() == expected_host.as_bytes())
+        && headers.get_all(header::ORIGIN).iter().count() <= 1
+        && (!require_origin || headers.contains_key(header::ORIGIN))
+        && headers
+            .get(header::ORIGIN)
+            .is_none_or(|value| value.as_bytes() == expected_origin.as_bytes())
+}
+
+fn authelia_request_authorized(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    origin: &Uri,
+    expected_user: &str,
+    proxy_ips: &[IpAddr],
+    method: &axum::http::Method,
+) -> bool {
+    let Some(peer) = peer else { return false };
+    if !proxy_ips.contains(&peer.ip()) || proxy_ips.is_empty() {
+        return false;
+    }
+    if !origin_matches(headers, origin, *method != axum::http::Method::GET
+            && *method != axum::http::Method::HEAD) {
+        return false;
+    }
+    // The ForwardAuth middleware replaces Remote-User after consulting
+    // Authelia. Never trust an arbitrary browser-provided user header or a
+    // direct request from another proxy-network container.
+    headers.get_all("remote-user").iter().count() == 1
+        && headers.get("remote-user").is_some_and(|value| value.as_bytes() == expected_user.as_bytes())
+        && headers.get_all("x-forwarded-proto").iter().count() == 1
+        && headers.get("x-forwarded-proto").is_some_and(|value| value == "https")
+}
+
 async fn restrict_trusted_origin(
     State(state): State<WebState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let WebAuth::TrustedProxy(origin) = &state.auth else {
-        return next.run(request).await;
-    };
-    // Probes reach loopback directly. Library routes require the configured
-    // host even without an Origin header, so DNS rebinding cannot read them.
+    // Health contains no private content and remains probeable from the
+    // container's loopback without forwarding an Authelia cookie or username.
     if request.uri().path() == "/healthz" {
         return next.run(request).await;
     }
-    let headers = request.headers();
-    let expected_host = origin.authority().unwrap().as_str();
-    let expected_origin = format!("{}://{expected_host}", origin.scheme_str().unwrap());
-    if headers.get(header::HOST).map(HeaderValue::as_bytes) != Some(expected_host.as_bytes())
-        || headers
-            .get(header::ORIGIN)
-            .is_some_and(|value| value.as_bytes() != expected_origin.as_bytes())
-    {
-        return StatusCode::FORBIDDEN.into_response();
+    match &state.auth {
+        WebAuth::Token(_) => {}
+        WebAuth::TrustedProxy(origin) => {
+            if !origin_matches(request.headers(), origin, false) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+        WebAuth::Authelia { origin, expected_user, proxy_ips } => {
+            let peer = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|connection| connection.0);
+            if !authelia_request_authorized(
+                request.headers(),
+                peer,
+                origin,
+                expected_user,
+                proxy_ips,
+                request.method(),
+            ) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
     }
     next.run(request).await
 }
@@ -538,7 +607,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(mode) if mode == "none" => {
             WebAuth::TrustedProxy(trusted_origin(addr, env::var("CHAT_HUB_WEB_ORIGIN").ok())?)
         }
-        Ok(mode) if mode != "token" => return Err("CHAT_HUB_WEB_AUTH must be token or none".into()),
+        Ok(mode) if mode == "authelia" => {
+            let origin = authelia_origin(env::var("CHAT_HUB_WEB_ORIGIN").ok())?;
+            // Name and port are deliberately fixed to the Traefik service on
+            // the private Docker network. A DNS failure aborts startup.
+            let mut proxy_ips = tokio::net::lookup_host(("traefik", 8082))
+                .await?
+                .map(|address| address.ip())
+                .collect::<Vec<IpAddr>>();
+            proxy_ips.sort_unstable();
+            proxy_ips.dedup();
+            if proxy_ips.is_empty() || proxy_ips.iter().any(IpAddr::is_loopback) {
+                return Err("Cannot establish trusted Traefik peer addresses".into());
+            }
+            WebAuth::Authelia {
+                origin,
+                expected_user: Arc::from("esben"),
+                proxy_ips: Arc::new(proxy_ips),
+            }
+        }
+        Ok(mode) if mode != "token" => {
+            return Err("CHAT_HUB_WEB_AUTH must be authelia, token or none".into());
+        },
         Err(error) if error != env::VarError::NotPresent => return Err(error.into()),
         _ => {
             let token_path = required_path("CHAT_HUB_WEB_TOKEN_FILE", None)?;
@@ -587,7 +677,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("chat-hub-web listening on {}", listener.local_addr()?);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
