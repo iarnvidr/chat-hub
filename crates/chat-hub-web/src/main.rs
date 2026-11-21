@@ -59,7 +59,10 @@ fn render_index_html(template: &str, auth: &WebAuth) -> Result<Arc<str>, String>
     }
     Ok(Arc::from(template.replace(
         INDEX_AUTH_MARKER,
-        &format!(r#"<meta name="chat-hub-auth-mode" content="{}">"#, auth.html_mode()),
+        &format!(
+            r#"<meta name="chat-hub-auth-mode" content="{}">"#,
+            auth.html_mode()
+        ),
     )))
 }
 
@@ -1231,14 +1234,16 @@ mod tests {
         assert!(render_index_html(
             &format!("{INDEX_AUTH_MARKER}{INDEX_AUTH_MARKER}"),
             &authelia,
-        ).is_err());
+        )
+        .is_err());
         let shell = render_index_html(INDEX_AUTH_MARKER, &authelia).unwrap();
         assert!(shell.contains(r#"content="authelia""#));
         assert!(!shell.contains(r#"content="token""#));
         let dev = render_index_html(
             INDEX_AUTH_MARKER,
             &WebAuth::Token(Arc::from("synthetic-token")),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(dev.contains(r#"content="token""#));
     }
 
@@ -1274,9 +1279,17 @@ mod tests {
         assert_eq!(body["login_required"], false);
         assert_eq!(body["capabilities"]["read"], true);
         assert_eq!(body["capabilities"]["writes"], false);
-        let response = app.clone().oneshot(authelia_request(
-            "GET", "/", Some("172.21.0.2:5000"), Some("esben"), None,
-        )).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(authelia_request(
+                "GET",
+                "/",
+                Some("172.21.0.2:5000"),
+                Some("esben"),
+                None,
+            ))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let html = to_bytes(response.into_body(), 4096).await.unwrap();
         assert!(String::from_utf8_lossy(&html).contains(r#"content="authelia""#));
