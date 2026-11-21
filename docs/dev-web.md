@@ -4,7 +4,8 @@
 bridge on port `8080`. The backend is intentionally opened on `0.0.0.0` so the
 Paseo dev-container preview can reach it; use the preview's owner-only access
 boundary for browser access. The server reports readiness at `GET /healthz`.
-Provider capture is disabled in this development mode.
+Provider capture is disabled in this development mode; see
+[headless-capture.md](headless-capture.md) for the opt-in server capture mode.
 
 ## Start
 
