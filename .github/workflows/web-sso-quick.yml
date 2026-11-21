@@ -4,6 +4,7 @@ on:
     paths:
       - 'crates/chat-hub-web/**'
       - 'desktop-ui/auth.js'
+      - 'tests/web_authelia_auth.test.cjs'
       - 'desktop-ui/index.html'
       - 'docs/dev-web.md'
       - '.github/workflows/web-sso-quick.yml'
@@ -17,6 +18,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Check browser client syntax
         run: node --input-type=module --check < desktop-ui/auth.js
+      - name: Verify one-login Authelia behavior and standalone dev fallback
+        run: node --test tests/web_authelia_auth.test.cjs
       - name: Install pinned rustfmt
         run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt
       - name: Format the web server and its Authelia regression tests
