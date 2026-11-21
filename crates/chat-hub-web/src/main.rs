@@ -3,7 +3,7 @@ use axum::{
     extract::{connect_info::ConnectInfo, Path, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -41,11 +41,32 @@ impl WebAuth {
     fn login_required(&self) -> bool {
         matches!(self, Self::Token(_))
     }
+
+    fn html_mode(&self) -> &'static str {
+        match self {
+            Self::Token(_) => "token",
+            Self::TrustedProxy(_) => "proxy",
+            Self::Authelia { .. } => "authelia",
+        }
+    }
+}
+
+const INDEX_AUTH_MARKER: &str = r#"<meta name="chat-hub-auth-mode" content="server">"#;
+
+fn render_index_html(template: &str, auth: &WebAuth) -> Result<Arc<str>, String> {
+    if template.matches(INDEX_AUTH_MARKER).count() != 1 {
+        return Err("Desktop index must contain exactly one auth-mode marker".into());
+    }
+    Ok(Arc::from(template.replace(
+        INDEX_AUTH_MARKER,
+        &format!(r#"<meta name="chat-hub-auth-mode" content="{}">"#, auth.html_mode()),
+    )))
 }
 
 #[derive(Clone)]
 struct WebState {
     auth: WebAuth,
+    index_html: Arc<str>,
     api_token: Arc<str>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     api_router: Arc<Mutex<Option<Router>>>,
@@ -604,6 +625,10 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok", "capture":"disabled"}))
 }
 
+async fn index(State(state): State<WebState>) -> Html<String> {
+    Html(state.index_html.to_string())
+}
+
 fn required_path(name: &str, default: Option<&str>) -> Result<PathBuf, String> {
     env::var_os(name)
         .map(PathBuf::from)
@@ -654,12 +679,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let db_path = required_path("CHAT_HUB_DATABASE", None)?;
     let ui_path = required_path("CHAT_HUB_DESKTOP_UI", Some("desktop-ui"))?;
+    let html_template = fs::read_to_string(ui_path.join("index.html"))?;
+    let index_html = render_index_html(&html_template, &auth)?;
     let store = chat_hub_store::store::Store::open_existing(
         db_path.to_str().ok_or("database path is not UTF-8")?,
     )?;
     let api_token = random_secret()?;
     let state = WebState {
         auth,
+        index_html,
         api_token: Arc::from(api_token.clone()),
         sessions: Arc::default(),
         api_router: Arc::new(Mutex::new(None)),
@@ -673,6 +701,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(());
     let static_files = ServeDir::new(ui_path).append_index_html_on_directories(true);
     let app = Router::new()
+        .route("/", get(index))
+        .route("/index.html", get(index))
         .route("/healthz", get(healthz))
         .route("/api/session", post(login).delete(logout))
         .route("/api/capabilities", get(capabilities))
@@ -709,8 +739,10 @@ mod tests {
     }
 
     fn test_app_with_auth(auth: WebAuth) -> Router {
+        let index_html = render_index_html(INDEX_AUTH_MARKER, &auth).unwrap();
         let state = WebState {
             auth,
+            index_html,
             api_token: Arc::from("synthetic-api-token"),
             sessions: Arc::default(),
             api_router: Arc::new(Mutex::new(None)),
@@ -726,6 +758,8 @@ mod tests {
             .layer(middleware::from_fn_with_state(state.clone(), authenticate))
             .with_state(());
         Router::new()
+            .route("/", get(index))
+            .route("/index.html", get(index))
             .route("/healthz", get(healthz))
             .route("/api/session", post(login).delete(logout))
             .route("/api/capabilities", get(capabilities))
