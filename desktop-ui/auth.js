@@ -5,6 +5,7 @@ const gate = document.getElementById('server-login');
 const form = document.getElementById('server-login-form');
 const tokenField = document.getElementById('server-token');
 const message = document.getElementById('server-login-message');
+const authMode = document.querySelector('meta[name="chat-hub-auth-mode"]')?.content || 'server';
 const reconnect = document.getElementById('server-reconnect');
 document.getElementById('server-reconnect-button')?.addEventListener('click', () => {
   // A full navigation, unlike a fetch, lets Authelia redirect to its portal.
@@ -44,7 +45,10 @@ async function resume() {
     // Only the standalone token-authenticated development server returns 401
     // for a missing app session. Authelia redirects/forbids at the proxy, and
     // must never prompt the user for a second unrelated Chat Hub credential.
-    return {authenticated:false, tokenRequired:error?.status === 401};
+    // A 401 from Authelia is *not* a request for an app token. The server
+    // stamps the login mode into index.html before serving it; never infer
+    // the presence of another password prompt from an HTTP status alone.
+    return {authenticated:false, tokenRequired:authMode === 'token' && error?.status === 401};
   }
 }
 
