@@ -5,6 +5,11 @@ const gate = document.getElementById('server-login');
 const form = document.getElementById('server-login-form');
 const tokenField = document.getElementById('server-token');
 const message = document.getElementById('server-login-message');
+const reconnect = document.getElementById('server-reconnect');
+document.getElementById('server-reconnect-button')?.addEventListener('click', () => {
+  // A full navigation, unlike a fetch, lets Authelia redirect to its portal.
+  window.location.reload();
+});
 
 function applyCapabilities(value = {}) {
   const caps = value.capabilities && typeof value.capabilities === 'object' ? value.capabilities : value;
@@ -20,7 +25,7 @@ function applyCapabilities(value = {}) {
 async function resume() {
   try {
     const caps = await bridge.capabilities();
-    if (caps?.authenticated !== true) return false;
+    if (caps?.authenticated !== true) return {authenticated:false, tokenRequired:false};
     applyCapabilities(caps);
     const loginRequired = caps.login_required !== false;
     document.getElementById('server-logout').hidden = !loginRequired;
@@ -34,9 +39,12 @@ async function resume() {
     gate.hidden = true;
     document.querySelector('.skip-link').hidden = false;
     window.dispatchEvent(new Event('chat-hub:authenticated'));
-    return true;
-  } catch {
-    return false;
+    return {authenticated:true, tokenRequired:false};
+  } catch (error) {
+    // Only the standalone token-authenticated development server returns 401
+    // for a missing app session. Authelia redirects/forbids at the proxy, and
+    // must never prompt the user for a second unrelated Chat Hub credential.
+    return {authenticated:false, tokenRequired:error?.status === 401};
   }
 }
 
@@ -50,7 +58,7 @@ if (window.ChatHub?.transport === 'http') {
     try {
       await bridge.login(token);
       tokenField.value = '';
-      if (!await resume()) throw new Error('session_unavailable');
+      if (!(await resume()).authenticated) throw new Error('session_unavailable');
     } catch {
       tokenField.value = '';
       message.textContent = 'Sign-in failed. Check the token and try again.';
@@ -66,10 +74,11 @@ if (window.ChatHub?.transport === 'http') {
   });
 
   document.querySelector('.skip-link').hidden = true;
-  resume().then(authenticated => {
-    if (!authenticated) {
-      gate.hidden = false;
-      tokenField.focus();
-    }
+  resume().then(({authenticated, tokenRequired}) => {
+    if (authenticated) return;
+    gate.hidden = false;
+    form.hidden = !tokenRequired;
+    reconnect.hidden = tokenRequired;
+    if (tokenRequired) tokenField.focus();
   });
 }
