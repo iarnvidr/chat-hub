@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 axum = "0.7"
 chat-hub-api = { path = "../chat-hub-api", version = "0.2.5" }
+chat-hub-runtime = { path = "../chat-hub-runtime", version = "0.1.0" }
 chat-hub-store = { path = "../chat-hub-store", version = "0.1.0" }
 http = "1"
 serde = { version = "1", features = ["derive"] }
