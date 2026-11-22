@@ -45,6 +45,9 @@ class Collector:
         targets = links[:self.recent]
         targets += [p for p in links[self.recent:] if p not in self.visited][:self.backfill]
         for path in targets:
+            if getattr(self.browser, "prompt_waiting", 0):  # a prompt takes the page; retry next interval
+                self.state = "idle"
+                return
             await self.browser.goto("https://chatgpt.com" + path)
             await self._pause(self.settle)
             if await self.browser.signed_out():

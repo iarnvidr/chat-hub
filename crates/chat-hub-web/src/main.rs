@@ -21,6 +21,8 @@ use std::{
 use subtle::ConstantTimeEq;
 use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
+mod live;
+
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_SESSIONS: usize = 64;
 
@@ -74,6 +76,7 @@ struct WebState {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     api_router: Arc<Mutex<Option<Router>>>,
     capture: bool,
+    live: Option<Arc<live::Live>>,
 }
 
 fn exact_origin(origin: &str) -> Result<Uri, String> {
@@ -390,7 +393,7 @@ async fn capabilities(State(state): State<WebState>, headers: HeaderMap) -> Resp
     let stable = env::var("CHAT_HUB_WEB_MODE").is_ok_and(|mode| mode == "stable");
     let service_worker =
         stable && env::var("CHAT_HUB_WEB_SERVICE_WORKER").is_ok_and(|value| value == "1");
-    Json(serde_json::json!({"authenticated":true,"login_required":state.auth.login_required(),"capabilities":{"read":true,"writes":false,"catalog_write":false,"capture":state.capture,"capture_controls":false,"desktop":false,"desktop_diagnostics":false,"import_export":false,"native_file_dialog":false,"provider_view":false,"updater":false,"dev_mode":!stable,"service_worker":service_worker}})).into_response()
+    Json(serde_json::json!({"authenticated":true,"login_required":state.auth.login_required(),"capabilities":{"read":true,"writes":false,"catalog_write":false,"capture":state.capture,"live":state.live.is_some(),"capture_controls":false,"desktop":false,"desktop_diagnostics":false,"import_export":false,"native_file_dialog":false,"provider_view":false,"updater":false,"dev_mode":!stable,"service_worker":service_worker}})).into_response()
 }
 
 fn query_string(args: &Value, search: bool) -> Result<String, StatusCode> {
@@ -745,6 +748,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = chat_hub_store::store::Store::open_existing(
         db_path.to_str().ok_or("database path is not UTF-8")?,
     )?;
+    let capture_service = if capture {
+        Some(start_capture(&db_path).await?)
+    } else {
+        None
+    };
+    // Live prompts need the capture hub and a configured browser sidecar.
+    let live = match &capture_service {
+        Some((handle, _)) => live::Live::from_env(handle.capture_status().events())?.map(Arc::new),
+        None => None,
+    };
     let api_token = random_secret()?;
     let state = WebState {
         auth,
@@ -753,6 +766,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sessions: Arc::default(),
         api_router: Arc::new(Mutex::new(None)),
         capture,
+        live,
     };
     let api_base = chat_hub_api::server::router(store, api_token);
     if let Ok(mut router) = state.api_router.lock() {
@@ -769,6 +783,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/session", post(login).delete(logout))
         .route("/api/capabilities", get(capabilities))
         .route("/api/bridge/:command", post(bridge))
+        .route("/api/live/stream", get(live::stream))
+        .route("/api/live/status", get(live::status))
+        .route("/api/live/prompt", post(live::prompt))
         .merge(api)
         .fallback_service(static_files)
         .layer(middleware::from_fn_with_state(
@@ -780,11 +797,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             HeaderValue::from_static("no-store, no-cache, must-revalidate"),
         ))
         .with_state(state);
-    let capture_service = if capture {
-        Some(start_capture(&db_path).await?)
-    } else {
-        None
-    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("chat-hub-web listening on {}", listener.local_addr()?);
     if let Some((handle, _)) = &capture_service {
@@ -819,6 +831,14 @@ mod tests {
     }
 
     fn test_app_with(auth: WebAuth, capture: bool) -> Router {
+        test_app_state(auth, capture, None)
+    }
+
+    pub(crate) fn test_app_state(
+        auth: WebAuth,
+        capture: bool,
+        live: Option<Arc<live::Live>>,
+    ) -> Router {
         let index_html = render_index_html(INDEX_AUTH_MARKER, &auth).unwrap();
         let state = WebState {
             auth,
@@ -827,6 +847,7 @@ mod tests {
             sessions: Arc::default(),
             api_router: Arc::new(Mutex::new(None)),
             capture,
+            live,
         };
         let api_base = chat_hub_api::server::router(
             chat_hub_store::store::Store::in_memory().unwrap(),
@@ -845,6 +866,9 @@ mod tests {
             .route("/api/session", post(login).delete(logout))
             .route("/api/capabilities", get(capabilities))
             .route("/api/bridge/:command", post(bridge))
+            .route("/api/live/stream", get(live::stream))
+            .route("/api/live/status", get(live::status))
+            .route("/api/live/prompt", post(live::prompt))
             .merge(api)
             .layer(middleware::from_fn_with_state(
                 state.clone(),

@@ -3,6 +3,7 @@
 ## 0.2.5 — release candidate
 
 - Adds opt-in headless server capture (`CHAT_HUB_WEB_CAPTURE=1`): `chat-hub-web` runs the loopback capture proxy, and a headless `server-browser` sidecar captures ChatGPT history with no remote view. See `docs/headless-capture.md`.
+- Adds prompt sending and a live conversation view to the server PWA (`capabilities.live`): New chat, Continue chat and a composer submit prompts through the loopback headless sidecar, and the reply streams into the page from observed capture deltas over SSE (`/api/live/*`), with no remote browser view. See `docs/headless-capture.md`.
 - Uses one Cargo workspace, root lockfile and shared build directory for the core, desktop and stable crates.
 - Extracts shared models and bounded import/transcript decoding into independent `chat-hub-model` and `chat-hub-formats` crates (both version 0.1.0), while preserving the existing application APIs.
 - Adds bounded, repository-scoped compiled Rust cache reuse for trusted CI builds, with verified cache contracts and retention limits.

@@ -5,6 +5,7 @@ host is tunnelled untouched. Keep the lists small: each entry is a host ChatGPT
 needs to render or to pass its Cloudflare challenge.
 """
 from __future__ import annotations
+import re
 from urllib.parse import urlsplit, urlunsplit
 
 START_URL = "https://chatgpt.com/"
@@ -64,3 +65,20 @@ def conversation_path(href: str) -> str | None:
     if len(parts) == 3 and parts[:2] == ["", "c"] and parts[2].replace("-", "").isalnum():
         return path
     return None
+
+
+CONVERSATION_ID = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}")
+MAX_PROMPT_BYTES = 32 * 1024
+
+
+def prompt_target_url(conversation_id: str | None) -> str:
+    """Page a prompt is typed into: a new chat, or one ChatGPT conversation UUID."""
+    if conversation_id is None:
+        return START_URL
+    if not isinstance(conversation_id, str) or not CONVERSATION_ID.fullmatch(conversation_id):
+        raise ValueError("Invalid conversation id")
+    return navigation_url(f"https://chatgpt.com/c/{conversation_id}")
+
+
+def prompt_text_ok(text) -> bool:
+    return isinstance(text, str) and bool(text.strip()) and len(text.encode("utf-8")) <= MAX_PROMPT_BYTES

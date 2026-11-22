@@ -10,6 +10,9 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+mod stream;
+pub use stream::{LiveEvent, LiveEventKind, LiveEvents, EVENT_QUEUE, MAX_DELTA_BYTES};
+
 pub const ITEM_BYTES: usize = 2 * 1024 * 1024;
 pub const RETAINED_BYTES: usize = 16 * 1024 * 1024;
 pub const QUEUE_ITEMS: usize = 32;
@@ -40,6 +43,7 @@ pub struct CaptureStatus {
     enabled: bool,
     limits: Limits,
     state: Arc<Mutex<State>>,
+    events: LiveEvents,
 }
 impl CaptureStatus {
     pub fn new(enabled: bool) -> Self {
@@ -47,7 +51,12 @@ impl CaptureStatus {
             enabled,
             limits: Limits::default(),
             state: Arc::new(Mutex::new(State::default())),
+            events: LiveEvents::default(),
         }
+    }
+    /// Hub of live stream events; free while nobody subscribes.
+    pub fn events(&self) -> LiveEvents {
+        self.events.clone()
     }
     pub fn snapshot(&self) -> Snapshot {
         match self.state.try_lock() {
@@ -175,6 +184,7 @@ enum Encoding {
 pub struct Accumulator {
     sink: LiveSink,
     work: Option<Work>,
+    live: Option<stream::LiveStream>,
 }
 #[doc(hidden)]
 pub fn channel(enabled: bool) -> (LiveSink, mpsc::Receiver<Work>) {
@@ -274,8 +284,13 @@ impl LiveSink {
             attempt.finish(Outcome::Dropped);
             return None;
         }
+        let live = (context.method == "POST"
+            && matches!(encoding, Encoding::Identity)
+            && self.status.events.has_subscribers())
+        .then(|| stream::LiveStream::new(self.status.events.clone(), self.status.limits.item));
         Some(Accumulator {
             sink: self.clone(),
+            live,
             work: Some(Work {
                 context,
                 metadata,
@@ -329,6 +344,9 @@ pub(crate) fn decode_schema_body(encoding: &str, body: &[u8], limit: usize) -> O
 }
 impl Accumulator {
     pub fn observe(&mut self, bytes: &[u8]) {
+        if let Some(live) = &mut self.live {
+            live.observe(bytes);
+        }
         let Some(work) = &mut self.work else {
             return;
         };
@@ -342,6 +360,9 @@ impl Accumulator {
         }
     }
     pub fn finish(mut self) {
+        if let Some(live) = self.live.take() {
+            live.finish();
+        }
         let Some(mut work) = self.work.take() else {
             return;
         };

@@ -65,7 +65,7 @@ function bootApp({records = () => [], detail = id => ({conversation: {id, title:
     Event: TestEvent, CustomEvent: TestCustomEvent, Date, Promise, Map, Set, Array, Object, String,
     Number, Math, JSON, Error, setTimeout: () => 1, clearTimeout() {},
     fixtureAdapter: () => ({}), httpBridge: () => ({invoke,capabilities:async()=>({authenticated:true}),login:async()=>{},logout:async()=>{}}), normalizeList: x => x, normalizeSearch: x => x,
-    chatgptConversationId: c => c?.source_id || null,
+    chatgptConversationId: c => c?.source_id || null, providerViewAvailable: () => true,
     appendPinMarker: (title, pinned) => { if (pinned) title.append(new Element('pin-marker')); },
     branchChoices: () => [], orderedMessages: () => [], messageText: () => '',
     hasUnsupportedContent: () => false, renderMarkdown: () => {},

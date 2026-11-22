@@ -51,6 +51,10 @@ export function httpBridge({ fetchImpl = globalThis.fetch, base = '' } = {}) {
       return request(`/api/bridge/${command}`, { method: 'POST', body: JSON.stringify({ args }) });
     },
     capabilities() { return request('/api/capabilities'); },
+    liveStatus() { return request('/api/live/status'); },
+    sendPrompt(conversationId, text) {
+      return request('/api/live/prompt', { method: 'POST', body: JSON.stringify({ conversation_id: conversationId, text }) });
+    },
     login(token) { return request('/api/session', { method: 'POST', body: JSON.stringify({ token }) }); },
     logout() { return request('/api/session', { method: 'DELETE', headers: { 'X-CSRF-Token': csrfToken() } }); },
   };
