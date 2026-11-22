@@ -633,6 +633,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chat-hub-api",
+ "chat-hub-runtime",
  "chat-hub-store",
  "http",
  "ring",

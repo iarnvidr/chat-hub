@@ -73,6 +73,7 @@ struct WebState {
     api_token: Arc<str>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     api_router: Arc<Mutex<Option<Router>>>,
+    capture: bool,
 }
 
 fn exact_origin(origin: &str) -> Result<Uri, String> {
@@ -389,7 +390,7 @@ async fn capabilities(State(state): State<WebState>, headers: HeaderMap) -> Resp
     let stable = env::var("CHAT_HUB_WEB_MODE").is_ok_and(|mode| mode == "stable");
     let service_worker =
         stable && env::var("CHAT_HUB_WEB_SERVICE_WORKER").is_ok_and(|value| value == "1");
-    Json(serde_json::json!({"authenticated":true,"login_required":state.auth.login_required(),"capabilities":{"read":true,"writes":false,"catalog_write":false,"capture":false,"capture_controls":false,"desktop":false,"desktop_diagnostics":false,"import_export":false,"native_file_dialog":false,"provider_view":false,"updater":false,"dev_mode":!stable,"service_worker":service_worker}})).into_response()
+    Json(serde_json::json!({"authenticated":true,"login_required":state.auth.login_required(),"capabilities":{"read":true,"writes":false,"catalog_write":false,"capture":state.capture,"capture_controls":false,"desktop":false,"desktop_diagnostics":false,"import_export":false,"native_file_dialog":false,"provider_view":false,"updater":false,"dev_mode":!stable,"service_worker":service_worker}})).into_response()
 }
 
 fn query_string(args: &Value, search: bool) -> Result<String, StatusCode> {
@@ -624,8 +625,64 @@ async fn normalize_api_error(response: Response) -> Response {
     (status, Json(serde_json::json!({"code":code}))).into_response()
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status":"ok", "capture":"disabled"}))
+async fn healthz(State(state): State<WebState>) -> Json<serde_json::Value> {
+    let capture = if state.capture { "enabled" } else { "disabled" };
+    Json(serde_json::json!({"status":"ok", "capture":capture}))
+}
+
+/// `CHAT_HUB_WEB_CAPTURE` opts into the loopback capture proxy; anything unrecognised is an error.
+fn parse_capture(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(_) => Err("CHAT_HUB_WEB_CAPTURE must be 1, true, 0 or false".into()),
+    }
+}
+
+/// Runs the existing live-capture service (proxy + sole store writer). Its own API
+/// listener binds an ephemeral loopback port with a private token and is never exposed.
+async fn start_capture(
+    database_path: &std::path::Path,
+) -> Result<
+    (
+        chat_hub_runtime::service::ServiceHandle,
+        tokio::sync::mpsc::Sender<chat_hub_runtime::proxy::CaptureEvent>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let proxy_addr: SocketAddr = env::var("CHAT_HUB_PROXY_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8788".into())
+        .parse()
+        .map_err(|_| "invalid CHAT_HUB_PROXY_ADDR")?;
+    if !proxy_addr.ip().is_loopback() {
+        return Err("CHAT_HUB_PROXY_ADDR must use a loopback address".into());
+    }
+    use chat_hub_runtime::config::Config;
+    let config = Config {
+        capture_enabled: true,
+        capture_profile_scope: Config::capture_profile_scope_from_env()?,
+        bind_addr: "127.0.0.1:0".parse()?,
+        bearer_token: random_secret()?,
+        database_path: database_path
+            .to_str()
+            .ok_or("database path is not UTF-8")?
+            .to_owned(),
+        ca_dir: required_path("CHAT_HUB_CA_DIR", None)?,
+        proxy_addr,
+    };
+    Ok(chat_hub_runtime::service::start(config, 64).await?)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {_ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {}}
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn index(State(state): State<WebState>) -> Html<String> {
@@ -680,6 +737,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             WebAuth::Token(Arc::from(access_token))
         }
     };
+    let capture = parse_capture(env::var("CHAT_HUB_WEB_CAPTURE").ok().as_deref())?;
     let db_path = required_path("CHAT_HUB_DATABASE", None)?;
     let ui_path = required_path("CHAT_HUB_DESKTOP_UI", Some("desktop-ui"))?;
     let html_template = fs::read_to_string(ui_path.join("index.html"))?;
@@ -694,6 +752,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_token: Arc::from(api_token.clone()),
         sessions: Arc::default(),
         api_router: Arc::new(Mutex::new(None)),
+        capture,
     };
     let api_base = chat_hub_api::server::router(store, api_token);
     if let Ok(mut router) = state.api_router.lock() {
@@ -721,13 +780,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             HeaderValue::from_static("no-store, no-cache, must-revalidate"),
         ))
         .with_state(state);
+    let capture_service = if capture {
+        Some(start_capture(&db_path).await?)
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("chat-hub-web listening on {}", listener.local_addr()?);
+    if let Some((handle, _)) = &capture_service {
+        if let Some(proxy) = handle.status().proxy_addr {
+            eprintln!("chat-hub-web capture proxy listening on {proxy}");
+        }
+    }
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+    if let Some((handle, _sender)) = capture_service {
+        handle.shutdown().await;
+    }
     Ok(())
 }
 
@@ -742,6 +815,10 @@ mod tests {
     }
 
     fn test_app_with_auth(auth: WebAuth) -> Router {
+        test_app_with(auth, false)
+    }
+
+    fn test_app_with(auth: WebAuth, capture: bool) -> Router {
         let index_html = render_index_html(INDEX_AUTH_MARKER, &auth).unwrap();
         let state = WebState {
             auth,
@@ -749,6 +826,7 @@ mod tests {
             api_token: Arc::from("synthetic-api-token"),
             sessions: Arc::default(),
             api_router: Arc::new(Mutex::new(None)),
+            capture,
         };
         let api_base = chat_hub_api::server::router(
             chat_hub_store::store::Store::in_memory().unwrap(),
@@ -773,6 +851,48 @@ mod tests {
                 restrict_trusted_origin,
             ))
             .with_state(state)
+    }
+
+    async fn get_json(app: Router, uri: &str) -> Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn capture_env_is_off_by_default_and_strict() {
+        assert_eq!(parse_capture(None), Ok(false));
+        assert_eq!(parse_capture(Some("0")), Ok(false));
+        assert_eq!(parse_capture(Some("1")), Ok(true));
+        for invalid in ["", "yes", "TRUE", " 1", "secret-sentinel"] {
+            assert_eq!(
+                parse_capture(Some(invalid)).unwrap_err(),
+                "CHAT_HUB_WEB_CAPTURE must be 1, true, 0 or false"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_flag_drives_capabilities_and_health() {
+        for (capture, health) in [(false, "disabled"), (true, "enabled")] {
+            let origin = "http://127.0.0.1:8080".parse().unwrap();
+            let app = test_app_with(WebAuth::TrustedProxy(origin), capture);
+            let caps = get_json(app.clone(), "/api/capabilities").await;
+            assert_eq!(caps["capabilities"]["capture"], capture);
+            assert_eq!(caps["capabilities"]["provider_view"], false);
+            assert_eq!(caps["capabilities"]["writes"], false);
+            let status = get_json(app, "/healthz").await;
+            assert_eq!(status, serde_json::json!({"status":"ok","capture":health}));
+        }
     }
 
     async fn bridge_call(
@@ -1175,7 +1295,18 @@ mod tests {
 
     #[tokio::test]
     async fn health_response_contains_only_metadata() {
-        let response = healthz().await;
+        let app = test_app_with_auth(WebAuth::TrustedProxy(
+            "http://127.0.0.1:8080".parse().unwrap(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let bytes = to_bytes(response.into_response().into_body(), 1024)
             .await
             .unwrap();

@@ -15,7 +15,7 @@ document.getElementById('server-reconnect-button')?.addEventListener('click', ()
 function applyCapabilities(value = {}) {
   const caps = value.capabilities && typeof value.capabilities === 'object' ? value.capabilities : value;
   window.ChatHub.capabilities = caps;
-  const aliases = {provider_view:'desktop',capture_controls:'capture',import_export:'desktop',native_file_dialog:'desktop',updater:'desktop',desktop_diagnostics:'desktop'};
+  const aliases = {provider_view:'desktop',import_export:'desktop',native_file_dialog:'desktop',updater:'desktop',desktop_diagnostics:'desktop'};
   for (const element of document.querySelectorAll('[data-capability]')) {
     const name = aliases[element.dataset.capability] || element.dataset.capability;
     element.hidden = caps[name] !== true;
