@@ -275,7 +275,8 @@ class TrustedWriterTests(unittest.TestCase):
 
         accept = (ROOT / ".github/workflows/accept-native.yml").read_text()
         native_job = accept.split("  native-build:", 1)[1].split("  artifact-transfer:", 1)[0]
-        self.assertIn("branches: [main]", accept)
+        self.assertIn("workflow_dispatch:", accept)
+        self.assertNotIn("  push:", accept)
         self.assertIn("packages: write", native_job)
         self.assertIn("mode: publish", native_job)
         self.assertNotIn("linux-cache-seed", accept)

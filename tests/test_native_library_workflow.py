@@ -133,7 +133,10 @@ class NativeLibraryWorkflowTests(unittest.TestCase):
         _assert_workflow_contract(self, parse_composite_action_steps(action), 'macos')
         workflow = (ROOT / '.github/workflows/macos.yml').read_text()
         gate = workflow.split('  native-release-gate:', 1)[1]
-        self.assertIn('needs: [scope, package-pr, package-main, artifact-transfer]', gate)
+        self.assertIn('needs: [package-pr, package-main, artifact-transfer]', gate)
+        self.assertIn("if [[ \"$EVENT_NAME\" == pull_request ]]", gate)
+        self.assertIn("Apple Silicon was NOT built for this PR", gate)
+        self.assertIn("github.event_name == 'workflow_dispatch'", workflow.split("  package-pr:",1)[1].split("  package-main:",1)[0])
         self.assertIn('test "$TRANSFER_RESULT" = success', gate)
 
     def test_release_gate_has_correct_dependencies(self):

@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#111318">
+  <!-- Replaced by chat-hub-web at serve time; native desktop does not use this. -->
+  <meta name="chat-hub-auth-mode" content="server">
   <link rel="manifest" href="./manifest.webmanifest">
   <title>Chat Hub</title>
   <link rel="stylesheet" href="./styles.css">
@@ -31,6 +33,11 @@
       <button class="primary" type="submit">Sign in</button>
       <p id="server-login-message" role="status" aria-live="polite"></p>
     </form>
+    <div id="server-reconnect" class="server-login-card" hidden>
+      <h1>Reconnect with Authelia</h1>
+      <p>The existing Authelia session could not be verified. Reload this page to sign in through Authelia.</p>
+      <button id="server-reconnect-button" class="primary" type="button">Reconnect with Authelia</button>
+    </div>
   </section>
   <div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
   <div class="workspace">
