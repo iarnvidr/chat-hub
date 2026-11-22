@@ -10,7 +10,7 @@ class AutoReleasePolicyTests(unittest.TestCase):
         for required in (
             'workflows: ["Map accepted Chat Hub macOS artifact"]',
             "github.event.workflow_run.conclusion == 'success'",
-            "github.event.workflow_run.event == 'push'",
+            "github.event.workflow_run.event == 'workflow_dispatch'",
             'merge-base --is-ancestor', 'build/release_artifact.py retrieve',
             'python3 build/merge_preview.py', '--verify-existing',
             '--prerelease --latest=false',
@@ -23,9 +23,10 @@ class AutoReleasePolicyTests(unittest.TestCase):
                          'native_artifact_digest', '"channel": "merge-preview"'):
             self.assertIn(required, helper)
 
-    def test_acceptance_runs_for_every_main_merge(self):
+    def test_native_acceptance_only_runs_on_request(self):
         text = (ROOT / '.github/workflows/accept-native.yml').read_text().split('permissions:', 1)[0]
-        self.assertIn('branches: [main]', text)
+        self.assertIn('workflow_dispatch:', text)
+        self.assertNotIn('  push:', text)
         self.assertNotIn('    paths:', text)
 
     def test_draft_cleanup_is_explicit_and_main_only(self):
