@@ -5,6 +5,7 @@
 pub mod archive;
 pub mod artifacts;
 pub mod capture;
+pub mod capture_journal;
 pub mod catalog;
 pub mod error;
 pub mod library_export;
