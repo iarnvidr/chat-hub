@@ -1,7 +1,13 @@
-name: Apple Silicon build
+name: Apple Silicon build (on demand)
 on:
-  pull_request:
+  pull_request: # required legacy status only; no macOS runner on PRs
   workflow_dispatch:
+    inputs:
+      diagnose_oras:
+        description: Also run the separate ORAS installation diagnostic (manual branch runs)
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -9,7 +15,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   oras-diagnostic:
-    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && inputs.diagnose_oras == true
     runs-on: macos-15
     timeout-minutes: 10
     permissions:
@@ -28,37 +34,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 build/diagnose-oras-install.py "$GITHUB_WORKSPACE/build/install-oras.sh" "$RUNNER_TEMP/chat-hub-oras-diagnostic"
-  scope:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    outputs:
-      required: ${{ steps.native-scope.outputs.required }}
-    steps:
-      - name: Fetch exact workflow revision
-        run: |
-          set -euo pipefail
-          git init --quiet "$GITHUB_WORKSPACE"
-          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git -C "$GITHUB_WORKSPACE" fetch --no-tags origin "$GITHUB_SHA"
-          git -C "$GITHUB_WORKSPACE" checkout --quiet --detach "$GITHUB_SHA"
-      - id: native-scope
-        name: Determine whether native validation is required
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          result="$(python3 build/native_scope.py --root "$GITHUB_WORKSPACE" --base "$BASE_SHA" --head "$HEAD_SHA")"
-          echo "$result" >> "$GITHUB_STEP_SUMMARY"
-          required="$(printf '%s\n' "$result" | sed -n 's/^required=//p')"
-          test "$required" = true -o "$required" = false
-          echo "required=$required" >> "$GITHUB_OUTPUT"
   package-pr:
-    needs: scope
-    if: >-
-      github.event_name == 'pull_request' &&
-      needs.scope.result == 'success' &&
-      needs.scope.outputs.required == 'true'
+    # Explicit dispatch on a feature branch is a request for a native preview.
+    # A normal PR never starts a macOS runner.
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
@@ -220,34 +199,39 @@ jobs:
           path: artifact-transport/chat-hub-native-release-${{ github.event_name == 'pull_request' && 'pr' || 'main' }}-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 90
   native-release-gate:
+    # This lightweight Linux status retains the name in existing branch protection.
+    # It is NOT Apple Silicon acceptance. Only workflow_dispatch runs build macOS.
     name: native-release-gate
-    if: always() && (github.event_name == 'pull_request' ||
-                     (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
-    needs: [scope, package-pr, package-main, artifact-transfer]
+    if: always()
+    needs: [package-pr, package-main, artifact-transfer]
     runs-on: ubuntu-24.04
     steps:
-      - name: Require native build for in-scope changes and main manual builds
+      - name: Verify on-demand native execution and legacy PR compatibility
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          SCOPE_RESULT: ${{ needs.scope.result }}
-          NATIVE_REQUIRED: ${{ needs.scope.outputs.required }}
           PR_PACKAGE_RESULT: ${{ needs.package-pr.result }}
           MAIN_PACKAGE_RESULT: ${{ needs.package-main.result }}
           TRANSFER_RESULT: ${{ needs.artifact-transfer.result }}
         run: |
           set -euo pipefail
           if [[ "$EVENT_NAME" == pull_request ]]; then
-            test "$SCOPE_RESULT" = success || { echo "Native scope evaluation failed; failing closed." >&2; exit 1; }
-            case "$NATIVE_REQUIRED" in
-              true) test "$PR_PACKAGE_RESULT" = success && test "$MAIN_PACKAGE_RESULT" = skipped && test "$TRANSFER_RESULT" = skipped || { echo "Native changes require the complete unprivileged macOS build and smoke suite; PR artifacts are unavailable without a Node-free runner path." >&2; exit 1; } ;;
-              false) test "$PR_PACKAGE_RESULT" = skipped && test "$MAIN_PACKAGE_RESULT" = skipped && test "$TRANSFER_RESULT" = skipped || { echo "Unexpected native package or artifact transfer result for out-of-scope changes." >&2; exit 1; } ;;
-              *) echo "Native scope result is missing or malformed." >&2; exit 1 ;;
-            esac
+            test "$PR_PACKAGE_RESULT" = skipped
+            test "$MAIN_PACKAGE_RESULT" = skipped
+            test "$TRANSFER_RESULT" = skipped
+            echo 'Apple Silicon was NOT built for this PR; only required Linux checks apply.' >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$EVENT_NAME" == workflow_dispatch && "$REF" == refs/heads/main ]]; then
-            test "$PR_PACKAGE_RESULT" = skipped && test "$MAIN_PACKAGE_RESULT" = success && test "$TRANSFER_RESULT" = success || { echo "Trusted-main native build and artifact transfer did not succeed." >&2; exit 1; }
+            test "$PR_PACKAGE_RESULT" = skipped
+            test "$MAIN_PACKAGE_RESULT" = success
+            test "$TRANSFER_RESULT" = success
+            echo 'Requested main Apple Silicon build, smoke and artifact transfer passed.' >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            test "$PR_PACKAGE_RESULT" = success
+            test "$MAIN_PACKAGE_RESULT" = skipped
+            test "$TRANSFER_RESULT" = skipped
+            echo 'Requested feature-branch Apple Silicon build and smoke passed.' >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Unsupported event/ref for required native gate." >&2
+            echo 'Unsupported Apple Silicon workflow event.' >&2
             exit 1
           fi
-# Deliberately no automatic GitHub release. See docs/PUBLICATION.md before releasing.
+# Manual native publication remains protected by release.yml.
