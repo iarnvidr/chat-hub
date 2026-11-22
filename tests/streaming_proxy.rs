@@ -178,6 +178,7 @@ async fn large_request_and_response_stream_before_upstream_completion() {
             .await
             .unwrap();
         s.write_all(&prefix).await.unwrap();
+        s.flush().await.unwrap();
         release_rx.await.unwrap();
         s.write_all(&vec![b'z'; n - 64]).await.unwrap();
         // Complete the large TLS response before dropping the mock upstream.

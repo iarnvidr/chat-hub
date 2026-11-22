@@ -3,17 +3,20 @@ export function entityGraph(detail){
   const entity=detail?.entity;if(!entity?.id)throw Error('Invalid indexed item');
   const groups=new Map();
   for(const ref of detail.references||[]){if(typeof ref.conversation_id!=='string')continue;
-    if(!groups.has(ref.conversation_id))groups.set(ref.conversation_id,[]);groups.get(ref.conversation_id).push(ref);
+    const id=typeof ref.canonical_conversation_id==='string'?ref.canonical_conversation_id:ref.conversation_id;
+    if(!groups.has(id))groups.set(id,[]);groups.get(id).push(ref);
   }
   const nodes=[{id:entity.id,kind:entity.kind,entity_id:entity.id,label:entity.label,entity,degree:groups.size,hub:true,landmark:true,cluster:0}],edges=[];
   for(const[id,refs]of[...groups].slice(0,60)){
-    const ref=refs[0],nodeId=`chat:${id}`;
+    const ref=refs.find(item=>item.conversation_id===id)||refs[0],nodeId=`chat:${id}`;
     nodes.push({id:nodeId,kind:'chat',conversation_id:id,source_id:ref.source_id,provider:ref.provider,
+      search_conversation_id:ref.conversation_id,
       label:ref.title||'Untitled chat',cached_archive:ref.role==='archive',degree:1,cluster:0,landmark:groups.size<12});
     const relation=refs.some(r=>r.relation==='produces')?'produces':refs.some(r=>r.relation==='attaches')?'attaches':'mentions';
+    const reference=refs.find(item=>item.relation===relation)||ref;
     edges.push({source:entity.id,target:nodeId,basis:'entity_reference',relation,
       reason:relation==='produces'?'Produced in this chat':relation==='attaches'?'Attached in this chat':`Referenced in ${refs.length} saved source record${refs.length===1?'':'s'}`,
-      evidence:[],reference:ref});
+      evidence:[],reference});
   }
   return{nodes,edges,focus_id:entity.id,clusters:groups.size?1:0};
 }

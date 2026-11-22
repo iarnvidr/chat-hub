@@ -8,14 +8,15 @@ export function groupSearchConversations(hits) {
       group = {...hit, matching_hits: [], matched_message_count: 0};
       groups.set(hit.id, group);
     }
-    const key = JSON.stringify([hit.search_node_id ?? null, hit.search_message_id ?? null]);
+    const key = JSON.stringify([hit.search_conversation_id ?? hit.id, hit.search_node_id ?? null, hit.search_message_id ?? null]);
     if (!group.matching_hits.some(item => item.key === key)) {
-      group.matching_hits.push({key, node_id: hit.search_node_id, leaf_node_id: hit.search_leaf_node_id,
+      group.matching_hits.push({key, conversation_id: hit.search_conversation_id ?? hit.id,
+        node_id: hit.search_node_id, leaf_node_id: hit.search_leaf_node_id,
         message_id: hit.search_message_id, snippet: hit.snippet});
       if (hit.search_node_id != null) group.matched_message_count++;
     }
     if (group.search_node_id == null && hit.search_node_id != null) {
-      for (const name of ['snippet', 'search_node_id', 'search_message_id', 'search_leaf_node_id', 'selected_branch']) group[name] = hit[name];
+      for (const name of ['snippet', 'search_conversation_id', 'search_node_id', 'search_message_id', 'search_leaf_node_id', 'selected_branch']) group[name] = hit[name];
     }
   }
   return [...groups.values()];
@@ -23,7 +24,7 @@ export function groupSearchConversations(hits) {
 
 export function conversationOpenTarget(result) {
   if(!result||typeof result.id!=='string')throw new Error('Invalid conversation search result');
-  const target={id:result.id};
+  const target={id:typeof result.search_conversation_id==='string'?result.search_conversation_id:result.id};
   if(typeof result.search_leaf_node_id==='string')target.leafNodeId=result.search_leaf_node_id;
   if(typeof result.search_node_id==='string')target.anchorNodeId=result.search_node_id;
   return target;
