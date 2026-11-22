@@ -20,6 +20,7 @@ const COOLDOWN_STORAGE_KEY = 'chat-hub.chatgpt-history-cooldown.v1';
 let automaticRetriesRemaining = MAX_AUTOMATIC_RETRIES;
 let automaticRetryPaused = false;
 let verificationNeeded = false;
+let backoffUntil = 0;
 
 function say(message, {manual = false} = {}) {
   if (status) status.textContent = message;
@@ -41,16 +42,17 @@ function updateButton() {
 
 function persistCooldown() {
   try {
-    if (cooldownUntil > Date.now() || automaticRetryPaused) {
-      // This provider-scoped timestamp contains no account or session identifier.
-      // The app currently exposes no safe account key in the status DTO.
+    if (cooldownUntil > Date.now() || automaticRetryPaused || automaticRetriesRemaining < MAX_AUTOMATIC_RETRIES) {
+      // Provider-scoped policy only: no account identifiers or conversation data.
       window.localStorage?.setItem(COOLDOWN_STORAGE_KEY, JSON.stringify({
         provider: 'chatgpt', until: cooldownUntil > Date.now() ? cooldownUntil : 0,
+        backoff_until: backoffUntil,
+        automatic_retries_remaining: automaticRetriesRemaining,
         automatic_retry_paused: automaticRetryPaused,
         verification_needed: verificationNeeded,
       }));
     } else window.localStorage?.removeItem(COOLDOWN_STORAGE_KEY);
-  } catch { /* Cooldown persistence is best-effort; the native service remains authoritative. */ }
+  } catch { /* Native cooldown remains authoritative when browser storage fails. */ }
 }
 
 function restoreCooldown() {
@@ -59,20 +61,32 @@ function restoreCooldown() {
     if (saved?.provider !== 'chatgpt') return;
     automaticRetryPaused = saved.automatic_retry_paused === true;
     verificationNeeded = saved.verification_needed === true;
-    if (Number.isFinite(saved.until)) {
-      const remaining = Math.ceil((saved.until - Date.now()) / 1000);
-      if (remaining > 0) cooldownUntil = saved.until;
-      else if (!automaticRetryPaused) window.localStorage?.removeItem(COOLDOWN_STORAGE_KEY);
-    } else if (!automaticRetryPaused) window.localStorage?.removeItem(COOLDOWN_STORAGE_KEY);
-  } catch { /* Ignore corrupt or unavailable local state. */ }
+    if (Object.hasOwn(saved, 'automatic_retries_remaining')) {
+      automaticRetriesRemaining = Number.isInteger(saved.automatic_retries_remaining) &&
+        saved.automatic_retries_remaining >= 0 && saved.automatic_retries_remaining <= MAX_AUTOMATIC_RETRIES
+        ? saved.automatic_retries_remaining : 0;
+      if (automaticRetriesRemaining === 0) automaticRetryPaused = true;
+    }
+    if (Number.isFinite(saved.backoff_until) && saved.backoff_until >= 0) backoffUntil = saved.backoff_until;
+    if (Number.isFinite(saved.until) && saved.until > Date.now()) {
+      cooldownUntil = saved.until;
+      // Older records already include backoff in this deadline. Do not add it again.
+      if (!backoffUntil) backoffUntil = cooldownUntil;
+    }
+    persistCooldown();
+  } catch { /* Ignore corrupt or unavailable local state; native gate still applies. */ }
 }
 
 function scheduleAutomaticRetry() {
   clearTimeout(autoRetryTimer);
   autoRetryTimer = null;
+  if (automaticRetriesRemaining <= 0) {
+    automaticRetryPaused = true;
+    persistCooldown();
+  }
   if (!configured || automaticRetriesRemaining <= 0 || automaticRetryPaused) {
     footer(verificationNeeded ? 'ChatGPT verification needed' : 'Sync paused — choose Sync history to retry');
-    if (!automaticRetryPaused) {
+    if (!verificationNeeded && automaticRetriesRemaining <= 0) {
       say('Automatic retries are paused after repeated ChatGPT limits. Your fetched progress is saved; use Sync history to resume.');
     }
     return;
@@ -81,11 +95,12 @@ function scheduleAutomaticRetry() {
   autoRetryTimer = setTimeout(async () => {
     autoRetryTimer = null;
     if (!configured || running || cooldownUntil > Date.now()) return;
-    // Recheck the native deadline immediately before resuming. Another library
-    // task or a refreshed server cooldown can extend it while this timer waits.
     const result = await poll({allowConnect: false});
     if (!result) return;
-    if (result.automatic_retry_paused || result.retry_after_too_long) automaticRetryPaused = true;
+    if (result.automatic_retry_paused || result.retry_after_too_long) {
+      automaticRetryPaused = true;
+      persistCooldown();
+    }
     if (automaticRetryPaused) return;
     if (cooldownUntil > Date.now() || result?.retry_after > 0) return;
     if (!configured || running) return;
@@ -96,6 +111,7 @@ function scheduleAutomaticRetry() {
     }
     if (['error', 'failed'].includes(result.state) && result.error_code !== 'rate_limited') return;
     automaticRetriesRemaining -= 1;
+    persistCooldown();
     await start({automatic: true, retry: true});
   }, 0);
 }
@@ -110,16 +126,18 @@ function setCooldown(seconds, _message, manual = false) {
   clearTimeout(sessionTimer);
   const requestedDelay = Number(seconds);
   const serverDelay = Number.isFinite(requestedDelay) && requestedDelay > 0 ? requestedDelay : 0;
-  // MAX_COOLDOWN_SECONDS limits our own exponential backoff, never the
-  // provider's Retry-After deadline.
-  const delay = Math.max(serverDelay, automaticBackoffSeconds());
+  const now = Date.now();
+  // Apply our backoff once per attempt, not once per status poll. Repeated polls
+  // near expiry must not turn a 1-second remaining server wait into another 30s.
+  if (!backoffUntil) backoffUntil = now + automaticBackoffSeconds() * 1000;
+  cooldownUntil = Math.max(cooldownUntil, backoffUntil, now + serverDelay * 1000);
+  const delay = Math.max(0, Math.ceil((cooldownUntil - now) / 1000));
   if (delay <= 0) { scheduleAutomaticRetry(); return; }
-  cooldownUntil = Math.max(cooldownUntil, Date.now() + delay * 1000);
   persistCooldown();
   const copy = verificationNeeded
     ? 'ChatGPT returned a verification challenge. Open ChatGPT in Settings when you choose to verify; no conversation will be opened automatically.'
     : automaticRetryPaused
-      ? 'Automatic sync is paused because ChatGPT supplied a very long retry window. Sync manually later; fetched progress was saved.'
+      ? 'Automatic sync is paused. Sync manually after the retry window; fetched progress was saved.'
       : `ChatGPT is limiting history requests. Fetched progress was saved. Retry in ${delay} seconds.`;
   say(copy, {manual});
   footer(verificationNeeded ? 'ChatGPT verification needed'
@@ -164,9 +182,9 @@ async function connectedScope() {
 }
 
 async function syncPins({accountScope = null, afterHistory = false} = {}) {
-  if (!hasNative) return false;
+  if (!hasNative || cooldownUntil > Date.now() || automaticRetryPaused) return false;
   const scope = observedScope(accountScope) || await connectedScope();
-  if (!scope) return false;
+  if (!scope || cooldownUntil > Date.now() || automaticRetryPaused) return false;
   if (pinSyncPromise) {
     if (pinSyncInFlightScope === scope) return pinSyncPromise;
     await pinSyncPromise;
@@ -187,9 +205,18 @@ async function syncPins({accountScope = null, afterHistory = false} = {}) {
       window.dispatchEvent(new Event('chat-hub:history-updated'));
       return true;
     } catch {
-      // Pin refresh is read-only and independent of conversation-history status.
-      // Leave existing local values untouched when the remote result is unavailable.
       pinSyncCooldowns.set(scope,Date.now()+PIN_SYNC_FAILURE_COOLDOWN_MS);
+      // A native pin request can set the shared provider deadline. Import it
+      // immediately so reconnect events cannot keep trying every five seconds.
+      try {
+        const shared = await window.ChatHub.invoke('chatgpt_history_status');
+        if (shared?.automatic_retry_paused || shared?.retry_after_too_long || shared?.challenge_detected) {
+          automaticRetryPaused = true;
+          verificationNeeded = shared.challenge_detected === true;
+          persistCooldown();
+        }
+        if (shared?.retry_after > 0) setCooldown(shared.retry_after, 'Shared provider cooldown');
+      } catch { /* Never clear saved pins or bypass the native cooldown gate. */ }
       return false;
     } finally {
       pinSyncPromise = null;
@@ -205,6 +232,7 @@ async function poll({allowConnect = interactiveSync} = {}) {
   try {
     const result = await window.ChatHub.invoke('chatgpt_history_status');
     configured = result?.configured !== false;
+    const wasRunning = running;
     running = result?.state === 'running' || result?.state === 'syncing';
     updateButton();
     publishChanges(result);
@@ -213,6 +241,11 @@ async function poll({allowConnect = interactiveSync} = {}) {
       footer('Syncing history…');
     }
     else if (result?.state === 'complete' || result?.state === 'completed') {
+      if (wasRunning && !result.automatic_retry_paused && !result.challenge_detected && !result.retry_after) {
+        automaticRetriesRemaining = MAX_AUTOMATIC_RETRIES;
+        backoffUntil = 0;
+        persistCooldown();
+      }
       const copy = `History ready: ${result.imported || 0} added, ${result.updated || 0} updated, ${result.unchanged || 0} already saved.`;
       say(copy, {manual: allowConnect});
       footer('History up to date');
@@ -246,6 +279,11 @@ async function poll({allowConnect = interactiveSync} = {}) {
     } else if (result?.state === 'idle') {
       footer(cooldownUntil > Date.now() ? 'History sync waiting' : 'Open ChatGPT to sync history');
     }
+    // A pin/project request may set the shared deadline while the last history
+    // receipt is still "complete". That receipt must not bypass provider backoff.
+    if (result?.error_code !== 'rate_limited' && result?.retry_after > 0) {
+      setCooldown(result.retry_after, 'Shared provider cooldown', allowConnect);
+    }
     if (running) pollTimer = setTimeout(() => poll({allowConnect}), 2000);
     else if (pinsNeedPostHistoryRefresh && (result?.state === 'complete' || result?.state === 'completed')) {
       pinsNeedPostHistoryRefresh = false;
@@ -272,6 +310,7 @@ async function runStart(automatic) {
     return;
   }
   clearTimeout(pollTimer);
+  backoffUntil = 0;
   running = true;
   interactiveSync = !automatic;
   updateButton();
@@ -322,6 +361,7 @@ function start({automatic = false, retry = false} = {}) {
     automaticRetriesRemaining = MAX_AUTOMATIC_RETRIES;
     automaticRetryPaused = false;
     verificationNeeded = false;
+    backoffUntil = 0;
     persistCooldown();
     clearTimeout(autoRetryTimer);
     autoRetryTimer = null;
@@ -338,7 +378,7 @@ async function startup() {
   if (automaticRetryPaused) {
     say(verificationNeeded
       ? 'ChatGPT previously returned a verification challenge. Open ChatGPT in Settings only when you choose to verify; no conversation will be opened automatically.'
-      : 'Automatic sync is paused because ChatGPT supplied a very long retry window. Sync manually later; fetched progress was saved.');
+      : 'Automatic sync is paused. Use Sync history to resume after the retry window; fetched progress was saved.');
     footer(verificationNeeded ? 'ChatGPT verification needed' : 'Sync paused — choose Sync history to retry');
     return;
   }
@@ -350,8 +390,6 @@ async function startup() {
       if (configured) await start({automatic: true});
     }
     else if (connection?.state === 'not_open' || connection?.state === 'loading') {
-      // Initialize only an untouched hidden session. Native code refuses to
-      // navigate a page that already hosts a live chat or an unsent draft.
       await window.ChatHub.invoke('prepare_chatgpt_session');
       const deadline = Date.now() + 60000;
       const probe = async () => {

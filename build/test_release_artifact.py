@@ -100,7 +100,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         artifact = artifact or self.native_artifact
         record = {
             'schema': 2, 'repository': release.REPOSITORY,
-            'workflow_path': release.MAPPING_WORKFLOW if event == 'push' else release.NATIVE_WORKFLOW,
+            'workflow_path': run['path'],
             'run_id': run['id'], 'run_attempt': run['run_attempt'], 'event': event,
             'head': self.commit,
             'tree': tree or self.tree, 'workflow_sha': workflow_sha or self.commit,
@@ -183,6 +183,21 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertEqual(mapping['check_receipt']['run_id'], 124)
         self.assertEqual(mapping['check_receipt']['artifact_id'], 457)
         self.assertEqual(json.loads((self.root / 'accepted-native.json').read_text()), mapping)
+
+    def test_manual_on_demand_acceptance_maps_exact_main_and_retrieves_unchanged_artifact(self):
+        # A main workflow_dispatch is the new supported production path.
+        self.mapping_run['event'] = 'workflow_dispatch'
+        self.build_native(event='workflow_dispatch', run=self.mapping_run,
+                          artifact=self.native_artifact)
+        accepted = self.promote()
+        self.assertEqual(accepted['source_run_id'], 789)
+        self.assertEqual(accepted['acceptance'], 'trusted-main-build')
+        self.install_mapping(accepted)
+        result = self.retrieve(mapping_run_id=789)
+        self.assertEqual(result['source_artifact_digest'], self.native_artifact['digest'])
+        self.assertEqual((self.root / 'artifacts' / self.archive_name).read_bytes(),
+                         self.app_archive)
+        self.assertEqual((self.root / 'artifacts' / self.dmg_name).read_bytes(), self.dmg)
 
     def test_promoter_rejects_fork_and_missing_check_receipt(self):
         self.pr['head']['repo']['full_name'] = 'fork/chat-hub'

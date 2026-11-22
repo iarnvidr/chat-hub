@@ -48,7 +48,7 @@ tested so adding a member cannot silently omit it from validation.
 Implementation crates and the CLI deny all Clippy warnings. The existing Tauri
 desktop target still has unrelated, pre-refactor style warnings: its check
 denies Clippy correctness problems while reporting those style warnings, and
-its Rust tests and native macOS build remain mandatory. This baseline should
+its Rust tests remain mandatory on PRs; the native macOS build is explicitly requested for releases and device acceptance. This baseline should
 be removed when the desktop warnings are addressed independently.
 
 ```sh
@@ -139,9 +139,12 @@ a commit label alone does not encode the PR merge base. The existing exact
 candidate/tree checks and release promotion rules remain authoritative.
 
 Apple Silicon keeps its separate checksum-pinned sccache path and real native
-build/smoke jobs. Linux tests do not establish WKWebView, native launch, updater
-or signing behavior. Protected-main native publication and release receipt
-validation remain separate from the Linux cache publisher.
+build/smoke jobs, but only on `workflow_dispatch`—never automatic PR or main
+push. Linux tests do not establish WKWebView, native launch, updater or signing.
+The required legacy `native-release-gate` status is a lightweight Ubuntu
+compatibility check and does **not** claim Apple Silicon passed. Protected-main
+native publication and release receipt validation remain separate from the Linux
+cache publisher.
 
 ## Verification and transport cost
 
@@ -155,7 +158,7 @@ Expected isolation includes frontend edits leaving backend libraries fresh,
 store edits leaving capture libraries fresh, and a shared model edit rebuilding
 the actual dependent packages. Source fixture/build-script changes must still
 invalidate their consumers. Hosted traces and macOS acceptance remain required
-before claiming full cross-run/native reuse or promoting an artifact.
+before claiming full cross-run/native reuse or promoting a manually built artifact.
 
 Corresponding-source bundles include the crate workspace, Dagger module/config,
 tests/fixtures and build helpers with their executable modes, but exclude

@@ -1,9 +1,9 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
-    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+    extract::{connect_info::ConnectInfo, Path, State},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     env, fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -25,11 +25,173 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_SESSIONS: usize = 64;
 
 #[derive(Clone)]
+enum WebAuth {
+    Token(Arc<str>),
+    TrustedProxy(Uri),
+    // The only user login is Authelia. Requests must originate from the
+    // configured Traefik container and carry an identity set by ForwardAuth.
+    Authelia {
+        origin: Uri,
+        expected_user: Arc<str>,
+        proxy_ips: Arc<Vec<IpAddr>>,
+    },
+}
+
+impl WebAuth {
+    fn login_required(&self) -> bool {
+        matches!(self, Self::Token(_))
+    }
+
+    fn html_mode(&self) -> &'static str {
+        match self {
+            Self::Token(_) => "token",
+            Self::TrustedProxy(_) => "proxy",
+            Self::Authelia { .. } => "authelia",
+        }
+    }
+}
+
+const INDEX_AUTH_MARKER: &str = r#"<meta name="chat-hub-auth-mode" content="server">"#;
+
+fn render_index_html(template: &str, auth: &WebAuth) -> Result<Arc<str>, String> {
+    if template.matches(INDEX_AUTH_MARKER).count() != 1 {
+        return Err("Desktop index must contain exactly one auth-mode marker".into());
+    }
+    Ok(Arc::from(template.replace(
+        INDEX_AUTH_MARKER,
+        &format!(
+            r#"<meta name="chat-hub-auth-mode" content="{}">"#,
+            auth.html_mode()
+        ),
+    )))
+}
+
+#[derive(Clone)]
 struct WebState {
-    access_token: Arc<str>,
+    auth: WebAuth,
+    index_html: Arc<str>,
     api_token: Arc<str>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     api_router: Arc<Mutex<Option<Router>>>,
+}
+
+fn exact_origin(origin: &str) -> Result<Uri, String> {
+    let uri: Uri = origin
+        .parse()
+        .map_err(|_| "invalid CHAT_HUB_WEB_ORIGIN".to_owned())?;
+    let (Some(scheme @ ("http" | "https")), Some(host)) = (uri.scheme_str(), uri.authority())
+    else {
+        return Err("CHAT_HUB_WEB_ORIGIN must be an HTTP(S) origin without a path".into());
+    };
+    if host.as_str().contains('@') || origin != format!("{scheme}://{host}") {
+        return Err("CHAT_HUB_WEB_ORIGIN must be an HTTP(S) origin without a path".into());
+    }
+    Ok(uri)
+}
+
+fn trusted_origin(addr: SocketAddr, origin: Option<String>) -> Result<Uri, String> {
+    if !addr.ip().is_loopback() {
+        return Err("CHAT_HUB_WEB_AUTH=none requires a loopback bind address".into());
+    }
+    exact_origin(&origin.unwrap_or_else(|| format!("http://{addr}")))
+}
+
+fn authelia_origin(origin: Option<String>) -> Result<Uri, String> {
+    let value = origin.ok_or("CHAT_HUB_WEB_ORIGIN is required for Authelia")?;
+    let uri = exact_origin(&value)?;
+    if uri.scheme_str() != Some("https") {
+        return Err("Authelia requires a secure HTTPS browser origin".into());
+    }
+    Ok(uri)
+}
+
+fn origin_matches(headers: &HeaderMap, uri: &Uri, require_origin: bool) -> bool {
+    let Some(expected_host) = uri.authority().map(|value| value.as_str()) else {
+        return false;
+    };
+    let expected_origin = format!("{}://{expected_host}", uri.scheme_str().unwrap_or(""));
+    headers.get_all(header::HOST).iter().count() == 1
+        && headers
+            .get(header::HOST)
+            .is_some_and(|value| value.as_bytes() == expected_host.as_bytes())
+        && headers.get_all(header::ORIGIN).iter().count() <= 1
+        && (!require_origin || headers.contains_key(header::ORIGIN))
+        && headers
+            .get(header::ORIGIN)
+            .is_none_or(|value| value.as_bytes() == expected_origin.as_bytes())
+}
+
+fn authelia_request_authorized(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    origin: &Uri,
+    expected_user: &str,
+    proxy_ips: &[IpAddr],
+    method: &axum::http::Method,
+) -> bool {
+    let Some(peer) = peer else { return false };
+    if !proxy_ips.contains(&peer.ip()) || proxy_ips.is_empty() {
+        return false;
+    }
+    if !origin_matches(
+        headers,
+        origin,
+        *method != axum::http::Method::GET && *method != axum::http::Method::HEAD,
+    ) {
+        return false;
+    }
+    // The ForwardAuth middleware replaces Remote-User after consulting
+    // Authelia. Never trust an arbitrary browser-provided user header or a
+    // direct request from another proxy-network container.
+    headers.get_all("remote-user").iter().count() == 1
+        && headers
+            .get("remote-user")
+            .is_some_and(|value| value.as_bytes() == expected_user.as_bytes())
+        && headers.get_all("x-forwarded-proto").iter().count() == 1
+        && headers
+            .get("x-forwarded-proto")
+            .is_some_and(|value| value == "https")
+}
+
+async fn restrict_trusted_origin(
+    State(state): State<WebState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    // Health contains no private content and remains probeable from the
+    // container's loopback without forwarding an Authelia cookie or username.
+    if request.uri().path() == "/healthz" {
+        return next.run(request).await;
+    }
+    match &state.auth {
+        WebAuth::Token(_) => {}
+        WebAuth::TrustedProxy(origin) => {
+            if !origin_matches(request.headers(), origin, false) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+        WebAuth::Authelia {
+            origin,
+            expected_user,
+            proxy_ips,
+        } => {
+            let peer = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|connection| connection.0);
+            if !authelia_request_authorized(
+                request.headers(),
+                peer,
+                origin,
+                expected_user,
+                proxy_ips,
+                request.method(),
+            ) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+    }
+    next.run(request).await
 }
 
 struct Session {
@@ -64,19 +226,7 @@ async fn authenticate(
     if *request.method() != axum::http::Method::GET || !read_path_allowed(request.uri().path()) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(sid) = cookie(request.headers(), "chat_hub_session") else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let valid = state
-        .sessions
-        .lock()
-        .ok()
-        .map(|mut sessions| {
-            sessions.retain(|_, session| session.expires > Instant::now());
-            sessions.contains_key(&sid)
-        })
-        .unwrap_or(false);
-    if !valid {
+    if !has_read_access(&state, request.headers()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", state.api_token)) {
@@ -120,6 +270,9 @@ async fn login(
     headers: HeaderMap,
     Json(login): Json<LoginRequest>,
 ) -> Response {
+    let WebAuth::Token(access_token) = &state.auth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     if let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -139,8 +292,8 @@ async fn login(
         }
     }
     if login.token.is_empty()
-        || login.token.len() != state.access_token.len()
-        || !bool::from(login.token.as_bytes().ct_eq(state.access_token.as_bytes()))
+        || login.token.len() != access_token.len()
+        || !bool::from(login.token.as_bytes().ct_eq(access_token.as_bytes()))
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -184,6 +337,9 @@ async fn login(
 }
 
 async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    if !state.auth.login_required() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let (Some(sid), Some(csrf)) = (
         cookie(&headers, "chat_hub_session"),
         cookie(&headers, "chat_hub_csrf"),
@@ -214,22 +370,26 @@ async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Response {
     response
 }
 
-async fn capabilities(State(state): State<WebState>, headers: HeaderMap) -> Response {
-    let valid = cookie(&headers, "chat_hub_session")
-        .and_then(|sid| {
-            state.sessions.lock().ok().and_then(|mut sessions| {
-                sessions.retain(|_, session| session.expires > Instant::now());
-                sessions.contains_key(&sid).then_some(())
+fn has_read_access(state: &WebState, headers: &HeaderMap) -> bool {
+    !state.auth.login_required()
+        || cookie(headers, "chat_hub_session")
+            .and_then(|sid| {
+                state.sessions.lock().ok().and_then(|mut sessions| {
+                    sessions.retain(|_, session| session.expires > Instant::now());
+                    sessions.contains_key(&sid).then_some(())
+                })
             })
-        })
-        .is_some();
-    if !valid {
+            .is_some()
+}
+
+async fn capabilities(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    if !has_read_access(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let stable = env::var("CHAT_HUB_WEB_MODE").is_ok_and(|mode| mode == "stable");
     let service_worker =
         stable && env::var("CHAT_HUB_WEB_SERVICE_WORKER").is_ok_and(|value| value == "1");
-    Json(serde_json::json!({"authenticated":true,"capabilities":{"read":true,"writes":false,"catalog_write":false,"capture":false,"capture_controls":false,"desktop":false,"desktop_diagnostics":false,"import_export":false,"native_file_dialog":false,"provider_view":false,"updater":false,"dev_mode":!stable,"service_worker":service_worker}})).into_response()
+    Json(serde_json::json!({"authenticated":true,"login_required":state.auth.login_required(),"capabilities":{"read":true,"writes":false,"catalog_write":false,"capture":false,"capture_controls":false,"desktop":false,"desktop_diagnostics":false,"import_export":false,"native_file_dialog":false,"provider_view":false,"updater":false,"dev_mode":!stable,"service_worker":service_worker}})).into_response()
 }
 
 fn query_string(args: &Value, search: bool) -> Result<String, StatusCode> {
@@ -240,6 +400,10 @@ fn query_string(args: &Value, search: bool) -> Result<String, StatusCode> {
             continue;
         }
         if value.is_null() {
+            continue;
+        }
+        if !search && key == "query" && value.as_str().is_some_and(|query| query.trim().is_empty())
+        {
             continue;
         }
         let key = if search && key == "query" {
@@ -301,17 +465,15 @@ fn snake_case(value: &str) -> String {
     result
 }
 
-async fn bridge(
-    State(state): State<WebState>,
-    Path(command): Path<String>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Response {
+fn check_bridge_access(state: &WebState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    if !state.auth.login_required() {
+        return Ok(());
+    }
     let (Some(sid), Some(csrf)) = (
-        cookie(&headers, "chat_hub_session"),
-        cookie(&headers, "chat_hub_csrf"),
+        cookie(headers, "chat_hub_session"),
+        cookie(headers, "chat_hub_csrf"),
     ) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return Err(StatusCode::UNAUTHORIZED);
     };
     let session_valid = state
         .sessions
@@ -326,8 +488,17 @@ async fn bridge(
             })
         })
         .unwrap_or(false);
-    if !session_valid {
-        return StatusCode::FORBIDDEN.into_response();
+    session_valid.then_some(()).ok_or(StatusCode::FORBIDDEN)
+}
+
+async fn bridge(
+    State(state): State<WebState>,
+    Path(command): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(status) = check_bridge_access(&state, &headers) {
+        return status.into_response();
     }
     let args = match payload.get("args") {
         Some(args) => args,
@@ -457,6 +628,10 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok", "capture":"disabled"}))
 }
 
+async fn index(State(state): State<WebState>) -> Html<String> {
+    Html(state.index_html.to_string())
+}
+
 fn required_path(name: &str, default: Option<&str>) -> Result<PathBuf, String> {
     env::var_os(name)
         .map(PathBuf::from)
@@ -466,19 +641,56 @@ fn required_path(name: &str, default: Option<&str>) -> Result<PathBuf, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = env::var("CHAT_HUB_WEB_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:8080".into())
+        .parse()?;
+    let auth = match env::var("CHAT_HUB_WEB_AUTH") {
+        Ok(mode) if mode == "none" => {
+            WebAuth::TrustedProxy(trusted_origin(addr, env::var("CHAT_HUB_WEB_ORIGIN").ok())?)
+        }
+        Ok(mode) if mode == "authelia" => {
+            let origin = authelia_origin(env::var("CHAT_HUB_WEB_ORIGIN").ok())?;
+            // Name and port are deliberately fixed to the Traefik service on
+            // the private Docker network. A DNS failure aborts startup.
+            let mut proxy_ips = tokio::net::lookup_host(("traefik", 8082))
+                .await?
+                .map(|address| address.ip())
+                .collect::<Vec<IpAddr>>();
+            proxy_ips.sort_unstable();
+            proxy_ips.dedup();
+            if proxy_ips.is_empty() || proxy_ips.iter().any(IpAddr::is_loopback) {
+                return Err("Cannot establish trusted Traefik peer addresses".into());
+            }
+            WebAuth::Authelia {
+                origin,
+                expected_user: Arc::from("esben"),
+                proxy_ips: Arc::new(proxy_ips),
+            }
+        }
+        Ok(mode) if mode != "token" => {
+            return Err("CHAT_HUB_WEB_AUTH must be authelia, token or none".into());
+        }
+        Err(error) if error != env::VarError::NotPresent => return Err(error.into()),
+        _ => {
+            let token_path = required_path("CHAT_HUB_WEB_TOKEN_FILE", None)?;
+            let access_token = fs::read_to_string(token_path)?.trim().to_owned();
+            if access_token.is_empty() {
+                return Err("web access token file is empty".into());
+            }
+            WebAuth::Token(Arc::from(access_token))
+        }
+    };
     let db_path = required_path("CHAT_HUB_DATABASE", None)?;
-    let token_path = required_path("CHAT_HUB_WEB_TOKEN_FILE", None)?;
     let ui_path = required_path("CHAT_HUB_DESKTOP_UI", Some("desktop-ui"))?;
-    let access_token = fs::read_to_string(token_path)?.trim().to_owned();
-    if access_token.is_empty() {
-        return Err("web access token file is empty".into());
-    }
+    let html_template = fs::read_to_string(ui_path.join("index.html"))?;
+    let index_html = render_index_html(&html_template, &auth)?;
     let store = chat_hub_store::store::Store::open_existing(
         db_path.to_str().ok_or("database path is not UTF-8")?,
     )?;
     let api_token = random_secret()?;
     let state = WebState {
-        access_token: Arc::from(access_token),
+        auth,
+        index_html,
         api_token: Arc::from(api_token.clone()),
         sessions: Arc::default(),
         api_router: Arc::new(Mutex::new(None)),
@@ -492,23 +704,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(());
     let static_files = ServeDir::new(ui_path).append_index_html_on_directories(true);
     let app = Router::new()
+        .route("/", get(index))
+        .route("/index.html", get(index))
         .route("/healthz", get(healthz))
         .route("/api/session", post(login).delete(logout))
         .route("/api/capabilities", get(capabilities))
         .route("/api/bridge/:command", post(bridge))
         .merge(api)
         .fallback_service(static_files)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            restrict_trusted_origin,
+        ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store, no-cache, must-revalidate"),
         ))
         .with_state(state);
-    let addr: SocketAddr = env::var("CHAT_HUB_WEB_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".into())
-        .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("chat-hub-web listening on {}", listener.local_addr()?);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -519,8 +738,14 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_app() -> Router {
+        test_app_with_auth(WebAuth::Token(Arc::from("synthetic-access-token")))
+    }
+
+    fn test_app_with_auth(auth: WebAuth) -> Router {
+        let index_html = render_index_html(INDEX_AUTH_MARKER, &auth).unwrap();
         let state = WebState {
-            access_token: Arc::from("synthetic-access-token"),
+            auth,
+            index_html,
             api_token: Arc::from("synthetic-api-token"),
             sessions: Arc::default(),
             api_router: Arc::new(Mutex::new(None)),
@@ -536,10 +761,17 @@ mod tests {
             .layer(middleware::from_fn_with_state(state.clone(), authenticate))
             .with_state(());
         Router::new()
+            .route("/", get(index))
+            .route("/index.html", get(index))
+            .route("/healthz", get(healthz))
             .route("/api/session", post(login).delete(logout))
             .route("/api/capabilities", get(capabilities))
             .route("/api/bridge/:command", post(bridge))
             .merge(api)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                restrict_trusted_origin,
+            ))
             .with_state(state)
     }
 
@@ -684,7 +916,9 @@ mod tests {
                     .header(header::COOKIE, &cookie_header)
                     .header("x-csrf-token", csrf)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"args":{"limit":10}}"#))
+                    .body(Body::from(
+                        r#"{"args":{"query":"","cursor":null,"source":"chatgpt","projectKey":null,"tag":null,"archiveState":"active"}}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -693,31 +927,45 @@ mod tests {
         for (command, args, expected) in [
             (
                 "list_conversations",
-                r#"{"query":"synthetic query"}"#,
+                r#"{"query":"  ","cursor":null,"source":"chatgpt","projectKey":null,"tag":null,"archiveState":"active"}"#,
                 StatusCode::OK,
             ),
-            ("list_projects", r#"{"source":"all"}"#, StatusCode::OK),
+            (
+                "list_conversations",
+                r#"{"query":"synthetic query","cursor":null,"source":"chatgpt","projectKey":null,"tag":null,"archiveState":"active"}"#,
+                StatusCode::OK,
+            ),
+            ("list_projects", r#"{"source":"chatgpt"}"#, StatusCode::OK),
             ("list_local_tags", r#"{}"#, StatusCode::OK),
             (
                 "get_target_tags",
                 r#"{"targetKind":"conversation","targetId":"synthetic-id"}"#,
                 StatusCode::OK,
             ),
-            ("catalog_overview", r#"{"source":"all"}"#, StatusCode::OK),
+            (
+                "catalog_overview",
+                r#"{"source":"chatgpt","projectKey":null,"tag":null}"#,
+                StatusCode::OK,
+            ),
             (
                 "catalog_graph",
-                r#"{"source":"all","limit":40}"#,
+                r#"{"source":"chatgpt","projectKey":null,"tag":null,"focusId":null,"limit":100}"#,
                 StatusCode::OK,
             ),
             (
                 "catalog_entities",
-                r#"{"source":"all","kind":"repository","limit":40}"#,
+                r#"{"source":"chatgpt","projectKey":null,"tag":null,"kind":"file_artifact","conversationId":null,"query":null,"artifactState":"metadata_present","cursor":null,"limit":40}"#,
                 StatusCode::OK,
             ),
             (
                 "catalog_entity_graph",
-                r#"{"source":"all","kind":"repository","limit":80}"#,
+                r#"{"source":"chatgpt","projectKey":null,"tag":null,"kind":"repository","conversationId":null,"query":null,"artifactState":null,"limit":40}"#,
                 StatusCode::OK,
+            ),
+            (
+                "get_conversation",
+                r#"{"id":"missing-id"}"#,
+                StatusCode::NOT_FOUND,
             ),
             (
                 "get_conversation",
@@ -833,6 +1081,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_proxy_needs_loopback_and_its_configured_browser_origin() {
+        for addr in ["0.0.0.0:8080", "100.64.0.1:8080", "[::]:8080"] {
+            assert!(
+                trusted_origin(addr.parse().unwrap(), None).is_err(),
+                "{addr}"
+            );
+        }
+        let bind = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            trusted_origin(bind, None)
+                .unwrap()
+                .authority()
+                .unwrap()
+                .as_str(),
+            "127.0.0.1:8080"
+        );
+        assert!(trusted_origin(bind, Some("http://preview.example.test/path".into())).is_err());
+        let origin = "http://preview.example.test:5173";
+        let app = test_app_with_auth(WebAuth::TrustedProxy(
+            trusted_origin(bind, Some(origin.into())).unwrap(),
+        ));
+        let host = "preview.example.test:5173";
+        for (method, path, sent_host, sent_origin, expected) in [
+            ("GET", "/api/capabilities", host, origin, StatusCode::OK),
+            ("GET", "/api/v1/conversations", host, origin, StatusCode::OK),
+            (
+                "POST",
+                "/api/bridge/list_conversations",
+                host,
+                origin,
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                "/api/bridge/rebuild_catalog_index",
+                host,
+                origin,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "POST",
+                "/api/v1/catalog/rebuild",
+                host,
+                origin,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "DELETE",
+                "/api/session",
+                host,
+                origin,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                "/api/capabilities",
+                "untrusted.example.test",
+                origin,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "POST",
+                "/api/bridge/list_conversations",
+                host,
+                "http://untrusted.example.test",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::HOST, sent_host)
+                        .header(header::ORIGIN, sent_origin)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"args":{}}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {path}");
+            if path == "/api/capabilities" && response.status().is_success() {
+                let body = to_bytes(response.into_body(), 4096).await.unwrap();
+                let capabilities: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(capabilities["login_required"], false);
+                assert_eq!(capabilities["authenticated"], true);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn health_response_contains_only_metadata() {
         let response = healthz().await;
         let bytes = to_bytes(response.into_response().into_body(), 1024)
@@ -842,5 +1183,267 @@ mod tests {
         assert!(body.contains("capture"));
         assert!(!body.contains("token"));
         assert!(!body.contains("conversation"));
+    }
+    fn authelia_test_app() -> Router {
+        let origin =
+            authelia_origin(Some("https://chat-hub-preview.ginnungagaps.xyz".into())).unwrap();
+        test_app_with_auth(WebAuth::Authelia {
+            origin,
+            expected_user: Arc::from("esben"),
+            proxy_ips: Arc::new(vec!["172.21.0.2".parse().unwrap()]),
+        })
+    }
+
+    fn authelia_request(
+        method: &str,
+        path: &str,
+        peer: Option<&str>,
+        user: Option<&str>,
+        origin: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "chat-hub-preview.ginnungagaps.xyz")
+            .header("x-forwarded-proto", "https")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(user) = user {
+            builder = builder.header("remote-user", user);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        let mut request = builder.body(Body::from(r#"{"args":{}}"#)).unwrap();
+        if let Some(peer) = peer {
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        }
+        request
+    }
+
+    #[test]
+    fn browser_shell_replaces_exactly_one_server_auth_marker() {
+        let authelia = WebAuth::Authelia {
+            origin: authelia_origin(Some("https://chat-hub-preview.ginnungagaps.xyz".into()))
+                .unwrap(),
+            expected_user: Arc::from("esben"),
+            proxy_ips: Arc::new(vec!["172.21.0.2".parse().unwrap()]),
+        };
+        assert!(render_index_html("<html></html>", &authelia).is_err());
+        assert!(render_index_html(
+            &format!("{INDEX_AUTH_MARKER}{INDEX_AUTH_MARKER}"),
+            &authelia,
+        )
+        .is_err());
+        let shell = render_index_html(INDEX_AUTH_MARKER, &authelia).unwrap();
+        assert!(shell.contains(r#"content="authelia""#));
+        assert!(!shell.contains(r#"content="token""#));
+        let dev = render_index_html(
+            INDEX_AUTH_MARKER,
+            &WebAuth::Token(Arc::from("synthetic-token")),
+        )
+        .unwrap();
+        assert!(dev.contains(r#"content="token""#));
+    }
+
+    #[test]
+    fn authelia_mode_requires_explicit_exact_https_origin() {
+        assert!(authelia_origin(None).is_err());
+        for value in [
+            "http://chat-hub-preview.ginnungagaps.xyz",
+            "https://chat-hub-preview.ginnungagaps.xyz/path",
+            "https://user@chat-hub-preview.ginnungagaps.xyz",
+            "https://chat-hub-preview.ginnungagaps.xyz?token=secret",
+        ] {
+            assert!(authelia_origin(Some(value.into())).is_err(), "{value}");
+        }
+        assert!(authelia_origin(Some("https://chat-hub-preview.ginnungagaps.xyz".into())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn authelia_identity_from_traefik_is_the_only_browser_login() {
+        let app = authelia_test_app();
+        let good = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:59595"),
+            Some("esben"),
+            None,
+        );
+        let response = app.clone().oneshot(good).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["authenticated"], true);
+        assert_eq!(body["login_required"], false);
+        assert_eq!(body["capabilities"]["read"], true);
+        assert_eq!(body["capabilities"]["writes"], false);
+        let response = app
+            .clone()
+            .oneshot(authelia_request(
+                "GET",
+                "/",
+                Some("172.21.0.2:5000"),
+                Some("esben"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&html).contains(r#"content="authelia""#));
+        // Browser API calls use the same authenticated Authelia session and
+        // must not require any additional Chat Hub cookie or access token.
+        let response = app
+            .clone()
+            .oneshot(authelia_request(
+                "POST",
+                "/api/bridge/list_conversations",
+                Some("172.21.0.2:53111"),
+                Some("esben"),
+                Some("https://chat-hub-preview.ginnungagaps.xyz"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut second_login = authelia_request(
+            "POST",
+            "/api/session",
+            Some("172.21.0.2:53111"),
+            Some("esben"),
+            Some("https://chat-hub-preview.ginnungagaps.xyz"),
+        );
+        *second_login.body_mut() = Body::from(r#"{"token":"not-required"}"#);
+        let response = app.clone().oneshot(second_login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // The endpoint cannot create a second server-login session.
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authelia_rejects_direct_peer_wrong_user_and_spoofed_browser_headers() {
+        let app = authelia_test_app();
+        let allowed = Some("https://chat-hub-preview.ginnungagaps.xyz");
+        for (peer, user, origin, path, method) in [
+            (None, Some("esben"), None, "/api/capabilities", "GET"),
+            (
+                Some("172.21.0.99:5000"),
+                Some("esben"),
+                None,
+                "/api/capabilities",
+                "GET",
+            ),
+            (
+                Some("127.0.0.1:5000"),
+                Some("esben"),
+                None,
+                "/api/capabilities",
+                "GET",
+            ),
+            (
+                Some("172.21.0.2:5000"),
+                None,
+                None,
+                "/api/capabilities",
+                "GET",
+            ),
+            (
+                Some("172.21.0.2:5000"),
+                Some("alice"),
+                None,
+                "/api/capabilities",
+                "GET",
+            ),
+            (
+                Some("172.21.0.2:5000"),
+                Some("esben"),
+                None,
+                "/api/bridge/list_conversations",
+                "POST",
+            ),
+            (
+                Some("172.21.0.2:5000"),
+                Some("esben"),
+                Some("https://evil.example"),
+                "/api/bridge/list_conversations",
+                "POST",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authelia_request(method, path, peer, user, origin))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} {peer:?} {user:?} {origin:?}"
+            );
+        }
+        let mut bad = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:5000"),
+            Some("esben"),
+            None,
+        );
+        bad.headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("evil.example"));
+        assert_eq!(
+            app.clone().oneshot(bad).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut bad = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:5000"),
+            Some("esben"),
+            None,
+        );
+        bad.headers_mut()
+            .insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert_eq!(
+            app.clone().oneshot(bad).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut bad = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:5000"),
+            Some("esben"),
+            None,
+        );
+        bad.headers_mut()
+            .append("remote-user", HeaderValue::from_static("alice"));
+        assert_eq!(
+            app.clone().oneshot(bad).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        // A different origin is forbidden even if Authelia asserted identity.
+        let mut bad = authelia_request(
+            "GET",
+            "/api/capabilities",
+            Some("172.21.0.2:5000"),
+            Some("esben"),
+            allowed,
+        );
+        bad.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert_eq!(
+            app.clone().oneshot(bad).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 }

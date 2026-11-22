@@ -14,6 +14,22 @@ function committedTotal(capture) {
   }, 0);
 }
 
+export function formatCaptureDetails(capture) {
+  if(capture?.status!=='available')return 'Local capture health is unknown. Remote history sync is a separate operation.';
+  if(capture.enabled!==true)return 'Live capture is disabled. A connected ChatGPT session does not imply local saving.';
+  const count=key=>Number.isSafeInteger(capture.counters?.[key])&&capture.counters[key]>=0?capture.counters[key]:0;
+  const committed=committedTotal(capture)+count('committed_unchanged');
+  const failures=['invalid_snapshot','unsupported_encoding','decode_failed','oversized','dropped','interrupted','store_failed','shutdown_unprocessed'].reduce((sum,key)=>sum+count(key),0);
+  return `${committed} confirmed database outcomes this session; ${count('active')} active captures; ${failures} failed or dropped attempts. Pending sidebar entries alone are not saved transcripts.`;
+}
+
+export function formatPendingPersistence(value) {
+  if(value?.code==='pending_storage_invalid')return 'Pending-chat metadata is unreadable. It has been preserved rather than overwritten.';
+  if(value?.code==='pending_capacity_exceeded')return 'Pending-chat metadata reached its limit. New metadata could not be confirmed saved.';
+  if(value?.metadata_persisted===false)return 'Pending-chat metadata could not be saved on this Mac. Keep the app open and export diagnostics before restarting.';
+  return 'Pending metadata identifies chats awaiting reconciliation; it is not a backup of their messages.';
+}
+
 export async function refreshCaptureStatus(invoke, setText) {
   if (typeof invoke !== 'function') {
     setText('');
@@ -58,7 +74,7 @@ export function bindCapturePreferences(invoke, elements, confirmRestart) {
       status.textContent = `Saved. Capture is still ${preferences.active === true ? 'on' : 'off'} until you restart Chat Hub.`;
     } else {
       status.textContent = preferences.enabled === true
-        ? 'Live capture is on. Captured replies are saved on this Mac.'
+        ? 'Live capture is enabled. Check the confirmed saves and failure counts below.'
         : 'Live capture is off. New conversations are not saved in this library.';
     }
     renderButtons(preferences.restart_required === true);
@@ -130,16 +146,32 @@ if (typeof document !== 'undefined') {
   const bridge = window.__TAURI_INTERNALS__;
   const invoke = typeof bridge?.invoke === 'function' ? (...args) => bridge.invoke(...args) : null;
   const status = document.getElementById('capture-health');
+  const preferencesStatus = document.getElementById('capture-preferences-status');
+  let details=null,pendingStatus=null;
+  if(typeof document.createElement==='function'&&preferencesStatus?.insertAdjacentElement){
+    details=document.createElement('p');details.id='capture-diagnostic-summary';details.setAttribute('role','status');
+    pendingStatus=document.createElement('p');pendingStatus.id='pending-persistence-status';
+    pendingStatus.textContent=formatPendingPersistence(null);
+    const help=document.createElement('p');help.id='diagnostics-export-help';
+    help.textContent='File → Export diagnostics… saves a metadata-only JSON report using the native Save dialog. It excludes conversation text and credentials.';
+    preferencesStatus.insertAdjacentElement('afterend',details);
+    details.insertAdjacentElement('afterend',pendingStatus);
+    pendingStatus.insertAdjacentElement('afterend',help);
+    window.addEventListener('chat-hub:pending-persistence',event=>{
+      pendingStatus.textContent=formatPendingPersistence(event.detail);
+    });
+  }
   const capturePreferences = bindCapturePreferences(invoke, {
     toggle: document.getElementById('capture-enabled-toggle'),
     saveButton: document.getElementById('save-capture-setting'),
     restartButton: document.getElementById('restart-capture-settings'),
-    status: document.getElementById('capture-preferences-status'),
+    status: preferencesStatus,
   }, message => window.confirm(message));
   capturePreferences.load();
   let previousSaved = null;
   const refresh = async () => {
     const capture = await refreshCaptureStatus(invoke, text => { status.textContent = text; });
+    if(details)details.textContent=formatCaptureDetails(capture);
     if (capture?.status !== 'available' || capture.enabled !== true) return;
     const saved = committedTotal(capture);
     if (previousSaved !== null && saved !== previousSaved) {
