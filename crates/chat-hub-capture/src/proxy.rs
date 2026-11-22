@@ -153,7 +153,7 @@ enum CaptureSource {
 }
 enum BodyCapture {
     Legacy(Accumulator),
-    Live(crate::live_capture::Accumulator),
+    Live(Box<crate::live_capture::Accumulator>),
     Operation(operation_learner::Accumulator),
 }
 impl CaptureSource {
@@ -166,7 +166,7 @@ impl CaptureSource {
             Self::Legacy(lane) => Some(BodyCapture::Legacy(lane.begin(context, metadata))),
             Self::Live { sink, operations } => sink
                 .begin(context.clone(), metadata.clone())
-                .map(BodyCapture::Live)
+                .map(|accumulator| BodyCapture::Live(Box::new(accumulator)))
                 .or_else(|| {
                     if sink.request_capture_enabled() {
                         operations

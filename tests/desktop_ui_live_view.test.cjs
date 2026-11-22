@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const load = async () => import('data:text/javascript;base64,' + Buffer.from(fs.readFileSync(require.resolve('../desktop-ui/live-stream.js'))).toString('base64'));
+const load = async () => import(require('node:url').pathToFileURL(require.resolve('../desktop-ui/live-stream.js')).href);
 
 const live = (kind, messageId, delta = '', conversationId = null) =>
   ({type: 'live', event: {kind, messageId, delta, conversationId}});
