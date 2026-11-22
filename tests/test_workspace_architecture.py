@@ -17,7 +17,7 @@ EXPECTED_EDGES = {
     "chat-hub-ingest": {"chat-hub-store", "chat-hub-formats"},
     "chat-hub-capture": {"chat-hub-model", "chat-hub-formats"},
     "chat-hub-api": {"chat-hub-model", "chat-hub-store", "chat-hub-ingest"},
-    "chat-hub-web": {"chat-hub-api", "chat-hub-store"},
+    "chat-hub-web": {"chat-hub-api", "chat-hub-store", "chat-hub-runtime"},
     "chat-hub-runtime": {
         "chat-hub-model", "chat-hub-store", "chat-hub-capture", "chat-hub-api"
     },
