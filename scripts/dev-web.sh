@@ -15,12 +15,14 @@ if [[ ! -f "$database" ]]; then
   exit 2
 fi
 
-state_root="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}"
-token_file="${CHAT_HUB_WEB_TOKEN_FILE:-$state_root/chat-hub-web/access-token}"
-python3 "$repo_root/scripts/ensure-private-token.py" "$token_file"
+if [[ "${CHAT_HUB_WEB_AUTH:-token}" != none ]]; then
+  state_root="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}"
+  token_file="${CHAT_HUB_WEB_TOKEN_FILE:-$state_root/chat-hub-web/access-token}"
+  python3 "$repo_root/scripts/ensure-private-token.py" "$token_file"
+  export CHAT_HUB_WEB_TOKEN_FILE="$token_file"
+fi
 
 export CHAT_HUB_DATABASE="$database"
-export CHAT_HUB_WEB_TOKEN_FILE="$token_file"
 export CHAT_HUB_DESKTOP_UI="${CHAT_HUB_DESKTOP_UI:-$repo_root/desktop-ui}"
 export CHAT_HUB_WEB_ADDR="${CHAT_HUB_WEB_ADDR:-0.0.0.0:8080}"
 export CHAT_HUB_CAPTURE_ENABLED=false

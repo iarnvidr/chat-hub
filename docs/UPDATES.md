@@ -21,8 +21,31 @@ Other pending acceptance includes the real packaged-app startup/health and nativ
 Release publication is protected and manual. The workflow's prepare job runs only on `main` in the `chat-hub-release` environment with read-only contents permission; it verifies exact protected main and an existing owner-created matching tag and never creates a tag. A separate publish job requires successful prepare, the explicit `publish=true` input, and the same protected environment with contents-write permission. `publish` defaults to false. Review the exact source/version, updater manifest and signature verification, app package, release notes, and evidence in the prepare stage before separately authorizing publication. Retain its required compile, persisted-library, launch/health, signing, pinned-key, manifest, and DMG checks. The genuine baseline update ordering decision remains a separate explicit protected acceptance item; the workflow does not run that integration test. Keep signing private material out of the repository; only the public verification key belongs in source control.
 
 
-## Automatic merge previews
+## Apple Silicon builds and merge previews: on demand
 
-Every protected-main push now triggers the native acceptance pipeline, including documentation-only merges. After successful acceptance, .github/workflows/auto-release.yml retrieves the original checksum-bound native artifact with build/release_artifact.py and publishes a GitHub prerelease named merge-<full-commit-sha>. This attaches the macOS ZIP, source-inclusive DMG, SHA-256 checksums and build provenance, with no second compilation. A failure blocks publication; workflow_dispatch can backfill a prior successful acceptance run ID. Re-running an existing release cannot overwrite different assets.
+Routine pull requests, including browser/PWA/server and documentation changes,
+run the required Linux Dagger, security, and JavaScript tests. **They do not
+launch macOS runners.** The existing branch-protection requirement named
+`native-release-gate` remains as a fast Linux compatibility check and
+explicitly reports that no Apple Silicon build was performed; it is not proof
+of native acceptance.
 
-Because the embedded app still declares version 0.2.5, these are commit-addressed installable previews, not misleading stable updater versions. They are ad-hoc signed and not notarized. The existing protected signed stable release workflow and the releases/latest updater feed remain unchanged; automatic stable updater releases would also require a version increment and signing/production-acceptance policy on each merge.
+To request a native build, select **Actions → Apple Silicon build (on demand)
+→ Run workflow**, selecting the precise branch to test. On a non-main branch,
+this produces a validated, installable review ZIP and DMG without publishing a
+release. On protected `main`, the dispatch also produces the immutable native
+transport and downloadable artifact for manual release preparation.
+
+**Map accepted Chat Hub macOS artifact** is independently dispatchable only on
+protected main. It performs the complete native build, creates the corresponding
+source-bound accepted mapping, and can lead to an opt-in merge preview. A
+merge to main alone never triggers Apple Silicon compilation or a preview
+publication. The preview publisher accepts only a *successful, manually
+dispatched* mapping run and does not rebuild, re-sign, or alter stable updates.
+Historical mapped releases retain their original provenance.
+
+For a stable release, an owner must first create the matching tag, manually
+build native main, then run **Protected Chat Hub release** with the validated
+`trusted_main_run_id` or a successful `mapping_run_id`. The protected release
+environment and `publish=false` default are unchanged. The existing stable
+updater feed must never be advanced automatically.

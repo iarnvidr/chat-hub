@@ -1,8 +1,8 @@
 name: Map accepted Chat Hub macOS artifact
 
+# Full native acceptance is expensive: explicitly requested only, never on merge.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   actions: read
@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   native-build:
+    if: github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 60
     outputs:
@@ -41,7 +42,11 @@ jobs:
           platform: macos-arm64
           target: aarch64-apple-darwin
       - id: native-build
-        name: Build and smoke the exact merged main commit
+        name: Build and smoke the exact requested main commit
+        # Receipt must identify this manual acceptance workflow, not the
+        # separate manual native-preview workflow.
+        env:
+          CHAT_HUB_NATIVE_RECEIPT_WORKFLOW: .github/workflows/accept-native.yml
         uses: ./ci/actions/macos-native-build
         with:
           publish-transport: 'true'
@@ -111,6 +116,7 @@ jobs:
           path: artifact-transport/chat-hub-macos-arm64
           retention-days: 30
   map:
+    if: github.ref == 'refs/heads/main' && needs.native-build.result == 'success' && needs.artifact-transfer.result == 'success'
     needs: [native-build, artifact-transfer]
     runs-on: ubuntu-24.04
     timeout-minutes: 10

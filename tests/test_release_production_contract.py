@@ -86,7 +86,9 @@ class ProductionContract(unittest.TestCase):
 
     def test_main_acceptance_rebuilds_exact_sha_and_requires_transfer_before_mapping(self):
         workflow = (ROOT / ".github/workflows/accept-native.yml").read_text()
-        self.assertIn('branches: [main]', workflow)
+        self.assertIn('workflow_dispatch:', workflow)
+        self.assertNotIn('  push:', workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
         native = workflow.split("  native-build:\n", 1)[1].split("  artifact-transfer:\n", 1)[0]
         transfer = workflow.split("  artifact-transfer:\n", 1)[1].split("  map:\n", 1)[0]
         mapping = workflow.split("  map:\n", 1)[1]
@@ -101,10 +103,10 @@ class ProductionContract(unittest.TestCase):
         native_scope = runpy.run_path(str(ROOT / "build/native_scope.py"))
         acceptance = (ROOT / ".github/workflows/accept-native.yml").read_text()
         trigger = acceptance.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
-        # Native acceptance now runs on EVERY main merge. A changed-path filter
-        # would suppress a release for documentation-only changes.
-        self.assertIn("push:", trigger)
-        self.assertIn("branches: [main]", trigger)
+        # Native acceptance runs only when explicitly dispatched; neither
+        # PRs nor protected-main pushes should start Apple Silicon builds.
+        self.assertIn("workflow_dispatch:", trigger)
+        self.assertNotIn("push:", trigger)
         self.assertNotIn("paths:", trigger)
         self.assertNotIn("paths-ignore:", trigger)
         source_helpers = runpy.run_path(str(ROOT / "build/release_sources.py"))
@@ -125,8 +127,8 @@ class ProductionContract(unittest.TestCase):
         for path in ("rust-toolchain", "rust-toolchain.toml", ".cargo/config.toml"):
             with self.subTest(path=path):
                 self.assertTrue(native_scope["requires_native"]([path]))
-        # Documentation-only changes remain out of PR-native scope, but the
-        # unconditional main acceptance builds them for release.
+        # Documentation-only edits never trigger a native build implicitly.
+        # Native testing stays available by explicit main/branch dispatch.
         self.assertFalse(native_scope["requires_native"](["docs/UPDATES.md"]))
 
     def test_workflow_checkouts_fetch_the_immutable_event_sha(self):
