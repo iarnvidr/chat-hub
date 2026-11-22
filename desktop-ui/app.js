@@ -4,6 +4,7 @@ import {updateStatus} from './status.js';
 import {createConversationTabs, findCapturedChatRecord} from './conversation-tabs.js';
 import {installTabShortcuts} from './tab-shortcuts.js';
 import {chatgptConversationId} from './continuation.js';
+import {providerViewAvailable} from './live-stream.js';
 import {groupSearchConversations, appendSearchHighlight} from './search.js';
 import {branchForAnchor} from './entity-model.js';
 import {createRowActions} from './row-actions.js';
@@ -400,7 +401,8 @@ function openConversation(id, leafNodeId, anchorNodeId, options={}) {
     if (c?.conversation?.id !== id) throw Error('not_found');
     if(anchorNodeId&&!leafNodeId){const leaf=branchForAnchor(c,anchorNodeId);if(leaf&&leaf!==c.selection?.selected_node_id){conversationTabs.update(options.tabId||id,{leafNodeId:leaf,anchorNodeId});openConversation(id,leaf,anchorNodeId,{...options,selectTab:false});return;}}
     conversation = {...c.conversation, ...c, selected_node_id: c.selection?.selected_node_id};
-    $('continue-chatgpt').hidden = !chatgptConversationId(c.conversation);
+    // Server mode has no desktop provider view; only the live composer continues a chat.
+    $('continue-chatgpt').hidden = !providerViewAvailable({native: native || fixture, capabilities: window.ChatHub?.capabilities}) || !chatgptConversationId(c.conversation);
     $('set-chat-project').hidden = !chatgptConversationId(c.conversation);
     $('title').textContent = c.conversation?.title ?? 'Untitled conversation';
     const project = c.conversation?.project;

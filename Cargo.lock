@@ -635,6 +635,7 @@ dependencies = [
  "chat-hub-api",
  "chat-hub-runtime",
  "chat-hub-store",
+ "futures-util",
  "http",
  "ring",
  "serde",

@@ -9,10 +9,14 @@ import asyncio
 import os
 import subprocess
 from pathlib import Path
-from policy import conversation_path, navigation_url, request_allowed, signed_out_url
+from policy import conversation_path, navigation_url, prompt_target_url, request_allowed, signed_out_url
 
 NSS_NICKNAME = "chat-hub-capture-ca"
 LOGIN_BUTTON = '[data-testid="login-button"]'
+# ChatGPT page selectors used to send a prompt. They are guesses from the public
+# page and need acceptance against the real page; keep every one of them here.
+COMPOSER_SELECTORS = ("#prompt-textarea", 'div.ProseMirror[contenteditable="true"]', "textarea[name='prompt-textarea']")
+GENERATING_INDICATOR = '[data-testid="stop-button"]'
 
 
 def trust_ca(profile_home: Path, ca_cert: Path, certutil: str = "certutil") -> None:
@@ -45,6 +49,7 @@ class HeadlessBrowser:
         self.context = self.driver = None
         self.page = None
         self._jobs = asyncio.Lock()
+        self.prompt_waiting = 0  # the history sweep yields while a prompt job waits
 
     async def start(self) -> None:
         if self.context:
@@ -93,10 +98,53 @@ class HeadlessBrowser:
         if await links.count():
             await links.last.scroll_into_view_if_needed(timeout=5000)
 
-    async def run_job(self, job):
-        """Serialize browser work. `job(page)` is the seam for future prompt sending."""
-        async with self._jobs:
-            return await job(self.page)
+    async def run_job(self, job, priority: bool = False):
+        """Serialize browser work: one job at a time on the single page."""
+        if priority:
+            self.prompt_waiting += 1
+        try:
+            async with self._jobs:
+                if priority:
+                    self.prompt_waiting -= 1
+                    priority = False
+                return await job(self.page)
+        finally:
+            if priority:
+                self.prompt_waiting -= 1
+
+    async def send_prompt(self, conversation_id: str | None, text: str, timeout: float = 180.0) -> str:
+        """Type `text` into the ChatGPT composer and wait for the reply to finish.
+
+        Returns `done`, `needs_sign_in` or `error`. The text is only handed to the
+        page: it is never logged, stored or put in an exception message.
+        """
+        url = prompt_target_url(conversation_id)
+
+        async def job(page) -> str:
+            composer_css = ", ".join(COMPOSER_SELECTORS)
+            await self.goto(url)
+            try:  # either the composer or the login button settles the page
+                await page.locator(f"{composer_css}, {LOGIN_BUTTON}").first.wait_for(state="visible", timeout=30000)
+            except Exception:
+                return "needs_sign_in" if await self.signed_out() else "error"
+            if await self.signed_out():
+                return "needs_sign_in"
+            try:
+                composer = page.locator(composer_css).first
+                await composer.click(timeout=10000)
+                await composer.fill(text, timeout=15000)
+                await page.keyboard.press("Enter")
+                indicator = page.locator(GENERATING_INDICATOR).first
+                try:  # a very fast reply can finish before the indicator is seen
+                    await indicator.wait_for(state="visible", timeout=15000)
+                except Exception:
+                    pass
+                await indicator.wait_for(state="hidden", timeout=int(timeout * 1000))
+            except Exception:  # never include the message: it may embed the prompt
+                return "error"
+            return "done"
+
+        return await self.run_job(job, priority=True)
 
     async def close(self) -> None:
         if self.context:

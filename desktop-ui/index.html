@@ -42,7 +42,7 @@
   <div id="fixture-banner" class="fixture-banner" hidden>Development fixtures — native service not connected</div>
   <div class="workspace">
     <aside class="list-pane" aria-label="Conversation library">
-      <div class="sidebar-heading"><a class="brand" href="#">Chat Hub</a><button id="show-chatgpt" data-capability="provider_view" class="primary" type="button">New chat</button></div>
+      <div class="sidebar-heading"><a class="brand" href="#">Chat Hub</a><button id="show-chatgpt" data-capability="provider_view" class="primary" type="button">New chat</button><button data-live-new-chat class="primary" type="button" hidden>New chat</button></div>
       <label class="search"><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span class="sr-only">Search conversations</span><input id="search" type="search" placeholder="Search chats" autocomplete="off"></label>
       <div class="source-toggle" role="group" aria-label="Conversation source"><button id="source-chat" type="button" aria-pressed="true" data-source="chatgpt">Chat</button><button id="source-codex" type="button" aria-pressed="false" data-source="codex">Codex</button></div>
       <select id="history-source" aria-label="History source" hidden><option value="chatgpt" selected>Chat</option><option value="codex">Codex</option></select>
@@ -68,13 +68,18 @@
           <details id="overview-recent-section"><summary id="overview-recent-title">Chats in this map</summary><div id="overview-recent" class="overview-recent"></div></details>
         </section>
         <section id="library-reader" class="reader-pane" tabindex="-1" aria-label="Saved conversation">
-          <div id="reader-empty" class="reader-empty"><h1>Pick up a conversation</h1><p>Open a chat from your history, or start something new.</p><button class="primary" data-capability="provider_view" type="button" data-library-action="show-chatgpt">New chat</button></div>
+          <div id="reader-empty" class="reader-empty"><h1>Pick up a conversation</h1><p>Open a chat from your history, or start something new.</p><button class="primary" data-capability="provider_view" type="button" data-library-action="show-chatgpt">New chat</button><button data-live-new-chat class="primary" type="button" hidden>New chat</button></div>
           <div id="reader" hidden>
-            <div class="reader-head"><button id="back-to-library" type="button" aria-label="Back to library">Back</button><div class="reader-heading"><div id="provider" class="eyebrow"></div><h1 id="title"></h1><p id="account-attribution" class="subtle"></p><span id="reader-project" class="project-label" hidden></span></div><button id="continue-chatgpt" data-capability="provider_view" class="primary" type="button" hidden>Continue chat</button><label class="branch-label">Branch<select id="branch"></select></label></div>
+            <div class="reader-head"><button id="back-to-library" type="button" aria-label="Back to library">Back</button><div class="reader-heading"><div id="provider" class="eyebrow"></div><h1 id="title"></h1><p id="account-attribution" class="subtle"></p><span id="reader-project" class="project-label" hidden></span></div><button id="continue-chatgpt" data-capability="provider_view" class="primary" type="button" hidden>Continue chat</button><button id="live-continue-chat" class="primary" type="button" hidden>Continue chat</button><label class="branch-label">Branch<select id="branch"></select></label></div>
             <div class="reader-tools" role="search" aria-label="Find in this branch"><input id="branch-find" type="search" placeholder="Find in this chat…" aria-label="Find in this branch"><span id="branch-find-count" role="status" aria-live="polite"></span><button id="branch-find-prev" type="button" aria-label="Previous match" disabled>↑</button><button id="branch-find-next" type="button" aria-label="Next match" disabled>↓</button><button id="copy-branch" type="button">Copy branch</button><button id="show-chat-connections" type="button">Related chats</button><button id="show-message-graph" type="button">Message graph</button><button id="set-chat-project" data-capability="writes" type="button" hidden>Set project</button></div>
             <div class="reader-labels"><div id="reader-tags" class="tag-chips"></div><button id="edit-chat-tags" data-capability="writes" type="button" disabled>Tags</button><button id="show-chat-files" type="button" disabled>Files</button></div>
             <div id="messages" class="messages"></div>
           </div>
+          <section id="live-panel" class="live-panel" hidden aria-label="Send a message">
+            <article id="live-output" class="message archive-message" data-speaker="assistant" hidden><div class="role archive-message__meta">ASSISTANT</div><div id="live-output-body" class="markdown archive-message__body"></div></article>
+            <p id="live-status" role="status" aria-live="polite"></p>
+            <form id="live-composer"><label for="live-text"><span id="live-target">New chat</span></label><textarea id="live-text" rows="3" placeholder="Message ChatGPT…" autocomplete="off"></textarea><div class="actions"><button id="live-send" class="primary" type="submit">Send</button><button id="live-close" type="button">Close</button></div></form>
+          </section>
         </section>
         <section id="provider-shell" hidden aria-label="ChatGPT"><div class="provider-toolbar"><span id="provider-title" class="sr-only">New conversation</span><p id="provider-view-status" role="status" aria-live="polite">Loading ChatGPT…</p><div class="actions"><button id="provider-reload" type="button">Reload</button><button id="provider-back" type="button">Read saved copy</button></div></div><div id="provider-host" aria-label="ChatGPT browser area"></div></section>
       </main>
@@ -102,6 +107,7 @@
   <script type="module" src="./library-home.js"></script>
   <script type="module" src="./reader-tools.js"></script>
   <script type="module" src="./provider-view.js"></script>
+  <script type="module" src="./live-view.js"></script>
   <script type="module" src="./history-sync.js"></script>
   <script type="module" src="./workspace.js"></script>
   <script type="module" src="./overview.js"></script>
