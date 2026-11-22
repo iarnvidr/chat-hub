@@ -126,8 +126,10 @@ def receipt(root):
     pr_head = pr.get('head') or {}
     record = {
         'schema': 2, 'repository': os.environ['GITHUB_REPOSITORY'],
-        'workflow_path': (MAPPING_WORKFLOW if os.environ['GITHUB_EVENT_NAME'] == 'push'
-                          else NATIVE_WORKFLOW),
+        'workflow_path': os.environ.get(
+            'CHAT_HUB_NATIVE_RECEIPT_WORKFLOW',
+            MAPPING_WORKFLOW if os.environ['GITHUB_EVENT_NAME'] == 'push' else NATIVE_WORKFLOW,
+        ),
         'run_id': int(os.environ['GITHUB_RUN_ID']),
         'run_attempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
         'event': os.environ['GITHUB_EVENT_NAME'],
@@ -303,7 +305,7 @@ def validate_pr_candidate(data, artifact, run, pr, merge_sha, merge_tree, build_
 
 def validate_main_candidate(data, artifact, run, pr, merge_sha, merge_tree, build_version, api_fn,
                             allow_in_progress=False):
-    if (run.get('path') != MAPPING_WORKFLOW or run.get('event') != 'push'
+    if (run.get('path') != MAPPING_WORKFLOW or run.get('event') not in ('push', 'workflow_dispatch')
             or run.get('head_sha') != merge_sha
             or (run.get('conclusion') != 'success'
                 and not (allow_in_progress and run.get('status') == 'in_progress'))
@@ -321,7 +323,7 @@ def validate_main_candidate(data, artifact, run, pr, merge_sha, merge_tree, buil
     record = json.loads(members['native-receipt.json'])
     expected = {
         'schema': 2, 'repository': REPOSITORY, 'workflow_path': MAPPING_WORKFLOW,
-        'run_id': run['id'], 'run_attempt': run['run_attempt'], 'event': 'push',
+        'run_id': run['id'], 'run_attempt': run['run_attempt'], 'event': run['event'],
         'head': merge_sha, 'tree': merge_tree, 'version': build_version, 'platform': PLATFORM,
     }
     if any(record.get(key) != value for key, value in expected.items()):
@@ -436,7 +438,7 @@ def promote(root, merge_sha, mapping_run_id, api_fn=request):
         raise ValueError('trusted-main acceptance run ID must be numeric')
     run = api_fn(f'repos/{REPOSITORY}/actions/runs/{mapping_run_id}')
     if (run.get('id') != int(mapping_run_id) or run.get('path') != MAPPING_WORKFLOW
-            or run.get('event') != 'push' or run.get('head_branch') != 'main'
+            or run.get('event') not in ('push', 'workflow_dispatch') or run.get('head_branch') != 'main'
             or run.get('head_sha') != merge_sha
             or run.get('repository', {}).get('full_name') != REPOSITORY
             or run.get('status') != 'in_progress'):
@@ -462,7 +464,7 @@ def mapping_run(api_fn, run_id, commit):
         raise ValueError('mapping run ID must be numeric')
     run = api_fn(f'repos/{REPOSITORY}/actions/runs/{run_id}')
     if (run.get('id') != int(run_id) or run.get('repository', {}).get('full_name') != REPOSITORY
-            or run.get('path') != MAPPING_WORKFLOW or run.get('event') != 'push'
+            or run.get('path') != MAPPING_WORKFLOW or run.get('event') not in ('push', 'workflow_dispatch')
             or run.get('head_branch') != 'main' or run.get('head_sha') != commit
             or run.get('conclusion') != 'success'):
         raise ValueError('mapping run is not the successful trusted-main acceptance for this commit')
@@ -494,7 +496,7 @@ def source_artifact(accepted, api_fn):
         raise ValueError('accepted native run identity is malformed')
     run = api_fn(f'repos/{REPOSITORY}/actions/runs/{run_id}')
     if (run.get('id') != run_id or run.get('run_attempt') != attempt
-            or run.get('path') != MAPPING_WORKFLOW or run.get('event') != 'push'
+            or run.get('path') != MAPPING_WORKFLOW or run.get('event') not in ('push', 'workflow_dispatch')
             or run.get('head_branch') != 'main' or run.get('head_sha') != accepted.get('accepted_commit')
             or run.get('conclusion') != 'success'
             or run.get('repository', {}).get('full_name') != REPOSITORY
