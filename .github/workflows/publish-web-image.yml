@@ -22,6 +22,9 @@ jobs:
       actions: read
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - name: Authenticate exact successful Checks run
         id: source
@@ -101,6 +104,35 @@ jobs:
             --publisher-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --image-ref "$IMAGE_REF" \
             --output artifacts/chat-hub-web-image-receipt.json
+      - name: Bind exact-main image receipt to an attestation subject
+        id: signed-subject
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          value=json.loads(Path('artifacts/chat-hub-web-image-receipt.json').read_text())
+          source=value['source']
+          assert source['repository']=='iarnvidr/chat-hub'
+          assert source['commit']==os.environ['SOURCE_SHA']
+          assert source['run_id']==int(os.environ['SOURCE_RUN_ID'])
+          assert source['run_attempt']==int(os.environ['SOURCE_RUN_ATTEMPT'])
+          image=value['publication']['image_ref']
+          prefix='ghcr.io/iarnvidr/chat-hub-web:run-'+os.environ['SOURCE_RUN_ID']+'-'+os.environ['SOURCE_RUN_ATTEMPT']+'@'
+          if not image.startswith(prefix) or not re.fullmatch(r'sha256:[a-f0-9]{64}',image[len(prefix):]):
+              raise SystemExit('Refuse attestation for untrusted/mutable web image')
+          with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as output:
+              output.write('digest='+image[len(prefix):]+'\n')
+          PY
+      - name: Sign Chat Hub web image provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/iarnvidr/chat-hub-web
+          subject-digest: ${{ steps.signed-subject.outputs.digest }}
       - name: Retain immutable image receipt for deploy resolution
         uses: ./ci/actions/gha-artifact-upload
         with:
