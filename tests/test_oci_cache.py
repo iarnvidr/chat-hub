@@ -397,6 +397,44 @@ class PublicationTests(unittest.TestCase):
                 run_oras.assert_called_once_with(["tag", "ghcr.io/iarnvidr/chat-hub-ci-cache@sha256:" + "9" * 64, "pr-42"])
 
 
+    def test_missing_optional_cache_does_not_claim_any_package_or_check_evidence(self):
+        run = workflow_run()
+        run["conclusion"] = "success"
+        with tempfile.TemporaryDirectory() as temporary:
+            event = Path(temporary) / "event.json"
+            cache.write_json(event, {"workflow_run": run})
+            env = {"GITHUB_REPOSITORY": REPOSITORY, "GITHUB_EVENT_NAME": "workflow_run"}
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(cache, "validated_run", return_value=run), \
+                    mock.patch.object(cache, "artifact_download",
+                                      side_effect=cache.MissingArtifact("optional export timed out")) as download, \
+                    mock.patch.object(cache, "registry_session") as registry, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                cache.publish(event, "/tools/oras")
+            download.assert_called_once()
+            registry.assert_not_called()
+            self.assertIn("skipping optional OCI publication", output.getvalue())
+            self.assertNotIn("Retained", output.getvalue())
+
+    def test_missing_artifact_is_distinct_from_ambiguous_inventory(self):
+        name = "chat-hub-cargo-cache-123-2"
+        absent = {"total_count": 0, "artifacts": []}
+        duplicate = {"total_count": 2, "artifacts": [
+            {"name": name, "expired": False},
+            {"name": name, "expired": False},
+        ]}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            with self.assertRaises(cache.MissingArtifact):
+                cache.artifact_download(REPOSITORY, workflow_run(), name, output,
+                                        {cache.ARCHIVE: 100}, mock.Mock(return_value=absent))
+            with self.assertRaises(cache.CacheError) as caught:
+                cache.artifact_download(REPOSITORY, workflow_run(), name, output,
+                                        {cache.ARCHIVE: 100}, mock.Mock(return_value=duplicate))
+            self.assertNotIsInstance(caught.exception, cache.MissingArtifact)
+
+
+
 class RegistryTests(unittest.TestCase):
     def test_auth_is_isolated_and_never_in_child_environment(self):
         invocations = []

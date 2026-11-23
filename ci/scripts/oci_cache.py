@@ -44,6 +44,10 @@ class CacheError(Exception):
     """An invalid/unavailable optimization must not bypass required checks."""
 
 
+class MissingArtifact(CacheError):
+    """The producer did not retain an optional artifact; no bytes are available."""
+
+
 def repository(value: object) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", value):
         raise CacheError("invalid repository")
@@ -604,8 +608,10 @@ def artifact_download(repo: str, run: dict, name: str, output: Path,
     if not isinstance(listed, dict) or listed.get("total_count", 0) > 100:
         raise CacheError("artifact listing is unavailable or truncated")
     found = [item for item in listed.get("artifacts", []) if item.get("name") == name and not item.get("expired")]
+    if not found:
+        raise MissingArtifact(f"exact artifact {name} is missing")
     if len(found) != 1:
-        raise CacheError(f"exact artifact {name} is missing or ambiguous")
+        raise CacheError(f"exact artifact {name} is ambiguous")
     item = found[0]
     artifact_id = positive_integer(item.get("id"), "artifact ID")
     expected_digest = item.get("digest", "")
@@ -724,8 +730,17 @@ def publish(event_path: Path, oras: str) -> None:
         stage = Path(temporary)
         bundle = stage / "cache"
         artifact_name = f"chat-hub-cargo-cache-{run['id']}-{run['run_attempt']}"
-        artifact_download(repo, run, artifact_name, bundle,
-                          {ARCHIVE: MAX_ARCHIVE_BYTES, MANIFEST: MAX_JSON_BYTES})
+        try:
+            artifact_download(repo, run, artifact_name, bundle,
+                              {ARCHIVE: MAX_ARCHIVE_BYTES, MANIFEST: MAX_JSON_BYTES})
+        except MissingArtifact:
+            # Dagger's bounded export is deliberately optional. A green Checks
+            # run may have no snapshot after an export timeout. Never fabricate
+            # a compiler cache, crate package or passing-check receipt.
+            print(f"::notice::No compiler cache artifact for Checks run "
+                  f"{run['id']} attempt {run['run_attempt']}; "
+                  "skipping optional OCI publication (required Checks unchanged)")
+            return
         manifest = validate_bundle(bundle, repo)
         manifest["publication"] = validate_producer(manifest, run, repo)
         write_json(bundle / MANIFEST, manifest)
